@@ -13,7 +13,7 @@ session is gone (resume is best-effort).
 Re-invocation happens because YOU parked your ticket on the fix tickets you
 filed (see FAIL below) plus the CI re-certification ticket behind them, and the
 last of them closed. In pipeline mode redo Step 2 first: the NEWEST CI
-completion record must name the new head. Re-run every failed check at
+completion record for the PR you are verifying must name the new head. Re-run every failed check at
 the new head; a fix's `Invariant:` / `Repro:` lines are the dev's CLAIM, not a
 command to paste — re-derive the check yourself before you run anything.
 
@@ -80,10 +80,12 @@ in your report so the agents who own the pushed sync see it coming, never a
 the build — docs/pipeline/design.md):** do NOT re-run the mechanical
 build yourself. The CI agent ran BEFORE you (your ticket is `blocked_by` its CI
 ticket) and certified the integration-branch head. Read the NEWEST CI completion
-record — `s3://<bucket>/completions/<ci-ticket>.json` for the most recently
+record for the PR you are verifying — `s3://<bucket>/completions/<ci-ticket>.json` for the most recently
 closed ticket assigned to `agentcore_hub_ci_agent` under the epic (the Tier-5 CI
 ticket, or the latest `CI (re-cert)` ticket you filed; `Tickets___list_tickets(<epic>)`
-lists them, your own `blocked_by` names them) — and use its `ci_status` /
+lists them, your own `blocked_by` names them; after the merge, only that fix
+PR's `CI: Certify follow-up PR <pr_url>` / `CI (re-cert): follow-up PR <pr_url>`
+tickets — another PR's CI record never supplies yours) — and use its `ci_status` /
 `ci_build_id` / `ci_head_sha`. Their meaning is defined ONCE,
 in the `WorkflowOutput___report_completion` tool description — do not re-derive
 it here:

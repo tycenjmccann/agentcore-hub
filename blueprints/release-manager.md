@@ -88,26 +88,30 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   unified PR" in every step below. The one exception is the fallback under "After
   the unified PR has merged" (commits that already landed on the dead branch).
   On a `Ship: follow-up PR <url>` ticket the PR is the one in its title and
-  description; before reviewing, confirm CI certified THAT head — the
-  completion record of the `CI: Certify follow-up PR <url>` ticket your ticket
-  is blocked by has `ci_head_sha` equal to the PR's current head. A mismatch
-  is not a PASS: file a `CI (re-cert)` ticket and park behind it.
+  description; before reviewing, confirm CI certified THAT head per the SHA
+  cross-check below. A mismatch is not a PASS: file a
+  `CI (re-cert): follow-up PR <url>` ticket and park behind it.
 - Record the PR number, URL, and head SHA.
 - **Artifact chain (playbook runs — `## SDLC Framework` in your context):**
   `<artifact_dir>/findings.md` must exist at the PR head (the code reviewer's
   artifact; nothing else checks it). Missing → automatic IN-DIFF finding →
   CHANGES NEEDED with a `ship_fix` assigned to `agentcore_hub_code_reviewer`
   ("commit findings.md on <branch>"), never PASS.
-- **SHA cross-check:** read the NEWEST CI completion record — the most recently
-  closed ticket assigned to `agentcore_hub_ci_agent` under the epic (the Tier-5
-  CI ticket or the latest `CI (re-cert)` ticket; `Tickets___list_tickets` lists
-  them) at `s3://<bucket>/completions/<that ticket>.json` — and compare its
-  tested head SHA against the PR head SHA. Mismatch = commits landed after CI =
+- **SHA cross-check:** read the NEWEST CI completion record for THIS PR — the
+  most recently closed `agentcore_hub_ci_agent` ticket under the epic that
+  certifies THIS PR. For the run's unified PR that is the run's CI tickets whose
+  titles name no follow-up PR (the Tier-5 CI ticket or the latest `CI (re-cert)`
+  ticket); for a follow-up PR it is its `CI: Certify follow-up PR <url>` ticket
+  or the latest `CI (re-cert): follow-up PR <url>` ticket naming that same
+  `<url>` (`Tickets___list_tickets` lists them). Follow-up chains run
+  concurrently, so another PR's CI record never invalidates or supplies this
+  PR's certification. Read it at `s3://<bucket>/completions/<that ticket>.json`
+  and compare its tested head SHA against the PR head SHA. Mismatch = commits landed after CI =
   a **CI re-cert blocker**, not a code defect: it is never a CHANGES NEEDED
   verdict on staleness grounds (a mechanical sync commit — yours or the CI
   agent's — is the usual cause), but it does block PASS. File a fix ticket for
-  the CI agent to
-  re-run (`spawned_by_kind: "ship_fix"`, `blocked_by` = this round's fix tickets
+  the CI agent to re-run (titled `CI (re-cert): follow-up PR <url>` on a
+  follow-up PR; `spawned_by_kind: "ship_fix"`, `blocked_by` = this round's fix tickets
   so it certifies the fixed head), list it in your own `blocked_by` when you
   park (below), and do not pass until they match.
 - **Unverified live fixes:** for every closed `qa_fix` / `ship_fix` under the
@@ -119,7 +123,7 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
   Brief's WHAT HAPPENED. A fix you cannot re-verify as fixed is an automatic
   IN-DIFF finding → CHANGES NEEDED (`ship_fix`), never PASS.
 - **CI certification:** read `ci_status` / `ci_build_id` / `ci_head_sha` from
-  that same NEWEST CI completion record (`completions/<ci-ticket>.json`; field
+  that same NEWEST CI completion record for THIS PR (`completions/<ci-ticket>.json`; field
   semantics are defined once, in the `WorkflowOutput___report_completion` tool
   description) and render them into the Merge Brief's WHAT HAPPENED as one of:
   `• CI: certified — CodeBuild <ci_build_id> on <ci_head_sha, first 7 chars>`
@@ -671,11 +675,13 @@ stated on this run's tickets that is not the integration branch) is not delivere
 it merges, and the completion gate refuses the run while one from this run is
 still open (escalation reason `open_follow_up_pr` names it). On any post-merge
 invocation, and whenever that escalation names a PR: for each open PR from this
-run into the default branch or such a stated base (other than the unified PR) that has no
-`Ship: follow-up PR <url>` ticket under the epic, file its chain yourself per
-`load_blueprint("bug-fixer")` → "Post-merge follow-up PR: file its ship chain"
-(the CI ticket blocked_by the fix ticket that opened it, or nothing if that is
-Done). A PR deliberately folded into another is closed as superseded instead —
+run into the default branch or such a stated base (other than the unified PR) whose
+chain is incomplete — any of its four links (`CI: Certify`, `Ship:`, `Merge
+Approval:`, `CD: follow-up PR <url>`) missing, or one not `blocked_by` its
+not-yet-Done predecessor — reconcile its chain yourself per
+`load_blueprint("bug-fixer")` → "Post-merge follow-up PR: file its ship chain":
+create only the missing links and repair only the missing edges (the CI ticket
+blocked_by the fix ticket that opened it, or nothing if that is Done). A PR deliberately folded into another is closed as superseded instead —
 a closed PR never holds the run open.
 
 Both kinds share: assignee = the SAME `human:<who>` string as this run's Merge
@@ -776,16 +782,23 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
   polling THAT execution (step 4). If `Pipeline___get_state` reports it
   `Superseded`, follow `waitingOn.supersededBy` to the successor execution id,
   record the new id in the ledger, and poll that one.
-- **One ledger per deploy (follow-up CD).** The key is fixed, so a run that
-  ships a follow-up PR finds the EARLIER deploy's ledger there. A ledger whose
-  `prUrl` is not THIS CD ticket's PR is that earlier deploy, not yours: copy it
-  verbatim to `workflows/{workflow_id}/shared/cd-ledger-<its mergeCommit>.json`
-  (`S3Storage___read_object` then `S3Storage___write_object`; re-copying on a
-  retry is harmless — the key is that deploy's own `mergeCommit`), and only
-  THEN start a fresh ledger for this PR. Never "resume" another PR's
-  `executionId`. Each follow-up CD merges THIS PR, calls `start_deploy` with
-  `approved_head_sha` = THIS PR's head, watches it to terminal and reports
-  `merge_commit` + outcome, exactly as below.
+- **One ledger per CD ticket (follow-up CD).** Follow-up chains are not
+  serialized, so another PR's deploy may still be live while yours runs. On a
+  `CD: follow-up PR <url>` ticket your ledger is
+  `workflows/{workflow_id}/shared/cd-ledger-<CD ticket id>.json` (this ticket's
+  own id) and every `shared/cd-ledger.json` in this section means that key:
+  read it FIRST on every invocation, write it the moment `start_deploy` returns,
+  and resume its `executionId` before any new start (including
+  `waitingOn.supersededBy`). A follow-up CD never writes, copies or archives
+  `shared/cd-ledger.json` — that key stays the unified PR's deploy record,
+  unchanged — and never takes another key's `executionId` as its own. One
+  fallback: if your key is missing and `shared/cd-ledger.json`'s `prUrl` is
+  THIS PR (written before per-ticket keys), copy it verbatim to your key and
+  resume it. Each follow-up CD merges THIS PR, calls `start_deploy` with
+  `pipeline_name` and `approved_head_sha` = THIS PR's head, watches it to
+  terminal and passes `pipeline_name` on `report_completion` with
+  `merge_commit` + outcome, exactly as below — so the legacy check, which
+  probes only `shared/cd-ledger.json`, never applies to it.
 - Legacy mode writes NO ledger. Its absence, together with passing no
   `pipeline_name`, is exactly how `report_completion` recognises a legacy
   DEPLOY.md ship and accepts `outcome="shipped"` with a merge commit and no
@@ -1109,8 +1122,8 @@ path too ("The human's answer", above).
   `blocked_by: ""`, no ids in the title; then park your own ticket on it and exit
 - `holdsGate: "older"` or `"unknown"` is NOT your gate: keep polling, file
   nothing, page nobody — and never a second gate ticket for the same execution
-- Write `shared/cd-ledger.json` the instant `start_deploy` returns an execution
-  id, and read it FIRST on every re-dispatch: resume that execution (or
+- Write `shared/cd-ledger.json` (on a follow-up CD, your `cd-ledger-<CD ticket id>.json`) the instant
+  `start_deploy` returns an execution id, and read it FIRST on every re-dispatch: resume that execution (or
   `waitingOn.supersededBy`), never trigger a second deploy
 - `outcome="shipped"` needs `merge_commit` + `pipeline_execution_id` and
   `succeeded:true` for that execution (legacy DEPLOY.md ships: merge commit

@@ -19,7 +19,10 @@ has a deployed CodeBuild PR-check, see docs/pipeline/design.md):
 A ticket titled `CI (re-cert): …` (filed by the QA verifier or the release
 manager after their fix rounds moved the head) is an ordinary CI ticket: run the
 same P0 → P1 → P2 → P3 against the CURRENT head and write your own completion
-record — downstream agents read the newest CI record under the epic.
+record — downstream agents read the newest CI record for the PR it certifies
+(release-manager.md Step 1 "SHA cross-check"). A `CI (re-cert): follow-up PR
+<pr_url>` ticket certifies that PR, exactly as a `CI: Certify follow-up PR
+<pr_url>` ticket does (below).
 
 Independently of the mode, read `## Delivery Mode`. `CD_REGISTERED: false` means
 the hub will NOT merge or deploy this repo: you are the LAST agent before the
