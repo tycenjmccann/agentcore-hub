@@ -1907,8 +1907,9 @@ describe("TEAM-6032 followUpPrRefs", () => {
       d: { prUrl: "https://github.com/hub/agentcore-hub/pull/7" }, // hub-infra PR: other repo
       e: { prUrl: "TBD" },
       f: { output: "no pr" },
-    }, { owner: "o", repo: "r" });
-    expect(refs).toEqual([{ number: 12, url: "https://github.com/o/r/pull/12" }, { number: 9, url: "https://github.com/o/r/pull/9" }]);
+    }, [{ owner: "o", repo: "r", defaultBranch: "main" }]);
+    const R = { owner: "o", repo: "r", defaultBranch: "main" }; // TEAM-6062: each ref carries its repo
+    expect(refs).toEqual([{ ...R, number: 12, url: "https://github.com/o/r/pull/12" }, { ...R, number: 9, url: "https://github.com/o/r/pull/9" }]);
   });
 });
 
@@ -1945,7 +1946,7 @@ describe("TEAM-6032 openFollowUpPrs", () => {
 describe("TEAM-6032 completionBlockedNotice open_follow_up_pr", () => {
   it("own slug, names the PRs and the remedy", () => {
     const n = completionMod.completionBlockedNotice("open_follow_up_pr", "https://github.com/o/r/pull/12", {});
-    expect(n.slug).toBe("followup_pr");
+    expect(n.slug).toMatch(/^followup_pr_[0-9a-f]{8}$/); // TEAM-6062: keyed by the open-PR set
     expect(n.details).toContain("https://github.com/o/r/pull/12");
     expect(n.details).toContain("CI → Ship → Merge Approval → CD");
   });
@@ -1955,7 +1956,7 @@ describe("TEAM-6032 followUpPrGate", () => {
   const OPEN = { state: "open", head: { ref: "fix/a" }, base: { ref: "main" } };
   const wf = (agentTasks) => ({ id: "wf", featureBranch: "feature/E-1-x", repoConfig: { repos: [{ defaultBranch: "main" }] }, agentTasks });
   const tasks = { S: { agentId: "rm", mergeCommit: "m1" }, F: { prUrl: "https://github.com/o/r/pull/12" } };
-  const base = { repoRef: () => ({ owner: "o", repo: "r" }), getAgentPhase: (id) => (id === "rm" ? "ship" : "development"), warn: () => {} };
+  const base = { repoRef: () => [{ owner: "o", repo: "r", defaultBranch: "main" }], getAgentPhase: (id) => (id === "rm" ? "ship" : "development"), warn: () => {} };
   it("unified PR merged (ship-phase mergeCommit) + open follow-up → returns it", async () => {
     const open = await completionMod.followUpPrGate({ ...base, workflow: wf(tasks), agentTasks: tasks, mergeProof: null, api: async () => OPEN });
     expect(open).toEqual(["https://github.com/o/r/pull/12"]);
@@ -1971,5 +1972,64 @@ describe("TEAM-6032 followUpPrGate", () => {
     const open = await completionMod.followUpPrGate({ ...base, repoRef: () => { throw new Error("no repo"); }, warn: (m) => warns.push(m), workflow: wf(tasks), agentTasks: tasks, mergeProof: { merged: true }, api: async () => OPEN });
     expect(open).toEqual([]);
     expect(warns[0]).toContain("follow-up PR check skipped");
+  });
+});
+
+// TEAM-6062 — review of #928: the gate must read the record's pr_url (prUrl is
+// fill-once), key its notice by the open-PR set, and check every configured repo.
+describe("TEAM-6062 follow-up PR gate", () => {
+  const ON = (base) => ({ state: "open", head: { ref: "fix/a" }, base: { ref: base } });
+  const wf2 = { id: "wf", featureBranch: "feature/E-1-x", repoConfig: { repos: [
+    { url: "https://github.com/o/r", defaultBranch: "main" },
+    { url: "https://github.com/o/r2.git", defaultBranch: "develop" },
+  ] } };
+  const MERGED = { S: { agentId: "rm", mergeCommit: "m1" } };
+  const getAgentPhase = (id) => (id === "rm" ? "ship" : "development");
+  const byPath = (map) => async (path) => map[path];
+
+  it("TEAM-6062 followUpPrRefs: completion-record pr_url is used alongside a stale cached prUrl", () => {
+    const refs = completionMod.followUpPrRefs(
+      { F: { prUrl: "https://github.com/o/r/pull/11" } },
+      [{ owner: "o", repo: "r", defaultBranch: "main" }],
+      { F: { pr_url: "https://github.com/o/r/pull/12" } },
+    );
+    expect(refs.map((r) => r.number).sort()).toEqual([11, 12]);
+  });
+
+  it("TEAM-6062 followUpPrGate: stale cached integration PR + record PR open to main → returns the record PR", async () => {
+    const tasks = { ...MERGED, F: { prUrl: "https://github.com/o/r/pull/11" } };
+    const open = await completionMod.followUpPrGate({
+      workflow: wf2, agentTasks: tasks, mergeProof: null, getAgentPhase, warn: () => {},
+      readCompletionRecord: async (tid) => (tid === "F" ? { pr_url: "https://github.com/o/r/pull/12" } : null),
+      api: byPath({ "/repos/o/r/pulls/11": ON("feature/E-1-x"), "/repos/o/r/pulls/12": ON("main") }),
+    });
+    expect(open).toEqual(["https://github.com/o/r/pull/12"]);
+  });
+
+  it("TEAM-6062 completionBlockedNotice open_follow_up_pr: slug hashes the sorted PR set", () => {
+    const slug = (d) => completionMod.completionBlockedNotice("open_follow_up_pr", d, {}).slug;
+    const a = "https://github.com/o/r/pull/12", b = "https://github.com/o/r/pull/13";
+    expect(slug(`${a}, ${b}`)).toMatch(/^followup_pr_[0-9a-f]{8}$/);
+    expect(slug(`${a}, ${b}`)).toBe(slug(`${b}, ${a}`));
+    expect(slug(a)).not.toBe(slug(`${a}, ${b}`));
+    expect(completionMod.completionBlockedNotice("unmerged_branch", "x", {}).slug).toBe("unmerged");
+  });
+
+  it("TEAM-6062 followUpPrGate: two-repo config, open PR in repos[1] into its own default branch → returned", async () => {
+    const tasks = { ...MERGED, G: { prUrl: "https://github.com/o/r2/pull/34" } };
+    const open = await completionMod.followUpPrGate({
+      workflow: wf2, agentTasks: tasks, mergeProof: null, getAgentPhase, warn: () => {},
+      api: byPath({ "/repos/o/r2/pulls/34": ON("develop") }),
+    });
+    expect(open).toEqual(["https://github.com/o/r2/pull/34"]);
+  });
+
+  it("TEAM-6062 followUpPrGate: repos[1] PR into a non-default base → skip", async () => {
+    const tasks = { ...MERGED, G: { prUrl: "https://github.com/o/r2/pull/34" } };
+    const open = await completionMod.followUpPrGate({
+      workflow: wf2, agentTasks: tasks, mergeProof: null, getAgentPhase, warn: () => {},
+      api: byPath({ "/repos/o/r2/pulls/34": ON("main") }),
+    });
+    expect(open).toEqual([]);
   });
 });

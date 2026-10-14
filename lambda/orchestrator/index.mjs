@@ -3527,7 +3527,7 @@ export async function completeWorkflow(workflow) {
     }
     if (probe.merged === true) mergeProof = probe;
     // TEAM-6032 (DL-038): after the unified merge, a fix PR to the default branch still open is orphaned.
-    const open = await followUpPrGate({ workflow, agentTasks: freshWf?.agentTasks || workflow.agentTasks, mergeProof, repoRef: () => parseRepoUrl(workflow.repoConfig), getAgentPhase: (id) => getAgentDef(id)?.phase, api: githubApi });
+    const open = await followUpPrGate({ workflow, agentTasks: freshWf?.agentTasks || workflow.agentTasks, mergeProof, readCompletionRecord, getAgentPhase: (id) => getAgentDef(id)?.phase, api: githubApi });
     if (open.length > 0) {
       console.error(`[orchestrator] CompletionRejectedOpenFollowUpPr ${workflow.id}: ${open.join(", ")} still open — leaving run open.`);
       await notifyCompletionBlockedOnce(workflow, open.join(", "), "open_follow_up_pr");
