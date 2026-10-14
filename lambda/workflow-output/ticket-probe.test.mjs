@@ -2158,6 +2158,9 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     expect(fake.tickets.get(BUILD).status).not.toBe("Done");
     expect(fake.calls.some((c) => c.tool === "Tickets___transition_ticket" && c.params?.ticket_id === BUILD)).toBe(false);
     expect(record().replayDropped).toBeUndefined();
+    // TEAM-6151: the lost compensation changes nothing a reader trusts - the admission was
+    // re-marked provisional BEFORE the amendment was re-confirmed, so both twins refuse.
+    expect(record().securityReview.provisional).toBe(true);
   });
 
   it("TEAM-6142 (drain) a message queued before TEAM-6142 (no amendmentTicketId) re-confirms the record's stamped amendment", async () => {
