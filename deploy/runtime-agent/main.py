@@ -4817,17 +4817,26 @@ async def _run_agent_invocation(payload, context):
     payload_connectors = payload.get("connectors")
     _CURRENT_WORKFLOW_ID = workflow_id
     _CURRENT_AGENT_ID = agent_id
-    _CURRENT_TICKET_ID = payload.get("ticket_id", "")
-    _cs = payload.get("claim_started_at")
-    _CURRENT_CLAIM_STARTED_AT = _cs if isinstance(_cs, str) else ""
+    # TEAM-6000: this turn's own ticket and claim generation, snapshotted into
+    # locals. The module globals stay for the tool layer (the park fence, the
+    # coding heartbeat), but a second invocation landing in this process while
+    # this turn is mid-outage rewrites them — a death stamped from the globals
+    # would then carry the NEW claim's ticket and generation, a strict match for a
+    # LIVE claim that the detector (DL-038) now acts on within one sweep. Every
+    # reader on this turn's own path — resume fence, exhaustion comment,
+    # agent.died, fail-closed park, heartbeat stamps — uses these locals.
+    _turn_ticket_id = payload.get("ticket_id", "")
+    _turn_claim_started_at = _cs if isinstance(_cs := payload.get("claim_started_at"), str) else ""
+    _CURRENT_TICKET_ID = _turn_ticket_id
+    _CURRENT_CLAIM_STARTED_AT = _turn_claim_started_at
     # TEAM-4739 FR-7: a previous turn on this ticket that died or parked left what
     # it had reached in S3. Prepend it so the retry continues instead of redoing
     # the work — the whole cost of a mid-turn death was the second attempt
     # starting from nothing. Missing is the normal case and stays silent.
-    _resume = _read_resume_object(workflow_id, agent_id, _CURRENT_TICKET_ID)
+    _resume = _read_resume_object(workflow_id, agent_id, _turn_ticket_id)
     if _resume_block := _resume_prompt_block(_resume):
         prompt = _resume_block + prompt
-        logger.info(f"[{agent_id}] resuming {_CURRENT_TICKET_ID} from a previous attempt "
+        logger.info(f"[{agent_id}] resuming {_turn_ticket_id} from a previous attempt "
                     f"({len(_resume_block)} chars of context prepended)")
     # Fleet-wide watchdog knobs (D1.1) — payload-first → env → legacy constants.
     _WATCHDOG = _resolve_watchdog(payload)
@@ -4846,7 +4855,7 @@ async def _run_agent_invocation(payload, context):
     # even if the microVM is interrupted mid-loop and the SDK's own
     # loop-spanning invoke_agent span never gets exported.
     await _emit_session_anchor_span(agent_id, getattr(context, "session_id", None),
-                                    workflow_id, _CURRENT_TICKET_ID)
+                                    workflow_id, _turn_ticket_id)
 
     # FR-7: bound BEFORE the try so the finally can read them however early the
     # turn dies — a microVM reaped during agent construction unwinds through the
@@ -4866,9 +4875,9 @@ async def _run_agent_invocation(payload, context):
     # module's own default), so it must count as UNBOUND here exactly as it
     # does in _publish_event's guard — otherwise a chat turn that happened to
     # name a ticket would publish a death against a run id nothing can read.
-    _bound = bool(_CURRENT_WORKFLOW_ID
-                  and _CURRENT_WORKFLOW_ID != "unknown"
-                  and _CURRENT_TICKET_ID)
+    _bound = bool(workflow_id
+                  and workflow_id != "unknown"
+                  and _turn_ticket_id)
 
     try:
         # Fresh coding session per agent-task: a warm microVM reuses this module, so
@@ -4947,8 +4956,8 @@ async def _run_agent_invocation(payload, context):
                     unique_ts = f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())}.{self._seq:04d}Z"
                     # Stamp the ticket so lease liveness (R3) can scope activity
                     # to the claimed ticket when one agent runs siblings.
-                    if _CURRENT_TICKET_ID and "ticketId" not in detail:
-                        detail = {**detail, "ticketId": _CURRENT_TICKET_ID}
+                    if _turn_ticket_id and "ticketId" not in detail:
+                        detail = {**detail, "ticketId": _turn_ticket_id}
                     detail_map = {}
                     for k, v in detail.items():
                         if v is not None:
@@ -5025,15 +5034,15 @@ async def _run_agent_invocation(payload, context):
             "workflow.id": workflow_id,
             "agent.id": agent_id,
             "gen_ai.agent.id": agent_id,
-            "ticket.id": _CURRENT_TICKET_ID,
+            "ticket.id": _turn_ticket_id,
             "hub.prompt_cache": "on" if _cache_on else "off",
             "hub.cache_ttl": PERSONA_CACHE_TTL if _cache_on else "",
         }.items() if v}
         completion_gate = _CompletionGate(
             on_success=lambda: _delete_resume_object(
-                workflow_id, agent_id, _CURRENT_TICKET_ID),
-            ticket_id=_CURRENT_TICKET_ID)
-        park_gate = _ParkGate(_CURRENT_TICKET_ID)
+                workflow_id, agent_id, _turn_ticket_id),
+            ticket_id=_turn_ticket_id)
+        park_gate = _ParkGate(_turn_ticket_id)
 
         class _PromptDelivery:
             """TEAM-5706: counts messages strands ADDS to history. Monotonic, so
@@ -5140,9 +5149,10 @@ async def _run_agent_invocation(payload, context):
             (agent.error only). TEAM-5963: a TRANSIENT one that ran out of retries
             also sets `_transient_exhausted`, so the turn ends as a death too
             (agent.died + resume object) and the dead-session detector re-dispatches
-            it, even in shadow mode (TEAM-5977), once the lease expires. Bedrock
-            being down for five minutes is not a reason to strand the ticket
-            in_progress."""
+            it, even in shadow mode (TEAM-5977), on its next sweep: the holder's
+            generation-stamped exhaustion death is read as a dead lease (DL-038 /
+            TEAM-6000), so the 30-min lease TTL no longer gates it. Bedrock being
+            down for five minutes is not a reason to strand the ticket in_progress."""
             nonlocal _transient_exhausted
             import asyncio as _sr_asyncio
             attempt = 0
@@ -5265,7 +5275,7 @@ async def _run_agent_invocation(payload, context):
                             _transient_exhausted = True
                             import asyncio as _tx_asyncio
                             await _tx_asyncio.to_thread(
-                                _comment_transient_exhaustion, _CURRENT_TICKET_ID,
+                                _comment_transient_exhaustion, _turn_ticket_id,
                                 f"[transient-exhaustion] {agent_id}'s turn hit "
                                 f"{type(exc).__name__} and stayed unavailable after "
                                 f"{attempt} attempt(s) over {now - outage_start:.0f}s "
@@ -5273,14 +5283,14 @@ async def _run_agent_invocation(payload, context):
                                 f"{_STREAM_RETRY_DEADLINE_S:.0f}s). The turn "
                                 f"was released to dead-session recovery (agent.died + "
                                 f"resume object); the dead-session sweep re-dispatches it "
-                                f"once the lease expires — within the 30 min lease TTL + "
-                                f"one 5 min sweep after the last heartbeat, even with the "
-                                f"detector in shadow mode.")
+                                f"on its next pass (within one 5 min sweep — the lease TTL "
+                                f"does not gate a claim-stamped exhaustion death, DL-038), "
+                                f"even with the detector in shadow mode.")
                         _publish_agent_error(
                             workflow_id, agent_id,
                             f"stream failed after {attempt} attempt(s): "
                             f"{type(exc).__name__}: {str(exc)[:400]}",
-                            ticket_id=_CURRENT_TICKET_ID)
+                            ticket_id=_turn_ticket_id)
                         try:
                             # The detached runner must not publish it a second time.
                             exc._agent_error_published = True
@@ -5338,7 +5348,7 @@ async def _run_agent_invocation(payload, context):
                 yield _ev
             if _bound and not completion_gate.engaged and not park_gate.parked:
                 logger.warning(f"[{agent_id}] turn ended without completion or park "
-                               f"— re-prompting once for {_CURRENT_TICKET_ID}")
+                               f"— re-prompting once for {_turn_ticket_id}")
                 async for _ev in _stream_with_retry(_FINAL_TURN_NUDGE):
                     yield _ev
 
@@ -5452,7 +5462,7 @@ async def _run_agent_invocation(payload, context):
             # can forge a section that matches too, so any disagreement among
             # validating sections fails closed to "" instead of trusting the
             # first match in text order.
-            _epic_id = _workflow_context_epic(prompt, workflow_id, _CURRENT_TICKET_ID)
+            _epic_id = _workflow_context_epic(prompt, workflow_id, _turn_ticket_id)
             # TEAM-5706: a cancel cannot stop the thread, so it must not decide
             # the outcome either. Shielded: on cancel, flag the thread (it starts
             # no park; it may still annotate its escalation), wait for the call
@@ -5465,7 +5475,7 @@ async def _run_agent_invocation(payload, context):
             # already released the claim the death would otherwise recover.
             _fc_cancel = _fc_threading.Event()
             _fc_future = _fc_asyncio.ensure_future(_fc_asyncio.to_thread(
-                _harness_fail_closed, workflow_id, agent_id, _CURRENT_TICKET_ID,
+                _harness_fail_closed, workflow_id, agent_id, _turn_ticket_id,
                 final_text, epic_id=_epic_id, cancel=_fc_cancel,
                 session_id=getattr(context, "session_id", None) or ""))
             try:
@@ -5480,8 +5490,8 @@ async def _run_agent_invocation(payload, context):
                         logger.warning(
                             f"[{agent_id}] fail-closed thread still running "
                             f"{_FAIL_CLOSED_CANCEL_GRACE_S:.0f}s after cancel — treating "
-                            f"{_CURRENT_TICKET_ID} as not parked; agent.died follows")
-                        def _fc_late(f, _a=agent_id, _t=_CURRENT_TICKET_ID):
+                            f"{_turn_ticket_id} as not parked; agent.died follows")
+                        def _fc_late(f, _a=agent_id, _t=_turn_ticket_id):
                             try:
                                 outcome = f.result()
                             except BaseException as e:  # noqa: BLE001 — log only
@@ -5556,18 +5566,18 @@ async def _run_agent_invocation(payload, context):
         # re-dispatch, and a turn that reads before this write lands starts from
         # nothing.
         if _bound and (_parked or _synthesised == "parked" or not _accounted):
-            _write_resume_object(_CURRENT_WORKFLOW_ID, agent_id, _CURRENT_TICKET_ID,
+            _write_resume_object(workflow_id, agent_id, _turn_ticket_id,
                                  last_text=final_text, last_stream_at=last_stream_at,
-                                 claim_started_at=_CURRENT_CLAIM_STARTED_AT)
+                                 claim_started_at=_turn_claim_started_at)
         if not _accounted and _bound:
             logger.warning(f"[{agent_id}] turn ended without completion, park or error "
-                           f"— publishing agent.died for {_CURRENT_TICKET_ID}"
+                           f"— publishing agent.died for {_turn_ticket_id}"
                            + (" (transient retries exhausted)" if _transient_exhausted else ""))
             _publish_agent_died(
-                _CURRENT_WORKFLOW_ID, agent_id, _CURRENT_TICKET_ID,
+                workflow_id, agent_id, _turn_ticket_id,
                 session_id=getattr(context, "session_id", "") or "",
                 last_stream_at=last_stream_at, last_text=final_text,
-                claim_started_at=_CURRENT_CLAIM_STARTED_AT,
+                claim_started_at=_turn_claim_started_at,
                 **({"reason": "transient_exhaustion"} if _transient_exhausted else {}))
 
         # Deliver queued spans before the microVM becomes freeze-eligible.

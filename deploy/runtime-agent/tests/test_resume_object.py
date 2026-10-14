@@ -426,7 +426,8 @@ def test_artifact_keys_alone_are_worth_a_block() -> None:
 def test_the_read_happens_right_after_the_ticket_id_is_bound() -> None:
     """Any later and part of the prompt has already been assembled without it."""
     source = MAIN_PY.read_text()
-    bind = source.index('_CURRENT_TICKET_ID = payload.get("ticket_id"')
+    # TEAM-6000: the ticket id is bound into the turn's own local first.
+    bind = source.index('_turn_ticket_id = payload.get("ticket_id"')
     read = source.index("_read_resume_object(", bind)
     between = source[bind:read]
     assert between.count("\n") <= 8, (
