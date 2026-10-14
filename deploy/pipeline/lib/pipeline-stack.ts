@@ -689,7 +689,9 @@ function grantBuildArtifactPerms(
  * harness prompt/model/skills, and roll the one ECS service. It CANNOT
  * `lambda:UpdateFunctionConfiguration` (that is what blanks prod Jira creds —
  * DEPLOY.md's "never run the full deploy.sh" rule, enforced by permission),
- * cannot create/delete harnesses or runtimes, and has no iam:* / no ecs create.
+ * cannot create/delete harnesses or runtimes, and has no iam:* / no ecs create
+ * (its only IAM actions are the scoped PassRoles below and TEAM-5910's read of the
+ * two ticket-twin roles' inline policies).
  */
 function grantDeployPerms(
   scope: Construct,
@@ -717,6 +719,20 @@ function grantDeployPerms(
         `arn:aws:lambda:${ctx.region}:${ctx.account}:function:agentcore-hub-*`,
         // The Telegram intake bot predates the naming convention (surfaces.json).
         `arn:aws:lambda:${ctx.region}:${ctx.account}:function:telegram-bug-intake`,
+      ],
+    }),
+    // TEAM-5910: pre_build's ticket-twin preflight (deploy/lib/twin-preflight.mjs)
+    // reads the twin roles' INLINE policies to prove the s3:ListBucket grant the
+    // twins' Done guard depends on is live before their code ships. Read-only, two
+    // roles, inline only (no managed-policy reads: a managed-only grant refuses).
+    // Until ./deploy/pipeline/deploy.sh applies this, the read is AccessDenied and
+    // the preflight refuses any deploy that touches a twin — fail closed.
+    new iam.PolicyStatement({
+      sid: "TwinPreflightIamRead",
+      actions: ["iam:ListRolePolicies", "iam:GetRolePolicy"],
+      resources: [
+        `arn:aws:iam::${ctx.account}:role/AgentCoreHubJiraLambdaRole`,
+        `arn:aws:iam::${ctx.account}:role/AgentCoreHubTicketsLambdaRole`,
       ],
     }),
     // Harness prompt / model / skills (surfaces.json "harnesses"): the setup
@@ -1059,7 +1075,7 @@ function applyNagSuppressions(
       {
         id: "AwsSolutions-IAM5",
         reason:
-          "Scoped wildcards are intentional and minimal: agentcore-hub-* Lambda code updates, harness/* prompt+model updates, runtime/* image-only UpdateAgentRuntime scoped to the runtime-agent + coding-agent-runtime ECR repos (plus capacity-provider/* PassCapacityProvider so the Instances twin keeps its provider on swap), /config/* and /pipeline-artifacts/* S3 prefixes, and ecr:GetAuthorizationToken / bedrock-agentcore:ListHarnesses / ListAgentRuntimes (which have no resource scope). PassRole is pinned to the specific ECS + runtime execution roles with an iam:PassedToService condition. No admin or cross-service wildcard.",
+          "Scoped wildcards are intentional and minimal: agentcore-hub-* Lambda code updates, harness/* prompt+model updates, runtime/* image-only UpdateAgentRuntime scoped to the runtime-agent + coding-agent-runtime ECR repos (plus capacity-provider/* PassCapacityProvider so the Instances twin keeps its provider on swap), /config/* and /pipeline-artifacts/* S3 prefixes, and ecr:GetAuthorizationToken / bedrock-agentcore:ListHarnesses / ListAgentRuntimes (which have no resource scope). PassRole is pinned to the specific ECS + runtime execution roles with an iam:PassedToService condition. The only IAM reads are iam:ListRolePolicies / iam:GetRolePolicy on the two ticket-twin roles (TEAM-5910 preflight). No admin or cross-service wildcard.",
       },
       {
         id: "AwsSolutions-CB4",
