@@ -51,6 +51,7 @@ def _policy(with_list=True):
     st = [
         {"Effect": "Allow", "Action": ["logs:CreateLogGroup"], "Resource": f"arn:aws:logs:us-east-1:{ACCOUNT}:*"},
         {"Sid": "ArtifactRead", "Effect": "Allow", "Action": ["s3:GetObject"], "Resource": f"arn:aws:s3:::{BUCKET}/*"},
+        {"Sid": "CompletionRecordFence", "Effect": "Allow", "Action": ["s3:PutObject"], "Resource": f"arn:aws:s3:::{BUCKET}/completions/*"},
     ]
     if with_list:
         st.append({"Sid": "ArtifactBucketList", "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": f"arn:aws:s3:::{BUCKET}"})
