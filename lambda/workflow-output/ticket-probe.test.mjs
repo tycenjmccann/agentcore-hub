@@ -856,7 +856,7 @@ describe("TEAM-5926 — a Done that lands over the brief hold", () => {
     fake.tickets.get(GATE).status = "Done"; // no open gate ⇒ the brief goes off_gate ⇒ a hold
   });
 
-  it("(d1) the ticket reaches Done right after the hold stamp ⇒ retry, then the next tick converges the record and says so", async () => {
+  it("(d1) the ticket reaches Done right after the hold stamp ⇒ retry, then the next tick converges the record and says so - keeping the hold (TEAM-5958)", async () => {
     // The twin's Done committing between the drain's stamp and its re-read.
     onHoldStamp(() => { fake.tickets.get(BUILD).status = "Done"; });
 
@@ -872,12 +872,18 @@ describe("TEAM-5926 — a Done that lands over the brief hold", () => {
     const t2 = await tick();
     expect(t2.out.drained).toMatchObject({ applied: 1, dropped: 0, retried: 0 });
     expect(fake.queue).toHaveLength(0);
-    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "off_gate", ticketWrites: "applied", status: "complete" });
+    // TEAM-5958 (TEAM-5799 F4): the brief is still off the gate, so the hold STAYS. The
+    // Done is converged (applied, message gone, notice posted) but `briefPending` goes
+    // false only on gate delivery - a reopen then finds the twins' guard still refusing.
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "off_gate", ticketWrites: "applied", status: "complete" });
     expect(record().undelivered[0]).toMatchObject({ part: "brief", reason: expect.stringMatching(/^not on the gate: /) });
-    for (const twin of TWIN_GUARDS) expect((await twin()).judgeBriefHold(KEY, fake.objects.get(KEY))).toBeNull();
+    for (const twin of TWIN_GUARDS) {
+      expect((await twin()).judgeBriefHold(KEY, fake.objects.get(KEY))).toMatchObject({ proven: false, why: expect.stringMatching(/has briefPending:true \(brief off_gate\)/) });
+    }
     for (const id of [BUILD, EPIC]) {
       expect(released(id)).toHaveLength(1);
       expect(released(id)[0]).toMatch(/earlier "LEFT OPEN" replay notice is superseded/);
+      expect(released(id)[0]).toMatch(/still holds briefPending:true/);
       expect(briefComments(id)).toHaveLength(1);
     }
     expect(tools("Tickets___transition_ticket")).toHaveLength(0);
@@ -935,19 +941,22 @@ describe("TEAM-5926 — a Done that lands over the brief hold", () => {
     fake.tickets.get(BUILD).status = "Done";
     expireVisibility();
     expect((await tick()).out.drained).toMatchObject({ applied: 1 });
-    expect(record()).toMatchObject({ briefPending: false, ticketWrites: "applied" });
+    expect(record()).toMatchObject({ briefPending: true, ticketWrites: "applied" }); // TEAM-5958: the hold is kept
 
     const comments = [BUILD, EPIC].map((id) => fake.tickets.get(id).comments.length);
     fake.queue.push({ MessageId: "dup", Body: body, group: fake.queue[0]?.group || "g", inFlight: null, receives: 0 });
     await tick();
     expect([BUILD, EPIC].map((id) => fake.tickets.get(id).comments.length)).toEqual(comments);
     for (const id of [BUILD, EPIC]) expect(released(id)).toHaveLength(1);
-    expect(record()).toMatchObject({ briefPending: false, ticketWrites: "applied" });
+    expect(record()).toMatchObject({ briefPending: true, ticketWrites: "applied" }); // TEAM-5958: the hold is kept
   });
 
-  it("(d4) a follow-ups-only hold over a stale briefPending on a Done ticket ⇒ the stamp releases the brief hold", async () => {
+  it("(d4) a follow-ups-only hold over a brief hold on a Done ticket ⇒ the follow-ups stamp KEEPS the brief hold and says the Done superseded the LEFT OPEN notice", async () => {
     // The (d1) state one step on: a hold stamped, the ticket Done, and now a follow-up
-    // no retry can file. `{...record, ...extra}` used to carry briefPending:true forward.
+    // no retry can file. TEAM-5926 cleared briefPending here; TEAM-5958 keeps it - the
+    // brief is still off the gate, and only gate delivery clears the hold. What this
+    // guards: the follow-ups drop over a Done ticket is FINAL (dropped, not retry), the
+    // superseded notice is posted once, and `{...record, ...extra}` carries the hold.
     fake.objects.set(KEY, JSON.stringify({ ...record(), briefPending: true, briefDelivered: "off_gate" }));
     fake.etags.set(KEY, `"e${++fake.etagSeq}"`);
     fake.tickets.get(BUILD).status = "Done";
@@ -955,8 +964,9 @@ describe("TEAM-5926 — a Done that lands over the brief hold", () => {
 
     const t = await tick();
     expect(t.out.drained).toMatchObject({ dropped: 1 });
-    expect(record()).toMatchObject({ followUpsPending: true, briefPending: false, briefDelivered: "off_gate", replayDropped: { step: "follow_ups" } });
+    expect(record()).toMatchObject({ followUpsPending: true, briefPending: true, briefDelivered: "off_gate", replayDropped: { step: "follow_ups" } });
     for (const id of [BUILD, EPIC]) expect(released(id)).toHaveLength(1);
+    expect(fake.queue).toHaveLength(0); // final: the message is gone, the hold is on the record
   });
 
   it("(d5) neither twin's post-commit warning reads as a brief-hold refusal", async () => {

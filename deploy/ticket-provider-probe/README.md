@@ -158,7 +158,8 @@ idempotent:
    approver. The record keeps `briefPending:true` and the message is a surfaced
    `brief` drop (see Permanent refusals below), deleted, not retried. A ticket
    a human already closed has released the gate anyway, so there the brief is
-   only recorded undelivered and the replay applies. The hold restamps what the follow-ups
+   only recorded undelivered and the replay applies - with the hold KEPT
+   (TEAM-5958, below). The hold restamps what the follow-ups
    really are (`followUpsPending` is true only while one is still unfiled), so
    after a brief-only hold the human who puts the brief on the gate re-runs
    `report_completion` to close it (TEAM-5805, below).
@@ -176,7 +177,18 @@ idempotent:
    agent to re-run `report_completion`. The hold clears to `briefPending:false`
    (kept, not deleted, so the history shows) only once the brief is on the gate:
    - in step 6 below, when a redelivered message puts the brief on the gate;
-   - in a re-run `report_completion`, which re-posts the brief (marker-deduped).
+   - in a re-run `report_completion`, which re-posts the brief (marker-deduped);
+   - NEVER because the ticket reached Done (TEAM-5958, TEAM-5799 F4). TEAM-5926
+     cleared a hold a Done had landed over, fenced on a ticket-status re-read
+     (TEAM-5940); the clear itself was an `IfMatch` PUT no ticket read can fence,
+     so a reopen between the read and the PUT erased an undelivered hold for good -
+     nothing re-stamps it (a reopen never touches the record; on Jira it never
+     reaches a twin at all). The drain now leaves `briefPending:true` on the Done
+     ticket's record (`ticketWrites:"applied"`), posts the `[brief-hold-released:<id>]`
+     notice saying the LEFT OPEN notice is superseded and that the record still
+     holds, and terminates. Nothing reads the hold on a Done ticket; on a reopened
+     one it is exactly what makes both ticket Lambdas refuse Done until the brief
+     is delivered (the re-run `report_completion` is the remedy).
      A brief a human pasted onto the gate dedupes on its `## Decision` text, reads
      as `already_posted`, and clears the hold too. While the brief still cannot
      reach the gate, the re-run answers `status:"complete_pending_brief"` with
@@ -192,7 +204,15 @@ idempotent:
    false, wins unless this call itself put the brief on the gate), and tries again,
    3 times, then answers `completion_record_contended` without writing. A Done the
    ticket Lambda refuses on the hold is rewritten with `briefPending:true` unless the
-   current record already shows the brief on the gate. A prior record S3 cannot
+   current record already shows the brief on the gate. And (TEAM-5958, TEAM-5799
+   F6) a write that would PUT a hold on the record (`followUpsPending:true`,
+   `briefPending:true`) that the record it conditions on lacks, while the record
+   carries a FRESH `doneIntent` and a fresh `get_issue` says the ticket is not Done
+   (or cannot be read), writes nothing and answers `completion_record_done_in_flight`
+   (`ok:false`, `next_action:"retry_report_completion"`): the retry finds the ticket
+   Done and records the hold against it (as the drain's already-Done drop does), or
+   the intent has expired. `holdDeferredOnDoneIntent` is the one predicate the drain's
+   `drop()` and `report_completion`'s write share. A prior record S3 cannot
    read (anything but a 404) refuses the call (`completion_record_unreadable`):
    nothing written, nothing posted, no Done.
 
@@ -212,7 +232,8 @@ idempotent:
    notice. A stale intent (the twin died) is stripped by the next stamp and the hold
    is pushed as usual. Every record writer carries the intent (`adoptHold`, the
    drain's spreads); the empty-sweep skip refuses to overwrite a record with a fresh
-   one. The twin role needs `s3:PutObject` on `completions/*`
+   one; and `report_completion`'s own hold writes defer on a fresh one too
+   (TEAM-5958, `completion_record_done_in_flight`, above). The twin role needs `s3:PutObject` on `completions/*`
    (`deploy/setup-tickets-lambda.mjs`; a denied fence write refuses the Done, fail
    closed, and `deploy/lib/twin-preflight.mjs` refuses to ship twin code without it).
 
@@ -225,7 +246,8 @@ idempotent:
    is recorded in `undelivered[]` the same way; anything else means `retry`.
 6. Restamp the record: `status:"complete"`, `followUpsPending:false`,
    `ticketWrites:"queued"`, and `briefPending:false` when the record was held and
-   the brief is now on the gate. This comes BEFORE Done, because the ticket
+   the brief is now on the gate (ONLY then - a hold a Done landed over stays
+   `true`, TEAM-5958). This comes BEFORE Done, because the ticket
    Lambdas refuse Done while the record still says `followUpsPending:true` or
    `briefPending:true`.
 7. Transition the ticket to Done. Jira fires its webhook on this real change,

@@ -609,6 +609,21 @@ export function completionRecordUnreadable(ticketId, key, error) {
   };
 }
 
+/**
+ * TEAM-5958 (TEAM-5799 F6): the answer when the record write was DEFERRED because a twin
+ * has fenced a Done on the record and is committing it (holdDeferredOnDoneIntent). Not
+ * "complete" and `ok:false`, so the harness keeps the persona retrying (main.py
+ * `_reports_done` reads any `ok:false` as open); nothing was written, Done not attempted.
+ */
+export function completionRecordDoneInFlight(ticketId, key, error) {
+  return {
+    ok: false,
+    reason: "completion_record_done_in_flight",
+    next_action: "retry_report_completion",
+    message: `report_completion for ${ticketId} was DEFERRED: ${error}. Nothing was recorded and the ticket was NOT transitioned. Retry the call with the SAME arguments in a moment: the ticket will read Done (and the retry records what is still pending against it), or the Done-intent will have expired.`,
+  };
+}
+
 /** TEAM-5830: bounded compare-and-swap attempts of one completion-record write. */
 export const RECORD_CAS_ATTEMPTS = 3;
 
@@ -959,12 +974,39 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // retry answer rather than an unconditional write. `status` is passed as a function
   // because the adoption can change it. `{ ok: true }` or `{ ok: false, error }`; an S3
   // write error throws, as the plain PutObject did.
+  //
+  // TEAM-5958 (TEAM-5799 F6): and the write DEFERS on the twins' Done-intent fence.
+  // adoptHold carries `doneIntent` verbatim (TEAM-5941), but carrying it is not acting
+  // on it: a write that puts a hold on the record (`followUpsPending:true` when a
+  // follow-up could not be filed, `briefPending:true` carried or forced) while a twin
+  // has fenced its Done and is about to commit lands a hold the twin's guard never saw
+  // — the twins then only DETECT it after the commit (done_over_follow_ups_hold). The
+  // drain's drop() already backs off on exactly this (holdDeferredOnDoneIntent); so
+  // does this write now: a hold this attempt would introduce (the record conditioned
+  // on lacks it), a fresh intent, and a ticket that does not read Done on a FRESH
+  // get_issue (the one above is minutes old; the Done may have committed since, and a
+  // committed Done keeps its intent as audit — nothing is in flight then) ⇒ nothing is
+  // written and the answer is retryable (`deferred`). An unreadable ticket is the safe
+  // side (defer). A stale intent (the twin died, or its commit failed and the clear
+  // failed) is not a Done in flight: the write proceeds, bounded by the twins' TTL.
   let recordBase = { record: earlyPrior?.record ?? null, etag: earlyPrior?.etag };
   let deliveredNow = false;
   const writeRecord = async (statusOf, { forceHold = false } = {}) => {
     for (let attempt = 1; attempt <= RECORD_CAS_ATTEMPTS; attempt++) {
       adoptHold(report, recordBase.record, { deliveredNow, forceHold });
       report.status = statusOf();
+      const holdWritten = (report.followUpsPending === true && recordBase.record?.followUpsPending !== true)
+        || (report.briefPending === true && recordBase.record?.briefPending !== true);
+      const inFlight = holdDeferredOnDoneIntent({ current: recordBase.record, holdWritten, ticketDone: issue ? isDoneStatus(issue.status) : false });
+      if (inFlight) {
+        const fresh = await readTicketDone(ticket_id);
+        if (!fresh.ok || !fresh.done) {
+          const hold = report.followUpsPending === true && recordBase.record?.followUpsPending !== true ? "followUpsPending:true" : "briefPending:true";
+          console.warn(`[report_completion] ${ticket_id}: ${key} carries a fresh Done-intent (${inFlight}) and ${ticket_id} ${fresh.ok ? "does not read Done yet" : `could not be re-read (${fresh.error})`} - a Done is in flight, so this write (${hold}) is DEFERRED; nothing written`);
+          return { ok: false, deferred: true, reason: "completion_record_done_in_flight", error: `a Done on ${ticket_id} is being committed by the ticket provider (Done-intent ${inFlight}) and this write would put ${hold} on ${key}, a hold the committing provider can no longer see` };
+        }
+        console.log(`[report_completion] ${ticket_id}: ${key} carries a fresh Done-intent (${inFlight}) but ${ticket_id} reads Done - the Done committed; writing`);
+      }
       const r = await conditionalPut(key, JSON.stringify(report, null, 2), recordBase.etag !== undefined ? { ifMatch: recordBase.etag } : {});
       if (r.outcome === "won") {
         recordBase = { record: JSON.parse(JSON.stringify(report)), etag: r.etag };
@@ -1163,7 +1205,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   });
   if (!firstWrite.ok) {
     console.warn(`[report_completion] REFUSED ${ticket_id}: ${firstWrite.error} - no record written, ticket not transitioned`);
-    return { ...completionRecordUnreadable(ticket_id, key, firstWrite.error), reason: "completion_record_contended" };
+    // TEAM-5958: a deferred write (a Done in flight) is its own retryable answer — the
+    // retry finds the ticket Done (and writes the hold over it, as the drain's already-
+    // Done drop does) or the intent expired; not a contended record.
+    if (firstWrite.deferred) return completionRecordDoneInFlight(ticket_id, key, firstWrite.error);
+    return { ...completionRecordUnreadable(ticket_id, key, firstWrite.error), reason: firstWrite.reason || "completion_record_contended" };
   }
   console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
   // Done waits on both holds: every follow-up filed AND the merge brief on its gate.
@@ -1241,6 +1287,10 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       const refusedOnHold = isBriefHoldRefusal(transition.error);
       if (refusedOnHold) briefHeld = true;
       try {
+        // TEAM-5958: the same Done-intent deferral applies (one writeRecord). It is a
+        // no-op in practice — a twin that refused ON the hold read briefPending:true,
+        // so forceHold introduces nothing — and when it does fire the rewrite is
+        // already best-effort: logged, the record stands, the retry restamps.
         const rewrite = await writeRecord(() => (briefHeld ? STATUS_PENDING_BRIEF : STATUS_TRANSITION_FAILED), { forceHold: refusedOnHold });
         if (!rewrite.ok) console.error(`[report_completion] ${ticket_id}: could not rewrite the record's status (${rewrite.error}) - the record S3 holds stands, the retry will restamp it`);
       } catch (err) {
@@ -1616,6 +1666,22 @@ function stripStaleDoneIntent(record) {
   return record;
 }
 
+/**
+ * TEAM-5958 (TEAM-5799 F6): the ONE rule for a writer about to put a hold on the record
+ * (`briefPending:true` / `followUpsPending:true`) while a twin's Done may be committing.
+ * The drain's drop() and report_completion's record write both decide through it:
+ * `holdWritten` (this write introduces or stamps a hold), the ticket does not read Done
+ * (a committed Done keeps its intent as audit — nothing is in flight then), and the
+ * record carries a FRESH `doneIntent` ⇒ the twin's guard admitted on a record with no
+ * hold and its commit may land any moment; a hold written now is one it can no longer
+ * see. Returns the intent's `at` to defer on (write nothing, answer retryable), or null
+ * to proceed. Stale (TTL) ⇒ the twin died or its clear failed: proceed, as drop() does.
+ */
+export function holdDeferredOnDoneIntent({ current, holdWritten, ticketDone }) {
+  if (!holdWritten || ticketDone || !doneIntentFresh(current)) return null;
+  return current.doneIntent.at;
+}
+
 /** Read a completion record; `{ record: null }` when absent, `{ error }` when S3 could not say or the body is not a JSON object. */
 async function readRecord(key) {
   try {
@@ -1700,8 +1766,10 @@ export async function drainCompletion(msg) {
     // not stamp, do not post the LEFT OPEN notices (nothing is left open): retry, and
     // the next tick decides on the ticket as it is then (Done ⇒ no hold to push; a stale
     // intent ⇒ the twin died, and the hold is stamped as usual).
-    if (held && !alreadyDone && rec.record && doneIntentFresh(rec.record)) {
-      return retry(`${ticketId} has a Done in flight (doneIntent ${rec.record.doneIntent.at}); the ${held} is not stamped and no notice is posted - the next tick decides`);
+    // TEAM-5958: the same predicate report_completion's record write defers on.
+    const inFlight = holdDeferredOnDoneIntent({ current: rec.record, holdWritten: !!held, ticketDone: alreadyDone });
+    if (inFlight) {
+      return retry(`${ticketId} has a Done in flight (doneIntent ${inFlight}); the ${held} is not stamped and no notice is posted - the next tick decides`);
     }
     console.error(`[ticket-replay] ${ticketId}: DROPPED - ${step} could not be applied (${error}); the ticket is left open for a human`);
     const targets = ticketReadable ? [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])] : [asText(msg.epicKey) || null].filter(Boolean);
@@ -1718,14 +1786,6 @@ export async function drainCompletion(msg) {
     }
     const notice = notices[0] || null;
     if (rec.record) {
-      // TEAM-5940: a stamp that RELEASES the brief hold (briefPending:false arrives only
-      // from the releasedHold branch below) is fenced on the ticket's status right now,
-      // not the step-1 snapshot: the notices above are provider writes a reopen can land
-      // behind. A reopened or unreadable ticket keeps the hold (retry, record untouched).
-      if (extra?.briefPending === false) {
-        const fenced = await fenceRelease();
-        if (fenced) return fenced;
-      }
       // TEAM-5941: a fresh Done-intent rides along (the spread keeps it); a stale one — the
       // twin that wrote it is gone — comes off with this stamp.
       const stamped = await putRecordIfUnchanged(reportKey, stripStaleDoneIntent({ ...rec.record, ...(extra || {}), ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } }), recordEtag);
@@ -1740,8 +1800,8 @@ export async function drainCompletion(msg) {
       // TEAM-5926 (TEAM-5799 ship-review F1): a twin's Done guard may have read the
       // record BEFORE this stamp and committed the Done after it. Re-read the ticket now
       // that the hold is durable: a Done that landed is converged on the next tick
-      // (step 1 sees it Done: a brief hold gets the released notice and step 6 restamps
-      // briefPending:false; unfiled follow-ups take the already-Done follow_ups drop,
+      // (step 1 sees it Done: a brief hold gets the superseded notice and step 6 applies
+      // with the hold KEPT (TEAM-5958); unfiled follow-ups take the already-Done follow_ups drop,
       // which keeps followUpsPending:true for the human who files them), so this drop
       // is not final and the message stays. A ticket that cannot be read is the same
       // retry: the hold is on the record, the safe side. Only a ticket step 1 read open:
@@ -1754,17 +1814,6 @@ export async function drainCompletion(msg) {
     }
     await publishJourneyEvent(workflowId || ticketId, "workflow.ticket_replay_dropped", { ticketId, agentId: msg.agentId || null, step, error, notice });
     return { outcome: "dropped", reason: `${step}: ${error}`, permanent: true, notice };
-  };
-  // TEAM-5940: the read IMMEDIATELY before a write that clears briefPending off a hold a
-  // Done released. A retry result when the ticket is not Done any more (a human reopened
-  // it behind the released notice: the hold stands on the record and the next tick's
-  // step 1 reads it open and takes the held path) or cannot be read (the safe side, as
-  // drop()'s post-stamp re-read); null when the Done still stands and the clear may go.
-  const fenceRelease = async () => {
-    const fence = await readTicketDone(ticketId);
-    if (!fence.ok) return retry(`re-read of ${ticketId} before releasing the brief hold failed (${fence.error}); the hold stands`);
-    if (!fence.done) return retry(`${ticketId} was reopened after the brief-hold-released notice; the hold stands on the record and the next tick decides`);
-    return null;
   };
   const undelivered = [];
 
@@ -1852,15 +1901,22 @@ export async function drainCompletion(msg) {
 
   // TEAM-5926: a brief hold this drain stamped while a twin's Done went through
   // (drop()'s post-stamp re-read sends the message back to land here). The Done
-  // already released the gate, so the hold has nothing left to hold: say so where the
-  // "LEFT OPEN" drop notice went, BEFORE the record lets go of it, then restamp
-  // briefPending:false below. The brief stays off_gate and undelivered on the record.
-  const releasedHold = alreadyDone && rec.record?.briefPending === true && !!brief && !brief.gate;
-  if (releasedHold) {
+  // already released the gate, so the "LEFT OPEN" drop notice is superseded: say so
+  // where it went. TEAM-5958 (TEAM-5799 F4): but the hold itself is NOT cleared. The
+  // brief is still off its gate, and `briefPending` goes false only on proof it is on
+  // the gate (step 6 below, or report_completion's own delivery) — TEAM-5866's
+  // invariant. A clear here was fenced on a ticket-status read (TEAM-5940), which no
+  // S3 condition can honour: a reopen between that read and the PUT erased the hold
+  // for good, and nothing re-stamps it (a reopen never touches the record; on Jira it
+  // never reaches a twin at all). Kept, the hold costs a Done ticket nothing — no
+  // reader acts on it until a NEW Done is attempted — and on a reopened ticket it is
+  // exactly what makes the twins refuse Done until the brief is delivered.
+  const doneOverHold = alreadyDone && rec.record?.briefPending === true && !!brief && !brief.gate;
+  if (doneOverHold) {
     const marker = `[brief-hold-released:${ticketId}]`;
     for (const target of [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])]) {
       const r = await postMarkedComment(target, marker,
-        `${marker}\n\n${ticketId} reached Done while the ticket-provider replay was holding it open for its merge brief, so the earlier "LEFT OPEN" replay notice is superseded: the Done stands (the hub does not undo moves). The merge brief ${msg.brief.s3Key} is still NOT on the Merge Approval gate (${brief.outcome === "off_gate" ? `posted on ${brief.targets.join(", ")} instead: ${brief.reason}` : brief.reason}); a human must put it in front of the approver before approving the merge. The completion record s3://${BUCKET}/${reportKey} no longer holds the ticket.`);
+        `${marker}\n\n${ticketId} read Done while the ticket-provider replay was holding it open for its merge brief, so the earlier "LEFT OPEN" replay notice is superseded (the hub does not undo moves). The merge brief ${msg.brief.s3Key} is still NOT on the Merge Approval gate (${brief.outcome === "off_gate" ? `posted on ${brief.targets.join(", ")} instead: ${brief.reason}` : brief.reason}); a human must put it in front of the approver before approving the merge. The completion record s3://${BUCKET}/${reportKey} still holds briefPending:true: if this ticket is open or is reopened, Done is refused until the brief is on the gate - re-run WorkflowOutput___report_completion with the same arguments to deliver it.`);
       if (!r.ok && !isPermanentTicketRefusal(r.cause)) return retry(`brief-hold-released notice on ${target} not posted (${r.error})`);
     }
   }
@@ -1882,8 +1938,8 @@ export async function drainCompletion(msg) {
         followUpsPending: stillUnfiled, status: stillUnfiled ? STATUS_PENDING_FOLLOW_UPS : "complete",
         ...(entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
         ...(briefDelivery ? { ...briefDelivery, ...(holds.some((h) => h.step === "brief") ? { briefPending: true } : {}) } : {}),
-        // TEAM-5926: `{...rec.record, ...extra}` would otherwise keep the released hold.
-        ...(releasedHold ? { briefPending: false } : {}),
+        // TEAM-5958: `{...rec.record, ...extra}` keeps a brief hold a Done landed over
+        // (doneOverHold) — the brief is still off the gate, so the hold stays true.
         ...(undelivered.length > 0 ? { undelivered } : {}),
       },
     });
@@ -1901,15 +1957,9 @@ export async function drainCompletion(msg) {
     // twins' Done guard below must read it as delivered. `false`, not deleted: the
     // record keeps the history that it was held.
     if (record.briefPending === true && brief?.gate) record.briefPending = false;
-    // TEAM-5926: and a hold a concurrent Done released (the notice above said so).
-    if (releasedHold) record.briefPending = false;
-    // TEAM-5940: and that release is fenced on the ticket's status right now - the
-    // released notices and step 5 are provider writes between the re-read above and
-    // this PUT. Nothing is awaited between this read and the write.
-    if (releasedHold) {
-      const fenced = await fenceRelease();
-      if (fenced) return fenced;
-    }
+    // TEAM-5958: a hold a concurrent Done landed over (doneOverHold) stays `true` — that
+    // is the ONLY clear above: gate delivery. The ticket is Done; nothing reads the hold
+    // until a new Done is attempted, and then it is the refusal a reopen needs.
     // TEAM-5941: a stale Done-intent comes off with this write; a fresh one stays.
     stripStaleDoneIntent(record);
     // TEAM-5830: conditional on the step-0 read, like drop() above.
