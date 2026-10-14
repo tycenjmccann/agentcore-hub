@@ -4508,13 +4508,19 @@ _STREAM_RETRY_CAP_S = float(_wd_num(os.getenv("STREAM_RETRY_CAP_S")) or 60)
 # agent.streaming event before each one, so a long wait never reads as silence to
 # the dead-session detector (lease.mjs lastAgentActivity).
 _STREAM_RETRY_HEARTBEAT_S = 30.0
+# TEAM-6022: the invocation lease TTL, mirrored from lease.mjs `resolveTtlMs`
+# (same WORKFLOW_LEASE_TTL_MINUTES override; default = defaultTtlMinutes in
+# src/config/lease-constants.json, which is not shipped in this image).
+# Unparsable/non-positive values fall back (`_wd_num`).
+_LEASE_TTL_S = float(_wd_num(os.getenv("WORKFLOW_LEASE_TTL_MINUTES")) or 30) * 60
 # TEAM-5976 F1: a model call in flight that has yielded nothing for this long
 # publishes an agent.streaming `detail.type="heartbeat"` row (no content — nothing
 # renders it; lease renewal filters on the event type only). Scoped to MODEL calls:
 # those are bounded by botocore, while a tool thread hung forever must still let
-# the lease lapse. Clamped to TTL/6 of the 30-minute lease.
+# the lease lapse. Clamped to TTL/6 of the lease. TEAM-6022: and capped at one
+# TTL of silence — see `_inflight_heartbeat`.
 _STREAM_RETRY_INFLIGHT_HEARTBEAT_S = float(
-    min(_wd_num(os.getenv("STREAM_RETRY_INFLIGHT_HEARTBEAT_S")) or 60, 300))
+    min(_wd_num(os.getenv("STREAM_RETRY_INFLIGHT_HEARTBEAT_S")) or 60, _LEASE_TTL_S / 6))
 # TEAM-5976 F5: what the caller sees where a broken assistant message restarts.
 # strands commits a message to history only once its stream completes, so the
 # retry REGENERATES it; its partial is rolled back out of the turn's text, but
@@ -4527,7 +4533,9 @@ class StreamRetryDeadlineExceeded(TimeoutError):
     passed. Before this, `remaining` was read only in the except block, so a
     retry that HUNG was bounded by botocore's read_timeout alone (1200s, times
     the attempt cap) while the in-flight heartbeat renewed the lease throughout.
-    A TimeoutError so every classifier reads it as transient; `_stream_with_retry`
+    An attempt with no deadline (the first, or one after a re-arm) is bounded on
+    the lease side instead: TEAM-6022 stops the in-flight heartbeat after one
+    lease TTL of silence. A TimeoutError so every classifier reads it as transient; `_stream_with_retry`
     treats it as exhaustion — the deadline is the bound, not a reason to retry."""
 
 # Transient by nature: the stream broke, but asking again can work. Matched on
@@ -5182,7 +5190,8 @@ async def _run_agent_invocation(payload, context):
             # Absolute, so the backoff's heartbeat publishes and the consumer's
             # rollback between attempts are charged to it; a relative budget
             # re-derived at each attempt's start let them push it forward. None =
-            # unbounded, which the first attempt and every attempt after a re-arm are.
+            # unbounded, which the first attempt and every attempt after a re-arm are
+            # (their lease is bounded by the in-flight heartbeat's cap, TEAM-6022).
             outage_deadline = None
             baseline = prompt_delivery.added
             while True:
@@ -5213,9 +5222,20 @@ async def _run_agent_invocation(payload, context):
 
                 async def _inflight_heartbeat():
                     last = 0  # the attempt's start, not this task's first run
+                    # Consecutive intervals in flight with nothing yielded; any
+                    # event, or no model call open, resets it.
+                    quiet = 0
                     while True:
                         await _stream_heartbeat_wait(_STREAM_RETRY_INFLIGHT_HEARTBEAT_S)
-                        if model_inflight.inflight and seen[0] == last:
+                        quiet = quiet + 1 if (model_inflight.inflight
+                                              and seen[0] == last) else 0
+                        # TEAM-6022: a hung model call cannot keep its lease alive
+                        # longer than one lease TTL. One silent read is bounded by
+                        # botocore's 1200s read_timeout, under the TTL, so a call
+                        # quiet for a whole TTL is hung (only botocore's own retries
+                        # get it there). After the last beat the lease lapses within
+                        # one TTL and the dead-session sweep can reap it.
+                        if quiet and quiet * _STREAM_RETRY_INFLIGHT_HEARTBEAT_S < _LEASE_TTL_S:
                             tracker._publish_event("agent.streaming", {
                                 "agentId": agent_id,
                                 "type": "heartbeat",

@@ -476,6 +476,7 @@ def test_the_wall_budget_and_attempt_cap_are_the_documented_ones() -> None:
     )
     assert ns["_STREAM_RETRY_INFLIGHT_HEARTBEAT_S"] == 60.0
     assert ns["_STREAM_RETRY_INFLIGHT_HEARTBEAT_S"] <= 300.0, "TTL/6 of the 30-min lease"
+    assert ns["_LEASE_TTL_S"] == 1800.0, "lease-constants.json defaultTtlMinutes"
 
 
 _ENV_KNOB_CASES = [
@@ -532,6 +533,19 @@ def test_team5976_inflight_heartbeat_is_clamped_inside_the_lease(monkeypatch) ->
     monkeypatch.setenv("STREAM_RETRY_INFLIGHT_HEARTBEAT_S", "900")
     ns = _load_production_entrypoints()
     assert ns["_STREAM_RETRY_INFLIGHT_HEARTBEAT_S"] == 300.0
+
+
+@pytest.mark.parametrize("raw, expected", _ENV_KNOB_CASES, ids=_ENV_KNOB_IDS)
+def test_team6022_lease_ttl_mirror_falls_back_on_garbage(monkeypatch, raw, expected) -> None:
+    """TEAM-6022: the Python mirror of lease.mjs `resolveTtlMs` reads the same
+    WORKFLOW_LEASE_TTL_MINUTES override; anything invalid or non-positive is the
+    30-minute default, never a zero TTL that would silence every heartbeat."""
+    if raw is None:
+        monkeypatch.delenv("WORKFLOW_LEASE_TTL_MINUTES", raising=False)
+    else:
+        monkeypatch.setenv("WORKFLOW_LEASE_TTL_MINUTES", raw)
+    ns = _load_production_entrypoints()
+    assert ns["_LEASE_TTL_S"] == float(expected or 30) * 60, (raw, ns["_LEASE_TTL_S"])
 
 
 def test_team5976_watchdog_payload_inf_falls_back_to_legacy() -> None:
@@ -1226,11 +1240,12 @@ def _load_with_ticker(scripts: list[list[Any]], **overrides: Any):
 
 @pytest.mark.asyncio
 async def test_team5976_a_quiet_inflight_model_call_heartbeats() -> None:
-    """The defect: a model call that went silent (botocore read_timeout is 1200s,
-    x3 attempts) published nothing, so the lease aged out behind a LIVE turn and
+    """The defect: a model call that went silent (botocore read_timeout is 1200s
+    per read) published nothing, so the lease aged out behind a LIVE turn and
     the ticket could be re-dispatched under it. Each quiet interval now publishes
     one lease-renewing agent.streaming row — `detail.type="heartbeat"`, no content,
-    so nothing renders it — stamped with agent and ticket."""
+    so nothing renders it — stamped with agent and ticket. Up to one lease TTL of
+    silence only: botocore's retries of a hung read are not covered (TEAM-6022)."""
     ns, agent_cls, errors, deaths, puts, waits = _load_with_ticker(lambda tick: [
         [_model_call_starts, tick, tick, _model_call_ends, {"data": "ok"}, _engage_completion],
     ])
@@ -1317,6 +1332,59 @@ async def test_team5976_a_cancelled_turn_cancels_the_heartbeat_and_resumes_befor
     assert _pending_tasks() == [], "a cancelled turn left its heartbeat task running"
     assert ns["_test_log"] == ["resume", "died"], ns["_test_log"]
     assert errors == []
+
+
+# TEAM-6022 — the in-flight heartbeat stops after one lease TTL of silence.
+
+
+@pytest.mark.asyncio
+async def test_team6022_a_hung_model_call_stops_renewing_the_lease_after_one_ttl() -> None:
+    """The defect: attempt 1 has no outage deadline, so a call hung on botocore
+    (1200s read_timeout x 3 tries) kept beating — and its lease alive — for about
+    an hour. The invariant: a hung model call cannot keep its lease alive longer
+    than one lease TTL. With the shipped 60s interval and 30-min TTL the beats stop
+    once the call has been quiet a whole TTL: 29 beats, none at or past 1800s."""
+    ns, agent_cls, errors, deaths, puts, waits = _load_with_ticker(lambda tick: [
+        [_model_call_starts,
+         *[tick] * (int(1800 // 60) + 3),  # quiet well past one TTL
+         _model_call_ends, {"data": "ok"}, _engage_completion],
+    ])
+    assert ns["_LEASE_TTL_S"] == 1800.0 and ns["_STREAM_RETRY_INFLIGHT_HEARTBEAT_S"] == 60.0
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+
+    beats = _detail_rows(puts, "heartbeat")
+    assert len(beats) == 29, f"beats must stop at one TTL of silence; got {len(beats)}"
+    assert waits and set(waits) == {60.0}, waits
+    assert _deltas(frames) == ["ok"]
+    assert _pending_tasks() == [], "the heartbeat task outlived the turn"
+    assert errors == [] and deaths == []
+
+
+@pytest.mark.asyncio
+async def test_team6022_progress_and_a_new_model_call_reset_the_cap() -> None:
+    """The cap counts silence since the last stream PROGRESS, per model call — not
+    since the attempt or the call started — so a long healthy turn is never cut.
+    TTL 180s at a 60s interval: each quiet stretch may beat twice."""
+    ns, agent_cls, errors, deaths, puts, waits = _load_with_ticker(lambda tick: [
+        [
+            _model_call_starts, tick, tick, tick, tick,  # 2 beats, then capped
+            {"data": "a"}, tick,                         # progress: no beat, reset
+            tick, tick, tick, tick,                      # 2 beats, then capped
+            _model_call_ends, tick,                      # a tool: not a model call
+            _model_call_starts, tick, tick, tick, tick,  # a new call: 2 beats
+            _model_call_ends, _engage_completion,
+        ],
+    ])
+    ns["_LEASE_TTL_S"] = 180.0
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+
+    beats = _detail_rows(puts, "heartbeat")
+    assert len(beats) == 6, f"each quiet stretch may beat until one TTL; got {len(beats)}"
+    assert _deltas(frames) == ["a"]
+    assert _pending_tasks() == []
+    assert errors == [] and deaths == []
 
 
 # F2 — the classifier reads the whole exception chain.
