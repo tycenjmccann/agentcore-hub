@@ -60,6 +60,11 @@ environmental, not a dev round. AFTER the gate is approved you never sync — on
 the CD ticket a moved head voids the human's approval (see `## CD ticket: merge +
 deploy`), so a conflict there stays BLOCKED. A NON-TRIVIAL conflict goes in your
 ordinary `ship_fix` to the dev that owns the conflicting component.
+`<default branch>` in the Main-sync rule above (and the MERGEABLE-OR-SYNC
+step below) means this PR's resolved base: the `base_branch:` your `## Branch`
+context names when a fix ticket stated one (a fix PR into `release/2.1` syncs
+from `release/2.1`), the repo default branch only when no base is stated —
+never merge the default branch into a stated non-default base.
 
 ### Step 1: Open (or adopt) the unified PR
 The `## Repository` section of your context gives owner/repo and the default
@@ -67,6 +72,13 @@ branch; the run's shared integration branch is `feature/{EPIC}-...`.
 - `create_pull_request` from the shared branch into the default branch
   (title: `feat: {run title} ({EPIC})`). If a PR already exists for that head,
   the tool returns it — adopt it.
+- **Post-merge fix (your `## Branch` context carries the NOTE "this run's unified
+  PR already merged …"):** the shared branch is dead — do NOT `create_pull_request`
+  from it or adopt a PR whose head is it. Adopt the fix ticket's OWN PR instead:
+  read `pr_url` + branch from `s3://<bucket>/completions/<fix ticket>.json`,
+  confirm its base is the `base_branch:` in `## Branch`, and treat THAT PR as "the
+  unified PR" in every step below. The one exception is the fallback under "After
+  the unified PR has merged" (commits that already landed on the dead branch).
 - Record the PR number, URL, and head SHA.
 - **Artifact chain (playbook runs — `## SDLC Framework` in your context):**
   `<artifact_dir>/findings.md` must exist at the PR head (the code reviewer's
@@ -143,8 +155,10 @@ too:
   - `mergeable: MERGEABLE` with the branch merely behind the base → NOT a
     finding, nothing to do. GitHub's squash merge handles it.
   - `CONFLICTING` → YOU sync it, per the Main-sync rule above, in THIS turn and
-    BEFORE the brief: merge `origin/<default branch>` INTO the shared branch
-    (merge commit, never rebase, never force), resolve the trivial class, push,
+    BEFORE the brief: merge the PR's resolved base INTO the PR's head branch —
+    `origin/<base_branch>` when `## Branch` states one for a fix PR, else
+    `origin/<default branch>` into the shared branch — as a merge commit (never
+    rebase, never force), resolve the trivial class, push,
     then re-read the head SHA and re-certify that new head via Step 1's CI
     re-cert path. Never a dev fix ticket for staleness, and never a CHANGES
     NEEDED verdict on staleness grounds.
@@ -598,10 +612,30 @@ rather than the target repo's code, the fix ticket you file for it opens its PR
 against the hub's own default branch directly: pass `base_branch="main"` on
 `Tickets___create_ticket` — never this run's shared integration branch. An infra
 fix is unrelated to this run's feature and must not ride this run's PR into the
-target repo. On every OTHER ticket you file, leave `base_branch` out entirely: a
+target repo. This holds before AND after the unified PR merges. Before the
+merge, on every OTHER ticket you file, leave `base_branch` out entirely: a
 blank value means "no branch was stated", and the run's own integration branch is
 the default. Passing it by habit is how an ordinary phase fix gets retargeted at
 `main` and stops riding the run's PR.
+
+**After the unified PR has merged, the default flips.** Once your merge has
+landed (you hold its `merge_commit`), the run's integration branch is dead: a fix
+merged into it never reaches the default branch. Every ordinary fix ticket or
+`follow_ups` fix entry you file from then on passes
+`base_branch="<default_branch>"` (`"baseBranch":"<default_branch>"` on a
+follow-up) — the `default_branch:` of your `## Repository` context, never a
+literal `main` — unless the work targets another stated base (the
+`base_branch:` your `## Branch` context names, e.g. `release/2.1`), which it
+passes instead; so the fixer PRs straight to that base through review → CI →
+Merge Approval. A hub-infra fix keeps its hub `main` base from the rule above
+(it targets the HUB's repo, not this one); the flip never applies to it. State
+the base explicitly even though the orchestrator resolves a blank base after
+the merge: you can file the fix before your own completion records the merge,
+and the explicit line wins. Fallback, if fix work did land on the integration
+branch after the merge: open a fresh unified PR from the feature branch to the
+default branch and take it through Merge Approval — never complete with
+commits stranded on that branch (the completion gate refuses the run until
+they land or a PR to the default branch is open).
 
 Both kinds share: assignee = the SAME `human:<who>` string as this run's Merge
 Approval gate ticket (read it off that ticket — never invent or guess one),
@@ -1034,6 +1068,6 @@ path too ("The human's answer", above).
   thing — a human rejected a gate ticket ("The human's answer")
 - You never approve a deploy and never ask for one to be auto-approved — the
   human's Telegram ✅ on the gate ticket is the only approval path there is
-- A branch behind the default branch is never a finding and never a fix ticket —
+- A branch behind its resolved base (the default branch unless `## Branch` states one) is never a finding and never a fix ticket —
   sync it in your own turn per the Main-sync rule, during the ship review only;
   after the merge gate is approved, never

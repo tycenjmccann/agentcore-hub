@@ -26,6 +26,18 @@ block** — THIS ticket's own session (reopened / re-dispatched); pass that id o
 your FIRST coding call. Start fresh even then ONLY when the feedback explicitly
 demands a clean-slate redo.
 
+**Never PR into a merged branch.** You can be dispatched on a fix follow-up
+(`ship_fix`/`docs`) after this run's unified PR has already merged — the
+integration branch is dead then: your `## Branch` context carries a NOTE
+saying the unified PR already merged, and its base_branch is the base your
+fix PR targets (the repo default branch unless your ticket stated another
+base, e.g. `release/2.1`). When base_branch is the integration branch and
+that NOTE is absent, check anyway
+before you PR: `gh pr list --head <base_branch> --base <default branch>
+--state merged`, or a `merge_commit` on the run's CD ticket. If it merged, branch fresh from the
+default branch and PR to the default branch (through review → CI → Merge
+Approval like any change); never PR into the merged integration branch.
+
 ## Main-sync rule (a branch behind the default branch is NOT a defect)
 "Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
 <branch> && git merge origin/<default branch>` — a merge commit, keeping both
@@ -45,7 +57,11 @@ scoped for your role immediately below.
 `base_branch` after your own PR is merged into it (see the delivery step). A
 non-trivial conflict that survives the `model="opus"` retry → report BLOCKED
 naming the conflicting files; never a silent handoff, and never a fix ticket for
-staleness alone.
+staleness alone. `<default branch>` in the Main-sync rule above (and the sync
+step below) means this PR's resolved base: the `base_branch:` your `## Branch`
+context names when your ticket stated one (a fix PR into `release/2.1` syncs
+from `release/2.1`), the repo default branch only when no base is stated —
+never merge the default branch into a stated non-default base.
 
 ## Sibling-sweep rule (a defect is a CLASS, not one site)
 A defect is a pattern until proven unique. Before a fix ticket is filed, and
@@ -153,9 +169,15 @@ A session that dies after the deliverable but before the report leaves the run u
 - Confirm tests pass
 - Open the PR **into base_branch** and merge it once tests pass (see Branch Model)
 - **Sync base_branch on main — LAST development step.** Once your PR is merged into
-  base_branch, merge `origin/<default branch>` INTO `base_branch` (see the Main-sync
-  rule) and push. The sync is part of the deliverable, so the ship-then-report
-  ordering above is unchanged: sync, then report.
+  base_branch, merge the PR's resolved base (see Your scope) INTO
+  `base_branch` per the Main-sync rule and push it: `origin/<default branch>`
+  for the integration branch, whose unified PR targets the default branch.
+  When your PR targets `base_branch` directly instead (the `## Branch` NOTE says
+  the unified PR already merged, or your ticket stated a base that is not the
+  integration branch) nothing merges into base_branch: sync `origin/<base_branch>`
+  INTO your `feature_branch` before you open the PR, and never merge the
+  default branch into a stated non-default base. The sync is part of the
+  deliverable, so the ship-then-report ordering above is unchanged: sync, then report.
 - **Fix tickets: sweep before you report.** Re-run the Sibling-sweep rule's
   search for the pattern you just fixed; every occurrence is fixed (or refuted on
   the ticket with evidence) BEFORE `report_completion`.
@@ -190,7 +212,7 @@ Target 10–15 minutes of activity per turn. The hard cap is 60 minutes per `cla
 - Model tiers per `claude_code` call (`model=`): PLAN turns on `"opus"` (`"fable"` for ambiguous / architecture-heavy work); EXECUTE turns on `"sonnet"` for well-specified plans, `"opus"` for complex ones; `"haiku"` only for trivial mechanical edits. Never plan on haiku. The `codex` peers are the same ladder — `codex(model="astra")` ≈ fable, `codex(model="sol")` ≈ opus, `codex(model="terra")` ≈ sonnet, `codex(model="luna")` ≈ haiku — when you want a second engine on the same difficulty.
 - Tier names resolve through the model registry (`config/models.json`); never pass a raw model id from a blueprint.
 - Review-fix round 2+ = `"fable"` for PLAN **and** EXECUTE. Your ticket is a review fix when its title starts `Fix (review):`; it is round 2+ when `Tickets___list_tickets(epic_id)` shows an earlier `Fix (review):` ticket under the same epic, or when any finding you were handed is a regression a prior fix round introduced. Round-1 review fixes keep the tiers above. Why: the second time code comes back from review, the remaining findings are the subtle invariants a cheaper execute turn already got wrong once (wf_bug_TEAM-4798: round 4 on opus/sonnet cleared its 4 findings and introduced a new P1 in the same ref-minting code).
-- Never hand off to review with `base_branch` behind the repo default branch — a branch that only needs a main-merge is your job to sync (Main-sync rule), not a fix ticket
+- Never hand off to review with `base_branch` (or, when your PR targets it directly, your `feature_branch`) behind its resolved base — the repo default branch unless a base is stated — a branch that only needs a base-merge is your job to sync (Main-sync rule), not a fix ticket
 - Never let `claude_code` write code before you have read and approved its plan (Step 2).
 - Always delegate to `claude_code`
 - If `claude_code` fails or times out, break the task smaller and retry

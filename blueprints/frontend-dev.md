@@ -35,6 +35,19 @@ when the feedback explicitly demands a clean-slate redo.
 Only when base_branch IS the repo default branch (no shared branch was created)
 do you PR against it directly.
 
+**Never PR into a merged branch.** You can be dispatched on a fix follow-up
+(`ship_fix`/`docs`) after this run's unified PR has already merged — the
+integration branch is dead then: your `## Branch` context carries a NOTE
+saying the unified PR already merged, and its base_branch is the base your
+fix PR targets (the repo default branch unless your ticket stated another
+base, e.g. `release/2.1`). When base_branch is the integration branch and
+that NOTE is absent, nothing stops
+you from checking anyway before you PR: `gh pr list --head <base_branch>
+--base <default branch> --state merged`, or a `merge_commit` on the run's CD ticket. If it merged,
+branch fresh from the default branch and PR to the default branch (through
+review → CI → Merge Approval like any change); never PR into the merged
+integration branch.
+
 ## Main-sync rule (a branch behind the default branch is NOT a defect)
 "Sync on main" means MERGE, never rebase: `git fetch origin && git checkout
 <branch> && git merge origin/<default branch>` — a merge commit, keeping both
@@ -54,7 +67,11 @@ scoped for your role immediately below.
 `base_branch` after your own PR is merged into it (see the delivery step). A
 non-trivial conflict that survives the `model="opus"` retry → report BLOCKED
 naming the conflicting files; never a silent handoff, and never a fix ticket for
-staleness alone.
+staleness alone. `<default branch>` in the Main-sync rule above (and the sync
+step below) means this PR's resolved base: the `base_branch:` your `## Branch`
+context names when your ticket stated one (a fix PR into `release/2.1` syncs
+from `release/2.1`), the repo default branch only when no base is stated —
+never merge the default branch into a stated non-default base.
 
 ## Sibling-sweep rule (a defect is a CLASS, not one site)
 A defect is a pattern until proven unique. Before a fix ticket is filed, and
@@ -202,9 +219,15 @@ A session that dies after the deliverable but before the report leaves the run u
    - Screenshot of the result (the harvested S3 key from the `[coding-artifacts: ...]` footer — never a committed file)
 4. Merge the PR into base_branch once your evidence is complete
 5. **Sync base_branch on main — the LAST development step.** After merging your PR
-   into base_branch, merge `origin/<default branch>` INTO `base_branch` (see the
-   Main-sync rule) and push it. The sync is part of the deliverable, so the
-   ship-then-report ordering above is unchanged: sync, then report.
+   into base_branch, merge the PR's resolved base (see Your scope) INTO
+   `base_branch` per the Main-sync rule and push it: `origin/<default branch>`
+   for the integration branch, whose unified PR targets the default branch.
+   When your PR targets `base_branch` directly instead (the `## Branch` NOTE says
+   the unified PR already merged, or your ticket stated a base that is not the
+   integration branch) nothing merges into base_branch: sync `origin/<base_branch>`
+   INTO your `feature_branch` before you open the PR, and never merge the
+   default branch into a stated non-default base. The sync is part of the
+   deliverable, so the ship-then-report ordering above is unchanged: sync, then report.
 6. **Fix tickets: sweep before you report.** Re-run the Sibling-sweep rule's
    search for the pattern you just fixed; every occurrence is fixed (or refuted on
    the ticket with evidence) BEFORE `report_completion`.
@@ -225,5 +248,5 @@ A session that dies after the deliverable but before the report leaves the run u
 - Follow existing code patterns — don't introduce new paradigms
 - Keep changes scoped to what the ticket asks for
 - PRs target base_branch, never the repo default branch (unless base_branch IS the default)
-- Never hand off to review with `base_branch` behind the repo default branch — a branch that only needs a main-merge is your job to sync (Main-sync rule), not a fix ticket
+- Never hand off to review with `base_branch` (or, when your PR targets it directly, your `feature_branch`) behind its resolved base — the repo default branch unless a base is stated — a branch that only needs a base-merge is your job to sync (Main-sync rule), not a fix ticket
 - A fix is class-wide: sweep for siblings of the pattern, fix them all, prefer one shared helper over duplicated edits (Sibling-sweep rule) — a known sibling left behind means the ticket is not Done

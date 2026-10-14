@@ -497,21 +497,131 @@ describe("appendReviewNotificationOnce (TEAM-3684 Finding 2)", () => {
   });
 });
 
-describe("completeTaskEntry", () => {
-  it("touches only status + completedAt when the entry exists", async () => {
-    await completeTaskEntry("wf_1", "TEAM-2", { status: "complete", completedAt: "2026-01-01T00:00:00Z" });
+/**
+ * TEAM-5890 — a tiny DynamoDB that APPLIES UpdateExpressions (SET incl.
+ * if_not_exists) and evaluates attribute_exists / attribute_not_exists
+ * conditions against `row`, raising CCFE like the real service. The stub
+ * above only records command shapes; the completion-stamp contract is about
+ * what the row holds after a sequence of writes, so it needs real semantics.
+ */
+function miniDdb(row, hooks = {}) {
+  const resolve = (path, names) => path.split(".").map((seg) => names?.[seg] ?? seg);
+  const get = (segs) => segs.reduce((o, k) => (o == null ? undefined : o[k]), row);
+  const set = (segs, v) => { let o = row; for (const k of segs.slice(0, -1)) o = (o[k] ??= {}); o[segs.at(-1)] = v; };
+  const ccfe = () => { const e = new Error("ccfe"); e.name = "ConditionalCheckFailedException"; throw e; };
+  return {
+    async send(cmd) {
+      sent.push({ type: cmd.constructor.name, input: cmd.input });
+      hooks.beforeWrite?.(cmd.input);
+      const { UpdateExpression: ue, ConditionExpression: ce, ExpressionAttributeNames: n, ExpressionAttributeValues: v } = cmd.input;
+      if (!ue) return {};
+      if (ce) {
+        // Reduce the condition to a boolean expression: attribute_[not_]exists(P)
+        // and `P <> :v` become literals, then only AND/OR/parens remain.
+        const bool = ce
+          .replace(/attribute_(not_)?exists\(([^)]+)\)/g, (_, not, p) => String((get(resolve(p, n)) !== undefined) !== Boolean(not)))
+          .replace(/([\w.#]+)\s*<>\s*(:\w+)/g, (_, p, ph) => String(get(resolve(p, n)) !== v[ph]))
+          .replace(/\bAND\b/g, "&&").replace(/\bOR\b/g, "||");
+        if (!/^[\s()truefals&|]+$/.test(bool)) throw new Error(`miniDdb: unsupported condition ${ce}`);
+        if (!new Function(`return (${bool});`)()) ccfe();
+      }
+      for (const [, lhs, rhs] of ue.replace(/^\s*SET\s+/i, "").matchAll(/([\w.#]+)\s*=\s*(if_not_exists\([^)]*\)|:\w+)/g)) {
+        const ine = /^if_not_exists\(([^,]+),\s*(:\w+)\)$/.exec(rhs);
+        if (ine) { if (get(resolve(ine[1].trim(), n)) === undefined) set(resolve(lhs, n), v[ine[2]]); }
+        else set(resolve(lhs, n), v[rhs]);
+      }
+      return {};
+    },
+  };
+}
+
+describe("completeTaskEntry — the completion stamp is written once, on running -> complete (TEAM-5890)", () => {
+  const T1 = "2026-10-01T00:01:00.000Z", T3 = "2026-10-01T00:03:00.000Z";
+  const TRANSITION_GUARD = "attribute_exists(agentTasks.#tid) AND (attribute_not_exists(agentTasks.#tid.#st) OR agentTasks.#tid.#st <> :s)";
+
+  it("shape: the transition write touches only status + completedAt and is guarded on NOT already complete", async () => {
+    await completeTaskEntry("wf_1", "TEAM-2", { status: "complete", completedAt: T1 });
     const w = writes()[0];
     expect(w.input.UpdateExpression).toBe("SET agentTasks.#tid.#st = :s, agentTasks.#tid.completedAt = :ts");
-    expect(w.input.ConditionExpression).toBe("attribute_exists(agentTasks.#tid)");
+    expect(w.input.ConditionExpression).toBe(TRANSITION_GUARD);
+    expect(w.input.UpdateExpression).not.toMatch(/if_not_exists/); // a reworked (re-claimed) head must get ITS OWN stamp
   });
 
-  it("seeds the whole entry only when untracked (condition fails)", async () => {
+  it("shape: the seed fallback is first-writer-wins (attribute_not_exists), never an unconditioned replace", async () => {
     failNextCondition = true;
-    const seed = { id: "t1", agentId: "dev", ticketId: "TEAM-2", status: "complete", completedAt: "2026-01-01T00:00:00Z" };
+    const seed = { id: "t1", agentId: "dev", ticketId: "TEAM-2", status: "complete", completedAt: T1 };
     await completeTaskEntry("wf_1", "TEAM-2", seed);
-    const last = writes()[writes().length - 1];
-    expect(last.input.UpdateExpression).toBe("SET agentTasks.#tid = :task");
-    expect(last.input.ExpressionAttributeValues[":task"]).toEqual(seed);
+    const seedWrite = writes().find((w) => w.input.UpdateExpression === "SET agentTasks.#tid = :task");
+    expect(seedWrite.input.ConditionExpression).toBe("attribute_not_exists(agentTasks.#tid)");
+    expect(seedWrite.input.ExpressionAttributeValues[":task"]).toEqual(seed);
+    for (const w of writes()) {
+      if (w.input.UpdateExpression?.startsWith("SET agentTasks = if_not_exists")) continue; // ensureAgentTasksMap
+      expect(w.input.ConditionExpression).toBeTruthy();
+    }
+  });
+
+  it("running -> complete stamps and returns true", async () => {
+    const row = { agentTasks: { "TEAM-2": { id: "t1", status: "running", startedAt: "2026-10-01T00:00:00.000Z" } } };
+    initWorkflowStore(miniDdb(row), "workflows-test");
+    expect(await completeTaskEntry("wf_1", "TEAM-2", { status: "complete", completedAt: T1 })).toBe(true);
+    expect(row.agentTasks["TEAM-2"]).toMatchObject({ status: "complete", completedAt: T1 });
+  });
+
+  it("a second completion on a complete entry keeps the FIRST stamp and returns false (stale-read duplicate)", async () => {
+    const row = { agentTasks: { "TEAM-2": { id: "t1", status: "running" } } };
+    initWorkflowStore(miniDdb(row), "workflows-test");
+    await completeTaskEntry("wf_1", "TEAM-2", { status: "complete", completedAt: T1 });
+    expect(await completeTaskEntry("wf_1", "TEAM-2", { status: "complete", completedAt: T3 })).toBe(false);
+    expect(row.agentTasks["TEAM-2"].completedAt).toBe(T1);
+  });
+
+  it("a legacy complete entry WITHOUT completedAt is never backfilled (its order stays unknown)", async () => {
+    const row = { agentTasks: { "TEAM-2": { id: "t1", status: "complete", commitSha: "head000", output: "done" } } };
+    initWorkflowStore(miniDdb(row), "workflows-test");
+    expect(await completeTaskEntry("wf_1", "TEAM-2", { ...row.agentTasks["TEAM-2"], completedAt: T3 })).toBe(false);
+    expect(row.agentTasks["TEAM-2"].completedAt).toBeUndefined();
+    expect(row.agentTasks["TEAM-2"]).toMatchObject({ status: "complete", commitSha: "head000", output: "done" });
+  });
+
+  it("a re-claimed rework generation (running again, carrying the old stamp) gets a NEW stamp — TEAM-5707 reads completedAt >= startedAt", async () => {
+    const row = { agentTasks: { "TEAM-2": { id: "t1", status: "running", startedAt: "2026-10-01T00:02:00.000Z", completedAt: T1, commitSha: "head000" } } };
+    initWorkflowStore(miniDdb(row), "workflows-test");
+    expect(await completeTaskEntry("wf_1", "TEAM-2", { status: "complete", completedAt: T3 })).toBe(true);
+    expect(row.agentTasks["TEAM-2"].completedAt).toBe(T3);
+  });
+
+  it("an untracked entry is still seeded whole, returns true", async () => {
+    const row = { agentTasks: {} };
+    initWorkflowStore(miniDdb(row), "workflows-test");
+    const seed = { id: "t1", agentId: "dev", ticketId: "TEAM-2", status: "complete", completedAt: T1 };
+    expect(await completeTaskEntry("wf_1", "TEAM-2", seed)).toBe(true);
+    expect(row.agentTasks["TEAM-2"]).toEqual(seed);
+  });
+
+  it("seed race: a concurrent claim materialises the entry as RUNNING between the two writes -> the retry stamps it", async () => {
+    const row = { agentTasks: {} };
+    let armed = true;
+    initWorkflowStore(miniDdb(row, { beforeWrite: (input) => {
+      if (armed && input.UpdateExpression === "SET agentTasks.#tid = :task") { armed = false; row.agentTasks["TEAM-2"] = { id: "t9", status: "running", startedAt: "2026-10-01T00:00:30.000Z" }; }
+    } }), "workflows-test");
+    expect(await completeTaskEntry("wf_1", "TEAM-2", { id: "t1", status: "complete", completedAt: T1 })).toBe(true);
+    expect(row.agentTasks["TEAM-2"]).toEqual({ id: "t9", status: "complete", startedAt: "2026-10-01T00:00:30.000Z", completedAt: T1 }); // the claim's entry, stamped — not clobbered by the seed
+  });
+
+  it("seed race: the entry materialises already COMPLETE between the two writes -> untouched, returns false", async () => {
+    const row = { agentTasks: {} };
+    let armed = true;
+    initWorkflowStore(miniDdb(row, { beforeWrite: (input) => {
+      if (armed && input.UpdateExpression === "SET agentTasks.#tid = :task") { armed = false; row.agentTasks["TEAM-2"] = { id: "t9", status: "complete", completedAt: T1, commitSha: "fff0000" }; }
+    } }), "workflows-test");
+    expect(await completeTaskEntry("wf_1", "TEAM-2", { id: "t1", status: "complete", completedAt: T3 })).toBe(false);
+    expect(row.agentTasks["TEAM-2"]).toEqual({ id: "t9", status: "complete", completedAt: T1, commitSha: "fff0000" });
+  });
+
+  it("a non-conditional error is rethrown, not swallowed as 'already complete'", async () => {
+    const boom = new Error("throttled"); boom.name = "ProvisionedThroughputExceededException";
+    throwOnce = boom;
+    await expect(completeTaskEntry("wf_1", "TEAM-2", { status: "complete", completedAt: T1 })).rejects.toBe(boom);
   });
 });
 
@@ -1028,6 +1138,20 @@ describe("appendEscalationOnce (TEAM-4739 W1'/W2/W3)", () => {
     expect(sent.filter((c) => c.type === "UpdateCommand")).toHaveLength(before);
   });
 
+  it("TEAM-5853: maxCount 1 is exactly-once — a racer that loses the CAS re-reads, sees the open row, stands down", async () => {
+    let gets = 0;
+    const open = { id: ID, type: "manager_escalation", count: 1, acknowledged: false };
+    const restore = rowReturning(
+      () => (++gets === 1 ? { workflowId: "wf_1", notifVersion: 0, humanNotifications: [] } : { workflowId: "wf_1", notifVersion: 1, humanNotifications: [open] }),
+      { failFirstCondition: true },
+    );
+    const before = sent.filter((c) => c.type === "UpdateCommand").length;
+    try {
+      expect(await appendEscalationOnce("wf_1", ID, notif(), { maxCount: 1 })).toBe(false);
+    } finally { restore(); }
+    expect(sent.filter((c) => c.type === "UpdateCommand").length - before).toBe(1); // the lost CAS only
+  });
+
   it("an ACKNOWLEDGED row is history — a fresh stall opens a new one at count:1", async () => {
     const restore = rowReturning({ workflowId: "wf_1", notifVersion: 3, humanNotifications: [
       { id: ID, type: "manager_escalation", count: 6, acknowledged: true },
@@ -1072,10 +1196,24 @@ describe("appendEscalationOnce (TEAM-4739 W1'/W2/W3)", () => {
     expect(gets).toBe(2);
   });
 
-  it("a missing workflow row is a no-op, not a throw", async () => {
+  // TEAM-5914: false means ONLY "a verified open row stood this down". A missing row
+  // or exhausted CAS could not persist anything, so it is null (unknown), still falsy.
+  it("a missing workflow row is a no-op, not a throw — null (could not persist), never false", async () => {
     const restore = rowReturning(undefined);
     try {
-      expect(await appendEscalationOnce("wf_missing", ID, notif())).toBe(false);
+      expect(await appendEscalationOnce("wf_missing", ID, notif())).toBeNull();
     } finally { restore(); }
+  });
+
+  it("TEAM-5914: CAS retries exhausted → null (could not persist), never false", async () => {
+    const restore = rowReturning({ workflowId: "wf_1", notifVersion: 1, humanNotifications: [] });
+    const realSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      if (cmd.constructor.name !== "UpdateCommand") return realSend(cmd);
+      const err = new Error("moved"); err.name = "ConditionalCheckFailedException"; throw err;
+    };
+    try {
+      expect(await appendEscalationOnce("wf_1", ID, notif(), { maxCount: 1 })).toBeNull();
+    } finally { stubDdb.send = realSend; restore(); }
   });
 });
