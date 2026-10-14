@@ -677,13 +677,14 @@ export function recordedHeads(agentTasks) {
  *                                         merge-base may predate the squash (N1). Or
  *                                         base's tip tree IS the head's tree (TEAM-5913).
  *                                         Or every file the branch changed AFTER its
- *                                         merged PR has identical content on base's tip
- *                                         (per-file proof, TEAM-5935; list complete).
+ *                                         merged PR has the identical tree entry (mode +
+ *                                         blob sha, TEAM-5943) on base's tip (per-file
+ *                                         proof, TEAM-5935; list complete).
  *   { merged: false, reason }             provably not on base and nothing open to
  *                                         carry it — incl. commits pushed AFTER the
  *                                         unified PR merged (the TEAM-5828 strand):
- *                                         at least one such file whose content on base's
- *                                         tip EQUALS its pre-merge content and differs
+ *                                         at least one such file whose tree entry on base's
+ *                                         tip EQUALS its pre-merge entry and differs
  *                                         from the branch tip, i.e. base demonstrably
  *                                         never took the change. Trees that merely differ
  *                                         prove nothing — an unrelated commit on base
@@ -691,36 +692,42 @@ export function recordedHeads(agentTasks) {
  *   { merged: null,  reason? }            unknown, or an open PR still carries it.
  * Only `merged === false` refuses completion (TEAM-3721 fail-open).
  */
-// TEAM-5935 — per-file landing proof. GitHub compare lists at most 300 files; a contents
-// 404 means the path is absent at that ref.
+// TEAM-5935 — per-file landing proof. GitHub compare lists at most 300 files.
 const COMPARE_FILES_MAX = 300, FILE_PROBE_CAP = 50;
 const ABSENT = Symbol("absent"), UNKNOWN = Symbol("unknown");
 
-// Blob sha of `path` at `ref`: a sha, ABSENT (404) or UNKNOWN (directory, symlink, submodule,
-// malformed body, any non-404 error). UNKNOWN can never become a `false`.
-async function blobAt({ owner, repo, api }, path, ref) {
-  const p = String(path).split("/").map(encodeURIComponent).join("/");
+// Tree-entry identity "<mode> <sha>" per path from ONE recursive tree read (the only API
+// that exposes mode — Contents never does, so blob sha alone can call a 100644→100755 or
+// file→symlink change "landed", TEAM-5943). Non-blob entries (tree/commit) are UNKNOWN;
+// a path missing from a complete index is ABSENT, from a truncated one UNKNOWN; a failed
+// or malformed read makes the whole ref UNKNOWN. UNKNOWN can never become a `false`.
+async function treeIndex({ owner, repo, api }, treeSha) {
   try {
-    const r = await api(`/repos/${owner}/${repo}/contents/${p}?ref=${encodeURIComponent(ref)}`);
-    return r && !Array.isArray(r) && r.type === "file" && nonEmptyString(r.sha) ? r.sha : UNKNOWN;
-  } catch (err) { return err?.status === 404 ? ABSENT : UNKNOWN; }
+    const t = await api(`/repos/${owner}/${repo}/git/trees/${encodeURIComponent(treeSha)}?recursive=1`);
+    if (!Array.isArray(t?.tree)) return null;
+    const entries = new Map();
+    for (const e of t.tree) if (nonEmptyString(e?.path)) entries.set(e.path, e.type === "blob" && nonEmptyString(e.mode) && nonEmptyString(e.sha) ? `${e.mode} ${e.sha}` : UNKNOWN);
+    return { entries, truncated: t.truncated === true };
+  } catch { return null; }
 }
+const entryAt = (idx, path) => (!idx ? UNKNOWN : idx.entries.has(path) ? idx.entries.get(path) : idx.truncated ? UNKNOWN : ABSENT);
 
-// Classify each post-merge feature change (`files` = mergedHead...tip compare files):
-//   LANDED  base == tip (both ABSENT counts)
-//   ABSENT  base == before && before != tip  (base holds exactly the pre-change content)
+// Classify each post-merge feature change (`files` = mergedHead...tip compare files) by
+// tree-entry identity in the three indexes (`base` = base tip, `before` = merged head, `tip`):
+//   LANDED  base == tip (mode AND sha; both ABSENT counts)
+//   ABSENT  base == before && before != tip  (base holds exactly the pre-change entry)
 //   UNKNOWN anything else (base moved the file to a third state, or a lookup was unresolvable)
 // Renamed: LANDED only if new path base == tip AND previous path ABSENT on base; else UNKNOWN.
 // Beyond FILE_PROBE_CAP only an ABSENT found within the cap may be returned; `landed` also
 // needs the list untruncated (< COMPARE_FILES_MAX).
-async function perFileLanding(ctx, files, { base, before, tip }) {
+function perFileLanding(files, { base, before, tip }) {
   const absent = [], unknown = [];
   for (const f of files.slice(0, FILE_PROBE_CAP)) {
     const path = f?.filename;
     if (!nonEmptyString(path)) { unknown.push("(unnamed)"); continue; }
-    const [m, b, t] = await Promise.all([blobAt(ctx, path, base), blobAt(ctx, path, before), blobAt(ctx, path, tip)]);
+    const [m, b, t] = [base, before, tip].map((i) => entryAt(i, path));
     if (f.status === "renamed") {
-      const prev = nonEmptyString(f.previous_filename) ? await blobAt(ctx, f.previous_filename, base) : UNKNOWN;
+      const prev = nonEmptyString(f.previous_filename) ? entryAt(base, f.previous_filename) : UNKNOWN;
       if (m !== UNKNOWN && t !== UNKNOWN && m === t && prev === ABSENT) continue;
       unknown.push(path); continue;
     }
@@ -808,7 +815,10 @@ export async function featureBranchLanding({ owner, repo, base, head, api, recor
   const files = Array.isArray(after.files) ? after.files : [];
   const inconclusive = (why) => ({ merged: null, reason: `no landing proof for ${head} on ${base}, but no proof of unlanded content either (${why})` });
   if (files.length === 0 || !tipSha || !headSha) return inconclusive("post-merge file list or tip unavailable");
-  const v = await perFileLanding({ owner, repo, api }, files, { base: tipSha, before: mergedHead, tip: headSha });
+  // TEAM-5943: one recursive tree per ref, read sequentially (bounded peak memory); a null
+  // index makes every path UNKNOWN at that ref — LANDED never needed `before`, ABSENT does.
+  const idx = async (t) => (t ? treeIndex({ owner, repo, api }, t) : null);
+  const v = perFileLanding(files, { base: await idx(tipTree), before: await idx(await treeOf(mergedHead)), tip: await idx(headTree) });
   if (v.absent.length > 0) {
     return unmerged(
       `feature branch ${head} has ${after.ahead_by ?? "?"} commit(s) after its merged PR #${mergedPr.number} not contained in ${base} and no open PR to ${base}` +
