@@ -683,7 +683,10 @@ export function pruneDeliveredBrief(record) {
  * TEAM-6029: the drain's one clear for a brief it just put on its gate — a held
  * `briefPending:true` goes `false` (not deleted: the record keeps the history that it
  * was held) and its stale `part:"brief"` entry comes off. Step 6 and drop() both call
- * it, so neither carries the hold over a delivery. Mutates and returns `record`.
+ * it, so neither carries the hold over a delivery. TEAM-6052: through pruneDeliveredBrief
+ * the off-gate hold's `briefFallbackReason` comes off too, so a follow-ups-only drop()
+ * stamps a gate delivery exactly as step 6 and report_completion do. Mutates and
+ * returns `record`.
  */
 export function clearBriefHoldOnGate(record) {
   if (record.briefPending === true) record.briefPending = false;
