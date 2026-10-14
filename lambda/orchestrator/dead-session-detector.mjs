@@ -52,7 +52,7 @@
  * sweep runs against a stub client + stub store with no AWS.
  */
 
-import { QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { QueryCommand } from "@aws-sdk/lib-dynamodb";
 // The ONE open-workflow scan, shared with reconcile-sweep.mjs (TEAM-3839): the
 // capped window ROTATES across sweeps (TEAM-3764 F5) so >SWEEP_CAP open
 // workflows can never permanently starve the older tail.
@@ -67,7 +67,7 @@ const MIN_SAMPLES = 5;              // below this, the median is untrustworthy �
 const MAX_THRESHOLD_MS = 6 * 60 * 60 * 1000; // never wait more than 6h to call it dead
 const SWEEP_INTERVAL_MS = 5 * 60 * 1000;     // median cache lifetime (matches the rule)
 const LIVE_STATUSES = ["running", "in_progress"];
-const MEDIAN_SCAN_PAGES = 10;       // bound the events scan on a cold median miss
+const MEDIAN_SCAN_PAGES = 10;       // bound the partition query on a cold median miss
 const COMPLETION_SCAN_PAGES = 20;   // bound the completion-check query (× 500 items/page,
                                     // same bound as lease.lastAgentActivity)
 const KNOWN_MODES = ["off", "shadow", "enforce"];
@@ -107,8 +107,8 @@ export function createDetector(deps) {
     log = (msg) => console.log(`[orchestrator] ${msg}`),
   } = deps;
 
-  // agentId → { medianMs, sampleCount, computedAt }. Refreshed once per sweep
-  // interval; a busy fleet reuses one median across the whole sweep.
+  // `${workflowId}:${agentId}` → { medianMs, sampleCount, computedAt }. Refreshed
+  // once per sweep interval; a busy fleet reuses one median across the whole sweep.
   const medianCache = new Map();
 
   /**
@@ -159,27 +159,27 @@ export function createDetector(deps) {
   }
 
   /**
-   * Rolling median run-duration (ms) for an agent, from its last MEDIAN_WINDOW
-   * agent.complete events paired with their agent.started. Cached per sweep
-   * interval. Best-effort: an events scan that surfaces fewer than MIN_SAMPLES
-   * pairs returns that low count, and the caller falls back to the TTL multiple.
+   * Rolling median run-duration (ms) for an agent, scoped to the candidate's own
+   * workflow partition (bounded by the key, not table size): the partition's last
+   * MEDIAN_WINDOW agent.complete events paired with agent.started. Cached per
+   * sweep interval per `${workflowId}:${agentId}`; too few pairs falls back to TTL.
    */
-  async function rollingMedian(agentId) {
-    const cached = medianCache.get(agentId);
+  async function rollingMedian(agentId, workflowId) {
+    const cacheKey = `${workflowId}:${agentId}`;
+    const cached = medianCache.get(cacheKey);
     if (cached && now() - cached.computedAt < SWEEP_INTERVAL_MS) return cached;
 
     const starts = new Map(); // `${workflowId}:${ticketId}` → latest started ms
     const durations = [];     // most-recent-first
     let lastKey;
     for (let page = 0; page < MEDIAN_SCAN_PAGES; page++) {
-      const res = await ddb.send(new ScanCommand({
+      const res = await ddb.send(new QueryCommand({
         TableName: eventsTable,
+        KeyConditionExpression: "workflowId = :w",
         FilterExpression: "#t IN (:started, :complete) AND detail.agentId = :aid",
         ExpressionAttributeNames: { "#t": "type" },
         ExpressionAttributeValues: {
-          ":started": "agent.started",
-          ":complete": "agent.complete",
-          ":aid": agentId,
+          ":w": workflowId, ":started": "agent.started", ":complete": "agent.complete", ":aid": agentId,
         },
         ExclusiveStartKey: lastKey,
       }));
@@ -207,7 +207,7 @@ export function createDetector(deps) {
     durations.sort((a, b) => b.ts - a.ts);
     const window = durations.slice(0, MEDIAN_WINDOW).map((d) => d.dur);
     const result = { medianMs: median(window), sampleCount: window.length, computedAt: now() };
-    medianCache.set(agentId, result);
+    medianCache.set(cacheKey, result);
     return result;
   }
 
@@ -524,7 +524,7 @@ export function createDetector(deps) {
           }
 
           // ── GUARD 2: silence must exceed the per-agent threshold. ────────────
-          const { medianMs, sampleCount } = await rollingMedian(agentId);
+          const { medianMs, sampleCount } = await rollingMedian(agentId, workflow.id);
           const threshold = computeThreshold(medianMs, sampleCount);
           const startedMs = task.startedAt ? Date.parse(task.startedAt) : 0;
           const activityMs = lastActivity ? Date.parse(lastActivity) : 0;

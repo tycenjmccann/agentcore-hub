@@ -59,6 +59,11 @@ export default defineConfig({
       // dependency-injected (stub ddb/store/lease + fake clock), so its
       // guard/trigger/retry/escalate logic is unit-testable with no AWS.
       "lambda/orchestrator/dead-session-detector.test.mjs",
+      // rolling-median-read-cost (TEAM-6081) — counting fake DDB under the REAL
+      // detector: rollingMedian's events read is bounded by the candidate's own
+      // workflow partition (Query), never a table Scan, and reads/results stay
+      // identical regardless of how much unrelated history sits in the table.
+      "lambda/orchestrator/rolling-median-read-cost.test.mjs",
       // detector-mode-default (TEAM-3763 F1) — the index.mjs sweep-dispatch
       // default: DEAD_SESSION_DETECTOR_MODE coalesces to "shadow" (observe-only)
       // when unset, so a fresh deploy stays dark. Drives the real handler with

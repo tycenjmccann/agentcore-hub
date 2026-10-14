@@ -83,14 +83,13 @@ function makeDdb({ workflows, events: all, updates = [], onQuery = null, visible
       const table = cmd.input.TableName;
       const v = cmd.input.ExpressionAttributeValues || {};
       if (kind === "ScanCommand" && table === "workflows") return { Items: workflows };
-      if (kind === "ScanCommand" && table === "events") {
-        // rollingMedian: agent.started/agent.complete for this agent. This run
-        // has no completions, so the median stays unsampled → 2x TTL fallback.
-        return { Items: events.filter((e) => [v[":started"], v[":complete"]].includes(e.type) && e.detail?.agentId === v[":aid"]) };
-      }
       if (kind === "QueryCommand" && table === "events") {
         if (onQuery) onQuery(cmd.input);
         const part = events.filter((e) => e.workflowId === v[":w"]);
+        if (v[":started"]) { // rollingMedian (TEAM-6081: partition Query, not table Scan).
+          // This run has no completions, so the median stays unsampled → 2x TTL fallback.
+          return { Items: part.filter((e) => [v[":started"], v[":complete"]].includes(e.type) && e.detail?.agentId === v[":aid"]) };
+        }
         if (v[":hb1"]) { // lease.lastAgentActivity
           return { Items: part.filter((e) => [v[":hb1"], v[":hb2"]].includes(e.type) && e.detail?.agentId === v[":aid"] && String(e.timestamp) >= String(v[":cutoff"])) };
         }

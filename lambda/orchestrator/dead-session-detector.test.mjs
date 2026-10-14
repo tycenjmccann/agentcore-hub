@@ -26,12 +26,14 @@ const deadTask = { id: "task_1", agentId: "dev", ticketId: "TEAM-2", status: "ru
 const leafTicket = { ticketId: "TEAM-2", type: "task", status: "in_progress", assignee: "dev" };
 
 /**
- * Fake DocumentClient: workflows Scan → the given rows; events Scan →
- * medianEvents; events Query → a page over `events` with REAL DynamoDB
- * semantics (TEAM-3683 F1): the key condition picks the partition, Limit
- * applies to raw items BEFORE the FilterExpression, and LastEvaluatedKey /
- * ExclusiveStartKey page through the remainder — so a Limit:1 query only ever
- * examines the partition's first event, exactly like the real service.
+ * Fake DocumentClient: workflows Scan → the given rows; events Query → a page
+ * over `events` with REAL DynamoDB semantics (TEAM-3683 F1 / TEAM-6081): the
+ * key condition picks the partition, Limit applies to raw items BEFORE the
+ * FilterExpression, and LastEvaluatedKey / ExclusiveStartKey page through the
+ * remainder — so a Limit:1 query only ever examines the partition's first
+ * event, exactly like the real service. rollingMedian (TEAM-6081: now a
+ * partition Query, not a table Scan) is the `:started` branch; medianEvents
+ * seeds that partition.
  */
 function makeDdb({ workflows = [], medianEvents = [], events = [] } = {}) {
   return {
@@ -39,16 +41,19 @@ function makeDdb({ workflows = [], medianEvents = [], events = [] } = {}) {
       const kind = cmd.constructor.name;
       const table = cmd.input.TableName;
       if (kind === "ScanCommand" && table === "workflows") return { Items: workflows };
-      if (kind === "ScanCommand" && table === "events") return { Items: medianEvents };
-      if (kind === "QueryCommand" && table === "events") return queryEventsPage(events, cmd.input);
+      if (kind === "QueryCommand" && table === "events") return queryEventsPage(medianEvents, events, cmd.input);
       return { Items: [] };
     }),
   };
 }
 
-/** One Query page: partition → slice(Limit) → THEN hasCompletionSince's filter. */
-function queryEventsPage(events, input) {
+/** One Query page: partition → slice(Limit) → THEN the reader's own filter. */
+function queryEventsPage(medianEvents, events, input) {
   const v = input.ExpressionAttributeValues || {};
+  if (v[":started"]) { // rollingMedian — partitioned, no Limit, no pagination needed in tests
+    const partition = medianEvents.filter((e) => e.workflowId === v[":w"]);
+    return { Items: partition.filter((e) => [v[":started"], v[":complete"]].includes(e.type) && e.detail?.agentId === v[":aid"]) };
+  }
   const partition = events.filter((e) => e.workflowId === v[":w"]);
   const start = input.ExclusiveStartKey ? input.ExclusiveStartKey.idx : 0;
   const raw = partition.slice(start, start + (input.Limit ?? partition.length));
