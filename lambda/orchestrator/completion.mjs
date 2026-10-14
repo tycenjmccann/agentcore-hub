@@ -272,11 +272,10 @@ export function completionBlockedNotice(reason, detail, { featureBranch } = {}) 
 
 const nonEmptyString = (v) => typeof v === "string" && v.trim().length > 0;
 
-/**
- * Does a completions/{ticketId}.json record (written by lambda/workflow-output
- * reportCompletion) prove the ticket produced a deliverable? A blank/empty
- * record is NOT evidence (TEAM-3690 / AC-D4.1).
- */
+// TEAM-5996: mirror of gate-contract.mjs isIntentOnlyReservation (zip-local; gate-contract-parity.test.ts pins it) - a twin's Done-intent reservation is no record.
+export const isIntentOnlyReservation = (r) => !!r && typeof r === "object" && !Array.isArray(r) && r.reservation === "done-intent" && Object.keys(r).every((k) => ["reservation", "ticketId", "doneIntent"].includes(k));
+/** Does a completions/{ticketId}.json record (lambda/workflow-output reportCompletion) prove a
+ *  deliverable? A blank/empty record is NOT evidence (TEAM-3690 / AC-D4.1). */
 export function completionRecordHasEvidence(record) {
   if (!record || typeof record !== "object" || Array.isArray(record)) return false;
   if (nonEmptyString(record.summary)) return true;

@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, isIntentOnlyReservation, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -560,7 +560,7 @@ function resetCompletionRecordCache() {
 async function readCompletionRecord(ticketId) {
   if (!ARTIFACT_BUCKET || !ticketId) return null;
   if (_completionRecordCache.has(ticketId)) return _completionRecordCache.get(ticketId);
-  const p = readArtifactJson(`completions/${ticketId}.json`);
+  const p = readArtifactJson(`completions/${ticketId}.json`).then((r) => (isIntentOnlyReservation(r) ? null : r)); // TEAM-5996: a Done-intent reservation is no record
   _completionRecordCache.set(ticketId, p);
   return p;
 }

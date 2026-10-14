@@ -442,6 +442,32 @@ describe("cancelled run: done without a completion record (TEAM-5421)", () => {
         expectCompletePath();
       });
 
+      // TEAM-5996: a twin's Done-intent reservation (TEAM-5959) is no record — read exactly as a 404.
+      for (const [label, body] of [
+        ["a Done-intent reservation", { reservation: "done-intent", ticketId: DONE, doneIntent: { at: "2026-10-01T00:00:00.000Z", provider: "jira", nonce: "n" } }],
+        ["a cleared reservation", { reservation: "done-intent", ticketId: DONE }],
+      ]) {
+        it(`(b2) only ${label} on record → one ticket.cancelled, no agent.complete, no cascade`, async () => {
+          process.env.ARTIFACT_BUCKET = "test-bucket";
+          await load();
+          h.state.s3Objects[`completions/${DONE}.json`] = body;
+          inProgressChildren();
+          cancelWorkflow();
+          await run();
+          expectCancelledOnly();
+        });
+      }
+
+      it("(d) a reservation a writer added a hold to is a record → unchanged agent.complete path", async () => {
+        process.env.ARTIFACT_BUCKET = "test-bucket";
+        await load();
+        h.state.s3Objects[`completions/${DONE}.json`] = { reservation: "done-intent", ticketId: DONE, briefPending: true };
+        inReviewChildren();
+        cancelWorkflow();
+        await run();
+        expectCompletePath();
+      });
+
       it("(c) a non-cancelled run → unchanged agent.complete path", async () => {
         inReviewChildren();
         await run();
