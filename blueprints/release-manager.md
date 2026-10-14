@@ -13,7 +13,8 @@ ticket's title to know which one you are on:
 
 - **Follow-up pairs** (`Ship: follow-up PR <url>` / `CD: follow-up PR <url>`) —
   one extra pair per post-merge follow-up PR (a fix that PRs to the default
-  branch after the unified PR merged; the fixer files the chain per
+  branch, or to a stated `base_branch:` that is not the integration branch,
+  after the unified PR merged; the fixer files the chain per
   `load_blueprint("bug-fixer")` → "Post-merge follow-up PR: file its ship
   chain"). Each pair is a full ship of THAT PR: every step below, with that PR
   as "the unified PR".
@@ -665,11 +666,12 @@ default branch and take it through Merge Approval — never complete with
 commits stranded on that branch (the completion gate refuses the run until
 they land or a PR to the default branch is open).
 
-**Orphan rule (TEAM-6032).** A PR to the default branch is not delivered until
+**Orphan rule (TEAM-6032).** A PR to the default branch (or to a `base_branch:`
+stated on this run's tickets that is not the integration branch) is not delivered until
 it merges, and the completion gate refuses the run while one from this run is
 still open (escalation reason `open_follow_up_pr` names it). On any post-merge
 invocation, and whenever that escalation names a PR: for each open PR from this
-run into the default branch (other than the unified PR) that has no
+run into the default branch or such a stated base (other than the unified PR) that has no
 `Ship: follow-up PR <url>` ticket under the epic, file its chain yourself per
 `load_blueprint("bug-fixer")` → "Post-merge follow-up PR: file its ship chain"
 (the CI ticket blocked_by the fix ticket that opened it, or nothing if that is

@@ -996,6 +996,42 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     warn.mockRestore();
   });
 
+  // TEAM-6108 (QA F3): a post-merge follow-up PR into a ticket-stated `base_branch:` that is not
+  // the integration branch (release/2.1) is as orphaned as one into main. B-6 states the base.
+  const runStatedBase = async (pr) => {
+    h.state.snapshots = [FU_CHILDREN.map((t) => (t.ticketId === "B-6" ? { ...t, description: "Fix the release.\nbase_branch: release/2.1\n" } : t))];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: FU_TASKS };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, 12: pr } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+  };
+
+  it("TEAM-6108: follow-up PR into a stated base (release/2.1) still OPEN → run refused, escalated", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await runStatedBase(fuPr({ base: { ref: "release/2.1" } }));
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${FU_URL}`))).toBe(true);
+    expect(fuNotified()).toBe(true);
+    expect(ebEventsOfType("workflow.completion_blocked").some((e) => e.reason === "open_follow_up_pr")).toBe(true);
+    error.mockRestore();
+  });
+
+  it("TEAM-6108: follow-up PR into the stated base merged → completes", async () => {
+    await runStatedBase(fuPr({ base: { ref: "release/2.1" }, state: "closed", merged_at: "2026-09-03T10:00:00Z" }));
+    expect(h.state.storeCompletions.length).toBe(1);
+    expect(fuNotified()).toBe(false);
+  });
+
+  it("TEAM-6108: follow-up PR into the stated base closed unmerged → completes", async () => {
+    await runStatedBase(fuPr({ base: { ref: "release/2.1" }, state: "closed", merged_at: null }));
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
+  it("TEAM-6108: open PR into an arbitrary base no ticket states → not covered, completes", async () => {
+    await runStatedBase(fuPr({ base: { ref: "release/9.9" } }));
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+
   // TEAM-6062 — review of #928. fuNotices: every follow-up notice row (the id carries a PR-set hash).
   const fuNotices = () => h.state.notifications.filter(({ n }) => n.id.startsWith("notif_completion_followup_pr_") && n.id.endsWith("_wf_1"));
 

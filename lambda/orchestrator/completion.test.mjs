@@ -2127,3 +2127,40 @@ describe("TEAM-6075 follow-up PR gate hardening", () => {
     expect(open).toEqual([P5]);
   });
 });
+
+// TEAM-6108 (QA F3) — a `base_branch:` stated on this run's tickets that is not the
+// integration branch is a follow-up base too; an arbitrary base stays uncovered.
+describe("TEAM-6108 follow-up PR gate: ticket-stated base", () => {
+  const FB = "feature/E-1-x";
+  const ON = (base, over) => ({ state: "open", head: { ref: "fix/a" }, base: { ref: base }, ...over });
+  const wf = (agentTasks) => ({ id: "wf", featureBranch: FB, repoConfig: { repos: [{ defaultBranch: "main" }] }, agentTasks });
+  const tasks = { S: { agentId: "rm", mergeCommit: "m1" }, F: { prUrl: "https://github.com/o/r/pull/12" } };
+  const gate = (pr, tickets) => completionMod.followUpPrGate({
+    workflow: wf(tasks), agentTasks: tasks, tickets, mergeProof: null, warn: () => {}, api: async () => pr,
+    repoRef: () => [{ owner: "o", repo: "r", defaultBranch: "main" }], getAgentPhase: (id) => (id === "rm" ? "ship" : "development"),
+  });
+  const STATED = [{ ticketId: "F", description: "Fix it.\nbase_branch: release/2.1\n" }, { ticketId: "X" }];
+
+  it("classifyFollowUpPr: PR into a stated base → open / closed; unstated → skip", () => {
+    const ctx = { featureBranch: FB, defaultBranch: "main", statedBases: ["release/2.1"] };
+    expect(completionMod.classifyFollowUpPr(ON("release/2.1"), ctx)).toBe("open");
+    expect(completionMod.classifyFollowUpPr(ON("release/2.1", { state: "closed", merged_at: "t" }), ctx)).toBe("closed");
+    expect(completionMod.classifyFollowUpPr(ON("release/2.1"), { featureBranch: FB, defaultBranch: "main" })).toBe("skip");
+    expect(completionMod.classifyFollowUpPr(ON("release/2.1", { head: { ref: FB } }), ctx)).toBe("skip");
+  });
+  it("followUpPrGate: open PR into the stated base release/2.1 → refused", async () => {
+    expect(await gate(ON("release/2.1"), STATED)).toEqual(["https://github.com/o/r/pull/12"]);
+  });
+  it("followUpPrGate: same PR merged or closed unmerged → allowed", async () => {
+    expect(await gate(ON("release/2.1", { state: "closed", merged_at: "t" }), STATED)).toEqual([]);
+    expect(await gate(ON("release/2.1", { state: "closed", merged_at: null }), STATED)).toEqual([]);
+  });
+  it("followUpPrGate: a ticket stating the integration branch never covers a PR into it", async () => {
+    expect(await gate(ON(FB), [{ description: `base_branch: ${FB}` }])).toEqual([]);
+  });
+  it("followUpPrGate: arbitrary base / no tickets / null roster → skip", async () => {
+    expect(await gate(ON("release/9.9"), STATED)).toEqual([]);
+    expect(await gate(ON("release/2.1"), undefined)).toEqual([]);
+    expect(await gate(ON("release/2.1"), null)).toEqual([]);
+  });
+});
