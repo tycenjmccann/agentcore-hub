@@ -72,6 +72,7 @@ import {
   rejudgeAdmitted,
   withDoneIntent,
   withoutDoneIntent,
+  doneIntentReservation,
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
   designAmendmentRefusal,
@@ -473,20 +474,26 @@ function completionRecordRequiredError(ticketId, why, what = "a ship-phase ticke
  * gate-contract.mjs for the design. This is the I/O half, in this twin's idiom (throws
  * a completionRecordRequiredError to refuse). Twin of the tickets Lambda's
  * fenceDoneIntent. Mutates `admitted` on success: `etag`/`bodyText` become the fenced
- * record (so postCommitHoldCheck compares against it) and `intent` is set.
+ * record (so postCommitHoldCheck compares against it), `absent` is false and `intent` is set.
  *
- *   · no record admitted (404) ⇒ nothing to fence (no record ⇒ no hold can appear);
+ *   · a record admitted ⇒ PUT the intent onto it with IfMatch on the admitted ETag;
+ *   · no record admitted (404) ⇒ TEAM-5959 (TEAM-5799 F5): RESERVE the key with a
+ *     create-only PUT (IfNoneMatch:"*") of an intent-only reservation
+ *     (gate-contract.mjs doneIntentReservation) — it used to skip the fence, and a
+ *     record created + hold-stamped inside the commit window then lost the fence;
  *   · PUT won ⇒ fenced;
  *   · 412/409 ⇒ re-read and re-judge with the guard's own judge: a hold ⇒ the standard
- *     refusal; admitted ⇒ CAS again, DONE_INTENT_FENCE_ATTEMPTS times, then refuse;
+ *     refusal; admitted (a hold-free record, or another twin's reservation) ⇒ CAS again
+ *     with IfMatch, DONE_INTENT_FENCE_ATTEMPTS times in all, then refuse;
  *   · the record vanished (PUT or re-read 404) ⇒ a ship / security ticket refuses as it
- *     would on "no record" (DL-030); any other ticket proceeds unfenced;
+ *     would on "no record" (DL-030); any other ticket RE-RESERVES create-only on the
+ *     next attempt (TEAM-5959: it used to proceed unfenced);
  *   · AccessDenied, 5xx, a failed re-read ⇒ REFUSE (fail closed: deploy config, not a race).
  * A refusal here can leave the reason comment and blocker links written (as the
  * TEAM-5707 precondition re-read can); the ticket itself has not moved.
  */
 async function fenceDoneIntent(ticketId, admitted) {
-  if (!ARTIFACT_BUCKET || !admitted.key || admitted.absent === true) return;
+  if (!ARTIFACT_BUCKET || !admitted.key) return;
   const key = admitted.key;
   const vanished = () => {
     if (admitted.recordGated) {
@@ -500,11 +507,15 @@ async function fenceDoneIntent(ticketId, admitted) {
   for (let attempt = 1; attempt <= DONE_INTENT_FENCE_ATTEMPTS; attempt++) {
     const at = new Date().toISOString();
     const nonce = randomUUID();
-    const body = JSON.stringify(withDoneIntent(JSON.parse(admitted.bodyText), { provider: "jira", at, nonce }), null, 2);
+    const intent = { provider: "jira", at, nonce };
+    // TEAM-5959: nothing admitted (404, or vanished under an earlier attempt) ⇒ a
+    // create-only reservation; a record ⇒ the intent CASed onto its body.
+    const reserving = admitted.absent === true;
+    const body = JSON.stringify(reserving ? doneIntentReservation(ticketId, intent) : withDoneIntent(JSON.parse(admitted.bodyText), intent), null, 2);
     let kind;
     try {
-      const res = await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key, Body: body, ContentType: "application/json", IfMatch: admitted.etag }));
-      Object.assign(admitted, { etag: res.ETag, bodyText: body, intent: { at, nonce } });
+      const res = await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key, Body: body, ContentType: "application/json", ...(reserving ? { IfNoneMatch: "*" } : { IfMatch: admitted.etag }) }));
+      Object.assign(admitted, { etag: res.ETag, bodyText: body, intent: { at, nonce }, absent: false });
       return;
     } catch (err) {
       kind = classifyS3WriteError(err);
@@ -512,9 +523,14 @@ async function fenceDoneIntent(ticketId, admitted) {
         console.warn(`[agentcore-hub-jira] ${ticketId}: refusing done — the Done-intent fence on ${key} could not be written (${errText(err)})`);
         throw completionRecordRequiredError(ticketId, doneIntentUnfencedRefusal(key, `PutObject ${errText(err)}`), DONE_UNFENCED_WHAT);
       }
-      if (kind === "gone") return vanished();
+      if (kind === "gone") {
+        vanished();
+        console.warn(`[agentcore-hub-jira] ${ticketId}: ${key} vanished under the Done-intent fence (attempt ${attempt}/${DONE_INTENT_FENCE_ATTEMPTS}) — reserving it`);
+        continue;
+      }
     }
-    // The record moved under the fence: read what it says now, with the guard's judge.
+    // The record moved under the fence (or another writer created it first): read what
+    // it says now, with the guard's judge.
     let bodyText;
     let etag;
     try {
@@ -522,7 +538,11 @@ async function fenceDoneIntent(ticketId, admitted) {
       bodyText = await res.Body.transformToString();
       etag = res.ETag;
     } catch (err) {
-      if (classifyS3WriteError(err) === "gone") return vanished();
+      if (classifyS3WriteError(err) === "gone") {
+        vanished();
+        console.warn(`[agentcore-hub-jira] ${ticketId}: ${key} vanished under the Done-intent fence (attempt ${attempt}/${DONE_INTENT_FENCE_ATTEMPTS}) — reserving it`);
+        continue;
+      }
       console.warn(`[agentcore-hub-jira] ${ticketId}: refusing done — ${key} changed under the Done-intent fence and could not be re-read (${errText(err)})`);
       throw completionRecordRequiredError(ticketId, doneIntentUnfencedRefusal(key, `re-read ${errText(err)}`), DONE_UNFENCED_WHAT);
     }
@@ -531,7 +551,7 @@ async function fenceDoneIntent(ticketId, admitted) {
       console.warn(`[agentcore-hub-jira] ${ticketId}: refusing done on ${verdict.what} — the record changed under the Done-intent fence: ${verdict.why}`);
       throw completionRecordRequiredError(ticketId, verdict.why, verdict.what);
     }
-    Object.assign(admitted, { etag, bodyText });
+    Object.assign(admitted, { etag, bodyText, absent: false });
     console.warn(`[agentcore-hub-jira] ${ticketId}: ${key} changed under the Done-intent fence (${kind}, attempt ${attempt}/${DONE_INTENT_FENCE_ATTEMPTS}) — still admitted, fencing again`);
   }
   throw completionRecordRequiredError(ticketId, doneIntentContendedRefusal(key, DONE_INTENT_FENCE_ATTEMPTS), DONE_UNFENCED_WHAT);

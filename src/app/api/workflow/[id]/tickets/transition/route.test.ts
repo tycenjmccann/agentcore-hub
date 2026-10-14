@@ -742,6 +742,29 @@ describe("transition route — 412 fill-if-blank (TEAM-4282 F3)", () => {
     expect(invokes()).toHaveLength(1);
   });
 
+  it("TEAM-5959: existing record is a twin's Done-intent RESERVATION → refilled with IfMatch; the intent is carried, the marker is not", async () => {
+    await load();
+    const doneIntent = { at: "2026-10-14T06:00:00.000Z", provider: "jira", nonce: "11111111-2222-4333-8444-555555555555" };
+    seed(KEY, { reservation: "done-intent", ticketId: "TEAM-X", doneIntent });
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(json).toMatchObject({ success: true, completionRecordWritten: true });
+    expect(puts()).toHaveLength(2); // create-only (412 — the key is reserved), then the refill
+    expect(puts()[1].input.IfMatch).toBe('"etag-seed"');
+    expect(puts()[1].input.IfNoneMatch).toBeUndefined();
+
+    const merged = JSON.parse(stored()[KEY]);
+    expect(merged).toMatchObject({ ticket_id: "TEAM-X", summary: EVIDENCE, source: "workflow-manager", evidence_kind: "static", doneIntent });
+    expect(merged).not.toHaveProperty("reservation");
+    const { completionRecordHasEvidence, isIntentOnlyReservation } = await import("@/lib/workflow/completion-evidence");
+    expect(completionRecordHasEvidence(merged)).toBe(true);
+    expect(isIntentOnlyReservation(merged)).toBe(false);
+    expect(invokes()).toHaveLength(1);
+  });
+
   it("existing record is BLANK → refilled with IfMatch on the ETag just read", async () => {
     await load();
     seed(KEY, {

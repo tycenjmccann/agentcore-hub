@@ -33,7 +33,10 @@ process.env.JIRA_API_TOKEN = "x";
 
 const { handler, s3 } = await import("./index.mjs");
 // No real S3: every GetObject is a 404 (no record, fallback roster) unless a test overrides it.
-s3.send = async () => {
+// TEAM-5959: a PutObject succeeds — the Done-intent fence reserves an absent record
+// create-only, and a 404 answer to that PUT would read as "vanished" and retry to a refusal.
+s3.send = async (cmd) => {
+  if (cmd?.constructor?.name === "PutObjectCommand") return { ETag: '"hermetic-put"' };
   throw Object.assign(new Error("NoSuchKey"), { name: "NoSuchKey", $metadata: { httpStatusCode: 404 } });
 };
 

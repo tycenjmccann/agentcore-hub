@@ -310,6 +310,19 @@ async function rebuildIndex(event) {
  * failure and rethrown, which deriveCiVerdict turns into an "unknown" verdict plus
  * a dataQuality gap rather than a silent "no CI evidence".
  */
+// TEAM-5959 (TEAM-5799 F5): the ticket twins' Done-intent RESERVATION — the intent-only
+// body a twin leaves at completions/<id>.json when its Done guard admitted on a 404. Not a
+// completion record: completionRecords reads it exactly as a 404 (a recordless Done is
+// still "closed without work"). Mirror of gate-contract.mjs isIntentOnlyReservation (this zip cannot import it;
+// gate-contract-parity.test.ts pins the literal): the marker AND no key outside
+// {reservation, ticketId, doneIntent}.
+const RESERVATION_KEYS = new Set(["reservation", "ticketId", "doneIntent"]);
+export function isIntentOnlyReservation(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+  if (record.reservation !== "done-intent") return false;
+  return Object.keys(record).every((k) => RESERVATION_KEYS.has(k));
+}
+
 async function defaultGetCompletion(ticketId) {
   try {
     return await getJson(`completions/${ticketId}.json`);
@@ -2166,7 +2179,8 @@ export async function completionRecords(events, aiTasks, getCompletion, gaps = [
     await Promise.all(toRead.slice(i, i + COMPLETION_READ_CONCURRENCY).map(async (t) => {
       try {
         const record = await getCompletion(t.ticketId);
-        if (record) { recorded.add(t.ticketId); objects.set(t.ticketId, record); }
+        // TEAM-5959: a twin's Done-intent reservation is no record (read exactly as a 404).
+        if (record && !isIntentOnlyReservation(record)) { recorded.add(t.ticketId); objects.set(t.ticketId, record); }
       } catch {
         if (recorded.has(t.ticketId)) {
           // The event already proves the record; the failed read hides its content.

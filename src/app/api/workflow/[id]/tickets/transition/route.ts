@@ -12,7 +12,7 @@ import { withDefaultDecision } from "@/lib/workflow/gate-decision";
 // TEAM-4282 F3: the SAME predicate both completion gates use to decide whether a
 // completions record proves a deliverable. Imported (not replicated) so a blank
 // record we are allowed to fill is defined identically here and at the gate.
-import { completionRecordHasEvidence } from "@/lib/workflow/completion-evidence";
+import { completionRecordHasEvidence, RESERVATION_FIELD } from "@/lib/workflow/completion-evidence";
 
 export const dynamic = "force-dynamic";
 
@@ -281,7 +281,7 @@ async function writeCompletionRecord(ticketId: string, evidence: string): Promis
 
     // Spread-then-override: only the fields this record owns are set, so a blank
     // record's incidental non-evidence fields (e.g. `branch`) survive the refill.
-    const merged = {
+    const merged: Record<string, unknown> = {
       ...(existingRecord || {}),
       ticket_id: ticketId,
       summary: record.summary,
@@ -289,6 +289,11 @@ async function writeCompletionRecord(ticketId: string, evidence: string): Promis
       source: "workflow-manager",
       evidence_kind: (existingRecord?.evidence_kind as string) || "static",
     };
+    // TEAM-5959 (TEAM-5799 F5): a blank record may be a twin's Done-intent RESERVATION
+    // (completion-evidence.ts). The spread keeps its `doneIntent` — a fresh one is a Done
+    // in flight and every writer carries it — but the marker belongs to a record that
+    // has no fields, so this filled record must not carry it.
+    delete merged[RESERVATION_FIELD];
     try {
       const put = await sendConditional(
         () =>

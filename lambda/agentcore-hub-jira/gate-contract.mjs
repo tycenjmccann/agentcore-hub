@@ -1048,6 +1048,13 @@ export function judgeCompletionRecord(key, bodyText, { securityReview = false } 
   const briefWhy = briefHoldRefusal(k, record);
   if (briefWhy) return { proven: false, why: briefWhy };
 
+  // TEAM-5959 (TEAM-5799 F5): a Done-intent reservation is NOT a completion record. It
+  // is judged exactly as a 404 is: a ship / security ticket refuses "no record" (DL-030).
+  // AFTER the hold checks on purpose - a record carrying a hold is not intent-only, and
+  // the marker must never hide a hold. (Non-gated tickets never reach this judge; their
+  // judgeBriefHold admits a hold-free reservation, as it admits a 404.)
+  if (isIntentOnlyReservation(record)) return { proven: false, why: reservationNotARecord(k) };
+
   if (securityReview) {
     const why = securityReviewRecordRefusal(k, record);
     if (why) return { proven: false, why };
@@ -1190,21 +1197,41 @@ export function postCommitHoldConflict(verdict) {
 //     doneIntentOf below — the two cannot share a file; the parity test pins the TTL).
 // Exactly one side wins every interleaving, because both write the same key with CAS.
 //
-// The fence is written only onto a record that EXISTS: no record ⇒ no hold can appear
-// (every creator of completions/<id>.json writes a hold-free first record), and an
-// intent-only record would read to completionRecordProven as an existing record on a
-// ship ticket. A fence write the role may not make (AccessDenied), or any other write
-// error, REFUSES: it is deploy config (deploy/lib/tickets-lambda-config.mjs grants the
-// prefix-scoped s3:PutObject; deploy/lib/twin-preflight.mjs refuses to ship twin code
-// onto a role without it), and "could not fence" is not "no hold" — the same positive-
-// evidence band as the hold reads above. No text here contains
-// `has briefPending:true (brief `, so a fence refusal is a retry to workflow-output.
+// The fence is written on EVERY admission (TEAM-5959, TEAM-5799 F5). A record that
+// exists is fenced with IfMatch on its ETag. A 404 admission used to skip the fence on
+// the premise "no record ⇒ no hold can appear"; that premise was false: any create-only
+// writer (report_completion's first write, the hub route's mark-done) can create a clean
+// record inside the twin's commit window and the replay drain can CAS-stamp a hold onto
+// it, with no intent on the record for holdDeferredOnDoneIntent to defer on. So on a 404
+// the twin RESERVES the key with PutObject IfNoneMatch:"*" whose body is an intent-only
+// reservation (doneIntentReservation): the marker, the ticket id and the intent, nothing
+// else. The same create-only write re-reserves a record that vanished under the fence.
+// Every creator's IfNoneMatch then 412s, re-reads, and writes IfMatch carrying the intent
+// (the present-record path), so the deferral applies. A reservation is judged EXACTLY
+// like a 404 by every reader (isIntentOnlyReservation): completionRecordProven refuses
+// it on a ship / security ticket, judgeBriefHold admits it on any other (and the next
+// fence CASes onto it), completionRecordHasEvidence (hub + orchestrator), the cancel
+// sweep and cost-report read it as "no record". The marker is explicit so it cannot be
+// mistaken for a blank record; "intent-only" means the marker AND no key outside
+// {reservation, ticketId, doneIntent} - the moment any writer adds a field (a hold, a
+// summary, ticketWrites) it is a record and is judged as one; holds are never masked.
+// A fence write the role may not make (AccessDenied), or any other write error, REFUSES:
+// it is deploy config (deploy/lib/tickets-lambda-config.mjs grants the prefix-scoped
+// s3:PutObject; deploy/lib/twin-preflight.mjs refuses to ship twin code onto a role
+// without it), and "could not fence" is not "no hold" — the same positive-evidence band
+// as the hold reads above. No text here contains `has briefPending:true (brief `, so a
+// fence refusal is a retry to workflow-output.
 //
-// Lifecycle: WRITTEN by the twin before its commit; CARRIED by every record writer
-// (workflow-output adoptHold, the drain's spreads, the hub route's refill); CLEARED
-// best-effort by the twin when its commit fails; otherwise it STAYS on the record (an
-// audit of when the Done was fenced) and simply goes stale after DONE_INTENT_TTL_MS,
-// at which point the drain strips it on its next stamp. Nothing reads it after a Done.
+// Lifecycle: WRITTEN by the twin before its commit (IfMatch on a record, IfNoneMatch
+// create-only when there is none); CARRIED by every record writer (workflow-output
+// adoptHold, the drain's spreads, the hub route's refill - which strips the reservation
+// marker); CLEARED best-effort by the twin when its commit fails (on a reservation that
+// leaves `{reservation, ticketId}`, still "no record" to every reader, admitted and
+// fenced again by the next Done); otherwise it STAYS on the record (an audit of when the
+// Done was fenced) and simply goes stale after DONE_INTENT_TTL_MS, at which point the
+// drain strips it on its next stamp. Nothing reads it after a Done. The twin role has no
+// s3:DeleteObject, so a reservation behind a committed recordless Done persists - one
+// small object - until a real writer replaces it.
 export const DONE_INTENT_TTL_MS = 10 * 60_000;
 export const DONE_INTENT_FENCE_ATTEMPTS = 3;
 
@@ -1231,6 +1258,37 @@ export function withDoneIntent(record, { provider, at, nonce }) {
 export function withoutDoneIntent(record) {
   const { doneIntent: _dropped, ...rest } = record;
   return rest;
+}
+
+// ── Done-intent reservation (TEAM-5959; TEAM-5799 F5) ───────────────────────
+// The body a twin creates on a 404 admission. Mirrored (the marker field/value and the
+// intent-only rule) in src/lib/workflow/completion-evidence.ts and lambda/cost-report/
+// index.mjs, neither of which can import this file; src/lib/workflow/gate-contract-
+// parity.test.ts pins the literals to each other. The orchestrator needs no mirror: its
+// completionRecordHasEvidence field rule already reads a reservation as "no evidence".
+export const RESERVATION_FIELD = "reservation";
+export const DONE_INTENT_RESERVATION = "done-intent";
+const RESERVATION_KEYS = new Set([RESERVATION_FIELD, "ticketId", "doneIntent"]);
+
+/** The intent-only reservation: marker + ticket id + intent, nothing else. */
+export function doneIntentReservation(ticketId, { provider, at, nonce }) {
+  return { [RESERVATION_FIELD]: DONE_INTENT_RESERVATION, ticketId, doneIntent: { at, provider, nonce } };
+}
+
+/**
+ * Marker present AND no key outside {reservation, ticketId, doneIntent}. A reservation
+ * whose intent was cleared is still intent-only; one any writer added a field to (a
+ * hold, a summary, ticketWrites) is a record, whatever the marker says.
+ */
+export function isIntentOnlyReservation(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+  if (record[RESERVATION_FIELD] !== DONE_INTENT_RESERVATION) return false;
+  return Object.keys(record).every((k) => RESERVATION_KEYS.has(k));
+}
+
+/** judgeCompletionRecord's refusal on a reservation: the 404 text, saying why an object is there. */
+export function reservationNotARecord(key) {
+  return `no ${key} in the artifact bucket (only a Done-intent reservation, not a completion record)`;
 }
 
 /**
