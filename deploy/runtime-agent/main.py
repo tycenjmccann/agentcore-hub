@@ -390,7 +390,12 @@ lambda_client = boto3.client("lambda", region_name=REGION)
 _LAMBDA_CLIENT_OVERRIDE = contextvars.ContextVar("lambda_client_override", default=None)
 
 # Tool Lambda function names (the gateway targets are backed by these)
-TICKET_TOOLS_LAMBDA = os.getenv("TICKET_TOOLS_LAMBDA", "agentcore-hub-tickets")
+# TEAM-6069: the fallback follows TICKET_PROVIDER (default jira) — the function
+# setup-tickets-lambda.mjs actually deploys, and the rule the orchestrator and
+# workflow-output Lambdas use. The deploy always sets this explicitly.
+TICKET_TOOLS_LAMBDA = os.getenv("TICKET_TOOLS_LAMBDA") or (
+    "agentcore-hub-jira" if os.getenv("TICKET_PROVIDER", "jira") == "jira" else "agentcore-hub-tickets"
+)
 BUILDER_TOOLS_LAMBDA = os.getenv("BUILDER_TOOLS_LAMBDA", "agentcore-hub-builder-tools")
 WORKFLOW_OUTPUT_LAMBDA = os.getenv("WORKFLOW_OUTPUT_LAMBDA", "agentcore-hub-workflow-output")
 PIPELINE_TOOLS_LAMBDA = os.getenv("PIPELINE_TOOLS_LAMBDA", "agentcore-hub-pipeline-tools")

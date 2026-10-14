@@ -45,6 +45,16 @@ def upload_prompt(s3, agent_name: str, bucket: str, region: str) -> str:
     return key
 
 
+def _ticket_tools_lambda() -> str:
+    """Explicit TICKET_TOOLS_LAMBDA wins; else the deployed function for
+    TICKET_PROVIDER (default jira) — same rule as lib/runtime-env-defaults.sh."""
+    if name := os.environ.get("TICKET_TOOLS_LAMBDA"):
+        return name
+    if os.environ.get("TICKET_PROVIDER", "jira") == "jira":
+        return "agentcore-hub-jira"
+    return "agentcore-hub-tickets"
+
+
 def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
     """Mirror the env vars set by the lightweight CodeZip path in deploy-one.sh."""
     env = {
@@ -60,8 +70,13 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         # the baked image the same way it reaches the lightweight CodeZip path.
         "EVENTS_TABLE": os.environ.get("EVENTS_TABLE", "agentcore-hub-events"),
         "WORKFLOWS_TABLE": os.environ.get("WORKFLOWS_TABLE", "agentcore-hub-workflows"),
-        "TICKET_TOOLS_LAMBDA": os.environ.get("TICKET_TOOLS_LAMBDA", "agentcore-hub-jira"),
+        # TEAM-6069: deploy-one.sh resolves these from lib/runtime-env-defaults.sh
+        # before exec'ing this script; the literals below are only the fallback
+        # for a direct run and must equal that file's defaults (parity test).
+        "TICKET_TOOLS_LAMBDA": _ticket_tools_lambda(),
         "PIPELINE_TOOLS_LAMBDA": os.environ.get("PIPELINE_TOOLS_LAMBDA", "agentcore-hub-pipeline-tools"),
+        "WORKFLOW_OUTPUT_LAMBDA": os.environ.get("WORKFLOW_OUTPUT_LAMBDA", "agentcore-hub-workflow-output"),
+        "CLOUD_CODE_TABLE": os.environ.get("CLOUD_CODE_TABLE", "agentcore-hub-cloud-code-sessions"),
         "AGENTCORE_HUB_ARTIFACT_BUCKET": os.environ["ARTIFACT_BUCKET"],
         "CLAUDE_CODE_USE_BEDROCK": "1",
         "CLAUDE_MODEL": os.environ.get("CLAUDE_MODEL", "us.anthropic.claude-fable-5-1"),
@@ -108,8 +123,6 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
     # every persona runs the CLI locally (legacy).
     if coding_arn := os.environ.get("CODING_AGENT_RUNTIME_ARN"):
         env["CODING_AGENT_RUNTIME_ARN"] = coding_arn
-    if cc_table := os.environ.get("CLOUD_CODE_TABLE"):
-        env["CLOUD_CODE_TABLE"] = cc_table
     if personas := os.environ.get("REMOTE_CODING_PERSONAS"):
         env["REMOTE_CODING_PERSONAS"] = personas
     if cc_tenant := os.environ.get("CLOUD_CODE_TENANT_ID"):

@@ -29,6 +29,14 @@ source "$SCRIPT_DIR/../lib/check-eval-gate.sh" \
 # shellcheck disable=SC1091 # resolved relative to this script at runtime
 source "$SCRIPT_DIR/../lib/parse-force-args.sh" \
   || { echo "FATAL: cannot load arg parser ($SCRIPT_DIR/../lib/parse-force-args.sh) — refusing to deploy ungated" >&2; exit 1; }
+# Runtime env defaults (TEAM-6069): table + tool-Lambda names from the one
+# side-effect-free file config.sh also sources. Every caller (deploy-fleet.sh,
+# deploy-topology.sh, deploy.sh, a direct run) reaches this script, but only
+# deploy.sh sources config.sh — so resolving here is what makes a rename land
+# on every path. Explicit env still wins (${VAR:-default}).
+# shellcheck disable=SC1091 # resolved relative to this script at runtime
+source "$SCRIPT_DIR/../lib/runtime-env-defaults.sh" \
+  || { echo "FATAL: cannot load runtime env defaults ($SCRIPT_DIR/../lib/runtime-env-defaults.sh)" >&2; exit 1; }
 
 # Parse before any gate/deploy work: --force exports EVAL_GATE_OVERRIDE and
 # EVAL_GATE_OVERRIDE_REASON so require_eval_gate below takes the SAME audited
@@ -63,6 +71,10 @@ require_eval_gate "deploy/runtime-agent/prompts/**"
 #                           neither the legacy toolkit nor @aws/agentcore CLI
 #                           accepts a pre-built ECR image URI.
 DEPLOY_MODE="${DEPLOY_MODE:-lightweight}"
+
+# Before the robust exec, so deploy-one-robust.py inherits the same exported
+# names the lightweight --env block below forwards (twin parity, TEAM-6069).
+resolve_runtime_lambda_names
 
 if [ "$DEPLOY_MODE" = "robust" ]; then
   exec python3 "$SCRIPT_DIR/deploy-one-robust.py" "$AGENT_NAME"
@@ -227,10 +239,11 @@ run_deploy() {
   # before the registry existed. deploy-fleet.sh exports MODEL_ID, so its
   # "Model:" banner is what actually lands here.
   # shellcheck disable=SC2086 # PROMPT_ENV/MCP_ENV deliberately word-split into --env args
-  # EVENTS_TABLE/WORKFLOWS_TABLE (TEAM-6023): the ${VAR:-default} tail mirrors
-  # config.sh's own default for each, so a rename in config.sh (or .env.local)
-  # reaches the runtime once deploy.sh's exports flow down to this child —
-  # never bake the table name as a literal here.
+  # EVENTS_TABLE/WORKFLOWS_TABLE (TEAM-6023): never bake the table name as a
+  # literal here. The ${VAR:-default} tail mirrors lib/runtime-env-defaults.sh,
+  # which this script sources (TEAM-6069), so the tail is only a backstop.
+  # The tables + tool-Lambda names below are the SAME set deploy-one-robust.py
+  # forwards (test_table_env_parity.py pins the parity).
   agentcore deploy \
     --auto-update-on-conflict \
     --env "BYPASS_TOOL_CONSENT=true" \
@@ -240,7 +253,10 @@ run_deploy() {
     --env "AWS_REGION=us-east-1" \
     --env "EVENTS_TABLE=${EVENTS_TABLE:-agentcore-hub-events}" \
     --env "WORKFLOWS_TABLE=${WORKFLOWS_TABLE:-agentcore-hub-workflows}" \
-    --env "TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA:-agentcore-hub-jira}" \
+    --env "TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA}" \
+    --env "PIPELINE_TOOLS_LAMBDA=${PIPELINE_TOOLS_LAMBDA}" \
+    --env "WORKFLOW_OUTPUT_LAMBDA=${WORKFLOW_OUTPUT_LAMBDA}" \
+    --env "CLOUD_CODE_TABLE=${CLOUD_CODE_TABLE}" \
     --env "AGENTCORE_HUB_ARTIFACT_BUCKET=${ARTIFACT_BUCKET}" \
     --env "CLAUDE_CODE_USE_BEDROCK=1" \
     --env "CLAUDE_MODEL=${CLAUDE_MODEL:-us.anthropic.claude-fable-5-1}" \
@@ -256,7 +272,6 @@ run_deploy() {
     ${FLEET_MEMORY_ID:+--env "MEMORY_ID=${FLEET_MEMORY_ID}"} \
     ${IOS_TEST_GATEWAY_URL:+--env "IOS_TEST_GATEWAY_URL=${IOS_TEST_GATEWAY_URL}"} \
     ${CODING_AGENT_RUNTIME_ARN:+--env "CODING_AGENT_RUNTIME_ARN=${CODING_AGENT_RUNTIME_ARN}"} \
-    ${CLOUD_CODE_TABLE:+--env "CLOUD_CODE_TABLE=${CLOUD_CODE_TABLE}"} \
     ${REMOTE_CODING_PERSONAS:+--env "REMOTE_CODING_PERSONAS=${REMOTE_CODING_PERSONAS}"} \
     ${CLOUD_CODE_TENANT_ID:+--env "CLOUD_CODE_TENANT_ID=${CLOUD_CODE_TENANT_ID}"} \
     ${PERSONA_PROMPT_CACHE:+--env "PERSONA_PROMPT_CACHE=${PERSONA_PROMPT_CACHE}"} \
