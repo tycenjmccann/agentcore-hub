@@ -234,12 +234,19 @@ export function missingEvidenceTickets(children, agentTasks, requiredPhases, opt
 // human reads. Keyed by the `workflow.completion_blocked` reason; `slug` keeps the
 // TEAM-3985 notification id stable (`notif_completion_evidence_<wf>`) and gives
 // every reason its own id, so one open escalation never masks another reason.
-export function completionBlockedNotice(reason, detail) {
+export function completionBlockedNotice(reason, detail, { featureBranch } = {}) {
   if (reason === "incomplete_roster") {
     return {
       slug: "roster",
       title: "Run cannot complete: child ticket roster could not be read in full",
       details: `Every ticket looks Done but the completion gate could not read the epic's full child list (${detail}), so it deferred instead of completing on a partial roster. Jira paging usually recovers on its own: re-Done any ticket to re-check. If it keeps failing, the epic has more children than the pager can list or Jira is degraded.`,
+    };
+  }
+  if (reason === "unmerged_branch") {
+    return {
+      slug: "unmerged",
+      title: "Run cannot complete: feature branch has work not on the default branch",
+      details: `Every ticket is Done but the ship merge-verify gate refused to close the run: ${detail}. Land it: open a PR from ${featureBranch ? `feature branch ${featureBranch}` : "the feature branch"} to the default branch (or have the release manager open a fresh unified PR through Merge Approval), then re-Done any ticket to re-check.`,
     };
   }
   return {
@@ -614,6 +621,212 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
     return { required: true, shipped: true, handoff: handoffs === shipTickets.length, outcome: null, blockReason: null, offenders: [] };
   }
   return { required: true, shipped: false, handoff: false, outcome: blocked || "static-ci-only", blockReason, offenders };
+}
+
+// COPY of the ticket twins' export (lambda/agentcore-hub-{tickets,jira}) — three
+// zips, no shared module; src/lib/workflow/follow-ups-parity.test.ts pins `.source`.
+export const BASE_BRANCH_LINE_RE = /^base_branch:\s*(\S+)\s*$/m;
+
+/**
+ * TEAM-5828 / TEAM-5853 — the PR base a dev-phase ticket is told to target. Once
+ * this run's unified PR has merged (a SHIP-phase task carries a mergeCommit, whatever
+ * its outcome — a deploy block after the merge still merged) the integration branch
+ * is dead and the base is the default branch, overriding even a ticket's stale
+ * `base_branch:` naming that dead branch. Else the ticket's own line wins; else the
+ * integration branch as before. A dev task's mergeCommit (its sub-PR into the
+ * integration branch) is not the unified merge — hence the ship-phase scope.
+ */
+export function resolvePrBase({ workflow, ticketDescription, defaultBranch, getAgentPhase = () => undefined }) {
+  const fb = workflow?.featureBranch || "";
+  const merged = fb && Object.values(workflow?.agentTasks || {}).find(
+    (e) => nonEmptyString(e?.mergeCommit) && SHIP_PHASES.has(getAgentPhase(e.agentId))
+  );
+  const stated = BASE_BRANCH_LINE_RE.exec(String(ticketDescription || ""))?.[1];
+  if (stated && !(merged && stated === fb)) return { baseBranch: stated, isShared: Boolean(fb) && stated === fb, reason: "ticket" };
+  if (merged) return { baseBranch: defaultBranch, isShared: false, reason: "unified_pr_merged", mergeCommit: merged.mergeCommit.trim() };
+  return { baseBranch: fb || defaultBranch, isShared: Boolean(fb), reason: "default" };
+}
+
+/**
+ * TEAM-5913 — every distinct branch head this run recorded (harvested `commitSha`,
+ * TEAM-3755 F1). Deliberately unordered: completedAt is not ancestry (a replay or a
+ * late first completion reorders it), so the 404 proof must account for ALL of them.
+ */
+export function recordedHeads(agentTasks) {
+  return [...new Set(Object.values(agentTasks || {}).map((e) => e?.commitSha).filter(nonEmptyString).map((s) => s.trim()))];
+}
+
+/**
+ * TEAM-3986 / TEAM-5828 / TEAM-5853 / TEAM-5868 — did the feature branch land on `base`?
+ * `api` is the orchestrator's githubApi (path → json, throws with err.status; the caller
+ * fails open). Only PRs INTO `base` count, read across pages (newest first, ≤10 pages;
+ * a FULL tenth page means the history was truncated, and truncation turns every
+ * "provably not merged" below into "unknown" — N4). `recordedHeads` is recordedHeads().
+ *   { merged: true,  mergeCommit, prUrl } the latest merged PR's head IS the branch
+ *                                         head (squash-safe); or the branch is gone
+ *                                         (404) and EVERY recorded head is, or is an
+ *                                         ancestor of, that PR's head (TEAM-5913); or
+ *                                         compare says base
+ *                                         contains the branch; or the branch's tree
+ *                                         equals what merged (merged-head..head diff
+ *                                         empty, P2); or it equals a base state that
+ *                                         already contains the merge commit (P3).
+ *                                         GitHub compare is THREE-dot (merge-base..head),
+ *                                         so an empty base...head diff alone proves
+ *                                         only tree(head) == tree(merge-base) — and the
+ *                                         merge-base may predate the squash (N1). Or
+ *                                         base's tip tree IS the head's tree (TEAM-5913).
+ *                                         Or every file the branch changed AFTER its
+ *                                         merged PR has the identical tree entry (mode +
+ *                                         blob sha, TEAM-5943) on base's tip (per-file
+ *                                         proof, TEAM-5935; list complete).
+ *   { merged: false, reason }             provably not on base and nothing open to
+ *                                         carry it — incl. commits pushed AFTER the
+ *                                         unified PR merged (the TEAM-5828 strand):
+ *                                         at least one such file whose tree entry on base's
+ *                                         tip EQUALS its pre-merge entry and differs
+ *                                         from the branch tip, i.e. base demonstrably
+ *                                         never took the change. Trees that merely differ
+ *                                         prove nothing — an unrelated commit on base
+ *                                         differs them (TEAM-5935) — so that is null.
+ *   { merged: null,  reason? }            unknown, or an open PR still carries it.
+ * Only `merged === false` refuses completion (TEAM-3721 fail-open).
+ */
+// TEAM-5935 — per-file landing proof. GitHub compare lists at most 300 files.
+const COMPARE_FILES_MAX = 300, FILE_PROBE_CAP = 50;
+const ABSENT = Symbol("absent"), UNKNOWN = Symbol("unknown");
+
+// Tree-entry identity "<mode> <sha>" per path from ONE recursive tree read (the only API
+// that exposes mode — Contents never does, so blob sha alone can call a 100644→100755 or
+// file→symlink change "landed", TEAM-5943). Non-blob entries (tree/commit) are UNKNOWN;
+// a path missing from a complete index is ABSENT, from a truncated one UNKNOWN; a failed
+// or malformed read makes the whole ref UNKNOWN. UNKNOWN can never become a `false`.
+async function treeIndex({ owner, repo, api }, treeSha) {
+  try {
+    const t = await api(`/repos/${owner}/${repo}/git/trees/${encodeURIComponent(treeSha)}?recursive=1`);
+    if (!Array.isArray(t?.tree)) return null;
+    const entries = new Map();
+    for (const e of t.tree) if (nonEmptyString(e?.path)) entries.set(e.path, e.type === "blob" && nonEmptyString(e.mode) && nonEmptyString(e.sha) ? `${e.mode} ${e.sha}` : UNKNOWN);
+    return { entries, truncated: t.truncated === true };
+  } catch { return null; }
+}
+const entryAt = (idx, path) => (!idx ? UNKNOWN : idx.entries.has(path) ? idx.entries.get(path) : idx.truncated ? UNKNOWN : ABSENT);
+
+// Classify each post-merge feature change (`files` = mergedHead...tip compare files) by
+// tree-entry identity in the three indexes (`base` = base tip, `before` = merged head, `tip`):
+//   LANDED  base == tip (mode AND sha; both ABSENT counts)
+//   ABSENT  base == before && before != tip  (base holds exactly the pre-change entry)
+//   UNKNOWN anything else (base moved the file to a third state, or a lookup was unresolvable)
+// Renamed: LANDED only if new path base == tip AND previous path ABSENT on base; else UNKNOWN.
+// Beyond FILE_PROBE_CAP only an ABSENT found within the cap may be returned; `landed` also
+// needs the list untruncated (< COMPARE_FILES_MAX).
+function perFileLanding(files, { base, before, tip }) {
+  const absent = [], unknown = [];
+  for (const f of files.slice(0, FILE_PROBE_CAP)) {
+    const path = f?.filename;
+    if (!nonEmptyString(path)) { unknown.push("(unnamed)"); continue; }
+    const [m, b, t] = [base, before, tip].map((i) => entryAt(i, path));
+    if (f.status === "renamed") {
+      const prev = nonEmptyString(f.previous_filename) ? entryAt(base, f.previous_filename) : UNKNOWN;
+      if (m !== UNKNOWN && t !== UNKNOWN && m === t && prev === ABSENT) continue;
+      unknown.push(path); continue;
+    }
+    if (m === UNKNOWN || t === UNKNOWN) { unknown.push(path); continue; }
+    if (m === t) continue;
+    if (b !== UNKNOWN && m === b && b !== t) { absent.push(path); continue; }
+    unknown.push(path);
+  }
+  const truncated = files.length >= COMPARE_FILES_MAX, capped = files.length > FILE_PROBE_CAP;
+  const landed = absent.length === 0 && unknown.length === 0 && !truncated && !capped;
+  const why = truncated ? `post-merge diff lists ${files.length} files (truncated)`
+    : capped ? `${files.length} post-merge files exceed the ${FILE_PROBE_CAP}-file probe cap`
+    : `unresolvable on base: ${unknown.join(", ")}`;
+  return { absent, landed, why };
+}
+
+export async function featureBranchLanding({ owner, repo, base, head, api, recordedHeads = [] }) {
+  const enc = encodeURIComponent;
+  const list = [];
+  let lastBatch = 0;
+  for (let page = 1; page <= 10; page++) {
+    const prs = await api(`/repos/${owner}/${repo}/pulls?head=${owner}:${enc(head)}&base=${enc(base)}&state=all&sort=updated&direction=desc&per_page=100&page=${page}`);
+    const batch = Array.isArray(prs) ? prs : [];
+    list.push(...batch.filter((p) => p?.base?.ref === base));
+    lastBatch = batch.length;
+    if (batch.length < 100) break;
+  }
+  const truncated = lastBatch === 100;
+  const unmerged = (reason) =>
+    truncated ? { merged: null, reason: `PR history for ${head} into ${base} truncated at 10 pages; ${reason}` } : { merged: false, reason };
+  const mergedPr = list.filter((p) => p.merged_at).sort((a, b) => String(b.merged_at).localeCompare(String(a.merged_at)))[0];
+  const proof = () => ({ merged: true, mergeCommit: mergedPr.merge_commit_sha || "", prUrl: mergedPr.html_url || "" });
+  const mergedHead = mergedPr?.head?.sha || "";
+  let headSha = null;
+  if (mergedPr) {
+    try { headSha = (await api(`/repos/${owner}/${repo}/branches/${enc(head)}`))?.commit?.sha || null; }
+    catch (err) {
+      if (err?.status !== 404) throw err;
+      // Auto-deleted after merge — proof ONLY if the PR's head contains EVERY head this
+      // run recorded (TEAM-5913: order-free, so no replay or late completion can steer it).
+      const heads = recordedHeads.filter(nonEmptyString).map((s) => s.trim());
+      const why = (h) => ({ merged: null, reason: `branch ${head} is gone and recorded head ${h} is not contained in merged PR #${mergedPr.number} head ${mergedHead.slice(0, 12)}` });
+      if (!mergedHead || heads.length === 0) return why("(none)");
+      for (const h of heads) {
+        if (h.length < 7) return why(h);
+        if (mergedHead.startsWith(h)) continue;
+        const c = await api(`/repos/${owner}/${repo}/compare/${enc(h)}...${enc(mergedHead)}`);
+        if (!(c?.behind_by === 0 && (c.status === "identical" || c.status === "ahead"))) return why(h);
+      }
+      return proof();
+    }
+  }
+  if (mergedPr && headSha && mergedHead === headSha) return proof();
+  const cmp = await api(`/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`);
+  if (cmp?.status === "identical" || cmp?.status === "behind") {
+    return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: "" };
+  }
+  if (!mergedPr) {
+    if (cmp?.status === "ahead" || cmp?.status === "diverged") {
+      return unmerged(`branch ${cmp.ahead_by} commit(s) ahead of ${base} (status=${cmp.status})`);
+    }
+    return { merged: null };
+  }
+  // P2: head descends from the merged head (behind_by 0 ⇒ merge-base IS the merged
+  // head, so this three-dot diff is a true two-dot one) and adds nothing to it.
+  const after = mergedHead && headSha ? await api(`/repos/${owner}/${repo}/compare/${enc(mergedHead)}...${enc(headSha)}`) : null;
+  if (after && after.behind_by === 0 && Array.isArray(after.files) && after.files.length === 0) return proof();
+  // P3: tree(head) == tree(merge-base) AND that merge-base already contains the merge
+  // commit — base's tip does by construction; an older merge-base must be shown to.
+  if (Array.isArray(cmp?.files) && cmp.files.length === 0) {
+    if (cmp.behind_by === 0) return proof();
+    const mb = cmp.merge_base_commit?.sha, mc = mergedPr.merge_commit_sha;
+    if (mb && mc && (await api(`/repos/${owner}/${repo}/compare/${enc(mc)}...${enc(mb)}`))?.behind_by === 0) return proof();
+  }
+  const open = list.find((p) => p.state === "open");
+  if (open) return { merged: null, reason: `open PR #${open.number} to ${base}` };
+  if (!after) return { merged: null };
+  // TEAM-5913: P2/P3 are sufficient, not exhaustive — refuse only on positive evidence.
+  const tipSha = cmp?.base_commit?.sha || null;
+  const treeOf = async (sha) => (sha ? (await api(`/repos/${owner}/${repo}/git/commits/${enc(sha)}`).catch(() => null))?.tree?.sha || null : null);
+  const tipTree = await treeOf(tipSha), headTree = await treeOf(headSha);
+  if (tipTree && tipTree === headTree) return { merged: true, mergeCommit: tipSha, prUrl: "" };
+  // TEAM-5935: trees that DIFFER prove nothing (an unrelated commit on base differs them).
+  // Prove per file over the post-merge feature changes instead.
+  const files = Array.isArray(after.files) ? after.files : [];
+  const inconclusive = (why) => ({ merged: null, reason: `no landing proof for ${head} on ${base}, but no proof of unlanded content either (${why})` });
+  if (files.length === 0 || !tipSha || !headSha) return inconclusive("post-merge file list or tip unavailable");
+  // TEAM-5943: one recursive tree per ref, read sequentially (bounded peak memory); a null
+  // index makes every path UNKNOWN at that ref — LANDED never needed `before`, ABSENT does.
+  const idx = async (t) => (t ? treeIndex({ owner, repo, api }, t) : null);
+  const v = perFileLanding(files, { base: await idx(tipTree), before: await idx(await treeOf(mergedHead)), tip: await idx(headTree) });
+  if (v.absent.length > 0) {
+    return unmerged(
+      `feature branch ${head} has ${after.ahead_by ?? "?"} commit(s) after its merged PR #${mergedPr.number} not contained in ${base} and no open PR to ${base}` +
+      `; ${base} still holds the pre-merge content of: ${v.absent.join(", ")}`
+    );
+  }
+  if (v.landed) return { merged: true, mergeCommit: tipSha, prUrl: "" };
+  return inconclusive(v.why);
 }
 
 /**

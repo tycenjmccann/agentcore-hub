@@ -11,7 +11,7 @@ import * as out from "../../../lambda/workflow-output/index.mjs";
 import * as tickets from "../../../lambda/agentcore-hub-tickets/index.mjs";
 import * as jira from "../../../lambda/agentcore-hub-jira/index.mjs";
 import { FIX_KINDS, validateFixContract } from "../../../lambda/agentcore-hub-tickets/fix-contract.mjs";
-import { FOLLOWUP_LABEL_RE, FOLLOWUP_TITLE_RE } from "../../../lambda/orchestrator/completion.mjs";
+import { FOLLOWUP_LABEL_RE, FOLLOWUP_TITLE_RE, BASE_BRANCH_LINE_RE as ORCH_BASE_BRANCH_LINE_RE } from "../../../lambda/orchestrator/completion.mjs";
 import { CLIENT_TOKEN_RE as hubClientTokenRe, clientTokenParam } from "./client-token";
 
 /**
@@ -220,6 +220,9 @@ describe("base_branch — the line both twins write and this Lambda parses", () 
     expect(out.BASE_BRANCH_LINE_RE.source).toBe(tickets.BASE_BRANCH_LINE_RE.source);
     expect(out.BASE_BRANCH_LINE_RE.source).toBe(jira.BASE_BRANCH_LINE_RE.source);
     expect(out.BASE_BRANCH_LINE_RE.flags).toBe(tickets.BASE_BRANCH_LINE_RE.flags);
+    // TEAM-5828: the orchestrator's resolvePrBase reads the same line off the ticket.
+    expect(ORCH_BASE_BRANCH_LINE_RE.source).toBe(tickets.BASE_BRANCH_LINE_RE.source);
+    expect(ORCH_BASE_BRANCH_LINE_RE.flags).toBe(tickets.BASE_BRANCH_LINE_RE.flags);
   });
 
   it("parses the line the twins actually emit, out of a real description", () => {

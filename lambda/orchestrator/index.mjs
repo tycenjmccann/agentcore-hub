@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -678,6 +678,7 @@ export const handler = async (event) => {
   // a timer: a record written between two invocations must be visible to the
   // second one, otherwise re-Done'ing a ticket could not pick up late evidence.
   resetCompletionRecordCache();
+  blockedFallbackPublished.clear(); // TEAM-5914: same per-invocation lifetime, see notifyCompletionBlockedOnce
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
@@ -1230,24 +1231,21 @@ async function ackApprovedGateNotification(workflow, ticketId, assignee) {
  * harvest running before the completion check, and shipVerdictOf treating only a
  * mergeCommit/explicit "shipped" as proof (TEAM-3755 F1; commitSha is the
  * unmerged branch HEAD and must never count). Both are pinned by
- * lambda/orchestrator/ticket-done-blocked-terminal.test.mjs — if you change this
- * function, that suite is the contract to keep green.
+ * ticket-done-blocked-terminal.test.mjs — the contract to keep green on any change
+ * here. (The "done" is unconditional; the completion STAMP is once-only — TEAM-5890.)
  */
 async function markTaskComplete(workflow, ticketId, assignee) {
   const now = new Date().toISOString();
-  const entry = {
-    ...(workflow.agentTasks?.[ticketId] || {
-      id: `task_${Date.now()}_${assignee}`,
-      agentId: assignee,
-      ticketId,
-      createdAt: now,
-    }),
-    status: "complete",
-    completedAt: now,
-  };
-  // Field-scoped: the webhook's metadata merge (branch/prUrl/output) can land
-  // between our read and this write — a whole-entry put would erase it.
-  await store.completeTaskEntry(workflow.id, ticketId, entry);
+  const prior = workflow.agentTasks?.[ticketId];
+  const seed = { ...(prior || { id: `task_${Date.now()}_${assignee}`, agentId: assignee, ticketId, createdAt: now }), status: "complete", completedAt: now };
+  // Field-scoped write (the webhook's metadata merge can land between our read and
+  // this write). TEAM-5890: the store stamps completedAt ONLY on running -> complete,
+  // once per generation — mirror its verdict: a refused stamp (replayed done, stale
+  // running read) keeps what the snapshot held, possibly nothing, so a legacy complete
+  // entry is never backfilled onto an old head. completeWorkflow re-reads regardless.
+  const stamped = await store.completeTaskEntry(workflow.id, ticketId, seed);
+  const entry = { ...seed };
+  if (!stamped) { if (prior?.completedAt) entry.completedAt = prior.completedAt; else delete entry.completedAt; }
   if (!workflow.agentTasks) workflow.agentTasks = {};
   workflow.agentTasks[ticketId] = entry;
   await harvestCompletionEvidence(workflow, ticketId);
@@ -3264,30 +3262,31 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
  * a human re-driving any ticket (re-Done) re-runs the check and, once the
  * evidence is in, the run completes and the escalation is history.
  */
+const blockedFallbackPublished = new Set(); // TEAM-5914: notification ids published WITHOUT a persisted row, this invocation
 async function notifyCompletionBlockedOnce(workflow, offenders, reason = "missing_evidence") {
-  const notice = completionBlockedNotice(reason, offenders);
+  const notice = completionBlockedNotice(reason, offenders, workflow);
   const id = `notif_completion_${notice.slug}_${workflow.id}`;
   const list = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
   if (list.some((n) => n.id === id && !n.acknowledged)) return false;
-  try {
-    await publishEvent(workflow.epicId, "workflow.completion_blocked", {
-      workflowId: workflow.id, reason, offenders,
-    });
-    await store.appendNotification(workflow.id, {
-      id,
-      type: "manager_escalation",
-      title: notice.title,
-      details: notice.details,
-      reviewer: "completion-gate",
-      timestamp: new Date().toISOString(),
-      acknowledged: false,
-    });
-    console.log(`[orchestrator] ${workflow.id}: completion blocked (${reason}) — manager_escalation appended (${offenders})`);
-    return true;
-  } catch (err) {
-    console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification failed (non-fatal): ${err?.message || err}`);
-    return false;
-  }
+  // TEAM-5853: the snapshot check is a fast path; the notifVersion CAS lets exactly one racer append.
+  // TEAM-5914: only its verified `false` (open row) suppresses the event. A throw or null (not
+  // persisted) still publishes, once per handler invocation per id (a batch can repeat a run).
+  const appended = await store.appendEscalationOnce(workflow.id, id, {
+    type: "manager_escalation",
+    title: notice.title,
+    details: notice.details,
+    reviewer: "completion-gate",
+    timestamp: new Date().toISOString(),
+    acknowledged: false,
+  }, { maxCount: 1 }).catch((err) => {
+    console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification write failed (event still published): ${err?.message || err}`);
+    return null;
+  });
+  if (appended === false || (appended === null && blockedFallbackPublished.has(id))) return false;
+  if (appended === null) blockedFallbackPublished.add(id);
+  await publishEvent(workflow.epicId, "workflow.completion_blocked", { workflowId: workflow.id, reason, offenders }); // never throws
+  console.log(`[orchestrator] ${workflow.id}: completion blocked (${reason}) — manager_escalation ${appended ? "appended" : "NOT persisted"} (${offenders})`);
+  return appended === true;
 }
 
 /**
@@ -3510,7 +3509,8 @@ export async function completeWorkflow(workflow) {
   // leave the run open, never fall through to completion.
   let mergeProof = null;
   if (mergeVerifyConfigured && !verdict?.handoff) {
-    const probe = await featureBranchMergeProbe(workflow);
+    const probe = await featureBranchMergeProbe(workflow, freshWf?.agentTasks || workflow.agentTasks);
+    if (probe.merged === null && probe.reason) console.warn(`[orchestrator] merge-verify inconclusive for ${workflow.id}: ${probe.reason}`);
     if (probe.merged === false) {
       console.error(
         `[orchestrator] CompletionRejectedUnmergedBranch ${workflow.id}: ` +
@@ -3522,6 +3522,7 @@ export async function completeWorkflow(workflow) {
         featureBranch: workflow.featureBranch,
         reason: probe.reason,
       });
+      await notifyCompletionBlockedOnce(workflow, probe.reason, "unmerged_branch");
       return;
     }
     if (probe.merged === true) mergeProof = probe;
@@ -4119,9 +4120,17 @@ export async function buildAgentContext(ticket, workflow) {
   // it goes, and the rule the orchestrator enforces at ticket close. The intake
   // agent (spec author) additionally gets intent.md inline: it is the run's
   // source of truth and must be committed unchanged.
+  // TEAM-5854 / TEAM-5869: two facts. `unified` is the merge fact alone (no ticket line can
+  // hide it); `prBase` is the fix PR's ACTUAL base, resolved once WITH the ticket line and
+  // shared by every block below (an explicit base_branch: line drops mergeCommit — see resolvePrBase).
+  const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+  const getPhase = (id) => getAgentDef(id)?.phase;
+  const unified = resolvePrBase({ workflow, defaultBranch, getAgentPhase: getPhase });
+  const prBase = resolvePrBase({ workflow, ticketDescription: ticket.description, defaultBranch, getAgentPhase: getPhase });
+  const merged = unified.reason === "unified_pr_merged";
   if (chainFor(wfDef)) {
     context += sdlcFrameworkContext({
-      def: wfDef, workflow, ticket, agentDef: getAgentDef(ticket.assignee), intakeAgentId: wfDef.intakeAgentId,
+      def: wfDef, workflow, ticket, agentDef: getAgentDef(ticket.assignee), intakeAgentId: wfDef.intakeAgentId, base: merged ? { ...unified, baseBranch: prBase.baseBranch } : unified,
     });
     if (ticket.assignee === wfDef.intakeAgentId) {
       try {
@@ -4170,13 +4179,13 @@ export async function buildAgentContext(ticket, workflow) {
 
   // Dev agents: branch identity (scope, not HOW)
   if (agentDef?.phase === "development") {
-    const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
-    const baseBranch = workflow.featureBranch || defaultBranch;
     const slug = agentDef.agentId.replace(/^agentcore_hub_/, "").replace(/_/g, "-");
     context += `## Branch\n`;
     context += `feature_branch: feature/${ticket.ticketId}-${slug}\n`;
-    context += `base_branch: ${baseBranch}\n`;
-    if (workflow.featureBranch) {
+    context += `base_branch: ${prBase.baseBranch}\n`;
+    if (merged) {
+      context += `NOTE: this run's unified PR already merged (merge_commit ${unified.mergeCommit}); branch fresh from ${prBase.baseBranch}, PR to ${prBase.baseBranch} — never PR into the merged integration branch ${workflow.featureBranch}.\n`;
+    } else if (prBase.isShared) {
       context += `NOTE: base_branch is this run's SHARED integration branch. Branch from it, target your PR at it (never the repo default branch), and merge your PR into it when your evidence is complete — one unified PR to the default branch is opened by the orchestrator at run completion.\n`;
     }
     context += `\n`;
@@ -4188,6 +4197,14 @@ export async function buildAgentContext(ticket, workflow) {
         context += `## Design Artifacts\n${designDoc.slice(0, 8000)}\n\n`;
       }
     } catch { /* no design docs yet */ }
+  } else if (merged && ["review", "verification", "ship"].includes(agentDef?.phase)) {
+    // TEAM-5854 / TEAM-5869: review / CI / QA / RM get no ## Branch before the merge; after it they follow the fix PR at the base the ticket resolved.
+    const b = prBase.baseBranch;
+    context += `## Branch\nbase_branch: ${b}\n`;
+    context += `NOTE: this run's unified PR already merged (merge_commit ${unified.mergeCommit}); the integration branch ${workflow.featureBranch} is dead. `;
+    context += agentDef.phase === "ship"
+      ? `Adopt the fix ticket's OWN PR (pr_url + branch from its completion record), which targets ${b}, as the PR you ship (open/adopt on a Ship ticket, merge on a CD ticket) — never open or adopt a PR from ${workflow.featureBranch}, never sync or commit to it.\n\n`
+      : `Review / certify / verify the fix ticket's OWN PR (pr_url + branch from its completion record) against ${b}. A fix PR targeting ${b} is correct, not a finding; never sync, commit to, or certify ${workflow.featureBranch}.\n\n`;
   }
 
   // Original request + input sources for the workflow's intake agent (any def).
@@ -4854,49 +4871,17 @@ function defHasShipPhase(workflow) {
   ).some((p) => SHIP_PHASES.has(p));
 }
 
-/**
- * TEAM-3986 — ONE GitHub probe, three honest answers:
- *   { merged: true,  mergeCommit, prUrl }  a PR for the head has merged_at (its
- *                                          merge_commit_sha is the ship proof), or
- *                                          the branch is identical/behind the base;
- *   { merged: false, reason }              compare says ahead/diverged — provably unmerged;
- *   { merged: null }                       unknown status or API error — fail OPEN for
- *                                          the unmerged gate, and NO proof for the
- *                                          shipped verdict (self-report decides).
- * Squash merges leave the branch commits absent from base, so the PR's `merged_at`
- * is trusted first (authoritative for squash AND merge commits) and compare is only
- * the fallback. The TEAM-3721 fail-open semantics live at the call site in
- * completeWorkflow: only `merged === false` refuses.
- */
-async function featureBranchMergeProbe(workflow) {
+// TEAM-3986 / TEAM-5828: classification lives in completion.mjs featureBranchLanding.
+// Any GitHub error → { merged: null } (fail OPEN; only merged === false refuses).
+// TEAM-5913: every recorded head (harvested commitSha) binds the deleted-branch proof.
+async function featureBranchMergeProbe(workflow, agentTasks) {
   try {
     const { owner, repo } = parseRepoUrl(workflow.repoConfig);
     const base = workflow.repoConfig.repos?.[0]?.defaultBranch || "main";
-    const head = workflow.featureBranch;
-
-    const prs = await githubApi(
-      `/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(head)}&state=all&per_page=20`
-    );
-    if (Array.isArray(prs) && prs.length > 0) {
-      const mergedPr = prs.find((p) => p.merged_at);
-      if (mergedPr) {
-        return { merged: true, mergeCommit: mergedPr.merge_commit_sha || "", prUrl: mergedPr.html_url || "" };
-      }
-    }
-
-    const cmp = await githubApi(
-      `/repos/${owner}/${repo}/compare/${encodeURIComponent(base)}...${encodeURIComponent(head)}`
-    );
-    if (cmp?.status === "identical" || cmp?.status === "behind") {
-      return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: "" };
-    }
-    if (cmp?.status === "ahead" || cmp?.status === "diverged") {
-      return { merged: false, reason: `branch ${cmp.ahead_by} commit(s) ahead of ${base} (status=${cmp.status})` };
-    }
-    return { merged: null }; // unknown status — fail open, no proof
+    return await featureBranchLanding({ owner, repo, base, head: workflow.featureBranch, api: githubApi, recordedHeads: recordedHeads(agentTasks) });
   } catch (err) {
     console.warn(`[orchestrator] merge-verify skipped for ${workflow.id}: ${err.message}`);
-    return { merged: null }; // fail open, no proof
+    return { merged: null };
   }
 }
 
@@ -4952,7 +4937,7 @@ async function callGitHub(toolName, args) {
       } catch (err) {
         // "A pull request already exists" → return the existing one (idempotent).
         if (err.status === 422 && /already exists/i.test(err.githubMessage || "")) {
-          const existing = await githubApi(`/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(head)}&state=open`);
+          const existing = await githubApi(`/repos/${owner}/${repo}/pulls?head=${owner}:${encodeURIComponent(head)}&base=${encodeURIComponent(base)}&state=open`);
           if (existing?.length > 0) return existing[0];
         }
         throw err;

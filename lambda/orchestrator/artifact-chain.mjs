@@ -111,19 +111,26 @@ export function isPlanTicket(ticket, agentDef) {
  * The `## SDLC Framework` context block every persona on a playbook run sees.
  * Names the chain dir + branch, the whole chain, and — for this ticket — the
  * artifact it owes and the commit-before-report rule (blueprint-enforced).
+ * `base` (TEAM-5854/5869): `reason`/`mergeCommit` are the run's merge fact — once the unified PR
+ * merged the integration branch is dead; `baseBranch` is the fix PR's resolved base (ticket line wins).
  */
-export function sdlcFrameworkContext({ def, workflow, ticket, agentDef, intakeAgentId }) {
+export function sdlcFrameworkContext({ def, workflow, ticket, agentDef, intakeAgentId, base }) {
   const chain = chainFor(def);
   if (!chain) return "";
   const dir = chainDir(def, workflow?.id);
-  const branch = workflow?.featureBranch || "(shared feature branch — created when the spec author is dispatched)";
+  const merged = base?.reason === "unified_pr_merged";
+  const branch = merged
+    ? `your PR's branch (it targets ${base.baseBranch})`
+    : workflow?.featureBranch || "(shared feature branch — created when the spec author is dispatched)";
   const owed = requiredArtifactsForTicket({ def, ticket, agentDef, intakeAgentId });
   const plan = isPlanTicket(ticket, agentDef);
   const lines = [
     `## SDLC Framework`,
     `framework: ${def.sdlcFramework || "playbook"}`,
     `artifact_dir: ${dir}`,
-    `artifact_branch: ${branch}`,
+    merged
+      ? `artifact_branch: ${base.baseBranch} — via your PR's branch; the integration branch ${workflow?.featureBranch} already merged (merge_commit ${base.mergeCommit}), never commit to it`
+      : `artifact_branch: ${branch}`,
     `chain: ${chain.artifacts.map((a) => `${a.name}${a.gate ? ` → ${a.gate}` : ""}`).join(" → ")}`,
     `Every stage commits its artifact to artifact_dir on artifact_branch; the next stage starts by reading it. The commit chain is the audit trail.`,
   ];
