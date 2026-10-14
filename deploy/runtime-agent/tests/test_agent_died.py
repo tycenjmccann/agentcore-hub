@@ -224,6 +224,27 @@ def test_claim_started_at_is_omitted_when_absent(claim_started_at) -> None:
     assert "claimStartedAt" not in detail
 
 
+# ─── TEAM-5963: the death's reason ───────────────────────────────────────────
+
+
+def test_reason_is_stamped_only_when_given() -> None:
+    """A turn whose transient Bedrock retries ran out dies with
+    `reason="transient_exhaustion"`, so a human (and cost-report) can tell a
+    brownout from a hung session. Omitted otherwise — every existing death stays
+    byte-identical, and the detector's agent.died arm never filters on it."""
+    publish, events, _ = _load_publisher()
+    publish("wf_died", "agentcore_hub_backend_dev", "TEAM-5963",
+            claim_started_at="2026-10-14T12:00:00.000Z", reason="transient_exhaustion")
+    publish("wf_died", "agentcore_hub_backend_dev", "TEAM-5963")
+    publish("wf_died", "agentcore_hub_backend_dev", "TEAM-5963", reason="")
+    stamped, absent, empty = (
+        {k: v["S"] for k, v in call["Item"]["detail"]["M"].items()} for call in events.items
+    )
+    assert stamped["reason"] == "transient_exhaustion"
+    assert stamped["claimStartedAt"] == "2026-10-14T12:00:00.000Z"
+    assert "reason" not in absent and "reason" not in empty
+
+
 def test_a_transient_put_failure_is_retried() -> None:
     publish, events, _ = _load_publisher(fail_times=2)
     publish("wf_died", "agentcore_hub_backend_dev", "TEAM-4739")
@@ -513,13 +534,17 @@ async def test_a_park_on_a_different_ticket_id_spelling_is_still_the_same_ticket
 async def test_a_crashing_turn_publishes_error_not_death() -> None:
     """The disjointness rail. A turn that raised has already surfaced itself as
     `agent.error`; publishing a death too would make the detector count one
-    failure twice and escalate a round early."""
+    failure twice and escalate a round early.
 
-    class EventStreamError(Exception):
+    TEAM-5963: the rail holds for a DETERMINISTIC crash. A transient one whose
+    retries ran out is deliberately a death as well (the ticket would otherwise
+    strand in_progress) — that path is pinned in tests/test_stream_retry.py."""
+
+    class ValidationException(Exception):
         pass
 
     def explode(agent: Any) -> None:
-        raise EventStreamError("stream closed")
+        raise ValidationException("messages.1: content must not be empty")
 
     deaths: list[tuple] = []
     errors: list[tuple] = []
@@ -532,7 +557,7 @@ async def test_a_crashing_turn_publishes_error_not_death() -> None:
     )
     ns["_STREAM_RETRY_BASE_S"] = 0.0
 
-    with pytest.raises(EventStreamError):
+    with pytest.raises(ValidationException):
         async for _ in ns["_run_agent_invocation"](BOUND, CTX):
             pass
 

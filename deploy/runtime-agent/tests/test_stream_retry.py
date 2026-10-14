@@ -33,8 +33,16 @@ What is pinned here:
      fired on the only turns long enough to need it.
   3. `agent.error` is published exactly once, only after the retries are
      exhausted (or immediately for a deterministic error), and never on a turn
-     that recovered. `agent.died` is never published on this path — the two are
-     disjoint by construction (FR-7).
+     that recovered. A DETERMINISTIC failure is a crash: agent.error only, no
+     `agent.died` — the two stay disjoint (FR-7). TEAM-5963: a TRANSIENT failure
+     that ran out of retries is the one exception — it publishes its agent.error
+     AND ends as a death (`reason="transient_exhaustion"`, resume object written,
+     a `[transient-exhaustion]` comment on the ticket), because a crash leaves the
+     ticket in_progress behind a running claim and only a death lets the
+     dead-session detector re-dispatch it.
+  4. TEAM-5963: the window is sized for a Bedrock brownout (10 attempts, 300s of
+     backoff SLEEP, ceilings capped at 60s), and a long backoff renews the lease
+     with `agent.streaming` heartbeats so the wait never reads as silence.
 
 Hermetic: the Agent is a scripted fake and the shipped `_run_agent_invocation`
 source is exec'd from main.py by the loader in test_telemetry_spans.py (main.py
@@ -93,6 +101,10 @@ class MaxTokensReachedException(Exception):
 
 
 class AccessDeniedException(Exception):
+    pass
+
+
+class ModelNotReadyException(Exception):
     pass
 
 
@@ -250,18 +262,54 @@ def _load(scripts: list[list[Any]], **overrides: Any) -> tuple[dict, list, list,
     agent_cls = _flaky_agent_class(scripts)
     agent_cls.instances = []
     saved: list[tuple] = []
+    # TEAM-5963: one ordered log of the teardown side effects, plus the sleeps the
+    # backoff asked for (the seam records instead of waiting).
+    log: list[str] = []
+    sleeps: list[float] = []
+    comments: list[dict] = []
+    resumes: list[tuple] = []
+
+    async def _no_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    def _comment(**kwargs: Any) -> str:
+        log.append("comment")
+        comments.append(kwargs)
+        return "ok"
+
+    def _error(*a: Any, **k: Any) -> None:
+        log.append("error")
+        errors.append((a, k))
+
+    def _died(*a: Any, **k: Any) -> None:
+        log.append("died")
+        deaths.append((a, k))
+
+    def _resume(*a: Any, **k: Any) -> None:
+        log.append("resume")
+        resumes.append((a, k))
+
     ns = _load_production_entrypoints(
         overrides={
             "Agent": agent_cls,
-            "_publish_agent_error": lambda *a, **k: errors.append((a, k)),
-            "_publish_agent_died": lambda *a, **k: deaths.append((a, k)),
+            "_publish_agent_error": _error,
+            "_publish_agent_died": _died,
+            "_write_resume_object": _resume,
+            "Tickets___add_comment": _comment,
             "_save_memory_event": lambda *a: saved.append(a),
             **overrides,
         }
     )
     ns["_STREAM_RETRY_BASE_S"] = 0.0
+    # After the exec, not in `overrides`: the shipped source defines the seam
+    # itself, so an override passed in would be clobbered.
+    ns["_stream_retry_sleep"] = _no_sleep
     ns["_test_agent_class"] = agent_cls
     ns["_test_saved"] = saved
+    ns["_test_log"] = log
+    ns["_test_sleeps"] = sleeps
+    ns["_test_comments"] = comments
+    ns["_test_resumes"] = resumes
     return ns, agent_cls, errors, deaths
 
 
@@ -280,6 +328,7 @@ RETRYABLE = [
     ThrottlingException("Too many requests"),
     ModelStreamErrorException("stream member reported an error"),
     ServiceUnavailableException("temporarily unavailable"),
+    ModelNotReadyException("model is not ready to serve requests"),
     EventStreamError("An error occurred while reading the event stream"),
     ReadTimeoutError("Read timeout on endpoint URL"),
     TimeoutError("read timed out"),
@@ -350,8 +399,9 @@ def test_classifier_is_pure() -> None:
 def test_backoff_is_exponential_with_full_jitter() -> None:
     ns = _load_production_entrypoints()
     delay = ns["_stream_retry_delay"]
-    for attempt, ceiling in ((1, 1.0), (2, 2.0), (3, 4.0)):
-        samples = [delay(attempt, 60.0) for _ in range(200)]
+    base = ns["_STREAM_RETRY_BASE_S"]
+    for attempt, ceiling in ((1, base), (2, 2 * base), (3, 4 * base)):
+        samples = [delay(attempt, 600.0) for _ in range(200)]
         assert all(0.0 <= s <= ceiling for s in samples), (
             f"attempt {attempt} must jitter within [0, {ceiling}]; got "
             f"[{min(samples)}, {max(samples)}]"
@@ -369,10 +419,54 @@ def test_backoff_never_exceeds_the_remaining_budget() -> None:
     assert delay(3, -5.0) == 0.0, "a blown budget must never sleep"
 
 
-def test_the_wall_budget_and_attempt_cap_are_the_documented_ones() -> None:
+def test_backoff_ceiling_is_capped() -> None:
+    """TEAM-5963: past the cap the ceiling stops doubling, so attempts 7-10 keep
+    probing every <=60s instead of one 4-minute silence."""
     ns = _load_production_entrypoints()
-    assert ns["_STREAM_RETRY_MAX_ATTEMPTS"] >= 3
-    assert ns["_STREAM_RETRY_BUDGET_S"] <= 60.0
+    delay = ns["_stream_retry_delay"]
+    cap = ns["_STREAM_RETRY_CAP_S"]
+    assert all(delay(10, 10_000.0) <= cap for _ in range(200))
+
+
+def test_the_wall_budget_and_attempt_cap_are_the_documented_ones() -> None:
+    """TEAM-5961/5963: the old pin was `BUDGET_S <= 60` — it pinned the defect. A
+    60s window cannot outlast a Bedrock brownout (ServiceUnavailableException for
+    a minute or two), so every such outage cost the whole turn. The invariant now
+    is "survive ~5 minutes of backoff, and stay bounded": enough attempts to use
+    that window, and a per-retry cap that fits inside it."""
+    ns = _load_production_entrypoints()
+    assert ns["_STREAM_RETRY_MAX_ATTEMPTS"] >= 6
+    assert ns["_STREAM_RETRY_BUDGET_S"] >= 300.0
+    assert 0 < ns["_STREAM_RETRY_CAP_S"] <= ns["_STREAM_RETRY_BUDGET_S"]
+    assert ns["_STREAM_RETRY_HEARTBEAT_S"] < 15 * 60, (
+        "a backoff slice must renew the lease well inside the platform's 15-min idle kill"
+    )
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [(None, None), ("", None), ("abc", None), ("0", None), ("-3", None), ("4", 4)],
+    ids=["unset", "empty", "garbage", "zero", "negative", "valid"],
+)
+def test_stream_retry_env_knobs_fall_back_on_garbage(monkeypatch, raw, expected) -> None:
+    """The four STREAM_RETRY_* knobs parse through `_wd_num`: a typo in the
+    runtime env must fall back to the default, never disable retrying (0) or
+    crash the module at import."""
+    defaults = {
+        "STREAM_RETRY_MAX_ATTEMPTS": ("_STREAM_RETRY_MAX_ATTEMPTS", 10),
+        "STREAM_RETRY_BUDGET_S": ("_STREAM_RETRY_BUDGET_S", 300.0),
+        "STREAM_RETRY_BASE_S": ("_STREAM_RETRY_BASE_S", 2.0),
+        "STREAM_RETRY_CAP_S": ("_STREAM_RETRY_CAP_S", 60.0),
+    }
+    for env, (name, default) in defaults.items():
+        if raw is None:
+            monkeypatch.delenv(env, raising=False)
+        else:
+            monkeypatch.setenv(env, raw)
+        ns = _load_production_entrypoints()
+        want = default if expected is None else expected
+        assert ns[name] == want, f"{env}={raw!r} -> {ns[name]!r}, expected {want!r}"
+        monkeypatch.delenv(env, raising=False)
 
 
 # ─── 3. driven turns ─────────────────────────────────────────────────────────
@@ -483,8 +577,12 @@ async def test_the_attempt_cap_stops_an_endlessly_broken_stream() -> None:
         f"expected {ns['_STREAM_RETRY_MAX_ATTEMPTS']} attempts, got {agent.attempts}"
     )
     assert len(errors) == 1, f"agent.error must be published once, on exhaustion; got {errors}"
-    assert "3 attempt" in errors[0][0][2], f"the error must say how many attempts it took: {errors}"
-    assert deaths == []
+    cap = ns["_STREAM_RETRY_MAX_ATTEMPTS"]
+    assert f"{cap} attempt" in errors[0][0][2], (
+        f"the error must say how many attempts it took: {errors}"
+    )
+    # TEAM-5963: transient exhaustion ends as a recoverable death.
+    assert len(deaths) == 1, f"transient exhaustion must publish one agent.died; got {deaths}"
 
 
 @pytest.mark.asyncio
@@ -496,7 +594,7 @@ async def test_an_exhausted_wall_budget_stops_before_the_attempt_cap() -> None:
     but for a different reason: a 0.0 budget now means "no retry time is allowed at
     all" rather than "the turn already consumed it", and `remaining <= 0` fires on
     the first failure either way. The 60s-of-real-retrying case that A3 actually
-    changed is `test_the_budget_still_exhausts_after_60s_of_retrying` below."""
+    changed is `test_the_sleep_budget_exhausts_before_the_attempt_cap` below."""
     ns, agent_cls, errors, deaths = _load([[EventStreamError("stream closed")]])
     ns["_STREAM_RETRY_BUDGET_S"] = 0.0
 
@@ -507,7 +605,7 @@ async def test_an_exhausted_wall_budget_stops_before_the_attempt_cap() -> None:
     (agent,) = agent_cls.instances
     assert agent.attempts == 1, f"a spent budget must not be attempted against; got {agent.attempts}"
     assert len(errors) == 1, f"exactly one agent.error, even from the budget branch; got {errors}"
-    assert deaths == []
+    assert len(deaths) == 1, "a transient error that hit the budget is still a recoverable death"
 
 
 @pytest.mark.asyncio
@@ -727,26 +825,225 @@ async def test_a_failure_after_five_minutes_is_still_retried() -> None:
     assert deaths == []
 
 
+class _CeilingRandom(__import__("random").Random):
+    """`random` whose `uniform` returns the top of the range: the full-jitter
+    delay becomes its deterministic ceiling, so backoff arithmetic is testable."""
+
+    def uniform(self, a: float, b: float) -> float:
+        return b
+
+
 @pytest.mark.asyncio
-async def test_the_budget_still_exhausts_after_60s_of_retrying() -> None:
-    """The other half of A3: arming later must not make the budget unbounded. 61
-    seconds of ACTUAL retrying still stops before the attempt cap — which no
-    existing test covered, because the old clock could never get there."""
-    # Arm at t=1000, then the next failure reads a clock 61s later: past budget.
-    clock = _scripted_clock([1000.0, 1000.0, 1061.0, 1061.0, 1062.0])
+async def test_the_sleep_budget_exhausts_before_the_attempt_cap() -> None:
+    """The other half of A3, restated for TEAM-5963: arming later must not make
+    the budget unbounded, and the budget is cumulative BACKOFF SLEEP. Ceilings
+    4s, then 8s clipped to the 1s left: 5s slept, budget spent, the third failure
+    gives up — well before the 10-attempt cap."""
     ns, agent_cls, errors, deaths = _load(
-        [[EventStreamError("stream closed")]], time=clock
+        [[EventStreamError("stream closed")]], random=_CeilingRandom()
     )
+    ns["_STREAM_RETRY_BASE_S"] = 4.0
+    ns["_STREAM_RETRY_BUDGET_S"] = 5.0
 
     with pytest.raises(EventStreamError):
         async for _ in ns["_run_agent_invocation"](PAYLOAD, CTX):
             pass
 
     (agent,) = agent_cls.instances
-    assert agent.attempts == 2, (
-        "60s of retrying is the bound; the cap of 3 must not be reached here — "
-        f"got {agent.attempts}"
-    )
+    assert agent.attempts == 3, f"expected the budget to stop attempt 3; got {agent.attempts}"
     assert agent.attempts < ns["_STREAM_RETRY_MAX_ATTEMPTS"]
+    assert ns["_test_sleeps"] == [4.0, 1.0], f"got {ns['_test_sleeps']}"
+    assert sum(ns["_test_sleeps"]) == ns["_STREAM_RETRY_BUDGET_S"]
     assert len(errors) == 1, f"exactly one agent.error from the budget branch; got {errors}"
-    assert deaths == []
+    assert len(deaths) == 1
+
+
+# ─── 6. TEAM-5963: survive the brownout; exhaustion is a recoverable death ────
+
+
+@pytest.mark.asyncio
+async def test_four_service_unavailable_then_success_resumes_same_agent() -> None:
+    """The TEAM-5961 incident: a closed tool cycle, then Bedrock answers
+    ServiceUnavailableException four times running. Main gave up on attempt 3;
+    the turn must now ride it out on the SAME Agent, keeping the tool result."""
+    tool_runs: list[int] = []
+
+    def tool_cycle_once(agent: Any) -> None:
+        tool_runs.append(1)
+        _tool_cycle_closed(agent)
+
+    su = ServiceUnavailableException("Bedrock is unable to process your request")
+    ns, agent_cls, errors, deaths = _load([
+        [tool_cycle_once, su],
+        [su],
+        [su],
+        [su],
+        [{"data": "recovered"}, _engage_completion],
+    ])
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+
+    assert len(agent_cls.instances) == 1, "the retry rebuilt the Agent — the conversation is gone"
+    (agent,) = agent_cls.instances
+    assert agent.attempts == 5, f"expected 5 stream_async attempts, got {agent.attempts}"
+    assert agent.prompts[0] == PAYLOAD["prompt"]
+    assert agent.prompts[1:] == [[]] * 4, f"retries must re-enter with []; got {agent.prompts[1:]!r}"
+    assert tool_runs == [1], "the completed tool must not run again"
+    assert any("toolResult" in c for m in agent.messages for c in m["content"]), (
+        "the tool result the turn already produced was discarded"
+    )
+    _assert_valid_history(agent)
+    assert _prompt_copies(agent, PAYLOAD["prompt"]) == 1
+    assert _deltas(frames) == ["recovered"]
+    assert errors == [] and deaths == []
+    assert ns["_test_comments"] == [] and ns["_test_resumes"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ValidationException("messages.1: content must not be empty"),
+        AccessDeniedException("not authorized to invoke bedrock"),
+        MaxTokensReachedException("max output tokens reached"),
+    ],
+    ids=lambda e: type(e).__name__,
+)
+async def test_non_transient_fails_fast_without_death(exc: BaseException) -> None:
+    """A deterministic error keeps today's semantics exactly: one attempt, no
+    backoff, one agent.error, and NOT a death — re-dispatching it would fail the
+    same way, three more times."""
+    ns, agent_cls, errors, deaths = _load([[{"data": "half "}, exc]])
+
+    with pytest.raises(type(exc)):
+        async for _ in ns["_run_agent_invocation"](PAYLOAD, CTX):
+            pass
+
+    (agent,) = agent_cls.instances
+    assert agent.attempts == 1
+    assert ns["_test_sleeps"] == []
+    assert len(errors) == 1
+    assert deaths == [], "a deterministic crash must not be re-dispatched by the detector"
+    assert ns["_test_comments"] == [], "no transient-exhaustion comment for a deterministic error"
+    assert ns["_test_resumes"] == []
+
+
+@pytest.mark.asyncio
+async def test_transient_exhaustion_publishes_one_error_then_death_with_resume() -> None:
+    """10x ServiceUnavailable: the turn gives up, and ends as a death the
+    detector can recover — one agent.error, one agent.died stamped with the claim
+    generation and `reason="transient_exhaustion"`, the resume object, and a
+    reason comment on the ticket. In that order: the comment and the error are
+    written while the turn is still alive, the death and resume in its teardown."""
+    ns, agent_cls, errors, deaths = _load(
+        [[ServiceUnavailableException("Bedrock is unable to process your request")]]
+    )
+    payload = {**PAYLOAD, "claim_started_at": "2026-10-14T12:00:00.000Z"}
+
+    with pytest.raises(ServiceUnavailableException):
+        async for _ in ns["_run_agent_invocation"](payload, CTX):
+            pass
+
+    (agent,) = agent_cls.instances
+    assert agent.attempts == ns["_STREAM_RETRY_MAX_ATTEMPTS"] == 10
+    assert len(errors) == 1, f"exactly one agent.error; got {errors}"
+    assert "10 attempt" in errors[0][0][2]
+    assert len(deaths) == 1, f"exactly one agent.died; got {deaths}"
+    args, kwargs = deaths[0]
+    assert args[:3] == ("wf_retry", "agentcore_hub_backend_dev", "TEAM-4739")
+    assert kwargs["reason"] == "transient_exhaustion"
+    assert kwargs["claim_started_at"] == "2026-10-14T12:00:00.000Z", (
+        "the death must carry the claim generation, or the detector ignores it"
+    )
+    assert len(ns["_test_resumes"]) == 1, "the resume object must be written"
+    (comment,) = ns["_test_comments"]
+    assert comment["ticket_id"] == "TEAM-4739"
+    assert "[transient-exhaustion]" in comment["comment"]
+    assert "ServiceUnavailableException" in comment["comment"]
+    assert ns["_test_log"] == ["comment", "error", "died", "resume"], ns["_test_log"]
+
+
+@pytest.mark.asyncio
+async def test_transient_exhaustion_survives_comment_failure() -> None:
+    """The comment is best-effort: a broken ticket backend must not cost the
+    death and the resume object, which are what actually recover the ticket."""
+
+    def broken(**kwargs: Any) -> str:
+        raise RuntimeError("tickets lambda is down too")
+
+    ns, agent_cls, errors, deaths = _load(
+        [[ServiceUnavailableException("unavailable")]], Tickets___add_comment=broken
+    )
+
+    with pytest.raises(ServiceUnavailableException):
+        async for _ in ns["_run_agent_invocation"](PAYLOAD, CTX):
+            pass
+
+    assert len(errors) == 1
+    assert len(deaths) == 1 and deaths[0][1]["reason"] == "transient_exhaustion"
+    assert len(ns["_test_resumes"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_70s_backoff_emits_heartbeats() -> None:
+    """A long backoff sleeps in <=30s slices, publishing a lease-renewing
+    agent.streaming event (stamped with agent and ticket, so lastAgentActivity
+    counts it) before each — 70s of silence would otherwise age the lease."""
+    puts: list[dict] = []
+    ns, agent_cls, errors, deaths = _load(
+        [
+            [ServiceUnavailableException("unavailable")],
+            [{"data": "ok"}, _engage_completion],
+        ],
+        random=_CeilingRandom(),
+        _ddb_events_client=SimpleNamespace(put_item=lambda **kw: puts.append(kw)),
+    )
+    ns["_STREAM_RETRY_BASE_S"] = 70.0
+    ns["_STREAM_RETRY_CAP_S"] = 120.0
+
+    [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+
+    assert ns["_test_sleeps"] == [30.0, 30.0, 10.0], f"got {ns['_test_sleeps']}"
+    beats = [
+        {k: v["S"] for k, v in p["Item"]["detail"]["M"].items()}
+        for p in puts
+        if p["Item"]["type"]["S"] == "agent.streaming"
+        and p["Item"]["detail"]["M"].get("retryBackoff", {}).get("S") == "true"
+    ]
+    assert len(beats) >= 2, f"expected a heartbeat per backoff slice; got {beats}"
+    for beat in beats:
+        assert beat["agentId"] == "agentcore_hub_backend_dev"
+        assert beat["ticketId"] == "TEAM-4739"
+    assert errors == [] and deaths == []
+
+
+@pytest.mark.asyncio
+async def test_model_not_ready_is_retryable() -> None:
+    """ModelNotReadyException is Bedrock's 'capacity is coming back' answer."""
+    ns, agent_cls, errors, deaths = _load([
+        [ModelNotReadyException("model is not ready")],
+        [{"data": "ok"}, _engage_completion],
+    ])
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+
+    assert ns["_classify_stream_error"](ModelNotReadyException("x")) == "retry"
+    assert agent_cls.instances[0].attempts == 2
+    assert _deltas(frames) == ["ok"]
+    assert errors == [] and deaths == []
+
+
+@pytest.mark.asyncio
+async def test_detached_exhaustion_publishes_agent_error_once() -> None:
+    """The detached runner used to publish its own agent.error for any exception
+    it caught, so an exhausted stream produced two errors for one failure."""
+    import asyncio
+
+    ns, agent_cls, errors, deaths = _load([[ServiceUnavailableException("unavailable")]])
+
+    acks = [f async for f in ns["agent_invocation"]({**PAYLOAD, "detach": True}, CTX)]
+    assert "accepted" in str(acks)
+    await asyncio.gather(*list(ns["_DETACHED_TASKS"]))
+
+    assert len(errors) == 1, f"one failure, one agent.error; got {errors}"
+    assert len(deaths) == 1
