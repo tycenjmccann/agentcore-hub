@@ -99,8 +99,13 @@ function makeDdb({ workflows, events: all, updates = [], onQuery = null, visible
             // TEAM-5784: when the query carries a generation (:gen), a died row
             // only matches when it is unstamped (legacy) or stamped with THIS
             // generation — mirrors lease.mjs's server-side filter clause.
+            // TEAM-5977: strictGeneration drops the legacy (unstamped) arm —
+            // the expression carries :gen without attribute_not_exists — and
+            // :dreason requires detail.reason to match.
+            const strict = !String(cmd.input.FilterExpression).includes("attribute_not_exists(detail.claimStartedAt)");
             const diedTyped = v[":died"] && e.type === v[":died"]
-              && (!v[":gen"] || e.detail?.claimStartedAt == null || e.detail.claimStartedAt === v[":gen"]);
+              && (!v[":gen"] || (!strict && e.detail?.claimStartedAt == null) || e.detail?.claimStartedAt === v[":gen"])
+              && (!v[":dreason"] || e.detail?.reason === v[":dreason"]);
             const typed = diedTyped
               || (v[":err"] && e.type === v[":err"] && e.detail?.reason !== v[":dead"]);
             return typed && e.detail?.ticketId === v[":tid"] && String(e.timestamp) >= String(v[":since"]);
@@ -346,5 +351,173 @@ describe("replay TEAM-9100 — a prior generation's agent.died must not kill the
 
     expect(m.fired).toBe(1);
     expect(deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * TEAM-5977 / TEAM-5961 — a transient Bedrock outage outlasted the runtime's
+ * stream retries. The runtime published agent.error, wrote the resume object
+ * and published agent.died{reason:"transient_exhaustion", claimStartedAt} —
+ * and told the ticket it "was released to dead-session recovery". With the
+ * detector in its DEFAULT shadow mode that was false: the sweep only published
+ * dead_session.shadow and the ticket sat in_progress forever. Now the claim
+ * holder's own strict-matching exhaustion death promotes THAT candidate to the
+ * unchanged enforce path (GUARD 1, both CAS steps, the re-check, the retry cap).
+ */
+describe("replay TEAM-5961 — transient exhaustion releases in shadow mode (TEAM-5977)", () => {
+  function exhaustionEvents({ claimStartedAt = CLAIMED_AT, reason = "transient_exhaustion", extra = [] } = {}) {
+    const rows = runEvents().map((e) => {
+      if (e.type !== "agent.died") return e;
+      const detail = { ...e.detail, lastStreamAt: LAST_STREAM };
+      delete detail.reason;
+      // null = omit (a default parameter would swallow undefined).
+      if (claimStartedAt !== null) detail.claimStartedAt = claimStartedAt;
+      if (reason !== null) detail.reason = reason;
+      return { ...e, detail };
+    });
+    return [...rows, ...extra];
+  }
+  const strictQueries = (inputs) => inputs.filter((i) => i.ExpressionAttributeValues?.[":dreason"] === "transient_exhaustion");
+
+  it("a strict claim-holder exhaustion death is stolen and re-dispatched even in shadow", async () => {
+    const workflow = makeWorkflow();
+    const inputs = [];
+    const { deps, store, ddb } = makeDeps({ workflow, events: exhaustionEvents(), onQuery: (i) => inputs.push(i) });
+    const m = await createDetector(deps).runSweep("shadow");
+
+    expect(m.mode).toBe("shadow");
+    expect(m.fired).toBe(1);
+    expect(strictQueries(inputs)).toHaveLength(1);
+    expect(store.markDeadSessionDetected).toHaveBeenCalledWith(WF, TICKET, CLAIMED_AT);
+    // stealClaim (the real one) issued its CAS'd UpdateCommand on THIS generation.
+    const steal = ddb.updates.find((u) => u.ConditionExpression?.includes("startedAt = :exp"));
+    expect(steal.ExpressionAttributeValues[":exp"]).toBe(CLAIMED_AT);
+    const errs = eventsOfType(deps.publishEvent, "agent.error");
+    expect(errs).toHaveLength(1);
+    expect(errs[0][2].reason).toBe("dead_session");
+    expect(errs[0][2].detectorMeta.effectiveMode).toBe("enforce");
+    expect(errs[0][2].detectorMeta.positiveDeath).toBe(true);
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith(WF, TICKET);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    expect(eventsOfType(deps.publishEvent, "dead_session.shadow")).toHaveLength(0);
+  });
+
+  it("a LEGACY unstamped exhaustion death stays shadow-only (strict needs the claim stamp)", async () => {
+    const inputs = [];
+    const { deps, store, ddb } = makeDeps({ workflow: makeWorkflow(), events: exhaustionEvents({ claimStartedAt: null }), onQuery: (i) => inputs.push(i) });
+    const m = await createDetector(deps).runSweep("shadow");
+
+    expect(strictQueries(inputs)).toHaveLength(1); // asked, and the strict read said no
+    const shadow = eventsOfType(deps.publishEvent, "dead_session.shadow");
+    expect(shadow).toHaveLength(1);
+    expect(shadow[0][2].detectorMeta.effectiveMode).toBe("shadow");
+    expect(m.fired).toBe(1);
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(ddb.updates).toHaveLength(0);
+    expect(deps.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("an exhaustion death stamped with a DIFFERENT generation stays shadow-only", async () => {
+    // Swept 30 min later so the silence (70 min) is past the 60-min fallback
+    // threshold: the shadow branch fires on the math, with no positive death.
+    const { deps, store, ddb } = makeDeps({
+      workflow: makeWorkflow(), events: exhaustionEvents({ claimStartedAt: "2026-09-14T20:00:00.000Z" }),
+      nowMs: SWEEP_AT + 30 * 60 * 1000,
+    });
+    await createDetector(deps).runSweep("shadow");
+
+    const shadow = eventsOfType(deps.publishEvent, "dead_session.shadow");
+    expect(shadow).toHaveLength(1);
+    expect(shadow[0][2].detectorMeta.positiveDeath).toBe(false);
+    expect(shadow[0][2].detectorMeta.effectiveMode).toBe("shadow");
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(ddb.updates).toHaveLength(0);
+    expect(deps.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("a claim-stamped death with no transient_exhaustion reason stays shadow-only", async () => {
+    const inputs = [];
+    const { deps, store, ddb } = makeDeps({ workflow: makeWorkflow(), events: exhaustionEvents({ reason: "no_completion" }), onQuery: (i) => inputs.push(i) });
+    await createDetector(deps).runSweep("shadow");
+
+    expect(strictQueries(inputs)).toHaveLength(1);
+    const shadow = eventsOfType(deps.publishEvent, "dead_session.shadow");
+    expect(shadow).toHaveLength(1);
+    expect(shadow[0][2].detectorMeta.positiveDeath).toBe(true);
+    expect(shadow[0][2].detectorMeta.effectiveMode).toBe("shadow");
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(ddb.updates).toHaveLength(0);
+    expect(deps.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("GUARD 1 still first: a live lease is untouched even with a strict exhaustion death (control: dead lease releases)", async () => {
+    const live = [{ workflowId: WF, eventId: "4", type: "agent.streaming", timestamp: "2026-09-15T00:43:00.000Z", detail: { agentId: AGENT, ticketId: TICKET, type: "text", content: "still here" } }];
+    const inputs = [];
+    const a = makeDeps({ workflow: makeWorkflow(), events: exhaustionEvents({ extra: live }), onQuery: (i) => inputs.push(i) });
+    const mLive = await createDetector(a.deps).runSweep("shadow");
+
+    expect(mLive.skippedLiveLease).toBe(1);
+    expect(strictQueries(inputs)).toHaveLength(0);
+    expect(a.store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(a.ddb.updates).toHaveLength(0);
+    expect(a.deps.redispatch).not.toHaveBeenCalled();
+    vi.useRealTimers();
+
+    // Positive control, same fixture minus the live heartbeat.
+    const b = makeDeps({ workflow: makeWorkflow(), events: exhaustionEvents() });
+    await createDetector(b.deps).runSweep("shadow");
+    expect(b.deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("retries exhausted (deadSessionRetries=2): a promoted death escalates, never loops", async () => {
+    const workflow = { ...makeWorkflow(), deadSessionRetries: { [TICKET]: 2 } };
+    const { deps, store } = makeDeps({ workflow, events: exhaustionEvents() });
+    const m = await createDetector(deps).runSweep("shadow");
+
+    expect(m.escalations).toBe(1);
+    const esc = eventsOfType(deps.publishEvent, "agent.escalated");
+    expect(esc).toHaveLength(1);
+    expect(esc[0][2].reason).toBe("dead_session_retry_exhausted");
+    expect(store.setTaskStatus).toHaveBeenCalledWith(WF, TICKET, "error");
+    expect(deps.blockTicket).toHaveBeenCalledWith(TICKET, "dead_session_retry_exhausted");
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("a lost detection CAS stops the promoted candidate — no steal, no dispatch", async () => {
+    const { deps, store, ddb } = makeDeps({ workflow: makeWorkflow(), events: exhaustionEvents() });
+    store.markDeadSessionDetected.mockResolvedValue(false);
+    const m = await createDetector(deps).runSweep("shadow");
+
+    expect(store.markDeadSessionDetected).toHaveBeenCalledWith(WF, TICKET, CLAIMED_AT);
+    expect(ddb.updates).toHaveLength(0);
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
+    expect(eventsOfType(deps.publishEvent, "dead_session.shadow")).toHaveLength(0);
+    expect(deps.redispatch).not.toHaveBeenCalled();
+    expect(m.fired).toBe(0);
+  });
+
+  it("backstop: a stolen-but-stalled task with a strict exhaustion death is re-driven in shadow", async () => {
+    const workflow = makeWorkflow({ status: "ready", deadSessionDetectedAt: "2026-09-15T00:44:00.000Z" });
+    const inputs = [];
+    const { deps, store } = makeDeps({ workflow, events: exhaustionEvents(), onQuery: (i) => inputs.push(i) });
+    await createDetector(deps).runSweep("shadow");
+
+    expect(strictQueries(inputs)).toHaveLength(1);
+    expect(store.getWorkflow).toHaveBeenCalledWith(WF);
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledWith(WF, TICKET);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it("backstop: without a strict exhaustion death the stalled task stays observe-only in shadow", async () => {
+    const workflow = makeWorkflow({ status: "ready", deadSessionDetectedAt: "2026-09-15T00:44:00.000Z" });
+    const inputs = [];
+    const { deps, store } = makeDeps({ workflow, events: exhaustionEvents({ reason: "no_completion" }), onQuery: (i) => inputs.push(i) });
+    await createDetector(deps).runSweep("shadow");
+
+    expect(strictQueries(inputs)).toHaveLength(1); // asked, and the strict read said no
+    expect(store.getWorkflow).not.toHaveBeenCalled();
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
   });
 });

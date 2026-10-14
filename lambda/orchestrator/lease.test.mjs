@@ -585,3 +585,51 @@ describe("parkGeneration — the carrier must be the NEWEST status change (TEAM-
     expect(parkGeneration({ parkClaim: { startedAt: G, at: AT }, updatedAt: AT, status: "in_progress" }, task)).toBe(G);
   });
 });
+
+/**
+ * TEAM-5977 — `strictGeneration` and `reason`, both opt-in on the agent.died
+ * arm only and inside the SAME FilterExpression (so a non-matching death row
+ * cannot swallow a page and hide a real match behind Limit-before-filter).
+ * Omitted, every call stays byte-equivalent (the TEAM-4739 / TEAM-5784 suites
+ * above already pin those shapes).
+ */
+describe("hasAgentErrorSince strictGeneration + reason (TEAM-5977)", () => {
+  const GEN = "2026-10-14T10:00:00.000Z";
+  const filterOf = (inputs) => inputs[0].FilterExpression;
+
+  it("reason adds a detail.reason clause to the died arm, in the same FilterExpression", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(60_000),
+      { types: ["agent.died"], reason: "transient_exhaustion" });
+    expect(inputs).toHaveLength(1);
+    expect(filterOf(inputs)).toContain("(#t = :died AND detail.reason = :dreason)");
+    expect(filterOf(inputs)).toContain("detail.ticketId = :tid AND #ts >= :since");
+    expect(inputs[0].ExpressionAttributeValues[":dreason"]).toBe("transient_exhaustion");
+  });
+
+  it("strictGeneration with a claimGeneration requires the exact stamp — no legacy allowance", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(60_000),
+      { types: ["agent.died"], claimGeneration: GEN, strictGeneration: true, reason: "transient_exhaustion" });
+    expect(filterOf(inputs)).toContain(
+      "(#t = :died AND detail.claimStartedAt = :gen AND detail.reason = :dreason)");
+    expect(filterOf(inputs)).not.toContain("attribute_not_exists(detail.claimStartedAt)");
+    expect(inputs[0].ExpressionAttributeValues[":gen"]).toBe(GEN);
+  });
+
+  it("strictGeneration WITHOUT a claimGeneration matches nothing — false, no read", async () => {
+    const { ddb, inputs } = eventsPages([{ Items: [{ type: "agent.died", detail: { ticketId: "TEAM-2" } }] }]);
+    expect(await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", iso(60_000),
+      { types: ["agent.died"], strictGeneration: true, reason: "transient_exhaustion" })).toBe(false);
+    expect(inputs).toHaveLength(0);
+  });
+
+  it("the agent.error arm is untouched by reason / strictGeneration", async () => {
+    const a = eventsPages([{ Items: [] }]);
+    await hasAgentErrorSince(a.ddb, "events", "wf_1", "TEAM-2", iso(60_000),
+      { types: ["agent.error", "agent.died"], claimGeneration: GEN, strictGeneration: true, reason: "transient_exhaustion" });
+    expect(filterOf(a.inputs)).toContain("(#t = :err AND (attribute_not_exists(detail.reason) OR detail.reason <> :dead))");
+    expect(filterOf(a.inputs)).toContain(":dreason");
+    expect(filterOf(a.inputs).match(/:dreason/g)).toHaveLength(1);
+  });
+});

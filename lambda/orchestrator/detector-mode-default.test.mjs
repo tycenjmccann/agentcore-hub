@@ -21,7 +21,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Survives vi.resetModules(): each re-imported index.mjs uses the SAME mocked
 // createDetector, whose runSweep records the mode it was called with here.
-const h = vi.hoisted(() => ({ modes: [] }));
+const h = vi.hoisted(() => ({ modes: [], deps: null }));
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 vi.mock("@aws-sdk/lib-dynamodb", () => ({
@@ -54,7 +54,7 @@ vi.mock("@aws-sdk/client-bedrock-agent-runtime", () => ({
 }));
 // Capture the mode index hands to the sweep; ignore the injected deps.
 vi.mock("./dead-session-detector.mjs", () => ({
-  createDetector: () => ({
+  createDetector: (deps) => (h.deps = deps, {
     runSweep: async (mode) => { h.modes.push(mode); return { mode, sweptBy: "stub" }; },
   }),
   emitMetrics: () => {},
@@ -133,5 +133,25 @@ describe("DEAD_SESSION_DETECTOR_MODE default (index.mjs sweep dispatch)", () => 
     // index does NOT re-classify: it forwards the raw value; runSweep normalizes
     // it to shadow (see dead-session-detector.test.mjs "mode normalization").
     expect(h.modes).toEqual(["definitely-not-a-mode"]);
+  });
+});
+
+/**
+ * TEAM-5977 — getDetector() must hand the detector the REAL positive-death
+ * read. Without it `lease.hasAgentErrorSince` is undefined in production, the
+ * detector's agent.died arm (and the shadow-mode transient-exhaustion release)
+ * never runs, and a reported death waits out the median threshold — or, in
+ * shadow, waits forever.
+ */
+describe("getDetector wiring (TEAM-5977)", () => {
+  it("injects lease.hasAgentErrorSince into the detector's lease object", async () => {
+    delete process.env.DEAD_SESSION_DETECTOR_MODE;
+    const handler = await loadHandler();
+    await handler({ ...SWEEP_EVENT });
+
+    const realLease = await import("./lease.mjs");
+    expect(typeof h.deps?.lease?.hasAgentErrorSince).toBe("function");
+    expect(h.deps.lease.hasAgentErrorSince).toBe(realLease.hasAgentErrorSince);
+    expect(h.deps.lease.stealClaim).toBe(realLease.stealClaim);
   });
 });
