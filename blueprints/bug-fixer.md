@@ -63,8 +63,21 @@ no `phase`, no `spawned_by_kind` — the roster phases hold the run open):
 4. `CD: follow-up PR <pr_url>` → `agentcore_hub_release_manager`,
    `blocked_by` the Merge Approval ticket.
 Every description carries the `pr_url`, the PR head SHA and a
-`base_branch: <the PR's base>` line. One chain per PR: list the epic's tickets
-first and never re-file a chain whose titles already name your `pr_url`. Then
+`base_branch: <the PR's base>` line.
+**One chain per PR, reconciled on every pass.** The four creates are separate
+calls and a session can stop between them (e.g. CI + Ship filed, no Merge
+Approval or CD). So every pass — your first filing, any retry, and every
+orphan-adoption pass (release-manager.md "Orphan rule (TEAM-6032)",
+qa-verifier.md) — lists the epic's tickets first and reconciles all four links
+for that `pr_url`: a link whose title already names the `pr_url` is reused,
+never re-filed; create only the missing links, each `blocked_by` its
+predecessor above (nothing when that predecessor is already Done); and an
+existing link whose `blocked_by` lacks its not-yet-Done predecessor gets it via
+`Tickets___update_ticket(ticket_id=<link>, blocked_by="<its current blockers + predecessor>")`.
+A chain is complete only when all four exist with those edges. Chains for
+different PRs are not serialized and may run concurrently; each keeps its own
+CI certification and deploy ledger (release-manager.md Step 1 "SHA
+cross-check" and "The CD ledger"). Then
 `report_completion` with `pr_url` (a fix based on the default branch is refused
 without it). Pre-merge fixes — a PR into the live integration branch — are
 unchanged: you merge them yourself (Step 4) and the unified PR carries them.
