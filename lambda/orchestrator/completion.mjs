@@ -854,13 +854,13 @@ export function repoTargets(repoConfig) {
 
 /**
  * TEAM-6133 — the ONE PR-url parser: the first http(s) URL token in `text` whose host is
- * exactly github.com (any case; `new URL` lowercases it) and whose path is
- * /<owner>/<repo>/pull/<n>. A look-alike host (notgithub.com, example.org/github.com/…) is null.
+ * exactly github.com (any case; `new URL` lowercases it) and whose path is /<owner>/<repo>/pull/<n>, <n> a WHOLE
+ * positive integer (TEAM-6148: `1not-a-pr`, `1%2Fx`, `0` are null; prose punctuation is stripped off the token first). A look-alike host (notgithub.com, example.org/github.com/…) is null.
  */
 export function githubPrRef(text) {
   for (const tok of String(text ?? "").match(/https?:\/\/\S+/gi) || []) {
-    let u; try { u = new URL(tok); } catch { continue; }
-    const p = u.pathname.split("/"), n = /^\d+/.exec(p[4] || "");
+    let u; try { u = new URL(tok.replace(/[.,;:!?)\]}>'"]+$/, "")); } catch { continue; } // TEAM-6148: prose punctuation off the token
+    const p = u.pathname.split("/"), n = /^[1-9]\d*$/.exec(p[4] || "");
     if (u.hostname === "github.com" && p[1] && p[2] && p[3] === "pull" && n) return { owner: p[1], repo: p[2], number: Number(n[0]) };
   }
   return null;
