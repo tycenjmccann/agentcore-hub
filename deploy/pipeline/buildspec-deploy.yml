@@ -14,6 +14,9 @@
 # green means deployed-and-verified — it no longer exits 2 (#464). Before the
 # manifest existed the pipeline shipped 3 of ~14 surfaces and
 # everything else drifted behind main for days (audit 2026-09-04).
+# One exception runs BEFORE anything ships: when the plan updates a ticket twin,
+# pre_build refuses the whole deploy unless that twin's live role already holds
+# the handoff-applied s3:ListBucket grant its code depends on (TEAM-5910).
 #
 # The entire deploy runs inside ONE build-phase block with a bash `trap` so that
 # ANY failure — orchestrator update, S3 merge, ECS roll, eval targets, OR a
@@ -88,6 +91,22 @@ phases:
         # CodeBuild phase boundaries; write it to a file the build block reads).
         if grep -q '^HANDOFF' /tmp/deploy-plan.tsv; then printf 1 > /tmp/eval-handoff; else printf 0 > /tmp/eval-handoff; fi
         grep '^HANDOFF' /tmp/deploy-plan.tsv | cut -f2 > /tmp/eval-files || true
+      # ── TEAM-5910: ticket-twin preflight (before anything touches prod) ──
+      #
+      # Both ticket twins refuse every non-ship Done that S3 cannot prove has no
+      # completion record, and S3 answers a missing key with 404 (not 403) only to
+      # a role holding s3:ListBucket on the bucket. That grant lands ONLY through
+      # deploy/setup-tickets-lambda.mjs (a handoff), while Target 1b ships twin code
+      # with update-function-code alone — so without this, a green deploy could ship
+      # code that refuses every non-ship Done fleet-wide. For each twin in the plan,
+      # twin-preflight.mjs reads the function's Role + ARTIFACT_BUCKET (no other env
+      # value) and the role's INLINE policies, and refuses unless an unconditioned
+      # ListBucket is there. Unreadable, conditioned, managed-policy-only or Denied
+      # all refuse. A failed pre_build skips the whole build phase: nothing ships,
+      # nothing rolls back, the baseline stays put so the next run re-plans the twin.
+      - |
+        node deploy/lib/twin-preflight.mjs --plan /tmp/deploy-plan.tsv --bucket "${ARTIFACT_BUCKET:-}" --region "${AWS_REGION_HUB:-}" \
+          || { echo "TEAM-5910 ticket-twin preflight REFUSED - nothing deployed (DEPLOY.md: run deploy/setup-tickets-lambda.mjs)" >&2; exit 1; }
 
   build:
     commands:
