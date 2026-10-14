@@ -2060,3 +2060,44 @@ async def test_team5999_a_row_never_straddles_a_completed_message() -> None:
     assert _surviving_text(puts, deletes) == "X" * 150 + "Z"
     assert deletes == [], "the partial never reached DDB, so there was nothing to delete"
     assert errors == [] and deaths == []
+
+
+@pytest.mark.asyncio
+async def test_team6000_a_second_invocation_overwriting_the_globals_does_not_restamp_the_first_turns_death() -> None:
+    """TEAM-6000: `_CURRENT_TICKET_ID` / `_CURRENT_CLAIM_STARTED_AT` /
+    `_CURRENT_WORKFLOW_ID` are module globals, rewritten by every invocation that
+    lands in this process. A turn mid-outage that read them at death time stamped
+    its agent.died, its resume fence, its agent.error and its exhaustion comment
+    with the NEWER invocation's ticket and generation — a strict match for a LIVE
+    claim, which the detector (DL-038) now acts on within one sweep. The turn
+    snapshots its own identity at start and every teardown reader uses it."""
+    holder: dict[str, Any] = {}
+
+    def _second_invocation_lands(agent: Any) -> None:
+        # What `_run_agent_invocation` does first for a different ticket.
+        holder["ns"]["_CURRENT_WORKFLOW_ID"] = "wf_other"
+        holder["ns"]["_CURRENT_TICKET_ID"] = "TEAM-OTHER"
+        holder["ns"]["_CURRENT_CLAIM_STARTED_AT"] = "2026-10-14T13:00:00.000Z"
+
+    ns, agent_cls, errors, deaths = _load(
+        [[_second_invocation_lands, ServiceUnavailableException("Bedrock is unable to process your request")]]
+    )
+    holder["ns"] = ns
+    payload = {**PAYLOAD, "claim_started_at": "2026-10-14T12:00:00.000Z"}
+
+    with pytest.raises(ServiceUnavailableException):
+        async for _ in ns["_run_agent_invocation"](payload, CTX):
+            pass
+
+    assert len(deaths) == 1, deaths
+    args, kwargs = deaths[0]
+    assert args[:3] == ("wf_retry", "agentcore_hub_backend_dev", "TEAM-4739"), args
+    assert kwargs["claim_started_at"] == "2026-10-14T12:00:00.000Z", kwargs
+    assert kwargs["reason"] == "transient_exhaustion"
+    (resume,) = ns["_test_resumes"]
+    assert resume[0][:3] == ("wf_retry", "agentcore_hub_backend_dev", "TEAM-4739"), resume
+    assert resume[1]["claim_started_at"] == "2026-10-14T12:00:00.000Z", resume
+    (comment,) = ns["_test_comments"]
+    assert comment["ticket_id"] == "TEAM-4739", comment
+    (err_args, err_kwargs) = errors[0]
+    assert err_args[0] == "wf_retry" and err_kwargs.get("ticket_id") == "TEAM-4739", (err_args, err_kwargs)

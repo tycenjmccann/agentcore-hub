@@ -3,8 +3,9 @@
 Before this, a bound turn whose stream RETURNED with neither
 WorkflowOutput___report_completion nor a park of its own ticket was filed as a
 platform death (`agent.died`). The orchestrator only acts on that once the lease
-is dead, and the persona's own prose had just renewed it, so the ticket sat
-in_progress for the full 30-min TTL.
+is dead (a holder-stamped transient_exhaustion death is the one exception —
+DL-038 / TEAM-6000), and the persona's own prose had just renewed it, so the
+ticket sat in_progress for the full 30-min TTL.
 
 Now such a turn is re-prompted ONCE on the same Agent (`_FINAL_TURN_NUDGE`), and
 if the re-prompt still does neither, the harness fails CLOSED: it files a

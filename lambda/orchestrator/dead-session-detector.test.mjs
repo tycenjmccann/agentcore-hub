@@ -1258,23 +1258,112 @@ describe("positive death via agent.died (TEAM-4739)", () => {
       { types: ["agent.died"], claimGeneration: FRESH_STARTED });
   });
 
-  it("does NOT override the live-lease guard — a live lease stays untouched", async () => {
+  // TEAM-6000 (DL-038): the ONE read GUARD 1 may issue against a live lease is the
+  // strict transient-exhaustion read (claim-stamped, reason-filtered). The LOOSE
+  // read — any agent.died for this claim — still waits for the lease to expire.
+  const STRICT = { types: ["agent.died"], claimGeneration: FRESH_STARTED, strictGeneration: true, reason: "transient_exhaustion" };
+  const isStrict = (opts) => opts?.strictGeneration === true && opts?.reason === "transient_exhaustion";
+
+  it("does NOT override the live-lease guard — a generic agent.died leaves a live lease untouched", async () => {
     const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
     lease.isLeaseLive.mockReturnValue(true);
-    lease.hasAgentErrorSince = vi.fn(async () => true);
+    lease.hasAgentErrorSince = vi.fn(async (...a) => !isStrict(a[5])); // a loose death exists; no exhaustion death
     const { runSweep } = createDetector(deps);
 
     const m = await runSweep("enforce");
 
     expect(m.skippedLiveLease).toBe(1);
     expect(m.fired).toBe(0);
-    // GUARD 1 short-circuits BEFORE the death read is even attempted.
-    expect(lease.hasAgentErrorSince).not.toHaveBeenCalled();
+    // GUARD 1 short-circuits BEFORE the loose death read is attempted: the only
+    // read a live lease permits is the strict exhaustion read (TEAM-6000).
+    expect(lease.hasAgentErrorSince).toHaveBeenCalledTimes(1);
+    expect(lease.hasAgentErrorSince.mock.calls[0][5]).toEqual(STRICT);
     expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
     expect(lease.stealClaim).not.toHaveBeenCalled();
   });
 
-  it("TEAM-5977: enforce issues NO strict transient-exhaustion read; meta records effectiveMode", async () => {
+  it.each(["enforce", "shadow"])("TEAM-6000: a LIVE lease with the holder's own gen-matched exhaustion death is stolen and re-dispatched on THIS sweep (%s)", async (mode) => {
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
+    lease.isLeaseLive.mockReturnValue(true); // the backoff heartbeats that preceded the death
+    lease.hasAgentErrorSince = vi.fn(async (...a) => isStrict(a[5]) && a[5].claimGeneration === FRESH_STARTED);
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep(mode);
+
+    expect(m.skippedLiveLease).toBe(0);
+    expect(m.fired).toBe(1);
+    // One read only: the strict one at GUARD 1 — no loose read, no second strict read at the promotion.
+    expect(lease.hasAgentErrorSince).toHaveBeenCalledTimes(1);
+    expect(lease.hasAgentErrorSince.mock.calls[0][5]).toEqual(STRICT);
+    expect(store.markDeadSessionDetected).toHaveBeenCalledWith("wf_1", "TEAM-2", FRESH_STARTED);
+    expect(lease.stealClaim).toHaveBeenCalledWith(deps.ddb, "workflows", "wf_1", "TEAM-2", FRESH_STARTED);
+    expect(store.incrementDeadSessionRetry).toHaveBeenCalledTimes(1);
+    expect(deps.redispatch).toHaveBeenCalledTimes(1);
+    // The TOCTOU re-check carries the gen-fenced result: no second activity read.
+    expect(lease.lastAgentActivity).toHaveBeenCalledTimes(1);
+    const errs = eventsOfType(deps.publishEvent, "agent.error");
+    expect(errs).toHaveLength(1);
+    expect(errs[0][2].detectorMeta).toMatchObject({ positiveDeath: true, liveLeaseBypass: true, effectiveMode: "enforce" });
+    expect(eventsOfType(deps.publishEvent, "dead_session.shadow")).toHaveLength(0);
+  });
+
+  it("TEAM-6000: a stale exhaustion death from an OLDER generation never releases the NEWER live claim", async () => {
+    const OLD_GEN = new Date(NOW - 2 * 60 * 60 * 1000).toISOString();
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
+    lease.isLeaseLive.mockReturnValue(true);
+    // Models lease.mjs's server-side filter: the row is stamped OLD_GEN, the query asks for FRESH_STARTED.
+    lease.hasAgentErrorSince = vi.fn(async (...a) => isStrict(a[5]) && a[5].claimGeneration === OLD_GEN);
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(m.skippedLiveLease).toBe(1);
+    expect(m.fired).toBe(0);
+    expect(lease.hasAgentErrorSince).toHaveBeenCalledTimes(1);
+    expect(lease.hasAgentErrorSince.mock.calls[0][5].claimGeneration).toBe(FRESH_STARTED);
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("TEAM-6000: a gen-matched death with another reason still waits for the lease to expire", async () => {
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
+    lease.isLeaseLive.mockReturnValue(true);
+    lease.hasAgentErrorSince = vi.fn(async (...a) => a[5]?.reason !== "transient_exhaustion"); // claim-stamped, no reason
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("shadow");
+
+    expect(m.skippedLiveLease).toBe(1);
+    expect(m.fired).toBe(0);
+    expect(lease.hasAgentErrorSince).toHaveBeenCalledTimes(1);
+    expect(lease.hasAgentErrorSince.mock.calls[0][5]).toEqual(STRICT);
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+    expect(lease.stealClaim).not.toHaveBeenCalled();
+    expect(eventsOfType(deps.publishEvent, "dead_session.shadow")).toHaveLength(0);
+  });
+
+  it("TEAM-6000: a claim re-issued between the stamp and the steal loses at the steal CAS — no redispatch", async () => {
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
+    lease.isLeaseLive.mockReturnValue(true);
+    lease.hasAgentErrorSince = vi.fn(async (...a) => isStrict(a[5]) && a[5].claimGeneration === FRESH_STARTED);
+    lease.stealClaim = vi.fn(async () => false); // what the CAS returns for a NEW startedAt
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("enforce");
+
+    expect(store.markDeadSessionDetected).toHaveBeenCalledWith("wf_1", "TEAM-2", FRESH_STARTED);
+    expect(lease.stealClaim).toHaveBeenCalledWith(deps.ddb, "workflows", "wf_1", "TEAM-2", FRESH_STARTED);
+    expect(lease.lastAgentActivity).toHaveBeenCalledTimes(1); // the re-check carried the result; the CAS was the fence
+    expect(m.fired).toBe(0);
+    expect(eventsOfType(deps.publishEvent, "agent.error")).toHaveLength(0);
+    expect(store.incrementDeadSessionRetry).not.toHaveBeenCalled();
+    expect(deps.redispatch).not.toHaveBeenCalled();
+  });
+
+  it("TEAM-5977: on a DEAD lease, enforce issues NO strict transient-exhaustion read; meta records effectiveMode", async () => {
+    // TEAM-6000: the strict read is GUARD 1's live-lease exception only; the
+    // dead-lease enforce path is unchanged — one loose read, no reason filter.
     const { deps, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
     lease.hasAgentErrorSince = vi.fn(async () => true);
     const { runSweep } = createDetector(deps);
