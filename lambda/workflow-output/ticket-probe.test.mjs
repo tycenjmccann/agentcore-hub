@@ -2142,7 +2142,7 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     expect(fake.calls.some((c) => c.tool === "Tickets___transition_ticket" && c.params?.ticket_id === BUILD)).toBe(false);
     expect(record()).toMatchObject({ ticketWrites: "dropped", replayDropped: { step: "amendment" } });
     expect(record().replayDropped.error).toMatch(/design amendment TEAM-5698 reads To Do/);
-    expect(record().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND, provisional: true });
+    expect(record().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND, provisional: true, provisionalNonce: expect.any(String) });
     for (const twin of TWIN_GUARDS) {
       expect((await twin()).securityReviewRecordRefusal(KEY, record())).toMatch(/PROVISIONAL securityReview admission on amendment TEAM-5698/);
     }
