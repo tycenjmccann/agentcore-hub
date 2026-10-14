@@ -15,6 +15,14 @@ const blueprints = readdirSync(DIR)
   .filter((f) => f.endsWith(".md"))
   .map((f) => ({ file: f, text: readFileSync(join(DIR, f), "utf8").replace(/\s+/g, " ") }));
 const read = (name: string) => blueprints.find((b) => b.file === `${name}.md`)!.text;
+const ARCH = readFileSync(join(__dirname, "../../../docs/architecture.md"), "utf8").replace(/\s+/g, " ");
+/** `text` from `start` up to the first `end` after it; fails loudly when `start` is missing. */
+const section = (text: string, start: string, end: string) => {
+  const i = text.indexOf(start);
+  expect(i, `missing section start: ${start}`).toBeGreaterThanOrEqual(0);
+  const j = text.indexOf(end, i + start.length);
+  return text.slice(i, j < 0 ? undefined : j);
+};
 
 describe("blueprint PR-base rules (TEAM-5854)", () => {
   it("every `gh pr list … --state merged` check is scoped with --base", () => {
@@ -269,14 +277,67 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     expect(offenders).toEqual([]);
   });
 
-  it("release-manager ships follow-up pairs, files orphans, and archives the earlier cd-ledger", () => {
+  // TEAM-6134 retired the cd-ledger mergeCommit archive (see the F3 test below).
+  it("release-manager ships follow-up pairs and files orphans", () => {
     const t = read("release-manager");
     expect(t).toContain("Ship: follow-up PR");
     expect(t).toContain("CD: follow-up PR");
     expect(t).toContain("Orphan rule (TEAM-6032)");
     expect(t).toContain("open_follow_up_pr");
-    expect(t).toContain("workflows/{workflow_id}/shared/cd-ledger-<its mergeCommit>.json");
-    expect(t).toMatch(/copy it verbatim to `workflows\/\{workflow_id\}\/shared\/cd-ledger-<its mergeCommit>\.json`.*only THEN start a fresh ledger/);
+  });
+
+  // TEAM-6134 F1 (ship review of #954): the four chain tickets are four separate creates, so a
+  // session can stop after CI + Ship. Title de-dup alone then never files Merge Approval/CD, and
+  // the RM orphan rule skipped any PR that already had a Ship ticket. Every pass reconciles all four.
+  it("every follow-up chain filing and orphan pass reconciles all four links and their edges (TEAM-6134)", () => {
+    const chain = section(read("bug-fixer"), "### Post-merge follow-up PR: file its ship chain", "**Hub-infra fix PR.**");
+    expect(chain).toContain("**One chain per PR, reconciled on every pass.**");
+    expect(chain).toContain("reconciles all four links for that `pr_url`");
+    expect(chain).toContain("create only the missing links");
+    expect(chain).toContain('`Tickets___update_ticket(ticket_id=<link>, blocked_by="<its current blockers + predecessor>")`');
+    expect(chain).toContain("A chain is complete only when all four exist with those edges");
+    expect(chain).not.toContain("never re-file a chain whose titles already name your `pr_url`");
+    const orphan = section(read("release-manager"), "**Orphan rule (TEAM-6032).**", "Both kinds share:");
+    expect(orphan).not.toContain("that has no `Ship: follow-up PR <url>` ticket");
+    expect(orphan).toContain("whose chain is incomplete");
+    expect(orphan).toContain("create only the missing links and repair only the missing edges");
+  });
+
+  // TEAM-6134 F2: follow-up chains run concurrently, so "the newest CI record under the epic" can be
+  // another PR's — a spurious SHA mismatch for A and the wrong cert in A's brief. The unified PR
+  // keeps today's selection (its CI tickets are the only ones until a follow-up exists).
+  it("a PR's CI certification is the newest CI record for THAT PR, never another PR's (TEAM-6134)", () => {
+    const step1 = section(read("release-manager"), "### Step 1: Open (or adopt) the unified PR", "### Step 2:");
+    expect(step1).toContain("**SHA cross-check:** read the NEWEST CI completion record for THIS PR");
+    expect(step1).toContain("For the run's unified PR that is the run's CI tickets whose titles name no follow-up PR (the Tier-5 CI ticket or the latest `CI (re-cert)` ticket)");
+    expect(step1).toContain("`CI (re-cert): follow-up PR <url>`");
+    expect(step1).toContain("another PR's CI record never invalidates or supplies this PR's certification");
+    expect(step1).toContain("from that same NEWEST CI completion record for THIS PR");
+    expect(read("ci-agent")).toContain("A `CI (re-cert): follow-up PR <pr_url>` ticket certifies that PR");
+    expect(read("qa-verifier")).toContain("the NEWEST CI completion record for the PR you are verifying");
+    const STALE = [/newest CI record under the epic/i, /NEWEST CI completion record — the most recently closed/];
+    const offenders = blueprints.flatMap(({ file, text }) => STALE.filter((r) => r.test(text)).map((r) => `${file}: ${r}`));
+    expect(offenders).toEqual([]);
+  });
+
+  // TEAM-6134 F3: the archive rule assumed the other PR's deploy was finished. Chains are not
+  // serialized, so a re-dispatched CD-A found B's ledger and started fresh instead of resuming.
+  // Each follow-up CD owns cd-ledger-<CD ticket id>.json; the unified CD's cd-ledger.json is untouched.
+  it("a follow-up CD keeps its own ledger keyed by its CD ticket and resumes it first (TEAM-6134)", () => {
+    const rm = read("release-manager");
+    const ledger = section(rm, "#### The CD ledger", "1. **Preflight:**");
+    expect(ledger).toContain("`workflows/{workflow_id}/shared/cd-ledger.json` is this run's deploy record, and reading it");
+    expect(ledger).toContain("**One ledger per CD ticket (follow-up CD).**");
+    expect(ledger).toContain("`workflows/{workflow_id}/shared/cd-ledger-<CD ticket id>.json`");
+    expect(ledger).toContain("read it FIRST on every invocation, write it the moment `start_deploy` returns, and resume its `executionId` before any new start");
+    expect(ledger).toContain("never writes, copies or archives `shared/cd-ledger.json`");
+    expect(ledger).toContain("passes `pipeline_name` on `report_completion`");
+    expect(rm).toContain("Write `shared/cd-ledger.json` (on a follow-up CD, your `cd-ledger-<CD ticket id>.json`) the instant");
+    const offenders = blueprints.filter(({ text }) => /cd-ledger-<its mergeCommit>|only THEN start a fresh ledger/.test(text)).map((b) => b.file);
+    expect(offenders).toEqual([]);
+    expect(read("bug-fixer")).toContain("Chains for different PRs are not serialized");
+    expect(ARCH).toContain("**Persisted state: the follow-up CD ledger (`workflows/{id}/shared/cd-ledger-<CD ticket id>.json`).**");
+    expect(ARCH).not.toContain("**Persisted state: the cd-ledger archive");
   });
 
   it("qa-verifier treats a post-merge fix delivered only on its follow-up CD merge_commit", () => {
