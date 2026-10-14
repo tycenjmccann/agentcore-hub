@@ -2,6 +2,9 @@ import { describe, it, expect } from "vitest";
 import {
   completionRecordHasEvidence as hasEvidenceTs,
   evidenceBackfillFields as backfillTs,
+  isIntentOnlyReservation as isReservationTs,
+  RESERVATION_FIELD as RESERVATION_FIELD_TS,
+  DONE_INTENT_RESERVATION as DONE_INTENT_RESERVATION_TS,
 } from "./completion-evidence";
 // The orchestrator (Lambda) port. Both copies MUST agree — a drift means the HTTP
 // complete route and the orchestrator twin disagree on whether a completions
@@ -48,6 +51,28 @@ const RECORDS: Array<[string, unknown]> = [
   ],
   ["oversized summary", { summary: "x".repeat(20000), branch: "b" }],
   ["blank branch", { summary: "s", branch: "" }],
+  // TEAM-5959: the ticket twins' Done-intent reservation is NOT evidence (nor a record).
+  ["Done-intent reservation", { reservation: "done-intent", ticketId: "T-1", doneIntent: { at: "2026-10-14T06:00:00.000Z", provider: "jira", nonce: "n" } }],
+  ["Done-intent reservation, intent cleared", { reservation: "done-intent", ticketId: "T-1" }],
+  ["reservation a hold was stamped onto", { reservation: "done-intent", ticketId: "T-1", briefPending: true, ticketWrites: "dropped" }],
+  ["reservation a real writer filled", { reservation: "done-intent", ticketId: "T-1", summary: "did it", doneIntent: { at: "x" } }],
+];
+
+/** TEAM-5959: isIntentOnlyReservation rows — marker AND no key outside {reservation, ticketId, doneIntent}. */
+const RESERVATIONS: Array<[string, unknown, boolean]> = [
+  ["bare reservation", { reservation: "done-intent", ticketId: "T-1", doneIntent: { at: "x", provider: "jira", nonce: "n" } }, true],
+  ["intent cleared", { reservation: "done-intent", ticketId: "T-1" }, true],
+  ["marker only", { reservation: "done-intent" }, true],
+  ["+ briefPending (a hold)", { reservation: "done-intent", ticketId: "T-1", briefPending: true }, false],
+  ["+ followUpsPending (a hold)", { reservation: "done-intent", ticketId: "T-1", followUpsPending: true }, false],
+  ["+ summary (a real writer)", { reservation: "done-intent", ticketId: "T-1", summary: "s" }, false],
+  ["+ ticketWrites (the drain)", { reservation: "done-intent", ticketId: "T-1", ticketWrites: "dropped" }, false],
+  ["wrong marker value", { reservation: "other", ticketId: "T-1" }, false],
+  ["no marker, intent only", { ticketId: "T-1", doneIntent: { at: "x" } }, false],
+  ["blank record", {}, false],
+  ["null", null, false],
+  ["array", [], false],
+  ["string", "reservation", false],
 ];
 
 const ENTRIES: Array<[string, Record<string, unknown> | undefined | null]> = [
@@ -63,6 +88,28 @@ const ENTRIES: Array<[string, Record<string, unknown> | undefined | null]> = [
 ];
 
 describe("completion-evidence parity: completion-evidence.ts ≡ completion.mjs", () => {
+  // TEAM-5959: the orchestrator copy carries NO reservation predicate on purpose (DL-009:
+  // its line budget is at the limit, and it needs none — completionRecordHasEvidence's
+  // field rule already reads a reservation as "no evidence", asserted below for BOTH
+  // copies). The TS predicate is what the hub routes (cancel sweep, transition refill) use;
+  // gate-contract-parity.test.ts pins its literals to the twins' canonical copy.
+  it("TEAM-5959: the Done-intent reservation marker literals match the twins' gate-contract", () => {
+    expect(RESERVATION_FIELD_TS).toBe("reservation");
+    expect(DONE_INTENT_RESERVATION_TS).toBe("done-intent");
+  });
+
+  it("TEAM-5959: isIntentOnlyReservation answers every row, and a reservation is never evidence in EITHER copy", () => {
+    for (const [label, record, expected] of RESERVATIONS) {
+      expect(isReservationTs(record), `ts: ${label}`).toBe(expected);
+      if (expected) {
+        expect(hasEvidenceTs(record), `ts evidence: ${label}`).toBe(false);
+        expect(hasEvidenceMjs(record), `mjs evidence: ${label}`).toBe(false);
+        expect(backfillTs(record, {}), `ts backfill: ${label}`).toEqual({});
+        expect(backfillMjs(record, {}), `mjs backfill: ${label}`).toEqual({});
+      }
+    }
+  });
+
   it("completionRecordHasEvidence agrees on every record fixture", () => {
     let compared = 0;
     for (const [label, record] of RECORDS) {
@@ -105,6 +152,11 @@ describe("completion-evidence parity: completion-evidence.ts ≡ completion.mjs"
       "full record incl. ship signals": true,
       "oversized summary": true,
       "blank branch": true,
+      // TEAM-5959: a reservation is never evidence; one a real writer filled is (summary).
+      "Done-intent reservation": false,
+      "Done-intent reservation, intent cleared": false,
+      "reservation a hold was stamped onto": false,
+      "reservation a real writer filled": true,
     };
     for (const [label, record] of RECORDS) {
       expect(hasEvidenceTs(record), label).toBe(expected[label]);

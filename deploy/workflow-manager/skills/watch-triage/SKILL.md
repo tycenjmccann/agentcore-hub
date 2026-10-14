@@ -84,6 +84,15 @@ blockers:
   PY
   ```
 
+  A 412 whose existing body is ONLY `{"reservation": "done-intent", "ticketId": …,
+  "doneIntent": {…}}` (the `doneIntent` may be absent) is **not a record**: it is the
+  ticket twins' Done-intent reservation (TEAM-5959), left behind when a Done was
+  committed or attempted on a ticket that had no record. Every reader (the evidence
+  gate included) treats it as "no record", so the run stays blocked until a real
+  record replaces it. Replace it conditionally: `get_object` it, keep its `doneIntent`
+  field verbatim in `rec`, drop `reservation`, and `put_object(..., IfMatch=<its ETag>)`.
+  Any other existing body is the agent's record — leave it alone.
+
   (CLI equivalent: `aws s3api put-object --if-none-match '*' …` needs AWS CLI
   v2 ≥ 2.17 — on anything older do an `aws s3api head-object` existence check
   first, and never a plain `aws s3 cp`.) If the printed existing record already

@@ -414,6 +414,25 @@ describe("TEAM-5421 U6 — cancel close-out (DynamoDB)", () => {
     expect(body.tickets.keptByRecord).toEqual(["DEV"]);
   });
 
+  it("TEAM-5959: an open ticket whose record is only a twin's Done-intent reservation is swept like one with no record", async () => {
+    seedRun();
+    h.state.s3.set("completions/DEV.json", JSON.stringify({ reservation: "done-intent", ticketId: "DEV", doneIntent: { at: "2026-10-14T06:00:00.000Z", provider: "dynamodb", nonce: "n" } }));
+    h.state.s3.set("completions/FU2.json", JSON.stringify({ reservation: "done-intent", ticketId: "FU2" })); // intent cleared, still a reservation
+    const { body } = await post();
+    expect(ticket("DEV").status).toBe("cancelled");
+    expect(body.tickets.keptByRecord ?? []).toEqual([]);
+    expect(body.followUpsMoved).toBe(2); // FU2 moved with FU1: a reservation is no record
+    expect(ticket("FU2").parentId).toBe(body.postRunEpicKey);
+  });
+
+  it("TEAM-5959: a reservation a hold was stamped onto is a record — the ticket is kept", async () => {
+    seedRun();
+    h.state.s3.set("completions/DEV.json", JSON.stringify({ reservation: "done-intent", ticketId: "DEV", briefPending: true }));
+    const { body } = await post();
+    expect(ticket("DEV").status).toBe("todo");
+    expect(body.tickets.keptByRecord).toEqual(["DEV"]);
+  });
+
   it("a CD-blocked follow-up with a completion record is kept as it is, never moved or rewritten", async () => {
     seedRun();
     h.state.s3.set("completions/FU2.json", JSON.stringify({ status: "done" }));

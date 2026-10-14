@@ -13,9 +13,12 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
+import "./hermetic-s3.mjs"; // TEAM-5892: no S3 call in this file reaches the network
 import { adfToText, getIssue, handler, clampSummary, SEARCH_MAX_PAGES, mapStatusToInternal, findCancelTransition } from "./index.mjs";
 import { parseFixContractBlock } from "./fix-contract.mjs";
+import * as gateContract from "./gate-contract.mjs"; // TEAM-5926 (namespace: the suite still loads where an export is missing)
 
 // ─── Finding 1: adfToText ──────────────────────────────────────────────────────
 
@@ -1952,16 +1955,41 @@ const SHIP_ROSTER = {
  * neither followUpsPending nor status — which is what every test written before that
  * field existed assumed. `recordBodies[key]` overrides with a RAW STRING, so a
  * pending record, a non-JSON body and an empty body are all expressible.
+ * `recordBodyError` (TEAM-5832) makes GetObject succeed and the body stream throw.
+ * TEAM-5926: `recordBodies` is read on every GET, so a test may mutate it mid-call (a
+ * concurrent writer); `recordError` may be a function of the 0-based record-read
+ * index; each body is served with an ETag derived from it, as S3 does.
  */
-async function loadShipGate({ records = [], recordBodies = {}, recordError = null, bucket = "test-bucket" } = {}) {
+async function loadShipGate({ records = [], recordBodies = {}, recordError = null, recordBodyError = null, bucket = "test-bucket" } = {}) {
   process.env.ARTIFACT_BUCKET = bucket;
   const mod = await import(`./index.mjs?ship-gate=${loadSeq++}`);
-  const s3Calls = { records: [], gets: [] };
+  const s3Calls = { records: [], gets: [], puts: [], onRecordPut: null };
+  const etagOf = (body) => `"${createHash("md5").update(String(body)).digest("hex")}"`;
+  const s3Error = (name, status) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
   mod.s3.send = async (cmd) => {
     const key = cmd?.input?.Key;
+    // TEAM-5941: the Done-intent fence is a conditional PutObject of the record — the
+    // ONLY write this Lambda makes. S3's semantics: IfMatch on a missing key ⇒ 404; a
+    // moved ETag ⇒ 412. `s3Calls.onRecordPut` runs BEFORE the condition is evaluated (a
+    // concurrent writer may mutate `recordBodies`); an Error it returns is the PUT's failure.
+    if (cmd?.constructor?.name === "PutObjectCommand") {
+      s3Calls.puts.push(cmd.input);
+      const refused = await s3Calls.onRecordPut?.(cmd.input);
+      if (refused) throw refused;
+      const exists = key in recordBodies || records.includes(key);
+      if (cmd.input.IfMatch !== undefined && !exists) throw s3Error("NoSuchKey", 404);
+      const cur = key in recordBodies ? recordBodies[key] : JSON.stringify({ ticketId: key.slice("completions/".length).replace(/\.json$/, ""), summary: "shipped" });
+      if ((cmd.input.IfMatch !== undefined && etagOf(cur) !== cmd.input.IfMatch) || (cmd.input.IfNoneMatch === "*" && exists)) {
+        throw s3Error("PreconditionFailed", 412);
+      }
+      recordBodies[key] = String(cmd.input.Body);
+      return { ETag: etagOf(cmd.input.Body) };
+    }
     if (String(key).startsWith("completions/")) {
       s3Calls.records.push(key);
-      if (recordError) throw recordError;
+      const readError = typeof recordError === "function" ? recordError(s3Calls.records.length - 1) : recordError;
+      if (readError) throw readError;
+      if (recordBodyError) return { Body: { transformToString: async () => { throw recordBodyError; } } };
       if (!(key in recordBodies) && !records.includes(key)) {
         const err = new Error("NoSuchKey");
         err.name = "NoSuchKey";
@@ -1972,7 +2000,7 @@ async function loadShipGate({ records = [], recordBodies = {}, recordError = nul
         key in recordBodies
           ? recordBodies[key]
           : JSON.stringify({ ticketId: key.slice("completions/".length).replace(/\.json$/, ""), summary: "shipped" });
-      return { Body: { transformToString: async () => body } };
+      return { ETag: etagOf(body), Body: { transformToString: async () => body } };
     }
     s3Calls.gets.push(key);
     if (key === "config/agents.json") {
@@ -1990,7 +2018,7 @@ async function loadShipGate({ records = [], recordBodies = {}, recordError = nul
  * a transition list containing Done, and records every POST so a refusal can be
  * proven to have written NOTHING.
  */
-function installDoneStub({ labels = [], ticketId = SHIP_TICKET } = {}) {
+function installDoneStub({ labels = [], ticketId = SHIP_TICKET, onComment = null, onTransition = null } = {}) {
   const calls = { labelReads: [], transitions: [], comments: [], restore: null };
   const originalFetch = globalThis.fetch;
   calls.restore = () => { globalThis.fetch = originalFetch; };
@@ -2012,10 +2040,16 @@ function installDoneStub({ labels = [], ticketId = SHIP_TICKET } = {}) {
     }
     if (u.includes("/transitions") && method === "POST") {
       calls.transitions.push(JSON.parse(init.body));
+      // TEAM-5941: a concurrent write while the POST is in flight (after the fence), or a
+      // Response the stub should answer with instead (a 500: the commit fails).
+      const answer = onTransition ? await onTransition(calls.transitions.length - 1) : null;
+      if (answer instanceof Response) return answer;
       return new Response(null, { status: 204 });
     }
     if (u.includes("/comment") && method === "POST") {
       calls.comments.push(JSON.parse(init.body));
+      // TEAM-5926: lets a test land a concurrent write while the comment is in flight.
+      if (onComment) await onComment(calls.comments.length - 1);
       return new Response(JSON.stringify({ id: "1" }), { status: 201 });
     }
     throw new Error(`unexpected ${method} ${u}`);
@@ -2076,14 +2110,15 @@ test("TEAM-4706 (b): the same ship ticket WITH the record transitions normally",
     assert.equal(res.ticketId, SHIP_TICKET);
     assert.equal(res.reason, undefined);
     assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
-    assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+    // TEAM-5926: the guard read, then the post-commit brief-hold re-read.
+    assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY, SHIP_RECORD_KEY]);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
   }
 });
 
-test("TEAM-4706 (c): a NON-ship ticket closes with no record and never probes S3", async () => {
+test("TEAM-4706 (c): a NON-ship ticket closes with no record — one brief-hold read, a 404 admits (TEAM-5832)", async () => {
   const { mod, s3Calls } = await loadShipGate();
   const cap = installDoneStub({ labels: ["agent:agentcore_hub_backend_dev", "phase:development"], ticketId: "TEAM-4067" });
   try {
@@ -2091,10 +2126,9 @@ test("TEAM-4706 (c): a NON-ship ticket closes with no record and never probes S3
 
     assert.equal(res.status, "done");
     assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
-    // The cheap phase predicate runs FIRST: the completion-record probe never
-    // happens. (The only S3 traffic is the cold-start roster config read, which
-    // this Lambda already made before this ticket existed.)
-    assert.deepEqual(s3Calls.records, []);
+    // TEAM-5832: every non-ship Done reads its record for the brief hold; no record ⇒ admit.
+    // TEAM-5926: and re-reads it once the Done is committed.
+    assert.deepEqual(s3Calls.records, ["completions/TEAM-4067.json", "completions/TEAM-4067.json"]);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
@@ -2114,7 +2148,9 @@ test("TEAM-4706 (d): a human-review gate closes with no record — the UI/Telegr
 
     assert.equal(res.status, "done");
     assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
-    assert.deepEqual(s3Calls.records, []);
+    // TEAM-5832: the gate reads its (absent) record for the brief hold — the 404 admits.
+    // TEAM-5926: and re-reads it once the Done is committed.
+    assert.deepEqual(s3Calls.records, ["completions/TEAM-4068.json", "completions/TEAM-4068.json"]);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
@@ -4115,6 +4151,147 @@ test("TEAM-5729 (J3): a park WITHOUT expected_status still stamps the request no
   }
 });
 
+// ── TEAM-5805: the merge-brief hold ──────────────────────────────────────────
+// The replay stamps `briefPending:true` when it could not put the merge brief on the
+// Merge Approval gate. A ship-phase record reads it through judgeCompletionRecord;
+// every other ticket reads it through judgeBriefHold, which (TEAM-5832) fails CLOSED:
+// only a provable 404, or no bucket configured, admits.
+const OPERATOR_LABELS = ["agent:agentcore_hub_operator", "phase:development"];
+
+test("TEAM-5805 (m): a ship-phase record with briefPending:true is REFUSED", async () => {
+  const { res, cap } = await shipDoneWithRecord(
+    JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: false, status: "complete", briefPending: true, briefDelivered: "off_gate" })
+  );
+
+  assert.equal(res.reason, "completion_record_required");
+  assert.match(res.error, /completions\/TEAM-4066\.json has briefPending:true \(brief off_gate\)/);
+  assert.deepEqual(cap.transitions, []);
+});
+
+test("TEAM-5805 (n): the OPERATOR's non-ship ticket with a briefPending:true record is REFUSED, nothing written", async () => {
+  const { res, cap, s3Calls } = await shipDoneWithRecord(
+    JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: false, status: "complete", briefPending: true, briefDelivered: "undelivered" }),
+    { labels: OPERATOR_LABELS }
+  );
+
+  assert.equal(res.ok, false);
+  assert.equal(res.reason, "completion_record_required");
+  assert.equal(res.hint, COMPLETION_HINT);
+  assert.match(res.error, /a ticket whose merge brief is held/);
+  assert.match(res.error, /has briefPending:true \(brief undelivered\)/);
+  assert.deepEqual(cap.transitions, []);
+  assert.deepEqual(cap.comments, []);
+  assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+});
+
+test("TEAM-5805 (o): the operator's ticket closes on a delivered, never-held or missing record", async () => {
+  for (const body of [
+    JSON.stringify({ ticketId: SHIP_TICKET, briefPending: false, briefDelivered: "gate" }),
+    JSON.stringify({ ticketId: SHIP_TICKET, followUpsPending: false, status: "complete" }),
+  ]) {
+    const { res, cap } = await shipDoneWithRecord(body, { labels: OPERATOR_LABELS });
+    assert.equal(res.status, "done", body);
+    assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+  }
+  const { mod } = await loadShipGate();
+  const cap = installDoneStub({ labels: OPERATOR_LABELS });
+  try {
+    const res = await doneTransition(mod.handler);
+    assert.equal(res.status, "done");
+    assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
+  }
+});
+
+// ── TEAM-5832: the brief-hold read fails CLOSED, for every non-ship ticket ────
+const UNKNOWN_5832 = "whether briefPending is set is UNKNOWN";
+const s3Err = (name, status) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+
+/** Done on SHIP_TICKET with the given labels and loadShipGate options; never leaks env or fetch. */
+async function doneWith5832(labels, gateOpts) {
+  const { mod, s3Calls } = await loadShipGate(gateOpts);
+  const cap = installDoneStub({ labels });
+  try {
+    return { res: await doneTransition(mod.handler), cap, s3Calls };
+  } finally {
+    cap.restore();
+    delete process.env.ARTIFACT_BUCKET;
+  }
+}
+
+test("TEAM-5832 (q): an S3 error or a failing body stream on the brief-hold read is REFUSED, nothing written", async () => {
+  for (const [opts, cause] of [
+    [{ recordError: s3Err("AccessDenied", 403) }, "could not read completions/TEAM-4066.json (AccessDenied 403)"],
+    [{ recordError: s3Err("InternalError", 500) }, "could not read completions/TEAM-4066.json (InternalError 500)"],
+    [{ recordError: s3Err("SlowDown", 503) }, "could not read completions/TEAM-4066.json (SlowDown 503)"],
+    [{ recordBodyError: Object.assign(new Error("socket hang up"), { name: "ECONNRESET" }) }, "could not read completions/TEAM-4066.json (ECONNRESET)"],
+  ]) {
+    const { res, cap, s3Calls } = await doneWith5832(OPERATOR_LABELS, opts);
+    assert.equal(res.ok, false, cause);
+    assert.equal(res.reason, "completion_record_required");
+    assert.equal(res.hint, COMPLETION_HINT);
+    assert.ok(res.error.includes("a ticket whose merge-brief hold cannot be read"), res.error);
+    assert.ok(res.error.includes(`${cause} — ${UNKNOWN_5832}`), res.error);
+    // Not the proven-hold text: workflow-output's isBriefHoldRefusal must not match it.
+    assert.doesNotMatch(res.error, /has briefPending:true \(brief /);
+    assert.deepEqual(cap.transitions, []);
+    assert.deepEqual(cap.comments, []);
+    assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+  }
+});
+
+test("TEAM-5832 (r): an unparseable, array, null or empty record body is REFUSED, nothing written", async () => {
+  for (const [body, detail] of [
+    ["not json", "unparseable JSON"],
+    ["[]", "parsed to an array, not an object"],
+    ["null", "parsed to null, not an object"],
+    ["", "an empty body"],
+  ]) {
+    const { res, cap } = await doneWith5832(OPERATOR_LABELS, { recordBodies: { [SHIP_RECORD_KEY]: body } });
+    assert.equal(res.reason, "completion_record_required", body);
+    assert.ok(res.error.includes(`could not judge ${SHIP_RECORD_KEY} (${detail}`), res.error);
+    assert.ok(res.error.includes(UNKNOWN_5832), res.error);
+    assert.deepEqual(cap.transitions, []);
+    assert.deepEqual(cap.comments, []);
+  }
+});
+
+test("TEAM-5805 (p): ANY non-ship agent's held ticket is REFUSED — the writer holds without an assignee check (TEAM-5832)", async () => {
+  const { res, cap, s3Calls } = await shipDoneWithRecord(JSON.stringify({ briefPending: true, briefDelivered: "undelivered" }), {
+    labels: ["agent:agentcore_hub_backend_dev", "phase:development"],
+  });
+
+  assert.equal(res.reason, "completion_record_required");
+  assert.match(res.error, /a ticket whose merge brief is held/);
+  assert.match(res.error, /completions\/TEAM-4066\.json has briefPending:true \(brief undelivered\)/);
+  assert.deepEqual(cap.transitions, []);
+  assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+});
+
+test("TEAM-5832 (s): a held ticket with NO agent: label is REFUSED", async () => {
+  const { res, cap } = await shipDoneWithRecord(JSON.stringify({ briefPending: true, briefDelivered: "off_gate" }), {
+    labels: ["phase:development"],
+  });
+
+  assert.equal(res.reason, "completion_record_required");
+  assert.match(res.error, /has briefPending:true \(brief off_gate\)/);
+  assert.deepEqual(cap.transitions, []);
+  assert.deepEqual(cap.comments, []);
+});
+
+test("TEAM-5832 (t): with ARTIFACT_BUCKET unset a non-ship Done is admitted and makes no record read", async () => {
+  const { res, cap, s3Calls } = await doneWith5832(["agent:agentcore_hub_backend_dev", "phase:development"], {
+    bucket: "",
+    recordBodies: { [SHIP_RECORD_KEY]: JSON.stringify({ briefPending: true }) },
+  });
+
+  assert.equal(res.status, "done");
+  assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+  assert.deepEqual(s3Calls.records, []);
+});
+
 // TEAM-5716: a stale harness park could land after the orchestrator re-dispatched —
 // back in_progress under a NEW claim, so the status fence alone passed and the new
 // invocation's ticket got parked. A claim-stamped park now re-reads the claim on the
@@ -4253,3 +4430,593 @@ test("TEAM-5785: a failed post-POST claim read is unknown, not moved: park kept,
     globalThis.fetch = originalFetch;
   }
 });
+
+// ─── TEAM-5926 (TEAM-5799 ship-review F1): a Done over a concurrent brief hold ───
+// The guard reads the record, then the reason comment is awaited before the Done POST.
+// A replay drain's CAS stamp of briefPending:true landing in that window used to leave
+// a Done ticket under a held record with nothing said. The Done stands (the hub does not
+// undo moves); the post-commit re-read flags it.
+{
+  const KEY = "completions/TEAM-4067.json";
+  const DEV_LABELS = ["agent:agentcore_hub_backend_dev", "phase:development"];
+  const HOLD_BODY = JSON.stringify({ ticketId: "TEAM-4067", briefPending: true, briefDelivered: "off_gate", ticketWrites: "dropped" });
+  const BRIEF_HOLD_REFUSAL_RE = /\bhas briefPending:true \(brief /; // workflow-output's isBriefHoldRefusal
+  const commentTexts = (cap) => cap.comments.map((c) => adfToText(c.body).trim());
+  const s3Unavailable = () => Object.assign(new Error("ServiceUnavailable"), { name: "ServiceUnavailable", $metadata: { httpStatusCode: 503 } });
+
+  test("TEAM-5926 (j1) → TEAM-5959 (F5): a hold created during the reason comment on a ticket with NO record ⇒ the create-only reservation 412s, the re-read is a hold ⇒ REFUSED; Jira never POSTed", async () => {
+    const recordBodies = {};
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({
+      labels: DEV_LABELS, ticketId: "TEAM-4067",
+      onComment: (i) => { if (i === 0) recordBodies[KEY] = HOLD_BODY; },
+    });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+
+      assert.match(res.error, BRIEF_HOLD_REFUSAL_RE, "the standard hold text, so workflow-output answers complete_pending_brief");
+      assert.equal(res.reason, "completion_record_required");
+      assert.equal(res.status, undefined);
+      assert.equal(res.conflict, undefined);
+      assert.deepEqual(cap.transitions, [], "never Done over the hold");
+      assert.equal(s3Calls.puts.length, 1, "the one create-only reservation, answered 412");
+      assert.equal(s3Calls.puts[0].IfNoneMatch, "*");
+      assert.deepEqual(commentTexts(cap), ["implemented"], "the reason comment went out; no Conflict comment");
+      assert.deepEqual(s3Calls.records, [KEY, KEY], "the guard read (404) and the fence's re-read");
+      assert.equal(recordBodies[KEY], HOLD_BODY, "the hold stands untouched");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  // TEAM-5941: a hold that lands between the guard read and the commit is now REFUSED by
+  // the Done-intent fence (the twin's IfMatch PUT 412s, it re-reads and re-judges), so
+  // j1b and j5 flip from "flagged after the fact" to "never committed". j1 above flipped
+  // with TEAM-5959 (TEAM-5799 F5): its record is ABSENT at the guard read, and the fence
+  // now RESERVES the key create-only, so a record created and hold-stamped in the window
+  // makes the reservation 412 and the re-read refuse. The detector below is what sees a
+  // writer that walked around the fence (a stamp while the POST itself is in flight).
+  test("TEAM-5926 (j1b) → TEAM-5941: a ship ticket whose proven record turns into a hold before the fence is REFUSED, not flagged", async () => {
+    const recordBodies = { [SHIP_RECORD_KEY]: JSON.stringify({ ticketId: SHIP_TICKET, summary: "shipped" }) };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({
+      labels: ["agent:agentcore_hub_release_manager", "phase:ship"],
+      onComment: (i) => { if (i === 0) recordBodies[SHIP_RECORD_KEY] = JSON.stringify({ ticketId: SHIP_TICKET, summary: "shipped", briefPending: true, briefDelivered: "off_gate" }); },
+    });
+    try {
+      const res = await doneTransition(mod.handler, SHIP_TICKET, { reason: "PR merged" });
+      assert.match(res.error, BRIEF_HOLD_REFUSAL_RE);
+      assert.match(res.error, /a ship-phase ticket needs its completion record first/);
+      assert.equal(res.reason, "completion_record_required");
+      assert.equal(res.status, undefined);
+      assert.deepEqual(cap.transitions, [], "the Done never reached Jira");
+      assert.equal(cap.comments.length, 1, "the reason comment is already written (as with a TEAM-5707 re-read refusal)");
+      assert.equal(s3Calls.puts.length, 1, "one fence PUT, which lost");
+      assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY, SHIP_RECORD_KEY], "the guard read and the fence's re-read");
+      assert.equal(JSON.parse(recordBodies[SHIP_RECORD_KEY]).doneIntent, undefined, "a lost fence leaves no intent");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5926 (j5) → TEAM-5941: a ship ticket whose proven record turns into followUpsPending:true before the fence is REFUSED with the follow-ups text", async () => {
+    const recordBodies = { [SHIP_RECORD_KEY]: JSON.stringify({ ticketId: SHIP_TICKET, summary: "shipped", status: "complete", followUpsPending: false }) };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({
+      labels: ["agent:agentcore_hub_release_manager", "phase:ship"],
+      onComment: (i) => { if (i === 0) recordBodies[SHIP_RECORD_KEY] = JSON.stringify({ ticketId: SHIP_TICKET, summary: "shipped", status: "pending_follow_ups", followUpsPending: true, ticketWrites: "dropped" }); },
+    });
+    try {
+      const res = await doneTransition(mod.handler, SHIP_TICKET, { reason: "PR merged" });
+      assert.match(res.error, /has followUpsPending:true \(status pending_follow_ups\)/);
+      assert.doesNotMatch(res.error, BRIEF_HOLD_REFUSAL_RE);
+      assert.equal(res.reason, "completion_record_required");
+      assert.deepEqual(cap.transitions, []);
+      assert.deepEqual(commentTexts(cap), ["PR merged"]);
+      assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY, SHIP_RECORD_KEY]);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5926 (j5b): followUpsPending:true appearing on a NON-ship ticket's record is not flagged — its Done never gated on it", async () => {
+    const recordBodies = {};
+    const { mod } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({
+      labels: DEV_LABELS, ticketId: "TEAM-4067",
+      onComment: (i) => { if (i === 0) recordBodies[KEY] = JSON.stringify({ ticketId: "TEAM-4067", followUpsPending: true, ticketWrites: "dropped" }); },
+    });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.equal(cap.comments.length, 1);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5926 (j2): no concurrent stamp ⇒ no conflict, no Conflict comment", async () => {
+    const { mod, s3Calls } = await loadShipGate();
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.equal(res.warning, undefined);
+      assert.deepEqual(commentTexts(cap), ["implemented"]);
+      assert.deepEqual(s3Calls.records, [KEY, KEY]);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5926 (j3): the post-commit re-read fails twice ⇒ still a success, with a could-not-run warning", async () => {
+    const { mod, s3Calls } = await loadShipGate({ recordError: (n) => (n >= 1 ? s3Unavailable() : null) });
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.error, undefined);
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.match(res.warning, /post-commit completion-record check could not run \(could not read completions\/TEAM-4067\.json \(ServiceUnavailable 503\)\)/);
+      assert.doesNotMatch(res.warning, BRIEF_HOLD_REFUSAL_RE);
+      assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+      assert.deepEqual(commentTexts(cap), ["implemented"]);
+      assert.deepEqual(s3Calls.records, [KEY, KEY, KEY], "one guard read, the re-read and its one retry");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5926 (j4) → TEAM-5959: no record at the guard, a record that is not a hold (briefPending:false) lands during the comment ⇒ the reservation 412s, the re-read admits, the IfMatch fence wins ⇒ the Done commits, no conflict", async () => {
+    const body = JSON.stringify({ ticketId: "TEAM-4067", briefPending: false, briefDelivered: "gate" });
+    const recordBodies = {};
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({
+      labels: DEV_LABELS, ticketId: "TEAM-4067",
+      onComment: (i) => { if (i === 0) recordBodies[KEY] = body; },
+    });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.equal(res.warning, undefined);
+      assert.equal(cap.comments.length, 1);
+      assert.equal(s3Calls.puts.length, 2, "the create-only reservation (412), then the IfMatch fence on the record that won");
+      assert.equal(s3Calls.puts[0].IfNoneMatch, "*");
+      assert.equal(s3Calls.puts[1].IfMatch, createHash("md5").update(body).digest("hex").replace(/^/, '"').concat('"'));
+      assert.equal(JSON.parse(recordBodies[KEY]).briefPending, false);
+      assert.ok(JSON.parse(recordBodies[KEY]).doneIntent, "fenced onto the real record");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5926 (j4) → TEAM-5959: no record at the guard, a body that cannot be judged lands during the comment ⇒ the fence's re-judge REFUSES fail-closed (the guard's own judge), no POST", async () => {
+    const recordBodies = {};
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({
+      labels: DEV_LABELS, ticketId: "TEAM-4067",
+      onComment: (i) => { if (i === 0) recordBodies[KEY] = "{not json"; },
+    });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.reason, "completion_record_required");
+      assert.match(res.error, /a ticket whose merge-brief hold cannot be read needs its completion record first/);
+      assert.match(res.error, /whether briefPending is set is UNKNOWN/);
+      assert.doesNotMatch(res.error, BRIEF_HOLD_REFUSAL_RE, "doubt is a retry to workflow-output, not a proven hold");
+      assert.deepEqual(cap.transitions, []);
+      assert.equal(s3Calls.puts.length, 1);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+}
+
+// ─── TEAM-5941 (TEAM-5799 ship-review r2 F1): the Done-intent fence ─────────
+// The guard reads the record; the reason comment, links, the transitions GET and the
+// precondition re-check are awaited; THEN, as the last step before the POST, the twin
+// PutObjects `doneIntent` onto the record with IfMatch on the ETag the guard admitted.
+// That conditional write is what makes a hold landing in the window a REFUSAL (the PUT
+// 412s, the re-read is re-judged) instead of a Done flagged after the fact.
+{
+  const KEY = "completions/TEAM-4067.json";
+  const DEV_LABELS = ["agent:agentcore_hub_backend_dev", "phase:development"];
+  const SHIP_LABELS = ["agent:agentcore_hub_release_manager", "phase:ship"];
+  const SEC_LABELS = [`agent:${gateContract.SECURITY_REVIEWER_AGENT}`, "phase:design"];
+  const CLEAN = JSON.stringify({ ticketId: "TEAM-4067", status: "complete", followUpsPending: false });
+  const HOLD = JSON.stringify({ ticketId: "TEAM-4067", briefPending: true, briefDelivered: "off_gate", ticketWrites: "dropped" });
+  const BRIEF_HOLD_REFUSAL_RE = /\bhas briefPending:true \(brief /;
+  const md5 = (body) => `"${createHash("md5").update(String(body)).digest("hex")}"`;
+  const intentOf = (put) => JSON.parse(String(put.Body)).doneIntent;
+  const s3Err = (name, status) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+  test("TEAM-5941 (f1): one fence PUT — IfMatch on the guard's ETag, doneIntent{at,provider:jira,nonce} — then the Done; no conflict; the intent stays on the record", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.error, undefined);
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.equal(res.warning, undefined);
+      assert.equal(s3Calls.puts.length, 1);
+      assert.equal(s3Calls.puts[0].Key, KEY);
+      assert.equal(s3Calls.puts[0].IfMatch, md5(CLEAN), "conditioned on exactly the body the guard admitted");
+      const intent = intentOf(s3Calls.puts[0]);
+      assert.equal(intent.provider, "jira");
+      assert.ok(Number.isFinite(Date.parse(intent.at)));
+      assert.match(intent.nonce, UUID_RE);
+      assert.deepEqual(JSON.parse(String(s3Calls.puts[0].Body)), { ...JSON.parse(CLEAN), doneIntent: intent }, "the body is the admitted record plus the intent, nothing else touched");
+      // The fence is a PUT, not a read: still the guard read and the post-commit re-read.
+      assert.deepEqual(s3Calls.records, [KEY, KEY]);
+      assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+      assert.deepEqual(JSON.parse(recordBodies[KEY]).doneIntent, intent, "a committed Done keeps the intent (an audit; it goes stale on its own)");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5941 (f2): a hold stamped between the guard read and the fence ⇒ the PUT 412s ⇒ re-read ⇒ REFUSED with the standard hold text; Jira never POSTed", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    s3Calls.onRecordPut = () => { recordBodies[KEY] = HOLD; }; // the drain's stamp, a moment before the fence
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.match(res.error, BRIEF_HOLD_REFUSAL_RE);
+      assert.match(res.error, /a ticket whose merge brief is held needs its completion record first/);
+      assert.equal(res.reason, "completion_record_required");
+      assert.equal(res.status, undefined);
+      assert.deepEqual(cap.transitions, [], "the Done never reached Jira");
+      assert.equal(s3Calls.puts.length, 1, "the fence lost once and did not retry over a hold");
+      assert.deepEqual(s3Calls.records, [KEY, KEY], "the guard read, then the fence's re-read");
+      assert.equal(recordBodies[KEY], HOLD, "the drain's hold stands untouched");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5941 (f3, the detector kept): a hold stamped AFTER the fence, while the POST is in flight ⇒ the Done stands and is flagged done_over_brief_hold", async () => {
+    // A writer that ignores the fence (nothing in the hub does; adoptHold carries it).
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067", onTransition: () => { recordBodies[KEY] = HOLD; } });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, "done_over_brief_hold");
+      assert.equal(s3Calls.puts.length, 1);
+      assert.deepEqual(s3Calls.records, [KEY, KEY]);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5941 (f4): the fence 412s but the re-read still admits (a report re-run rewrote the record) ⇒ the second CAS wins and the Done commits", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const REWRITTEN = JSON.stringify({ ...JSON.parse(CLEAN), summary: "rewritten by a re-run" });
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    let fired = false;
+    s3Calls.onRecordPut = () => { if (!fired) { fired = true; recordBodies[KEY] = REWRITTEN; } };
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.error, undefined);
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.equal(s3Calls.puts.length, 2);
+      assert.equal(s3Calls.puts[1].IfMatch, md5(REWRITTEN), "the second fence conditions on the re-read ETag");
+      assert.equal(JSON.parse(recordBodies[KEY]).summary, "rewritten by a re-run");
+      assert.deepEqual(JSON.parse(recordBodies[KEY]).doneIntent, intentOf(s3Calls.puts[1]));
+      assert.deepEqual(s3Calls.records, [KEY, KEY, KEY], "guard read, the fence's re-read, the post-commit re-read");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5941 (f5): the record keeps changing under 3 fences ⇒ refused with the contended text (no hold phrase), no POST", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    let rev = 0;
+    s3Calls.onRecordPut = () => { recordBodies[KEY] = JSON.stringify({ ...JSON.parse(CLEAN), rev: ++rev }); };
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.match(res.error, /completions\/TEAM-4067\.json changed under 3 conditional writes while fencing the Done/);
+      assert.doesNotMatch(res.error, BRIEF_HOLD_REFUSAL_RE);
+      assert.equal(res.reason, "completion_record_required");
+      assert.equal(s3Calls.puts.length, gateContract.DONE_INTENT_FENCE_ATTEMPTS);
+      assert.deepEqual(cap.transitions, []);
+      assert.equal(JSON.parse(recordBodies[KEY]).doneIntent, undefined);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5941 (f6): the fence PUT is denied (AccessDenied 403) ⇒ refused fail-closed with the UNKNOWN text, no POST, no re-read", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    s3Calls.onRecordPut = () => s3Err("AccessDenied", 403);
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.match(res.error, /could not fence the Done on completions\/TEAM-4067\.json \(PutObject AccessDenied 403\)/);
+      assert.match(res.error, /is UNKNOWN/);
+      assert.doesNotMatch(res.error, BRIEF_HOLD_REFUSAL_RE);
+      assert.equal(res.reason, "completion_record_required");
+      assert.deepEqual(cap.transitions, []);
+      assert.equal(s3Calls.puts.length, 1);
+      assert.deepEqual(s3Calls.records, [KEY], "only the guard read: a denied write is config, not a race, so there is nothing to re-read");
+      assert.equal(recordBodies[KEY], CLEAN);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5941 (f7) → TEAM-5959: no record ⇒ ONE create-only PUT (IfNoneMatch:\"*\") of an intent-only reservation, then the Done; no conflict; the reservation stays as audit", async () => {
+    const recordBodies = {};
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.equal(res.warning, undefined);
+      assert.equal(s3Calls.puts.length, 1);
+      assert.equal(s3Calls.puts[0].IfNoneMatch, "*");
+      assert.equal(s3Calls.puts[0].IfMatch, undefined);
+      const body = JSON.parse(String(s3Calls.puts[0].Body));
+      assert.ok(gateContract.isIntentOnlyReservation(body));
+      assert.deepEqual(Object.keys(body).sort(), ["doneIntent", "reservation", "ticketId"]);
+      assert.equal(body.ticketId, "TEAM-4067");
+      assert.equal(body.doneIntent.provider, "jira");
+      assert.match(body.doneIntent.nonce, UUID_RE);
+      assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+      assert.ok(gateContract.isIntentOnlyReservation(JSON.parse(recordBodies[KEY])), "a committed Done keeps the reservation (and its intent) as audit");
+      assert.deepEqual(s3Calls.records, [KEY, KEY], "the guard read (404) and the post-commit re-read");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5941 (f8): the POST fails (500) ⇒ the error propagates and the intent is CAS-cleared: puts = [fence, clear], the record ends with no doneIntent", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067", onTransition: () => new Response(JSON.stringify({ errorMessages: ["boom"] }), { status: 500 }) });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.match(res.error, /Jira API 500/);
+      assert.equal(res.status, undefined);
+      assert.equal(s3Calls.puts.length, 2);
+      assert.ok(intentOf(s3Calls.puts[0]), "the fence");
+      assert.equal(intentOf(s3Calls.puts[1]), undefined, "the clear");
+      assert.equal(s3Calls.puts[1].IfMatch, md5(s3Calls.puts[0].Body), "the clear conditions on the fence's own write");
+      assert.deepEqual(JSON.parse(recordBodies[KEY]), JSON.parse(CLEAN), "the record is back to what the guard admitted");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5941 (f8b): the POST fails and the clear fails too ⇒ the error still propagates, the intent stays (the TTL retires it)", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    s3Calls.onRecordPut = () => (s3Calls.puts.length === 2 ? s3Err("InternalError", 500) : null);
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067", onTransition: () => new Response("boom", { status: 500 }) });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.match(res.error, /Jira API 500/);
+      assert.equal(s3Calls.puts.length, 2);
+      assert.ok(JSON.parse(recordBodies[KEY]).doneIntent, "the fence's intent is still on the record");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5941 (f11, ordering): the fence PUT is the LAST call before the transition POST — after the reason comment and the transitions GET", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const seq = [];
+    s3Calls.onRecordPut = () => { seq.push("fence PUT"); };
+    const cap = installDoneStub({
+      labels: DEV_LABELS, ticketId: "TEAM-4067",
+      onComment: () => { seq.push("reason comment"); },
+      onTransition: () => { seq.push("transition POST"); },
+    });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.status, "done");
+      assert.deepEqual(seq, ["reason comment", "fence PUT", "transition POST"]);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5941 (f12): a security-review ticket is re-judged WITH the securityReview opt — a record that lost its PASS stamp under the fence is refused as a security-review ticket", async () => {
+    const SEC_KEY = "completions/TEAM-4069.json";
+    const PASSED = JSON.stringify({ ticketId: "TEAM-4069", status: "complete", securityReview: { verdict: "PASS" } });
+    const recordBodies = { [SEC_KEY]: PASSED };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    s3Calls.onRecordPut = () => { recordBodies[SEC_KEY] = JSON.stringify({ ticketId: "TEAM-4069", status: "complete" }); };
+    const cap = installDoneStub({ labels: SEC_LABELS, ticketId: "TEAM-4069" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4069", { reason: "reviewed" });
+      assert.match(res.error, /a security-review ticket needs its completion record first/);
+      assert.match(res.error, /carries no securityReview verdict/);
+      assert.deepEqual(cap.transitions, []);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5941 (f13) → TEAM-5959: the record vanishes between the guard read and the fence — a ship ticket is refused as on 'no record' (DL-030); a dev ticket RE-RESERVES the key create-only and commits fenced", async () => {
+    // Ship: the hub route's revertCompletionRecord can delete a record it created.
+    const shipBodies = { [SHIP_RECORD_KEY]: JSON.stringify({ ticketId: SHIP_TICKET, summary: "shipped" }) };
+    const ship = await loadShipGate({ recordBodies: shipBodies });
+    ship.s3Calls.onRecordPut = () => { delete shipBodies[SHIP_RECORD_KEY]; };
+    let cap = installDoneStub({ labels: SHIP_LABELS });
+    try {
+      const res = await doneTransition(ship.mod.handler, SHIP_TICKET, { reason: "PR merged" });
+      assert.match(res.error, new RegExp(`a ship-phase ticket needs its completion record first .* \\(no ${SHIP_RECORD_KEY.replace(/[./]/g, "\\$&")} in the artifact bucket\\)`));
+      assert.deepEqual(cap.transitions, []);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+    // Dev: the IfMatch fence 404s ⇒ the key is reserved create-only on the next attempt
+    // (it used to proceed unfenced, and a record created + hold-stamped before the POST
+    // then lost the fence).
+    const devBodies = { [KEY]: CLEAN };
+    const dev = await loadShipGate({ recordBodies: devBodies });
+    let deleted = false;
+    dev.s3Calls.onRecordPut = () => { if (!deleted) { deleted = true; delete devBodies[KEY]; } };
+    cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(dev.mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.equal(dev.s3Calls.puts.length, 2, "the IfMatch fence (404), then the create-only reservation");
+      assert.ok(dev.s3Calls.puts[0].IfMatch);
+      assert.equal(dev.s3Calls.puts[1].IfNoneMatch, "*");
+      assert.ok(gateContract.isIntentOnlyReservation(JSON.parse(devBodies[KEY])));
+      assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  const reservationBody = (id, provider = "dynamodb") =>
+    JSON.stringify(gateContract.doneIntentReservation(id, { provider, at: new Date().toISOString(), nonce: "rival-nonce" }));
+
+  test("TEAM-5959 (f14): an intent-only reservation never satisfies a ship or security Done — refused as 'no record' (DL-030), no PUT, no POST", async () => {
+    const ship = await loadShipGate({ recordBodies: { [SHIP_RECORD_KEY]: reservationBody(SHIP_TICKET) } });
+    let cap = installDoneStub({ labels: SHIP_LABELS });
+    try {
+      const res = await doneTransition(ship.mod.handler, SHIP_TICKET, { reason: "PR merged" });
+      assert.equal(res.reason, "completion_record_required");
+      assert.match(res.error, /a ship-phase ticket needs its completion record first/);
+      assert.match(res.error, /no completions\/TEAM-4066\.json in the artifact bucket \(only a Done-intent reservation, not a completion record\)/);
+      assert.deepEqual(cap.transitions, []);
+      assert.equal(ship.s3Calls.puts.length, 0);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+    const SEC_KEY = "completions/TEAM-4069.json";
+    const sec = await loadShipGate({ recordBodies: { [SEC_KEY]: reservationBody("TEAM-4069") } });
+    cap = installDoneStub({ labels: SEC_LABELS, ticketId: "TEAM-4069" });
+    try {
+      const res = await doneTransition(sec.mod.handler, "TEAM-4069", { reason: "reviewed" });
+      assert.equal(res.reason, "completion_record_required");
+      assert.match(res.error, /a security-review ticket needs its completion record first/);
+      assert.match(res.error, /only a Done-intent reservation, not a completion record/);
+      assert.deepEqual(cap.transitions, []);
+      assert.equal(sec.s3Calls.puts.length, 0);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5959 (f15b): the POST fails on a reserved key ⇒ puts = [create-only reservation, IfMatch clear], `{reservation, ticketId}` stays; the next Done on the build ticket is ADMITTED, fenced IfMatch onto it, and commits", async () => {
+    const recordBodies = {};
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    let cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067", onTransition: () => new Response(JSON.stringify({ errorMessages: ["boom"] }), { status: 500 }) });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.match(res.error, /Jira API 500/);
+      assert.equal(s3Calls.puts.length, 2);
+      assert.equal(s3Calls.puts[0].IfNoneMatch, "*");
+      assert.equal(s3Calls.puts[1].IfMatch, md5(s3Calls.puts[0].Body), "the clear conditions on the reservation's own write");
+      assert.equal(intentOf(s3Calls.puts[1]), undefined);
+      const left = JSON.parse(recordBodies[KEY]);
+      assert.deepEqual(left, { reservation: "done-intent", ticketId: "TEAM-4067" });
+      assert.ok(gateContract.isIntentOnlyReservation(left), "still 'no record' to every reader");
+      assert.equal(gateContract.judgeBriefHold(KEY, recordBodies[KEY]), null, "a build ticket's guard admits it, as it admits a 404");
+      assert.equal(gateContract.judgeCompletionRecord(KEY, recordBodies[KEY]).proven, false, "a ship ticket's guard refuses it, as it refuses a 404");
+    } finally {
+      cap.restore();
+    }
+    cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.error, undefined);
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.equal(s3Calls.puts.length, 3, "one IfMatch fence on the reservation, no create-only");
+      assert.equal(s3Calls.puts[2].IfMatch, md5(s3Calls.puts[1].Body));
+      assert.equal(s3Calls.puts[2].IfNoneMatch, undefined);
+      assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+      const after = JSON.parse(recordBodies[KEY]);
+      assert.ok(gateContract.isIntentOnlyReservation(after));
+      assert.equal(after.doneIntent.provider, "jira");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5959 (f16): a hold stamped onto a reservation ({reservation, briefPending:true}) is a HOLD — refused with the standard text before any fence; the marker never masks it", async () => {
+    const held = JSON.stringify({ ...JSON.parse(reservationBody("TEAM-4067")), briefPending: true, briefDelivered: "off_gate", ticketWrites: "dropped" });
+    const { mod, s3Calls } = await loadShipGate({ recordBodies: { [KEY]: held } });
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.match(res.error, BRIEF_HOLD_REFUSAL_RE);
+      assert.equal(res.reason, "completion_record_required");
+      assert.deepEqual(cap.transitions, []);
+      assert.equal(s3Calls.puts.length, 0);
+      assert.equal(gateContract.isIntentOnlyReservation(JSON.parse(held)), false, "a hold field ends intent-only");
+      assert.match(gateContract.judgeCompletionRecord(KEY, held).why, BRIEF_HOLD_REFUSAL_RE, "on a ship ticket too: the hold text, not the reservation text");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5959 (f17): two twins reserve the same absent key ⇒ the loser's create-only 412s, it re-reads a hold-free reservation, fences IfMatch onto it and commits", async () => {
+    const recordBodies = {};
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const rival = reservationBody("TEAM-4067", "dynamodb");
+    s3Calls.onRecordPut = (input) => { if (input.IfNoneMatch === "*" && !(KEY in recordBodies)) recordBodies[KEY] = rival; };
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.equal(s3Calls.puts.length, 2);
+      assert.equal(s3Calls.puts[0].IfNoneMatch, "*", "lost the create-only race (412)");
+      assert.equal(s3Calls.puts[1].IfMatch, md5(rival), "the CAS onto the rival's reservation");
+      const final = JSON.parse(recordBodies[KEY]);
+      assert.ok(gateContract.isIntentOnlyReservation(final));
+      assert.equal(final.doneIntent.provider, "jira");
+      assert.deepEqual(s3Calls.records, [KEY, KEY, KEY], "the guard read (404), the fence's re-read, the post-commit re-read");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+}

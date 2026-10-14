@@ -334,6 +334,9 @@ export default defineConfig({
       // (ticket-probe), and the alarm is 3 failed probes in a row (alarm.test).
       "lambda/workflow-output/provider-outage.test.mjs",
       "lambda/workflow-output/ticket-probe.test.mjs",
+      // TEAM-5926: either REAL twin's Done racing the REAL drain's brief-hold stamp,
+      // in both orders — the twin flags it, the drain converges it.
+      "lambda/workflow-output/done-race-e2e.test.mjs",
       "deploy/ticket-provider-probe/**/*.test.mjs",
       // manual-step-lint.mjs (TEAM-5593) — a summary admitting an unticketed manual step is refused.
       "lambda/workflow-output/manual-step-lint.test.mjs",

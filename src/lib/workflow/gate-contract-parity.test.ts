@@ -9,6 +9,7 @@ import * as ticketsCopy from "../../../lambda/agentcore-hub-tickets/gate-contrac
 import * as jiraCopy from "../../../lambda/agentcore-hub-jira/gate-contract.mjs";
 import { sameGateBinding } from "../../../lambda/agentcore-hub-tickets/fix-contract.mjs";
 import { isTerminalStatus, terminalMoveRefusal } from "./types";
+import agentsConfig from "@/config/agents.json";
 
 /**
  * TEAM-4739 parity contract — same two-layer shape as fix-contract-parity.test.ts.
@@ -819,6 +820,95 @@ describe("judgeCompletionRecord — the DL-030 completion-record verdict", () =>
   });
 });
 
+/**
+ * TEAM-5805 — the merge-brief hold. The ticket-replay drain stamps `briefPending:true`
+ * when it could not put the merge brief on the Merge Approval gate; both twins' Done
+ * guard must refuse on it (strict `=== true`, the same rule as followUpsPending), in
+ * the same words, and a delivery to the gate restamps it `false`, which admits.
+ */
+describe("judgeCompletionRecord / judgeBriefHold — the TEAM-5805 brief hold", () => {
+  const KEY = "completions/TEAM-4066.json";
+  const judge = (body: unknown) => agree(`judgeCompletionRecord(${JSON.stringify(body)})`,
+    (m) => m.judgeCompletionRecord(KEY, body)) as { proven: boolean; why: string };
+  const hold = (body: unknown) => agree(`judgeBriefHold(${JSON.stringify(body)})`,
+    (m) => m.judgeBriefHold(KEY, body)) as { proven: boolean; why: string } | null;
+  const HELD_WHY = (delivered: string) =>
+    `${KEY} has briefPending:true (brief ${delivered}) — the merge brief has not reached ` +
+    `the Merge Approval gate; re-run WorkflowOutput___report_completion with the same ` +
+    `arguments to deliver the brief (it clears briefPending once the brief is on the gate)`;
+
+  it("refuses briefPending:true, naming where the brief went (or `unstated`)", () => {
+    for (const [body, delivered] of [
+      [{ briefPending: true, briefDelivered: "off_gate", followUpsPending: false, status: "complete" }, "off_gate"],
+      [{ briefPending: true, briefDelivered: "undelivered", status: "complete" }, "undelivered"],
+      [{ briefPending: true, followUpsPending: false, status: "complete" }, "unstated"],
+      [{ briefPending: true, briefDelivered: "  ", status: "complete_transition_failed" }, "unstated"],
+    ] as const) {
+      const v = judge(JSON.stringify(body));
+      expect(v, JSON.stringify(body)).toEqual({ proven: false, why: HELD_WHY(delivered) });
+      expect(hold(JSON.stringify(body))).toEqual({ proven: false, why: HELD_WHY(delivered) });
+    }
+  });
+
+  it("admits `briefPending !== true` — false (delivered), absent, a string, 1, null", () => {
+    for (const body of [
+      { briefPending: false, briefDelivered: "gate", followUpsPending: false, status: "complete" },
+      { followUpsPending: false, status: "complete" },
+      { evidence_kind: "skipped", skipped: true, reason: "empty_sweep_no_siblings" },
+      { followUpsPending: false, status: "complete_transition_failed" },
+      { briefPending: "true" },
+      { briefPending: 1 },
+      { briefPending: null },
+    ]) {
+      expect(judge(JSON.stringify(body)), `${JSON.stringify(body)} must be admitted`).toEqual({ proven: true, why: `${KEY} exists` });
+      expect(hold(JSON.stringify(body)), `${JSON.stringify(body)} must not hold`).toBeNull();
+    }
+  });
+
+  it("follow-ups AND brief pending ⇒ the follow-ups refusal comes first", () => {
+    const v = judge(JSON.stringify({ followUpsPending: true, status: "complete_pending_follow_ups", briefPending: true }));
+    expect(v.proven).toBe(false);
+    expect(v.why).toContain("has followUpsPending:true (status complete_pending_follow_ups)");
+    expect(v.why).not.toContain("briefPending");
+  });
+
+  it("judgeBriefHold fails CLOSED on a body it cannot judge — UNKNOWN, never a proven hold (TEAM-5832)", () => {
+    for (const body of [undefined, null, "", "   ", "not json", "[]", "null", '"s"', "42"]) {
+      const v = hold(body) as { proven: boolean; unknown?: boolean; why: string } | null;
+      expect(v, `${JSON.stringify(body)} must refuse`).not.toBeNull();
+      expect(v?.proven).toBe(false);
+      expect(v?.unknown).toBe(true);
+      expect(v?.why).toContain(`could not judge ${KEY} (`);
+      expect(v?.why).toContain("whether briefPending is set is UNKNOWN");
+      // workflow-output's isBriefHoldRefusal must not read this as a proven hold (drop vs retry).
+      expect(v?.why).not.toMatch(/has briefPending:true \(brief /);
+    }
+  });
+
+  it("briefHoldUnknown is BYTE-identical across the two copies", () => {
+    const cause = `could not read ${KEY} (AccessDenied 403)`;
+    const [ticketsWhy, jiraWhy] = MODULES.map(([, m]) => Buffer.from(m.briefHoldUnknown(KEY, cause).why, "utf8"));
+    expect(jiraWhy.equals(ticketsWhy), "the two copies phrase the unknown-hold refusal differently").toBe(true);
+    expect(ticketsWhy.toString("utf8").startsWith(`${cause} — whether briefPending is set is UNKNOWN`)).toBe(true);
+  });
+
+  it("the brief-hold refusal is BYTE-identical across the two copies", () => {
+    const body = JSON.stringify({ briefPending: true, briefDelivered: "off_gate" });
+    const [ticketsWhy, jiraWhy] = MODULES.map(([, m]) => Buffer.from(m.judgeCompletionRecord(KEY, body).why, "utf8"));
+    expect(jiraWhy.equals(ticketsWhy), "the two copies phrase the brief-hold refusal differently").toBe(true);
+  });
+
+  it("MERGE_BRIEF_AUTHOR_AGENT is the operator in both copies, and the operator is NOT ship-phase", () => {
+    // Not ship-phase is why this guard exists separately: a ship-phase ticket already
+    // reads its whole record through judgeCompletionRecord.
+    const author = agree("MERGE_BRIEF_AUTHOR_AGENT", (m) => m.MERGE_BRIEF_AUTHOR_AGENT);
+    expect(author).toBe("agentcore_hub_operator");
+    const row = (agentsConfig as { agents: { agentId: string; phase?: string }[] }).agents.find((a) => a.agentId === author);
+    expect(row, `${author} is not in src/config/agents.json`).toBeTruthy();
+    expect(row?.phase).not.toBe("ship");
+  });
+});
+
 // TEAM-5421 — the cancelled-status matrix. Both ticket twins and the TS mirror in
 // types.ts must agree on every (from, to) pair, or one provider would let a
 // cancelled ticket back onto the board while the other refuses it.
@@ -848,5 +938,206 @@ describe("terminalMoveRefusal / isTerminalStatus — twins + TS mirror agree", (
     expect(terminalMoveRefusal("done", "cancelled")).toMatch(/never cancelled/);
     expect(terminalMoveRefusal("cancelled", "todo")).toMatch(/terminal/);
     expect(terminalMoveRefusal("cancelled", "done")).toMatch(/terminal/);
+  });
+});
+
+/**
+ * TEAM-5941 — the Done-intent fence. The twins write `doneIntent` onto the completion
+ * record (IfMatch) as the last step before their commit; the replay drain backs off a
+ * hold stamp while a FRESH intent is on the record. workflow-output cannot import
+ * gate-contract.mjs (its zip), so it carries a THIRD copy of the TTL and the freshness
+ * rule (`DONE_INTENT_TTL_MS`, `doneIntentFresh`). A drift there is a drain that stamps a
+ * hold the twin is about to walk past, or one that waits forever on a dead twin — so the
+ * value is pinned here off the file, the way check-fix-kinds-parity.sh pins literals.
+ */
+describe("doneIntentOf / DONE_INTENT_TTL_MS — the Done-intent fence (TEAM-5941)", () => {
+  const NOW = Date.parse("2026-10-14T12:00:00.000Z");
+  const at = (msAgo: number) => new Date(NOW - msAgo).toISOString();
+
+  it("the TTL agrees across the two copies, and is 10 minutes", () => {
+    expect(agree("DONE_INTENT_TTL_MS", (m) => m.DONE_INTENT_TTL_MS)).toBe(10 * 60_000);
+    expect(agree("DONE_INTENT_FENCE_ATTEMPTS", (m) => m.DONE_INTENT_FENCE_ATTEMPTS)).toBe(3);
+  });
+
+  it("workflow-output's mirror carries the SAME TTL value", () => {
+    const src = readFileSync(resolve(__dirname, "../../..", "lambda/workflow-output/index.mjs"), "utf8");
+    const m = /export const DONE_INTENT_TTL_MS = ([^;]+);/.exec(src);
+    expect(m, "lambda/workflow-output/index.mjs no longer exports DONE_INTENT_TTL_MS").not.toBeNull();
+    // eslint-disable-next-line no-new-func
+    const mirrored = Function(`"use strict"; return (${m![1]});`)();
+    expect(mirrored).toBe(agree("DONE_INTENT_TTL_MS (mirror)", (m2) => m2.DONE_INTENT_TTL_MS));
+  });
+
+  it.each([
+    ["absent", {}, { present: false, fresh: false }],
+    ["no record", null, { present: false, fresh: false }],
+    ["a non-object intent", { doneIntent: "soon" }, { present: false, fresh: false }],
+    ["fresh (1 s old)", { doneIntent: { at: at(1000), provider: "jira", nonce: "n" } }, { present: true, fresh: true }],
+    ["fresh (1 ms under the TTL)", { doneIntent: { at: at(10 * 60_000 - 1) } }, { present: true, fresh: true }],
+    ["future `at` (clock skew) is fresh", { doneIntent: { at: at(-60_000) } }, { present: true, fresh: true }],
+    ["exactly the TTL is stale", { doneIntent: { at: at(10 * 60_000) } }, { present: true, fresh: false }],
+    ["stale (an hour)", { doneIntent: { at: at(3_600_000) } }, { present: true, fresh: false }],
+    ["an unparseable `at` is stale", { doneIntent: { at: "yesterday" } }, { present: true, fresh: false }],
+    ["no `at` is stale", { doneIntent: { provider: "jira" } }, { present: true, fresh: false }],
+  ])("doneIntentOf agrees on %s", (label, record, expected) => {
+    const v = agree(`doneIntentOf ${label}`, (m) => m.doneIntentOf(record, NOW)) as { present: boolean; fresh: boolean };
+    expect({ present: v.present, fresh: v.fresh }).toEqual(expected);
+  });
+
+  it("withDoneIntent / withoutDoneIntent never mutate and round-trip", () => {
+    const record = { ticketId: "T", briefPending: false };
+    const fenced = agree("withDoneIntent", (m) => m.withDoneIntent(record, { provider: "dynamodb", at: at(0), nonce: "n1" })) as Record<string, unknown>;
+    expect(fenced.doneIntent).toEqual({ at: at(0), provider: "dynamodb", nonce: "n1" });
+    expect(record).not.toHaveProperty("doneIntent");
+    expect(agree("withoutDoneIntent", (m) => m.withoutDoneIntent(fenced))).toEqual(record);
+    expect(fenced).toHaveProperty("doneIntent");
+  });
+
+  it("classifyS3WriteError: 412 ⇒ precondition, 409 ⇒ conflict, 404 ⇒ gone, else other", () => {
+    const e = (name: string, status?: number) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+    for (const [err, kind] of [
+      [e("PreconditionFailed", 412), "precondition"],
+      [e("Weird", 412), "precondition"],
+      [e("ConditionalRequestConflict", 409), "conflict"],
+      [e("NoSuchKey", 404), "gone"],
+      [e("NotFound"), "gone"],
+      [e("AccessDenied", 403), "other"],
+      [e("InternalError", 500), "other"],
+      [null, "other"],
+    ] as const) {
+      expect(agree(`classify ${err?.name}`, (m) => m.classifyS3WriteError(err))).toBe(kind);
+    }
+  });
+
+  it("rejudgeAdmitted uses the guard's own judge, and its refusal texts are the guard's", () => {
+    const KEY = "completions/TEAM-4066.json";
+    const held = JSON.stringify({ briefPending: true, briefDelivered: "off_gate" });
+    const pending = JSON.stringify({ followUpsPending: true, status: "complete_pending_follow_ups" });
+    const clean = JSON.stringify({ status: "complete", followUpsPending: false });
+    // brief-only guard (every non-ship ticket)
+    expect(agree("brief: clean", (m) => m.rejudgeAdmitted(KEY, clean, {}))).toBeNull();
+    expect(agree("brief: held", (m) => m.rejudgeAdmitted(KEY, held, {}))).toMatchObject({
+      what: "a ticket whose merge brief is held", unknown: false,
+      why: agree("brief why", (m) => m.judgeBriefHold(KEY, held).why),
+    });
+    expect(agree("brief: followUps ignored", (m) => m.rejudgeAdmitted(KEY, pending, {}))).toBeNull();
+    expect(agree("brief: unjudgeable", (m) => m.rejudgeAdmitted(KEY, "{nope", {}))).toMatchObject({ unknown: true, what: "a ticket whose merge-brief hold cannot be read" });
+    // record-gated guard (ship / security)
+    expect(agree("gated: pending", (m) => m.rejudgeAdmitted(KEY, pending, { recordGated: true }))).toMatchObject({
+      what: "a ship-phase ticket", why: agree("gated why", (m) => m.judgeCompletionRecord(KEY, pending).why),
+    });
+    expect(agree("gated: security stamp missing", (m) => m.rejudgeAdmitted(KEY, clean, { recordGated: true, securityReview: true }))).toMatchObject({ what: "a security-review ticket" });
+    expect(agree("gated: clean", (m) => m.rejudgeAdmitted(KEY, clean, { recordGated: true }))).toBeNull();
+  });
+
+  it("the fence refusals never read as a proven brief hold to workflow-output", () => {
+    for (const text of [
+      agree("contended", (m) => m.doneIntentContendedRefusal("completions/X.json", 3)),
+      agree("unfenced", (m) => m.doneIntentUnfencedRefusal("completions/X.json", "PutObject AccessDenied 403")),
+      agree("brief warning", (m) => m.DONE_OVER_BRIEF_HOLD_WARNING),
+    ] as string[]) {
+      expect(text).not.toMatch(/has briefPending:true \(brief /);
+    }
+    // TEAM-5941: the post-commit warning no longer advises a report_completion re-run,
+    // which cannot close or converge a Done ticket.
+    expect(agree("brief warning text", (m) => m.DONE_OVER_BRIEF_HOLD_WARNING)).not.toMatch(/re-run WorkflowOutput___report_completion/);
+  });
+});
+
+/**
+ * TEAM-5959 (TEAM-5799 F5) — the Done-intent RESERVATION. On a 404 admission each twin
+ * reserves completions/<id>.json create-only with an intent-only body; every reader treats
+ * it exactly as a 404. The marker literals are mirrored where this file cannot be imported
+ * (src/lib/workflow/completion-evidence.ts, lambda/cost-report/index.mjs); a drift there
+ * is a reader that counts a reservation as a record (or a record as a reservation), so the
+ * literals are pinned here off the files. The orchestrator carries no mirror (DL-009 line
+ * budget; its completionRecordHasEvidence field rule needs none — completion-evidence-
+ * parity.test.ts asserts a reservation is no evidence there).
+ */
+describe("Done-intent reservation — doneIntentReservation / isIntentOnlyReservation (TEAM-5959)", () => {
+  const intent = { provider: "jira", at: "2026-10-14T06:00:00.000Z", nonce: "n1" };
+
+  it("the marker literals agree across the two copies", () => {
+    expect(agree("RESERVATION_FIELD", (m) => m.RESERVATION_FIELD)).toBe("reservation");
+    expect(agree("DONE_INTENT_RESERVATION", (m) => m.DONE_INTENT_RESERVATION)).toBe("done-intent");
+  });
+
+  it.each([
+    ["src/lib/workflow/completion-evidence.ts", /export const RESERVATION_FIELD = "([^"]+)";/, /export const DONE_INTENT_RESERVATION = "([^"]+)";/, /const RESERVATION_KEYS = new Set\(\[RESERVATION_FIELD, "ticketId", "doneIntent"\]\);/],
+    ["lambda/cost-report/index.mjs", /if \(record\.(reservation) !== "done-intent"\) return false;/, /if \(record\.reservation !== "([^"]+)"\) return false;/, /const RESERVATION_KEYS = new Set\(\["reservation", "ticketId", "doneIntent"\]\);/],
+  ])("the mirror in %s carries the SAME marker field, value and key set", (file, fieldRe, valueRe, keysRe) => {
+    const src = readFileSync(resolve(__dirname, "../../..", file), "utf8");
+    const field = fieldRe.exec(src);
+    const value = valueRe.exec(src);
+    expect(field, `${file} no longer carries the reservation field literal`).not.toBeNull();
+    expect(value, `${file} no longer carries the reservation value literal`).not.toBeNull();
+    expect(field![1]).toBe(agree("RESERVATION_FIELD (mirror)", (m) => m.RESERVATION_FIELD));
+    expect(value![1]).toBe(agree("DONE_INTENT_RESERVATION (mirror)", (m) => m.DONE_INTENT_RESERVATION));
+    expect(keysRe.test(src), `${file} no longer carries the intent-only key set`).toBe(true);
+  });
+
+  it("doneIntentReservation is marker + ticketId + intent and nothing else", () => {
+    const body = agree("doneIntentReservation", (m) => m.doneIntentReservation("TEAM-1", intent)) as Record<string, unknown>;
+    expect(body).toEqual({ reservation: "done-intent", ticketId: "TEAM-1", doneIntent: { at: intent.at, provider: "jira", nonce: "n1" } });
+    expect(agree("isIntentOnlyReservation(own body)", (m) => m.isIntentOnlyReservation(m.doneIntentReservation("TEAM-1", intent)))).toBe(true);
+    expect(agree("doneIntentOf(reservation).fresh", (m) => m.doneIntentOf(m.doneIntentReservation("TEAM-1", intent), Date.parse(intent.at) + 1000).fresh)).toBe(true);
+  });
+
+  it.each([
+    ["bare reservation", { reservation: "done-intent", ticketId: "T", doneIntent: intent }, true],
+    ["intent cleared (a failed commit's clear)", { reservation: "done-intent", ticketId: "T" }, true],
+    ["+ briefPending (a hold)", { reservation: "done-intent", ticketId: "T", briefPending: true }, false],
+    ["+ followUpsPending (a hold)", { reservation: "done-intent", ticketId: "T", followUpsPending: true }, false],
+    ["+ summary (a real writer)", { reservation: "done-intent", ticketId: "T", summary: "s", doneIntent: intent }, false],
+    ["+ ticketWrites (the drain)", { reservation: "done-intent", ticketId: "T", ticketWrites: "dropped" }, false],
+    ["wrong marker value", { reservation: "something-else", ticketId: "T" }, false],
+    ["intent with no marker", { ticketId: "T", doneIntent: intent }, false],
+    ["blank record", {}, false],
+    ["null", null, false],
+    ["array", [], false],
+  ])("isIntentOnlyReservation agrees on %s", (label, record, expected) => {
+    expect(agree(`isIntentOnlyReservation ${label}`, (m) => m.isIntentOnlyReservation(record))).toBe(expected);
+  });
+
+  it("judgeCompletionRecord refuses a reservation as 'no record' (ship and security), BYTE-identical, after the hold checks", () => {
+    const key = "completions/TEAM-1.json";
+    const body = JSON.stringify({ reservation: "done-intent", ticketId: "TEAM-1", doneIntent: intent });
+    const plain = agree("judgeCompletionRecord(reservation)", (m) => m.judgeCompletionRecord(key, body)) as { proven: boolean; why: string };
+    expect(plain.proven).toBe(false);
+    expect(plain.why).toBe("no completions/TEAM-1.json in the artifact bucket (only a Done-intent reservation, not a completion record)");
+    expect(plain.why.startsWith("no completions/TEAM-1.json in the artifact bucket")).toBe(true); // the 404 text family
+    expect(plain.why).not.toMatch(/\bhas briefPending:true \(brief /);
+    const sec = agree("judgeCompletionRecord(reservation, securityReview)", (m) => m.judgeCompletionRecord(key, body, { securityReview: true })) as { proven: boolean; why: string };
+    expect(sec).toEqual(plain);
+    expect(agree("reservationNotARecord", (m) => m.reservationNotARecord(key))).toBe(plain.why);
+    // Holds first: a reservation a hold was stamped onto is refused as the HOLD, never as a reservation.
+    const cleared = JSON.stringify({ reservation: "done-intent", ticketId: "TEAM-1" });
+    expect((agree("judgeCompletionRecord(cleared reservation)", (m) => m.judgeCompletionRecord(key, cleared)) as { proven: boolean }).proven).toBe(false);
+    const heldBrief = JSON.stringify({ reservation: "done-intent", ticketId: "TEAM-1", briefPending: true, briefDelivered: "off_gate" });
+    expect((agree("judgeCompletionRecord(reservation+brief hold)", (m) => m.judgeCompletionRecord(key, heldBrief)) as { why: string }).why).toMatch(/\bhas briefPending:true \(brief off_gate\)/);
+    const heldFollowUps = JSON.stringify({ reservation: "done-intent", ticketId: "TEAM-1", followUpsPending: true, status: "complete_pending_follow_ups" });
+    expect((agree("judgeCompletionRecord(reservation+follow-ups hold)", (m) => m.judgeCompletionRecord(key, heldFollowUps)) as { why: string }).why).toMatch(/has followUpsPending:true/);
+  });
+
+  it("judgeBriefHold ADMITS a hold-free reservation (a non-gated ticket treats it as a 404) and refuses one with a hold", () => {
+    const key = "completions/TEAM-1.json";
+    expect(agree("judgeBriefHold(reservation)", (m) => m.judgeBriefHold(key, JSON.stringify({ reservation: "done-intent", ticketId: "TEAM-1", doneIntent: intent })))).toBeNull();
+    expect(agree("judgeBriefHold(cleared reservation)", (m) => m.judgeBriefHold(key, JSON.stringify({ reservation: "done-intent", ticketId: "TEAM-1" })))).toBeNull();
+    expect((agree("judgeBriefHold(reservation+hold)", (m) => m.judgeBriefHold(key, JSON.stringify({ reservation: "done-intent", ticketId: "TEAM-1", briefPending: true }))) as { proven: boolean }).proven).toBe(false);
+    // rejudgeAdmitted on the non-gated path (no recordGated) admits a rival twin's reservation ⇒ CAS again.
+    expect(agree("rejudgeAdmitted(reservation, non-gated)", (m) => m.rejudgeAdmitted(key, JSON.stringify({ reservation: "done-intent", ticketId: "TEAM-1", doneIntent: intent }), {}))).toBeNull();
+    // ... and on the gated path refuses it as "no record".
+    expect((agree("rejudgeAdmitted(reservation, gated)", (m) => m.rejudgeAdmitted(key, JSON.stringify({ reservation: "done-intent", ticketId: "TEAM-1", doneIntent: intent }), { recordGated: true })) as { what: string }).what).toBe("a ship-phase ticket");
+  });
+
+  it("the hub mirror agrees with the canonical predicate on every row", async () => {
+    const ts = await import("./completion-evidence");
+    for (const record of [
+      { reservation: "done-intent", ticketId: "T", doneIntent: intent }, { reservation: "done-intent", ticketId: "T" }, { reservation: "done-intent", ticketId: "T", briefPending: true },
+      { reservation: "done-intent", ticketId: "T", summary: "s" }, { reservation: "x" }, {}, null,
+    ]) {
+      const canonical = agree("isIntentOnlyReservation (canonical)", (m) => m.isIntentOnlyReservation(record));
+      expect(ts.isIntentOnlyReservation(record), `completion-evidence.ts on ${JSON.stringify(record)}`).toBe(canonical);
+    }
   });
 });

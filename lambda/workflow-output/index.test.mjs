@@ -93,6 +93,8 @@ const h = vi.hoisted(() => ({
   // TEAM-5167: overrides the SDK conditional-header probe — null runs the real one
   // (which is inconclusive against this mocked S3Client), a function is its verdict.
   probe: null,
+  // TEAM-5866: `{ key?, err }` — GetObject answers (ETag and all) but the BODY stream fails.
+  bodyError: null,
 }));
 
 const asString = (body) => (typeof body === "string" ? body : Buffer.from(body).toString("utf8"));
@@ -173,7 +175,10 @@ vi.mock("@aws-sdk/client-s3", () => ({
           ETag: h.etags.get(input.Key),
           LastModified: h.lastModified.get(input.Key),
           Body: {
-            transformToString: async () => body,
+            transformToString: async () => {
+              if (h.bodyError && (!h.bodyError.key || h.bodyError.key === input.Key)) throw h.bodyError.err;
+              return body;
+            },
             transformToByteArray: async () => Buffer.from(body),
           },
         };
@@ -385,7 +390,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord, doneIntentFresh, DONE_INTENT_TTL_MS, holdDeferredOnDoneIntent, deferHoldOnDoneIntent } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -468,6 +473,7 @@ beforeEach(() => {
   h.commentWindow = null;
   h.issue = undefined;
   h.headError = null;
+  h.bodyError = null;
   h.getError = null;
   h.objects.clear();
   h.etags.clear();
@@ -1570,6 +1576,329 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(res.transition.error).toMatch(/needs its completion record first/);
   });
 
+  it("a TEAM-5805 brief-hold refusal is pending_brief, not transition_failed", async () => {
+    // The twin read a record still stamped briefPending:true (a race with the drain, or
+    // the replay env unset). That is not a broken transition — it is the brief hold, and
+    // the persona's way out is a re-run that delivers the brief, so answer that.
+    h.transitionGate = () => ({
+      ok: false,
+      reason: "completion_record_required",
+      content: [{ type: "text", text: "Cannot move TEAM-4200 to done: a ticket whose merge brief is held needs its completion record first — call WorkflowOutput___report_completion(ticket_id=…) (TEAM-4200 has briefPending:true (brief off_gate) — the merge brief has not reached the Merge Approval gate; re-run WorkflowOutput___report_completion with the same arguments to deliver the brief (it clears briefPending once the brief is on the gate))" }],
+    });
+    const res = result(await report({}));
+    expect(res.status).toBe("complete_pending_brief");
+    expect(res.next_action).toBeTruthy();
+    expect(h.warns.join("\n")).not.toMatch(/transition FAILED/);
+  });
+
+  // TEAM-5830: the brief hold, with TICKET_REPLAY_QUEUE_URL unset (as in this file).
+  const HELD_KEY = "completions/TEAM-4200.json";
+  const seedHeld = (extra = {}) => {
+    h.objects.set(HELD_KEY, JSON.stringify({ ticket_id: "TEAM-4200", status: "complete", followUpsPending: false, briefPending: true, briefDelivered: "off_gate", ...extra }));
+    h.etags.set(HELD_KEY, '"held"');
+  };
+  const written = () => h.puts.filter((p) => p.Key === HELD_KEY);
+
+  it("TEAM-5830: with no replay queue, a held record is still re-delivered and never erased", async () => {
+    seedHeld();
+    const res = result(await report({}));
+    expect(res).toMatchObject({ status: "complete_pending_brief", next_action: "retry_report_completion" });
+    expect(transitioned()).toBe(false);
+    expect(JSON.parse(h.objects.get(HELD_KEY))).toMatchObject({ briefPending: true, briefDelivered: "off_gate", status: "complete_pending_brief" });
+  });
+
+  it("TEAM-5830: an unreadable prior record (AccessDenied) refuses: no record write, no follow-up, no Done", async () => {
+    seedHeld();
+    h.getError = { key: HELD_KEY, err: Object.assign(new Error("Access Denied"), { name: "AccessDenied", $metadata: { httpStatusCode: 403 } }) };
+    const res = result(await report({ follow_ups: JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document it" }]) }));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_unreadable", next_action: "retry_report_completion" });
+    expect(res.message).toMatch(/AccessDenied/);
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+    expect(JSON.parse(h.objects.get(HELD_KEY)).briefPending).toBe(true);
+  });
+
+  it("TEAM-5830 guard: a missing record (NoSuchKey) is still \"no record\" — written create-only, and Done", async () => {
+    const res = result(await report({}));
+    expect(res.status).toBe("complete");
+    expect(written()).toHaveLength(1);
+    expect(written()[0].IfNoneMatch).toBe("*");
+    expect(transitioned()).toBe(true);
+  });
+
+  it("TEAM-5830: the record write is a bounded compare-and-swap — a record that keeps moving is a retry answer, never an overwrite or a Done", async () => {
+    seedHeld({ briefPending: false, briefDelivered: "gate" });
+    // Every conditional write of the record finds it moved (another writer between each read and write).
+    h.putGate = (input) => (input.Key === HELD_KEY ? Object.assign(new Error("At least one of the pre-conditions you specified did not hold"), { name: "PreconditionFailed", $metadata: { httpStatusCode: 412 } }) : null);
+    const res = result(await report({}));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_contended", next_action: "retry_report_completion" });
+    expect(res.status).toBeUndefined();
+    expect(written()).toHaveLength(RECORD_CAS_ATTEMPTS);
+    expect(written().every((p) => p.IfMatch !== undefined)).toBe(true);
+    expect(transitioned()).toBe(false);
+  });
+
+  it("TEAM-5830: adoptHold — the current record's hold wins unless this call delivered; a refusal forces true unless the record proves delivery", () => {
+    const fresh = () => ({ ticket_id: "T", status: "complete" });
+    // current stamped a hold after we read ⇒ adopted
+    expect(adoptHold(fresh(), { briefPending: true, briefDelivered: "off_gate", undelivered: [{ part: "brief" }] })).toMatchObject({ briefPending: true, briefDelivered: "off_gate", undelivered: [{ part: "brief" }] });
+    // current cleared it (drain step 6) ⇒ our stale carried `true` yields
+    const stale = { ...fresh(), briefPending: true, briefDelivered: "off_gate", replayDropped: { step: "brief" } };
+    const cleared = adoptHold(stale, { briefPending: false, briefDelivered: "gate", briefTargets: ["G"] });
+    expect(cleared).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: ["G"] });
+    expect(cleared.replayDropped).toBeUndefined();
+    // this call put it on the gate ⇒ ours stand even over a stale `true`
+    expect(adoptHold({ ...fresh(), briefPending: false, briefDelivered: "gate" }, { briefPending: true, briefDelivered: "off_gate" }, { deliveredNow: true })).toMatchObject({ briefPending: false, briefDelivered: "gate" });
+    // no hold anywhere ⇒ no field invented
+    expect(adoptHold(fresh(), { status: "complete" }).briefPending).toBeUndefined();
+    expect(adoptHold(fresh(), null).briefPending).toBeUndefined();
+    // refusal ⇒ true when the current record says nothing, or true
+    expect(adoptHold(fresh(), null, { forceHold: true }).briefPending).toBe(true);
+    expect(adoptHold(fresh(), { status: "complete" }, { forceHold: true }).briefPending).toBe(true);
+    expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "off_gate" }, { forceHold: true }).briefPending).toBe(true);
+    // …even over this call's own delivery, when the current record does not prove it
+    expect(adoptHold({ ...fresh(), briefPending: false, briefDelivered: "gate" }, { briefPending: true, briefDelivered: "off_gate" }, { deliveredNow: true, forceHold: true }).briefPending).toBe(true);
+    // …except a delivery to the gate newer than the refusal
+    expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "gate" }, { forceHold: true }).briefPending).toBe(false);
+  });
+
+  it("TEAM-5941: adoptHold carries the twins' doneIntent verbatim — hold or no hold, delivered or not — and drops a copy the current record no longer has", () => {
+    const fresh = () => ({ ticket_id: "T", status: "complete" });
+    const intent = { at: "2026-10-14T12:00:00.000Z", provider: "jira", nonce: "0f8fad5b-d9cb-469f-a165-70867728950e" };
+    expect(adoptHold(fresh(), { status: "complete", doneIntent: intent }).doneIntent).toEqual(intent);
+    expect(adoptHold(fresh(), { briefPending: true, briefDelivered: "off_gate", doneIntent: intent }).doneIntent).toEqual(intent);
+    // deliveredNow skips the hold-field adoption; the intent is NOT a hold field and still rides along
+    expect(adoptHold({ ...fresh(), briefPending: false, briefDelivered: "gate" }, { briefPending: true, doneIntent: intent }, { deliveredNow: true })).toMatchObject({ briefPending: false, doneIntent: intent });
+    expect(adoptHold(fresh(), { status: "complete", doneIntent: intent }, { forceHold: true })).toMatchObject({ briefPending: true, doneIntent: intent });
+    // a stale copy on `report` goes when the current record carries none
+    expect(adoptHold({ ...fresh(), doneIntent: intent }, { status: "complete" }).doneIntent).toBeUndefined();
+    expect(adoptHold({ ...fresh(), doneIntent: intent }, null).doneIntent).toBeUndefined();
+    expect(adoptHold(fresh(), { status: "complete" }).doneIntent).toBeUndefined();
+  });
+
+  it("TEAM-5941: doneIntentFresh mirrors gate-contract's doneIntentOf — fresh under the 10-minute TTL, stale at or past it, absent/unparseable never fresh", () => {
+    const NOW = Date.parse("2026-10-14T12:00:00.000Z");
+    const at = (msAgo) => new Date(NOW - msAgo).toISOString();
+    expect(DONE_INTENT_TTL_MS).toBe(10 * 60_000);
+    expect(doneIntentFresh({ doneIntent: { at: at(1000) } }, NOW)).toBe(true);
+    expect(doneIntentFresh({ doneIntent: { at: at(DONE_INTENT_TTL_MS - 1) } }, NOW)).toBe(true);
+    expect(doneIntentFresh({ doneIntent: { at: at(-60_000) } }, NOW)).toBe(true); // clock skew: a future `at`
+    expect(doneIntentFresh({ doneIntent: { at: at(DONE_INTENT_TTL_MS) } }, NOW)).toBe(false);
+    expect(doneIntentFresh({ doneIntent: { at: "yesterday" } }, NOW)).toBe(false);
+    expect(doneIntentFresh({ doneIntent: {} }, NOW)).toBe(false);
+    expect(doneIntentFresh({ doneIntent: "soon" }, NOW)).toBe(false);
+    expect(doneIntentFresh({}, NOW)).toBe(false);
+    expect(doneIntentFresh(null, NOW)).toBe(false);
+  });
+
+  it("TEAM-5958/TEAM-5994: holdDeferredOnDoneIntent - pure, takes NO ticket status: fires on a hold written onto a record with a FRESH intent; shared by drop() and report_completion", () => {
+    const NOW = Date.parse("2026-10-14T12:00:00.000Z");
+    const now = vi.spyOn(Date, "now").mockReturnValue(NOW);
+    try {
+      const fresh = { status: "complete", doneIntent: { at: new Date(NOW - 1000).toISOString(), provider: "jira", nonce: "n" } };
+      const stale = { status: "complete", doneIntent: { at: new Date(NOW - DONE_INTENT_TTL_MS).toISOString(), provider: "jira", nonce: "n" } };
+      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: true })).toBe(fresh.doneIntent.at);
+      // TEAM-5994: a caller-supplied status is IGNORED — an earlier Done never exempts the intent.
+      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: true, ticketDone: true })).toBe(fresh.doneIntent.at);
+      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: false })).toBeNull(); // no hold written: nothing to defer
+      expect(holdDeferredOnDoneIntent({ current: stale, holdWritten: true })).toBeNull(); // the twin is gone
+      expect(holdDeferredOnDoneIntent({ current: { status: "complete" }, holdWritten: true })).toBeNull();
+      expect(holdDeferredOnDoneIntent({ current: null, holdWritten: true })).toBeNull();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("TEAM-5994: deferHoldOnDoneIntent - a fresh intent under a hold forces a FRESH ticket read; only a ticket that reads Done now proceeds", async () => {
+    const NOW = Date.parse("2026-10-14T12:00:00.000Z");
+    const now = vi.spyOn(Date, "now").mockReturnValue(NOW);
+    try {
+      const fresh = { status: "complete", doneIntent: { at: new Date(NOW - 1000).toISOString(), provider: "dynamodb", nonce: "n" } };
+      const reader = (answer) => vi.fn(async () => (answer instanceof Error ? Promise.reject(answer) : answer));
+      const ask = (readDone, extra = {}) => deferHoldOnDoneIntent({ current: fresh, holdWritten: true, ticketId: "TEAM-1", readDone, ...extra });
+
+      const done = reader({ ok: true, done: true });
+      expect(await ask(done)).toBeNull(); // the Done committed: its intent is audit
+      expect(done).toHaveBeenCalledWith("TEAM-1");
+      const open = reader({ ok: true, done: false });
+      expect(await ask(open)).toEqual({ at: fresh.doneIntent.at, fresh: { ok: true, done: false } });
+      const unreadable = reader({ ok: false, error: "Jira API 503" });
+      expect(await ask(unreadable)).toEqual({ at: fresh.doneIntent.at, fresh: { ok: false, error: "Jira API 503" } });
+      const throws = reader(new Error("boom"));
+      expect(await ask(throws)).toMatchObject({ at: fresh.doneIntent.at, fresh: { ok: false, error: "Error: boom" } });
+
+      // The regression invariant: a caller that SAW Done earlier cannot skip the read —
+      // there is no parameter that says so, and the read decides.
+      const reopened = reader({ ok: true, done: false });
+      expect(await ask(reopened, { ticketDone: true, alreadyDone: true })).toMatchObject({ at: fresh.doneIntent.at });
+      expect(reopened).toHaveBeenCalledTimes(1);
+      // An earlier OPEN observation may defer without a read (the safe direction).
+      const unused = reader({ ok: true, done: true });
+      expect(await ask(unused, { openSeen: true })).toMatchObject({ at: fresh.doneIntent.at });
+      expect(unused).not.toHaveBeenCalled();
+      // Nothing to defer ⇒ no read at all.
+      const none = reader({ ok: true, done: false });
+      expect(await deferHoldOnDoneIntent({ current: fresh, holdWritten: false, ticketId: "TEAM-1", readDone: none })).toBeNull();
+      expect(await deferHoldOnDoneIntent({ current: { status: "complete" }, holdWritten: true, ticketId: "TEAM-1", readDone: none })).toBeNull();
+      expect(none).not.toHaveBeenCalled();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  // TEAM-5958 (TEAM-5799 F6): report_completion's record write DEFERS on the twins' fence.
+  const seedFenced = (extra = {}) => {
+    h.objects.set(HELD_KEY, JSON.stringify({ ticket_id: "TEAM-4200", status: "complete", followUpsPending: false, doneIntent: { at: new Date().toISOString(), provider: "jira", nonce: "0f8fad5b-d9cb-469f-a165-70867728950e" }, ...extra }));
+    h.etags.set(HELD_KEY, '"fenced"');
+  };
+  const ONE_FOLLOW_UP = JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document it" }]);
+  const refuseCreate = () => { h.createGate = () => ({ error: "Jira API 400: Field 'labels' is invalid" }); };
+
+  it("TEAM-5958 (F6): a write that would put followUpsPending:true on a record carrying a FRESH doneIntent, on a ticket not yet Done, is DEFERRED - no PUT, no Done, completion_record_done_in_flight", async () => {
+    seedFenced();
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", status: "in_progress" });
+    refuseCreate();
+    const res = result(await report({ follow_ups: ONE_FOLLOW_UP }));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_done_in_flight", next_action: "retry_report_completion" });
+    expect(res.status).toBeUndefined();
+    expect(res.message).toMatch(/Done on TEAM-4200 is being committed/);
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(JSON.parse(h.objects.get(HELD_KEY))).toMatchObject({ followUpsPending: false });
+    expect(calls("Tickets___get_issue").length).toBeGreaterThanOrEqual(2); // the fresh re-read before deferring
+  });
+
+  it("TEAM-5958 (F6): an UNREADABLE ticket defers too - 'could not tell' is not 'Done'", async () => {
+    seedFenced();
+    h.ticketFail.add("Tickets___get_issue");
+    refuseCreate();
+    const res = result(await report({ follow_ups: ONE_FOLLOW_UP }));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_done_in_flight", next_action: "retry_report_completion" });
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(JSON.parse(h.objects.get(HELD_KEY))).toMatchObject({ followUpsPending: false });
+  });
+
+  it("TEAM-5958 (F6): the ticket already reads Done ⇒ the fresh intent is a committed Done's audit - the hold is written over the Done ticket (drop()'s already-Done rule), pending_follow_ups", async () => {
+    seedFenced();
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", status: "done" });
+    refuseCreate();
+    const res = result(await report({ follow_ups: ONE_FOLLOW_UP }));
+    expect(res).toMatchObject({ status: "complete_pending_follow_ups", next_action: "retry_report_completion" });
+    expect(written()).toHaveLength(1);
+    expect(record()).toMatchObject({ followUpsPending: true, status: "complete_pending_follow_ups", doneIntent: { provider: "jira" } });
+    expect(transitioned()).toBe(false);
+  });
+
+  it("TEAM-5958 (F6): a hold ALREADY on the record is not an introduction - written as before, fresh intent or not", async () => {
+    seedFenced({ followUpsPending: true, status: "complete_pending_follow_ups" });
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", status: "in_progress" });
+    refuseCreate();
+    const res = result(await report({ follow_ups: ONE_FOLLOW_UP }));
+    expect(res).toMatchObject({ status: "complete_pending_follow_ups" });
+    expect(written()).toHaveLength(1);
+    expect(record()).toMatchObject({ followUpsPending: true, doneIntent: { provider: "jira" } });
+    // no fence re-read of the ticket: nothing to defer (the other get_issue is the epic, for the notice dedupe)
+    expect(calls("Tickets___get_issue").filter((p) => p.ticket_id === "TEAM-4200")).toHaveLength(1);
+  });
+
+  it("TEAM-5958 (F6): a STALE intent (the twin died, or its commit failed and the clear failed) is not a Done in flight - written, bounded by the TTL", async () => {
+    seedFenced({ doneIntent: { at: new Date(Date.now() - DONE_INTENT_TTL_MS - 1000).toISOString(), provider: "jira", nonce: "n" } });
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", status: "in_progress" });
+    refuseCreate();
+    const res = result(await report({ follow_ups: ONE_FOLLOW_UP }));
+    expect(res).toMatchObject({ status: "complete_pending_follow_ups" });
+    expect(written()).toHaveLength(1);
+    expect(record().followUpsPending).toBe(true);
+  });
+
+  it("TEAM-5866 (1): a body stream that fails after S3 answered is an UNREADABLE record - refused, no IfMatch write over the hold, no Done", async () => {
+    seedHeld();
+    // GetObject returned (ETag "held" and all); the body stream then dies. On 534490a this
+    // read "no record" with a valid ETag, and the IfMatch write replaced the held record.
+    h.bodyError = { key: HELD_KEY, err: Object.assign(new Error("aborted"), { name: "ECONNRESET" }) };
+    const res = result(await report({ follow_ups: JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document it" }]) }));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_unreadable", next_action: "retry_report_completion" });
+    expect(res.message).toMatch(/ECONNRESET/);
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+    expect(JSON.parse(h.objects.get(HELD_KEY))).toMatchObject({ briefPending: true, briefDelivered: "off_gate" });
+  });
+
+  it("TEAM-5866 (1b): a body that is not JSON is refused too - never 'repaired' over a hold it cannot see; the message names the operator's remedy", async () => {
+    const body = '{"ticket_id":"TEAM-4200","briefPending":true,';
+    h.objects.set(HELD_KEY, body);
+    h.etags.set(HELD_KEY, '"held"');
+    const res = result(await report({}));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_unreadable", next_action: "retry_report_completion" });
+    expect(res.message).toMatch(/SyntaxError/);
+    expect(res.message).toMatch(/operator/i);
+    expect(res.message).toMatch(/repair or delete/);
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(h.objects.get(HELD_KEY)).toBe(body);
+  });
+
+  // TEAM-5925: valid JSON that is not a plain object has the same unknowable hold state as
+  // bad JSON (the twins' judgeBriefHold refuses it), so it is refused the same way.
+  const NON_OBJECT_BODIES = ["null", "[]", '"string"', "42"];
+
+  it.each(NON_OBJECT_BODIES)("TEAM-5925: a prior record that parses to a non-object (%s) is refused - no IfMatch replacement, no Done", async (body) => {
+    h.objects.set(HELD_KEY, body);
+    h.etags.set(HELD_KEY, '"held"');
+    const res = result(await report({}));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_unreadable", next_action: "retry_report_completion" });
+    expect(res.message).toMatch(/not an object/);
+    expect(res.message).toMatch(/repair or delete/);
+    expect(res.status).toBeUndefined();
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+    expect(h.objects.get(HELD_KEY)).toBe(body);
+  });
+
+  it.each(NON_OBJECT_BODIES)("TEAM-5925: a CAS re-read (after a 412) that finds a non-object (%s) gives up - no second write, no Done", async (body) => {
+    seedHeld({ briefPending: false, briefDelivered: "gate" });
+    let fired = false;
+    // The first conditional write loses: another writer left `body` under a new ETag.
+    h.putGate = (input) => {
+      if (input.Key !== HELD_KEY || fired) return null;
+      fired = true;
+      h.objects.set(HELD_KEY, body);
+      h.etags.set(HELD_KEY, '"moved"');
+      return Object.assign(new Error("At least one of the pre-conditions you specified did not hold"), { name: "PreconditionFailed", $metadata: { httpStatusCode: 412 } });
+    };
+    const res = result(await report({}));
+    h.putGate = null;
+    expect(res.ok).toBe(false);
+    expect(res.message).toMatch(/not an object/);
+    expect(res.status).toBeUndefined();
+    expect(written()).toHaveLength(1);
+    expect(written()[0].IfMatch).toBe('"held"');
+    expect(transitioned()).toBe(false);
+    expect(h.objects.get(HELD_KEY)).toBe(body);
+  });
+
+  it("TEAM-5925 parity: every body the twins' judgeBriefHold cannot judge, parseCompletionRecord refuses - and a plain object passes both", async () => {
+    const twins = [await import("../agentcore-hub-tickets/gate-contract.mjs"), await import("../agentcore-hub-jira/gate-contract.mjs")];
+    for (const body of [...NON_OBJECT_BODIES, "", "   ", '{"ticket_id":"T",']) {
+      for (const twin of twins) expect(twin.judgeBriefHold(HELD_KEY, body), body).toMatchObject({ proven: false });
+      expect(() => parseCompletionRecord(body), body).toThrow();
+    }
+    for (const [body, shape] of [["null", "null"], ["[]", "an array"], ['"string"', "string"], ["42", "number"]]) {
+      expect(() => parseCompletionRecord(body)).toThrow(`parsed to ${shape}, not an object`);
+      for (const twin of twins) expect(twin.judgeBriefHold(HELD_KEY, body).why).toContain(`parsed to ${shape}, not an object`);
+    }
+    const ok = '{"ticket_id":"T","briefPending":false}';
+    for (const twin of twins) expect(twin.judgeBriefHold(HELD_KEY, ok)).toBeNull();
+    expect(parseCompletionRecord(ok)).toEqual({ ticket_id: "T", briefPending: false });
+  });
+
   it("the typed-gate refusal is a failure too — prose the classifier cannot know", async () => {
     // Same structured shape, arbitrary hint text: `ok:false` is what catches it, which
     // is why the classifier keys on that rather than on a growing list of prefixes.
@@ -2151,16 +2480,29 @@ describe("report_completion — TEAM-5123: persisted follow-up outcomes and unfi
     expect(res.followUpsMaterialized.failed[0].retryable).toBe(true);
   });
 
-  it("(j) an unreadable prior record still saves (withheld, the row is unfiled), and the comment marker still dedupes", async () => {
+  // TEAM-5830 (deliberate contract change): this used to SAVE over a prior record S3
+  // could not read — a record it never saw, which may hold a merge-brief hold the write
+  // would erase. Now the call is refused before any side effect, and the retry, once
+  // the record reads again, files the notices and still dedupes on the marker.
+  it("(j) TEAM-5830: an unreadable prior record is refused (completion_record_unreadable): nothing written, posted or transitioned; the retry saves, and the marker still dedupes", async () => {
     bugRooted();
     h.createGate = () => REFUSED;
     const unreadable = Object.assign(new Error("We encountered an internal error"), { name: "InternalError" });
     h.getError = { key: "completions/TEAM-4200.json", err: unreadable };
+    const refused = result(await report({ follow_ups: FU() }));
+    expect(refused).toMatchObject({ ok: false, reason: "completion_record_unreadable", next_action: "retry_report_completion" });
+    expect(refused.status).toBeUndefined();
+    expect(refused.message).toMatch(/InternalError/);
+    expect(h.puts.filter((p) => p.Key === "completions/TEAM-4200.json")).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(h.warns.join("\n")).toMatch(/prior completion record completions\/TEAM-4200\.json was unreadable \(InternalError/);
+    h.getError = null;
     const first = result(await report({ follow_ups: FU() }));
     expect(first.status).toBe("complete_pending_follow_ups");
     expect(transitioned()).toBe(false);
     expect(calls("Tickets___add_comment")).toHaveLength(2);
-    expect(h.warns.join("\n")).toMatch(/prior completion record completions\/TEAM-4200\.json was unreadable \(InternalError/);
     const second = result(await report({ follow_ups: FU() }));
     expect(second.status).toBe("complete_pending_follow_ups");
     expect(calls("Tickets___add_comment")).toHaveLength(2);
@@ -3616,6 +3958,75 @@ describe("report_completion — FR-10 empty_sweep", () => {
     expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4644", reason: expect.stringContaining("Error") }]);
     expect(res.status).toBe("complete");
     h.transitionGate = null;
+  });
+
+  it("TEAM-5866 (3): a sibling whose record holds the merge brief is NOT skipped - no overwrite, no transition, reported in emptySweepFailed; the rest still skip, create-only", async () => {
+    const HELD = "completions/TEAM-4645.json";
+    const held = JSON.stringify({ ticket_id: "TEAM-4645", status: "complete_pending_brief", briefPending: true, briefDelivered: "off_gate" });
+    h.objects.set(HELD, held);
+    h.etags.set(HELD, '"held-4645"');
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    // The held sibling: no record write, no transition, named in the response.
+    expect(h.puts.filter((p) => p.Key === HELD)).toHaveLength(0);
+    expect(calls("Tickets___transition_ticket").map((p) => p.ticket_id)).not.toContain("TEAM-4645");
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4644", "TEAM-4643"]);
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4645", reason: expect.stringContaining("briefPending:true") }]);
+    expect(h.objects.get(HELD)).toBe(held);
+    // Every skip record that WAS written is a conditional create, never a blind put.
+    for (const p of h.puts.filter((p) => p.Key?.startsWith("completions/") && p.Key !== "completions/TEAM-4640.json")) {
+      expect(p.IfNoneMatch, p.Key).toBe("*");
+    }
+  });
+
+  it("TEAM-5941: a sibling whose record carries a FRESH doneIntent (a twin is committing its Done) is NOT skipped - no overwrite, no transition, reported in emptySweepFailed; a STALE one is skipped as before", async () => {
+    const FENCED = "completions/TEAM-4645.json";
+    const fenced = JSON.stringify({ ticket_id: "TEAM-4645", status: "complete", doneIntent: { at: new Date().toISOString(), provider: "dynamodb", nonce: "n1" } });
+    h.objects.set(FENCED, fenced);
+    h.etags.set(FENCED, '"fenced-4645"');
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    expect(h.puts.filter((p) => p.Key === FENCED)).toHaveLength(0);
+    expect(calls("Tickets___transition_ticket").map((p) => p.ticket_id)).not.toContain("TEAM-4645");
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4644", "TEAM-4643"]);
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4645", reason: expect.stringMatching(/has a Done in flight \(doneIntent .*\) - not skipped; it closes on its own/) }]);
+    expect(h.objects.get(FENCED)).toBe(fenced);
+
+    // Stale: the twin that wrote it is gone; the skip overwrites it (IfMatch), as any record.
+    h.puts.length = 0;
+    const stale = JSON.stringify({ ticket_id: "TEAM-4645", status: "complete", doneIntent: { at: new Date(Date.now() - DONE_INTENT_TTL_MS - 1).toISOString(), provider: "dynamodb", nonce: "n1" } });
+    h.objects.set(FENCED, stale);
+    h.etags.set(FENCED, '"stale-4645"');
+    const res2 = result(await sweep());
+    expect(res2.emptySweepSkipped).toContain("TEAM-4645");
+    expect(res2).not.toHaveProperty("emptySweepFailed");
+    const put = h.puts.find((p) => p.Key === FENCED);
+    expect(put.IfMatch).toBe('"stale-4645"');
+    expect(JSON.parse(h.objects.get(FENCED)).doneIntent).toBeUndefined();
+  });
+
+  it.each(["null", "[]", '"string"', "42"])("TEAM-5925: a sibling whose record parses to a non-object (%s) is NOT skipped - no overwrite, no transition, reported in emptySweepFailed", async (body) => {
+    const KEY = "completions/TEAM-4645.json";
+    h.objects.set(KEY, body);
+    h.etags.set(KEY, '"odd-4645"');
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    expect(h.puts.filter((p) => p.Key === KEY)).toHaveLength(0);
+    expect(calls("Tickets___transition_ticket").map((p) => p.ticket_id)).not.toContain("TEAM-4645");
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4644", "TEAM-4643"]);
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4645", reason: expect.stringMatching(/unreadable.*not an object/) }]);
+    expect(h.objects.get(KEY)).toBe(body);
+  });
+
+  it("TEAM-5866 (3b): a skip write that loses its conditional (412) refuses and surfaces - never a bare put, never a transition", async () => {
+    const KEY = "completions/TEAM-4644.json";
+    h.putGate = (input) => (input.Key === KEY ? Object.assign(new Error("At least one of the pre-conditions you specified did not hold"), { name: "PreconditionFailed", $metadata: { httpStatusCode: 412 } }) : null);
+    const res = result(await sweep());
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4645", "TEAM-4643"]);
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4644", reason: expect.stringMatching(/changed under the skip \(lost\)/) }]);
+    expect(calls("Tickets___transition_ticket").map((p) => p.ticket_id)).not.toContain("TEAM-4644");
+    expect(h.puts.filter((p) => p.Key === KEY).every((p) => p.IfNoneMatch === "*" || p.IfMatch !== undefined)).toBe(true);
+    h.putGate = null;
   });
 
   it("orders a row whose blockedBy is unreadable as a leaf", () => {
