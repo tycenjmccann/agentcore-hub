@@ -196,6 +196,26 @@ idempotent:
    read (anything but a 404) refuses the call (`completion_record_unreadable`):
    nothing written, nothing posted, no Done.
 
+   **A hold cannot land under a committing Done (TEAM-5941).** The ticket Lambdas'
+   Done guard reads the record, then awaits provider calls before the Done commits;
+   a drain stamp of `briefPending:true` inside that window used to leave a Done
+   ticket under a held record (TEAM-5926 only detected it afterwards, as
+   `conflict:"done_over_brief_hold"`). Now, as the LAST step before its commit, the
+   twin writes `doneIntent:{at,provider,nonce}` onto the record with `IfMatch` on
+   the ETag its guard admitted. If the drain stamped first, that write 412s and the
+   twin re-reads, re-judges and refuses with the standard hold text. If the twin
+   fenced first, the drain's own `IfMatch` stamp 412s (`retry`), and on the next
+   tick `drop()` sees a FRESH intent (younger than `DONE_INTENT_TTL_MS`, 10 min,
+   the same constant as gate-contract.mjs) on a ticket not yet Done and answers
+   `retry` without stamping or posting a LEFT OPEN notice; once the ticket reads
+   Done there is no hold to push, and the off-gate fallback comment is the human
+   notice. A stale intent (the twin died) is stripped by the next stamp and the hold
+   is pushed as usual. Every record writer carries the intent (`adoptHold`, the
+   drain's spreads); the empty-sweep skip refuses to overwrite a record with a fresh
+   one. The twin role needs `s3:PutObject` on `completions/*`
+   (`deploy/setup-tickets-lambda.mjs`; a denied fence write refuses the Done, fail
+   closed, and `deploy/lib/twin-preflight.mjs` refuses to ship twin code without it).
+
    **A brief can be posted twice (harmless).** The `[brief:<sha12>]` dedupe reads
    the ticket's comments, then posts: it is not an atomic claim, so a drain and a
    re-run that both read the gate before either posts each post one identical copy.

@@ -940,3 +940,106 @@ describe("terminalMoveRefusal / isTerminalStatus — twins + TS mirror agree", (
     expect(terminalMoveRefusal("cancelled", "done")).toMatch(/terminal/);
   });
 });
+
+/**
+ * TEAM-5941 — the Done-intent fence. The twins write `doneIntent` onto the completion
+ * record (IfMatch) as the last step before their commit; the replay drain backs off a
+ * hold stamp while a FRESH intent is on the record. workflow-output cannot import
+ * gate-contract.mjs (its zip), so it carries a THIRD copy of the TTL and the freshness
+ * rule (`DONE_INTENT_TTL_MS`, `doneIntentFresh`). A drift there is a drain that stamps a
+ * hold the twin is about to walk past, or one that waits forever on a dead twin — so the
+ * value is pinned here off the file, the way check-fix-kinds-parity.sh pins literals.
+ */
+describe("doneIntentOf / DONE_INTENT_TTL_MS — the Done-intent fence (TEAM-5941)", () => {
+  const NOW = Date.parse("2026-10-14T12:00:00.000Z");
+  const at = (msAgo: number) => new Date(NOW - msAgo).toISOString();
+
+  it("the TTL agrees across the two copies, and is 10 minutes", () => {
+    expect(agree("DONE_INTENT_TTL_MS", (m) => m.DONE_INTENT_TTL_MS)).toBe(10 * 60_000);
+    expect(agree("DONE_INTENT_FENCE_ATTEMPTS", (m) => m.DONE_INTENT_FENCE_ATTEMPTS)).toBe(3);
+  });
+
+  it("workflow-output's mirror carries the SAME TTL value", () => {
+    const src = readFileSync(resolve(__dirname, "../../..", "lambda/workflow-output/index.mjs"), "utf8");
+    const m = /export const DONE_INTENT_TTL_MS = ([^;]+);/.exec(src);
+    expect(m, "lambda/workflow-output/index.mjs no longer exports DONE_INTENT_TTL_MS").not.toBeNull();
+    // eslint-disable-next-line no-new-func
+    const mirrored = Function(`"use strict"; return (${m![1]});`)();
+    expect(mirrored).toBe(agree("DONE_INTENT_TTL_MS (mirror)", (m2) => m2.DONE_INTENT_TTL_MS));
+  });
+
+  it.each([
+    ["absent", {}, { present: false, fresh: false }],
+    ["no record", null, { present: false, fresh: false }],
+    ["a non-object intent", { doneIntent: "soon" }, { present: false, fresh: false }],
+    ["fresh (1 s old)", { doneIntent: { at: at(1000), provider: "jira", nonce: "n" } }, { present: true, fresh: true }],
+    ["fresh (1 ms under the TTL)", { doneIntent: { at: at(10 * 60_000 - 1) } }, { present: true, fresh: true }],
+    ["future `at` (clock skew) is fresh", { doneIntent: { at: at(-60_000) } }, { present: true, fresh: true }],
+    ["exactly the TTL is stale", { doneIntent: { at: at(10 * 60_000) } }, { present: true, fresh: false }],
+    ["stale (an hour)", { doneIntent: { at: at(3_600_000) } }, { present: true, fresh: false }],
+    ["an unparseable `at` is stale", { doneIntent: { at: "yesterday" } }, { present: true, fresh: false }],
+    ["no `at` is stale", { doneIntent: { provider: "jira" } }, { present: true, fresh: false }],
+  ])("doneIntentOf agrees on %s", (label, record, expected) => {
+    const v = agree(`doneIntentOf ${label}`, (m) => m.doneIntentOf(record, NOW)) as { present: boolean; fresh: boolean };
+    expect({ present: v.present, fresh: v.fresh }).toEqual(expected);
+  });
+
+  it("withDoneIntent / withoutDoneIntent never mutate and round-trip", () => {
+    const record = { ticketId: "T", briefPending: false };
+    const fenced = agree("withDoneIntent", (m) => m.withDoneIntent(record, { provider: "dynamodb", at: at(0), nonce: "n1" })) as Record<string, unknown>;
+    expect(fenced.doneIntent).toEqual({ at: at(0), provider: "dynamodb", nonce: "n1" });
+    expect(record).not.toHaveProperty("doneIntent");
+    expect(agree("withoutDoneIntent", (m) => m.withoutDoneIntent(fenced))).toEqual(record);
+    expect(fenced).toHaveProperty("doneIntent");
+  });
+
+  it("classifyS3WriteError: 412 ⇒ precondition, 409 ⇒ conflict, 404 ⇒ gone, else other", () => {
+    const e = (name: string, status?: number) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+    for (const [err, kind] of [
+      [e("PreconditionFailed", 412), "precondition"],
+      [e("Weird", 412), "precondition"],
+      [e("ConditionalRequestConflict", 409), "conflict"],
+      [e("NoSuchKey", 404), "gone"],
+      [e("NotFound"), "gone"],
+      [e("AccessDenied", 403), "other"],
+      [e("InternalError", 500), "other"],
+      [null, "other"],
+    ] as const) {
+      expect(agree(`classify ${err?.name}`, (m) => m.classifyS3WriteError(err))).toBe(kind);
+    }
+  });
+
+  it("rejudgeAdmitted uses the guard's own judge, and its refusal texts are the guard's", () => {
+    const KEY = "completions/TEAM-4066.json";
+    const held = JSON.stringify({ briefPending: true, briefDelivered: "off_gate" });
+    const pending = JSON.stringify({ followUpsPending: true, status: "complete_pending_follow_ups" });
+    const clean = JSON.stringify({ status: "complete", followUpsPending: false });
+    // brief-only guard (every non-ship ticket)
+    expect(agree("brief: clean", (m) => m.rejudgeAdmitted(KEY, clean, {}))).toBeNull();
+    expect(agree("brief: held", (m) => m.rejudgeAdmitted(KEY, held, {}))).toMatchObject({
+      what: "a ticket whose merge brief is held", unknown: false,
+      why: agree("brief why", (m) => m.judgeBriefHold(KEY, held).why),
+    });
+    expect(agree("brief: followUps ignored", (m) => m.rejudgeAdmitted(KEY, pending, {}))).toBeNull();
+    expect(agree("brief: unjudgeable", (m) => m.rejudgeAdmitted(KEY, "{nope", {}))).toMatchObject({ unknown: true, what: "a ticket whose merge-brief hold cannot be read" });
+    // record-gated guard (ship / security)
+    expect(agree("gated: pending", (m) => m.rejudgeAdmitted(KEY, pending, { recordGated: true }))).toMatchObject({
+      what: "a ship-phase ticket", why: agree("gated why", (m) => m.judgeCompletionRecord(KEY, pending).why),
+    });
+    expect(agree("gated: security stamp missing", (m) => m.rejudgeAdmitted(KEY, clean, { recordGated: true, securityReview: true }))).toMatchObject({ what: "a security-review ticket" });
+    expect(agree("gated: clean", (m) => m.rejudgeAdmitted(KEY, clean, { recordGated: true }))).toBeNull();
+  });
+
+  it("the fence refusals never read as a proven brief hold to workflow-output", () => {
+    for (const text of [
+      agree("contended", (m) => m.doneIntentContendedRefusal("completions/X.json", 3)),
+      agree("unfenced", (m) => m.doneIntentUnfencedRefusal("completions/X.json", "PutObject AccessDenied 403")),
+      agree("brief warning", (m) => m.DONE_OVER_BRIEF_HOLD_WARNING),
+    ] as string[]) {
+      expect(text).not.toMatch(/has briefPending:true \(brief /);
+    }
+    // TEAM-5941: the post-commit warning no longer advises a report_completion re-run,
+    // which cannot close or converge a Done ticket.
+    expect(agree("brief warning text", (m) => m.DONE_OVER_BRIEF_HOLD_WARNING)).not.toMatch(/re-run WorkflowOutput___report_completion/);
+  });
+});

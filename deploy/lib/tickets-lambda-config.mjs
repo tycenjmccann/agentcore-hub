@@ -67,7 +67,13 @@ export function resolveArtifactBucket({ env = process.env, accountId = "", regio
  *                        on the pipeline-tools role and had to move ITS probe to
  *                        ListObjectsV2 before a prefix condition could bind.) The role
  *                        already reads every object in the bucket, so this adds key-name
- *                        enumeration and nothing else; there is still no S3 write anywhere.
+ *                        enumeration and nothing else.
+ *   CompletionRecordFence — s3:PutObject on <bucket>/completions/* ONLY (TEAM-5941): the
+ *                        twins' Done-intent fence is a conditional PutObject of the
+ *                        completion record right before the provider commit. The one S3
+ *                        write on the role; twin code that carries the fence refuses every
+ *                        Done on a ticket with a record until this grant is live, which is
+ *                        why twin-preflight.mjs requires it before a twin code deploy.
  *
  * The three TEAM-4739 / TEAM-5716 statements are CONDITIONAL on their env var, so an install
  * that has never set them gets a byte-identical policy on redeploy. Each grants the narrowest
@@ -127,6 +133,18 @@ export function buildTicketsPolicyStatements({
       Effect: "Allow",
       Action: ["s3:ListBucket"],
       Resource: `arn:aws:s3:::${artifactBucket}`,
+    },
+    {
+      // TEAM-5941 (TEAM-5799 ship-review r2 F1): the Done-intent fence. Before the
+      // provider commit each twin PutObjects completions/<ticket>.json with IfMatch on
+      // the ETag its guard admitted (gate-contract.mjs "Done-intent fence"); a denied
+      // write REFUSES the Done (fail closed), so this grant must be live before twin code
+      // that carries the fence ships — deploy/lib/twin-preflight.mjs enforces that. The
+      // ONLY S3 write on the role, prefix-scoped: the twins never write anywhere else.
+      Sid: "CompletionRecordFence",
+      Effect: "Allow",
+      Action: ["s3:PutObject"],
+      Resource: `arn:aws:s3:::${artifactBucket}/completions/*`,
     }
   );
   if (pipelineToolsLambda) {

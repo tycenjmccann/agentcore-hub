@@ -31,6 +31,9 @@ export function resetFake() {
     objects: new Map(), etags: new Map(), etagSeq: 0, puts: [],
     tickets: new Map(), nextKey: 5700, calls: [], webhooks: [],
     down: false, downError: PROVIDER_503, failTool: null, lambdaFail: null, putError: null, getError: null, beforeTool: null,
+    // TEAM-5941: run inside a Done transition before the status changes — what the real
+    // twin does there is fence the completion record (a PutObject with doneIntent).
+    onTransition: null,
     queue: [], sends: [], dedup: new Map(), sendError: null, receiptSeq: 0,
     metrics: [], events: [], lambdaInvokes: [],
   });
@@ -135,6 +138,7 @@ function jiraTool(tool, p) {
       if (!t) return { error: `Jira API 404: Issue ${p.ticket_id} does not exist` };
       // The jira twin's ambiguous answer for a ticket already in the target status.
       if (/^done$/i.test(t.status)) return { error: 'No transition to "Done" found. Available: Reopen' };
+      fake.onTransition?.(t);
       t.status = "Done";
       // Jira fires jira:issue_updated only on a REAL change, which is what makes the
       // orchestrator's cascade a function of transitions rather than of attempts.

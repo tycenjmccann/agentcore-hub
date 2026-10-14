@@ -400,6 +400,15 @@ then re-run the pipeline. If the refusal is AccessDenied on `ListRolePolicies` /
 `pipeline-artifacts/ship-approvals/*` for its role, and the ticket role's
 `s3:GetObject` cover over `completions/*`.
 
+**This PR (TEAM-5941, TEAM-5799 ship-review r2 F1) needs one handoff script re-run,
+BEFORE merging to `main`:**
+
+| # | Command | Why |
+|---|---|---|
+| 1 | `source deploy/config.sh && TICKET_PROVIDER=<jira\|dynamodb> node deploy/setup-tickets-lambda.mjs` | the ticket role gains the prefix-scoped inline `s3:PutObject` on `completions/*` (`CompletionRecordFence`). Both ticket twins now write a `doneIntent` onto `completions/<ticket>.json` with `IfMatch` as the LAST step before the provider commit (the fence that stops a Done committing over a replay's `briefPending:true` stamp), and a write the role may not make REFUSES the Done, fail closed. So twin code with the fence on a role without the grant refuses every Done on a ticket that has a completion record |
+| 2 | `./scripts/verify-infra.sh` | the new `s3:PutObject covering completions/*` check is green |
+| 3 | merge / release | the Deploy stage's preflight (TEAM-5910, below) now also requires that grant and refuses to ship twin code without it, so the order above is enforced, not advisory |
+
 **This PR (TEAM-5910, TEAM-5799 follow-up) needs two handoff steps, IN THIS ORDER,
 before the first pipeline deploy that carries ticket-twin code (the TEAM-5799 twin
 changes ride in the same release, so do this before merging to `main`):**

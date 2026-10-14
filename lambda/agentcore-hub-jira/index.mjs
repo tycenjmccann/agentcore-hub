@@ -8,8 +8,8 @@
  *   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY
  */
 
-import { randomUUID } from "node:crypto"; // TEAM-5723: per-request fence nonce
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { randomUUID } from "node:crypto"; // TEAM-5723: per-request fence nonce; TEAM-5941: the Done-intent nonce
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 // TEAM-4740 FR-5 (interim): the ONLY DynamoDB this Lambda touches is the events
 // table, and only to audit an autowired blocker edge — the same write the DynamoDB
 // twin makes, so the twins emit one event vocabulary instead of two. Dark unless
@@ -64,6 +64,14 @@ import {
   judgePostCommitHold,
   postCommitHoldConflict,
   postCommitUncheckedWarning,
+  DONE_INTENT_FENCE_ATTEMPTS,
+  DONE_UNFENCED_WHAT,
+  classifyS3WriteError,
+  doneIntentContendedRefusal,
+  doneIntentUnfencedRefusal,
+  rejudgeAdmitted,
+  withDoneIntent,
+  withoutDoneIntent,
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
   designAmendmentRefusal,
@@ -392,7 +400,8 @@ async function completionRecordProven(ticketId, opts = {}, capture = null) {
     // Inside the try on purpose: a stream that fails mid-read, or a response with no
     // Body at all, is the same "could not tell" as the GetObject itself throwing.
     bodyText = await res.Body.transformToString();
-    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText, recordGated: true });
+    // TEAM-5941: `securityReview` rides along so the fence's re-judge uses the same judge.
+    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText, recordGated: true, securityReview: opts.securityReview === true });
   } catch (err) {
     const status = err?.$metadata?.httpStatusCode;
     if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
@@ -456,6 +465,93 @@ function completionRecordRequiredError(ticketId, why, what = "a ship-phase ticke
   );
   err.toolResult = { ...COMPLETION_RECORD_REQUIRED };
   return err;
+}
+
+/**
+ * TEAM-5941 (TEAM-5799 ship-review r2 F1): the Done-intent fence — the LAST awaited
+ * step before the transition POST. See the "Done-intent fence" section of
+ * gate-contract.mjs for the design. This is the I/O half, in this twin's idiom (throws
+ * a completionRecordRequiredError to refuse). Twin of the tickets Lambda's
+ * fenceDoneIntent. Mutates `admitted` on success: `etag`/`bodyText` become the fenced
+ * record (so postCommitHoldCheck compares against it) and `intent` is set.
+ *
+ *   · no record admitted (404) ⇒ nothing to fence (no record ⇒ no hold can appear);
+ *   · PUT won ⇒ fenced;
+ *   · 412/409 ⇒ re-read and re-judge with the guard's own judge: a hold ⇒ the standard
+ *     refusal; admitted ⇒ CAS again, DONE_INTENT_FENCE_ATTEMPTS times, then refuse;
+ *   · the record vanished (PUT or re-read 404) ⇒ a ship / security ticket refuses as it
+ *     would on "no record" (DL-030); any other ticket proceeds unfenced;
+ *   · AccessDenied, 5xx, a failed re-read ⇒ REFUSE (fail closed: deploy config, not a race).
+ * A refusal here can leave the reason comment and blocker links written (as the
+ * TEAM-5707 precondition re-read can); the ticket itself has not moved.
+ */
+async function fenceDoneIntent(ticketId, admitted) {
+  if (!ARTIFACT_BUCKET || !admitted.key || admitted.absent === true) return;
+  const key = admitted.key;
+  const vanished = () => {
+    if (admitted.recordGated) {
+      throw completionRecordRequiredError(ticketId, `no ${key} in the artifact bucket`, admitted.securityReview ? "a security-review ticket" : "a ship-phase ticket");
+    }
+    Object.assign(admitted, { absent: true });
+    delete admitted.etag;
+    delete admitted.bodyText;
+  };
+  const errText = (err) => `${err?.name || "S3Error"}${err?.$metadata?.httpStatusCode ? ` ${err.$metadata.httpStatusCode}` : ""}`;
+  for (let attempt = 1; attempt <= DONE_INTENT_FENCE_ATTEMPTS; attempt++) {
+    const at = new Date().toISOString();
+    const nonce = randomUUID();
+    const body = JSON.stringify(withDoneIntent(JSON.parse(admitted.bodyText), { provider: "jira", at, nonce }), null, 2);
+    let kind;
+    try {
+      const res = await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key, Body: body, ContentType: "application/json", IfMatch: admitted.etag }));
+      Object.assign(admitted, { etag: res.ETag, bodyText: body, intent: { at, nonce } });
+      return;
+    } catch (err) {
+      kind = classifyS3WriteError(err);
+      if (kind === "other") {
+        console.warn(`[agentcore-hub-jira] ${ticketId}: refusing done — the Done-intent fence on ${key} could not be written (${errText(err)})`);
+        throw completionRecordRequiredError(ticketId, doneIntentUnfencedRefusal(key, `PutObject ${errText(err)}`), DONE_UNFENCED_WHAT);
+      }
+      if (kind === "gone") return vanished();
+    }
+    // The record moved under the fence: read what it says now, with the guard's judge.
+    let bodyText;
+    let etag;
+    try {
+      const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+      bodyText = await res.Body.transformToString();
+      etag = res.ETag;
+    } catch (err) {
+      if (classifyS3WriteError(err) === "gone") return vanished();
+      console.warn(`[agentcore-hub-jira] ${ticketId}: refusing done — ${key} changed under the Done-intent fence and could not be re-read (${errText(err)})`);
+      throw completionRecordRequiredError(ticketId, doneIntentUnfencedRefusal(key, `re-read ${errText(err)}`), DONE_UNFENCED_WHAT);
+    }
+    const verdict = rejudgeAdmitted(key, bodyText, admitted);
+    if (verdict) {
+      console.warn(`[agentcore-hub-jira] ${ticketId}: refusing done on ${verdict.what} — the record changed under the Done-intent fence: ${verdict.why}`);
+      throw completionRecordRequiredError(ticketId, verdict.why, verdict.what);
+    }
+    Object.assign(admitted, { etag, bodyText });
+    console.warn(`[agentcore-hub-jira] ${ticketId}: ${key} changed under the Done-intent fence (${kind}, attempt ${attempt}/${DONE_INTENT_FENCE_ATTEMPTS}) — still admitted, fencing again`);
+  }
+  throw completionRecordRequiredError(ticketId, doneIntentContendedRefusal(key, DONE_INTENT_FENCE_ATTEMPTS), DONE_UNFENCED_WHAT);
+}
+
+/**
+ * TEAM-5941: take the intent back off the record when the transition did not commit.
+ * Best-effort, one conditional PUT, every failure only logged: a stale intent is
+ * harmless (the drain treats one older than DONE_INTENT_TTL_MS as absent).
+ */
+async function clearDoneIntent(ticketId, admitted) {
+  if (!admitted?.intent || !admitted.key || !admitted.bodyText) return;
+  try {
+    const body = JSON.stringify(withoutDoneIntent(JSON.parse(admitted.bodyText)), null, 2);
+    const res = await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: admitted.key, Body: body, ContentType: "application/json", IfMatch: admitted.etag }));
+    Object.assign(admitted, { etag: res.ETag, bodyText: body });
+    delete admitted.intent;
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: the Done did not commit and the Done-intent on ${admitted.key} could not be cleared (${err?.name || "S3Error"}) — it expires on its own`);
+  }
 }
 
 // ─── The typed gate guard (TEAM-4739) ────────────────────────────────────────
@@ -2297,6 +2393,10 @@ async function transitionTicket(params) {
     }
   }
   await recheckPrecondition();
+  // TEAM-5941: the Done-intent fence — the LAST awaited step before the transition POST
+  // (everything between here and the POST is synchronous). The labels-screen fallback
+  // below runs after it and needs no second fence: the intent is already on the record.
+  if (effectiveStatus.toLowerCase() === "done") await fenceDoneIntent(ticket_id, admitted);
 
   // TEAM-4739: the verification stamp rides in the SAME request as the transition —
   // `POST /transitions` accepts `update.labels` alongside `transition` — so a gate
@@ -2361,6 +2461,10 @@ async function transitionTicket(params) {
     // Remove ONLY the label we added (`remove` of an absent label is a no-op); stale
     // generations the ops stripped stay stripped. The original error propagates.
     if (parkClaimLabel) await removeParkClaimLabel(ticket_id, parkClaimLabel);
+    // TEAM-5941: the Done did not verify — take the intent back off the record,
+    // best-effort. (A throw after a LANDED POST clears it too; harmless, the ticket
+    // reads Done and nothing reads the intent after that.)
+    if (admitted.intent) await clearDoneIntent(ticket_id, admitted);
     throw err;
   }
 

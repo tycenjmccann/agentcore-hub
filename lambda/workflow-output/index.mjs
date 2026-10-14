@@ -633,6 +633,12 @@ export function adoptHold(report, current, { deliveredNow = false, forceHold = f
   }
   const deliveredSince = current?.briefPending === false && current?.briefDelivered === "gate";
   if (forceHold && !deliveredSince) report.briefPending = true;
+  // TEAM-5941: the twins' Done-intent fence (gate-contract.mjs) is CARRIED verbatim,
+  // whatever else this write decides — it is not a hold field, and a write that dropped
+  // it would re-open the window the fence closes (the drain would stamp a hold the
+  // committing twin can no longer see). Deleted only when the current record has none.
+  if (current && typeof current === "object" && current.doneIntent !== undefined) report.doneIntent = current.doneIntent;
+  else delete report.doneIntent;
   return report;
 }
 
@@ -1585,6 +1591,31 @@ export function parseCompletionRecord(text) {
   throw Object.assign(new Error(`parsed to ${shape}, not an object`), { name: "MalformedRecord" });
 }
 
+/**
+ * TEAM-5941: the twins' Done-intent fence, as the drain reads it. MIRRORS gate-contract.mjs
+ * (`DONE_INTENT_TTL_MS`, `doneIntentOf(...).fresh`), which this zip cannot import;
+ * src/lib/workflow/gate-contract-parity.test.ts pins the two values to each other.
+ *
+ * A twin writes `doneIntent` onto the record with IfMatch as the LAST step before its
+ * provider commit. A FRESH intent on a ticket that does not read Done yet means a Done is
+ * in flight: the drain must not stamp a hold the committing twin can no longer see, so
+ * drop() answers `retry` and the next tick decides (the ticket reads Done ⇒ no hold to
+ * push; the intent went stale ⇒ the twin died, the hold is stamped and the intent
+ * stripped). The TTL is 20x the twins' 30 s Lambda timeout.
+ */
+export const DONE_INTENT_TTL_MS = 10 * 60_000;
+export function doneIntentFresh(record, now = Date.now()) {
+  const intent = record && typeof record === "object" && !Array.isArray(record) ? record.doneIntent : undefined;
+  if (!intent || typeof intent !== "object" || Array.isArray(intent)) return false;
+  const at = Date.parse(intent.at);
+  return Number.isFinite(at) && now - at < DONE_INTENT_TTL_MS;
+}
+/** Drop a STALE intent off a record about to be written (in place); a fresh one is kept. */
+function stripStaleDoneIntent(record) {
+  if (record && record.doneIntent !== undefined && !doneIntentFresh(record)) delete record.doneIntent;
+  return record;
+}
+
 /** Read a completion record; `{ record: null }` when absent, `{ error }` when S3 could not say or the body is not a JSON object. */
 async function readRecord(key) {
   try {
@@ -1655,7 +1686,23 @@ export async function drainCompletion(msg) {
   // provider could not take keeps the message (retry), so the drop is never silent.
   // `epicKey` (when known) is told too; `record` adds fields to the stamp (e.g. the
   // brief still pending). The ticket is never transitioned on this path.
+  // Step 1's answer; declared here, ABOVE drop(), because drop() runs for the step-1 and
+  // step-2 failures before step 1 could assign it (TEAM-5941: it was a `let` below those
+  // calls, reachable only because `held` short-circuited first).
+  let alreadyDone = false;
   const drop = async (step, error, { ticketReadable = true, epicKey = null, record: extra = null } = {}) => {
+    // What holds the ticket open on this drop, if anything: the stamp below would write it.
+    const held = extra?.briefPending === true ? "brief hold" : extra?.followUpsPending === true ? "follow-ups hold" : null;
+    // TEAM-5941: a twin's Done-intent fence is FRESH on the record and the ticket does
+    // not read Done yet — a Done is in flight. Its guard admitted on a record with no
+    // hold, and its IfMatch fence has moved the ETag, so the stamp below would 412 anyway;
+    // and a stamp that did land would be one the committing twin can no longer see. Do
+    // not stamp, do not post the LEFT OPEN notices (nothing is left open): retry, and
+    // the next tick decides on the ticket as it is then (Done ⇒ no hold to push; a stale
+    // intent ⇒ the twin died, and the hold is stamped as usual).
+    if (held && !alreadyDone && rec.record && doneIntentFresh(rec.record)) {
+      return retry(`${ticketId} has a Done in flight (doneIntent ${rec.record.doneIntent.at}); the ${held} is not stamped and no notice is posted - the next tick decides`);
+    }
     console.error(`[ticket-replay] ${ticketId}: DROPPED - ${step} could not be applied (${error}); the ticket is left open for a human`);
     const targets = ticketReadable ? [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])] : [asText(msg.epicKey) || null].filter(Boolean);
     const notices = [];
@@ -1679,7 +1726,9 @@ export async function drainCompletion(msg) {
         const fenced = await fenceRelease();
         if (fenced) return fenced;
       }
-      const stamped = await putRecordIfUnchanged(reportKey, { ...rec.record, ...(extra || {}), ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } }, recordEtag);
+      // TEAM-5941: a fresh Done-intent rides along (the spread keeps it); a stale one — the
+      // twin that wrote it is gone — comes off with this stamp.
+      const stamped = await putRecordIfUnchanged(reportKey, stripStaleDoneIntent({ ...rec.record, ...(extra || {}), ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } }), recordEtag);
       // TEAM-5830: a record a re-run rewrote since step 0 is not overwritten with the
       // older copy; the message comes back and the next tick decides on the new record
       // (the notices above are marker-deduped). TEAM-5866: and a stamp S3 could not take
@@ -1697,7 +1746,6 @@ export async function drainCompletion(msg) {
       // is not final and the message stays. A ticket that cannot be read is the same
       // retry: the hold is on the record, the safe side. Only a ticket step 1 read open:
       // on one already Done there is no race left and the drop is final.
-      const held = extra?.briefPending === true ? "brief hold" : extra?.followUpsPending === true ? "follow-ups hold" : null;
       if (held && !alreadyDone) {
         const after = await readTicketDone(ticketId);
         if (!after.ok) return retry(`post-stamp re-read of ${ticketId} failed (${after.error}); the ${held} is stamped`);
@@ -1732,7 +1780,7 @@ export async function drainCompletion(msg) {
   const issue = read.ok ? normalizeIssue(read.payload) : null;
   if (!issue && isPermanentTicketRefusal(read.error)) return drop("get_issue", read.error, { ticketReadable: false });
   if (!issue) return retry(`get_issue: ${read.error || "the ticket payload carried no ticket key"}`);
-  let alreadyDone = isDoneStatus(issue.status);
+  alreadyDone = isDoneStatus(issue.status);
   const epicKey = issue.parentKey || asText(msg.epicKey) || null;
 
   // 2. The follow-ups, through report_completion's own create-once path.
@@ -1862,6 +1910,8 @@ export async function drainCompletion(msg) {
       const fenced = await fenceRelease();
       if (fenced) return fenced;
     }
+    // TEAM-5941: a stale Done-intent comes off with this write; a fresh one stays.
+    stripStaleDoneIntent(record);
     // TEAM-5830: conditional on the step-0 read, like drop() above.
     const restamped = await putRecordIfUnchanged(reportKey, record, recordEtag);
     if (!restamped.ok) return retry(restamped.moved ? restamped.error : `record ${reportKey} not restamped (${restamped.error})`);
@@ -1870,16 +1920,29 @@ export async function drainCompletion(msg) {
 
   // 7. The Done itself — skipped when the ticket already reads Done, so a replay never
   //    makes a second status change (and so never a second webhook).
+  let transitioned = false;
   if (!alreadyDone) {
     const transition = await transitionToDone(ticketId);
     // TEAM-5805: the twins' brief-hold refusal is permanent for this message too (it
     // carried no brief that could lift it), so it is a surfaced drop, not a DLQ loop.
     if (!transition.ok && (isPermanentTicketRefusal(transition.error) || isBriefHoldRefusal(transition.error))) return drop("transition", transition.error);
     if (!transition.ok) return retry(`transition: ${transition.error}`);
+    transitioned = !transition.alreadyDone;
   }
   if (record) {
-    record.ticketWrites = "applied";
-    const applied = await putRecordIfUnchanged(reportKey, record, recordEtag);
+    // TEAM-5941: the twin's Done-intent fence rewrote the record during the transition
+    // just above (a new ETag, `doneIntent` on the body), so the applied stamp is made on
+    // a FRESH read of it — one attempt — rather than on step 6's ETag, which would lose
+    // every time and leave `ticketWrites:"queued"` behind every replayed Done. A ticket
+    // that was already Done saw no fence; its stamp conditions on step 6 as before.
+    let base = { record, etag: recordEtag };
+    if (transitioned) {
+      const fresh = await readRecord(reportKey);
+      if (fresh.record) base = { record: fresh.record, etag: fresh.etag };
+      else console.error(`[ticket-replay] ${ticketId}: Done landed but the record could not be re-read for the applied stamp (${fresh.error || "no record"}) - stamping on the step-6 read`);
+    }
+    base.record.ticketWrites = "applied";
+    const applied = await putRecordIfUnchanged(reportKey, base.record, base.etag);
     if (!applied.ok) {
       console.error(`[ticket-replay] ${ticketId}: Done landed but the record still says ticketWrites:"queued" (${applied.error}) - a replay finds the ticket Done and only restamps`);
     }
@@ -2974,6 +3037,13 @@ async function skipSibling(row, { workflowId, sweeperTicketId }) {
   if (held) {
     console.warn(`[report_completion] ${ticketId}: empty_sweep will NOT skip it - its completion record has ${held}; the hold is lifted by report_completion or a human, never by the sweep`);
     return { ok: false, error: `completion record ${key} has ${held} - not skipped; the hold is lifted by report_completion or a human, never by the sweep` };
+  }
+  // TEAM-5941: nor over a record a twin has just fenced its own Done on — the skip record
+  // carries no fields, so it would erase the Done-intent inside the twin's commit window
+  // and let a replay stamp a hold the twin can no longer see. The sibling closes on its own.
+  if (doneIntentFresh(cur.record)) {
+    console.warn(`[report_completion] ${ticketId}: empty_sweep will NOT skip it - its completion record has a Done in flight (doneIntent ${cur.record.doneIntent.at}); it closes on its own`);
+    return { ok: false, error: `completion record ${key} has a Done in flight (doneIntent ${cur.record.doneIntent.at}) - not skipped; it closes on its own` };
   }
   const w = await conditionalPut(key, JSON.stringify(sweepSkipRecord({ ticketId, workflowId, sweeperTicketId }), null, 2), cur.etag !== undefined ? { ifMatch: cur.etag } : {});
   if (w.outcome === "error") throw w.err;

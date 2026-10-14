@@ -352,6 +352,11 @@ if [ -n "$ARTIFACT_BUCKET" ]; then
     "role_policy_grants_under $TICKETS_ROLE s3:GetObject arn:aws:s3:::$ARTIFACT_BUCKET/completions/"
   check "IAM: $TICKETS_ROLE grants s3:ListBucket on $ARTIFACT_BUCKET (a missing completions/* record must read as 404, not 403 - TEAM-5867)" \
     "role_policy_grants $TICKETS_ROLE s3:ListBucket arn:aws:s3:::$ARTIFACT_BUCKET"
+  # TEAM-5941: the Done-intent fence - a conditional PutObject of the record right before
+  # the provider commit. A denied write REFUSES the Done (fail closed), so a role without
+  # this grant refuses every Done on a ticket that has a completion record.
+  check "IAM: $TICKETS_ROLE grants s3:PutObject covering completions/* (the Done-intent fence - TEAM-5941)" \
+    "role_policy_grants_under $TICKETS_ROLE s3:PutObject arn:aws:s3:::$ARTIFACT_BUCKET/completions/"
 else
   echo "  - IAM: ticket tools completions/* read (ARTIFACT_BUCKET not set, skipped)"
 fi
