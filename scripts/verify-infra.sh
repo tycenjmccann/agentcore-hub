@@ -127,8 +127,10 @@ check_schema() {
 # so a grant hiding in a managed policy is seen too — not just the inline set.
 # Matches Action/Resource with IAM glob semantics against <action>/<target-arn>:
 # string or array, `*`/`?` wildcards, case-insensitive action (IAM action names
-# are case-insensitive; resource ARNs are not). Only an Allow statement counts —
-# Deny is ignored, same as IAM itself would still need an Allow to exist — and in
+# are case-insensitive; resource ARNs are not). Only an Allow statement grants, and
+# any Deny that MAY apply to <action>/<target-arn> fails the check whatever its
+# Condition, a NotAction/NotResource Deny failing closed (TEAM-5933, the same rule as
+# policyDenies / policyMayDenyUnder in deploy/lib/twin-preflight.mjs). In
 # mode=any/covers an Allow carrying ANY Condition does not count either (TEAM-5883): the
 # checks below ask for an UNCONDITIONED grant, and a conditioned one is exactly
 # the hand-narrowed policy they exist to catch. Any
@@ -187,10 +189,22 @@ def covers_prefix(pattern, ns):
     k = pattern.find("*")
     return 0 <= k <= len(ns) and pattern[:k] == ns[:k] and set(pattern[k:]) == {"*"}
 
+# The python port of mayIntersectPrefix in deploy/lib/twin-preflight.mjs (TEAM-5933):
+# could the glob match SOME string that starts with ns?
+def may_intersect_prefix(pattern, ns):
+    for k, c in enumerate(ns):
+        if k >= len(pattern):
+            return False
+        if pattern[k] == "*":
+            return True
+        if pattern[k] != "?" and pattern[k] != c:
+            return False
+    return True
+
 mode, action, target, prefix = os.environ["MODE"], os.environ["ACTION"], os.environ["TARGET"], os.environ["PREFIX"]
 lst = lambda v: v if isinstance(v, list) else ([] if v is None else [v])
 text = sys.stdin.read()
-dec, i, granted, scoped, unscoped = json.JSONDecoder(), 0, False, False, False
+dec, i, granted, scoped, unscoped, denied = json.JSONDecoder(), 0, False, False, False, False
 while True:
     while i < len(text) and text[i].isspace():
         i += 1
@@ -203,6 +217,18 @@ while True:
     except ValueError:
         sys.exit(1)
     for st in lst(doc.get("Statement")):
+        # TEAM-5933: a Deny that MAY apply fails the check, conditioned or not
+        # (policyDenies / policyMayDenyUnder in twin-preflight.mjs). NotAction /
+        # NotResource is assumed to apply, and so is a covers-mode Deny with no Resource.
+        if st.get("Effect") == "Deny":
+            if "NotAction" in st or "NotResource" in st:
+                denied = True
+            elif any(glob_re(a, re.IGNORECASE).fullmatch(action) for a in lst(st.get("Action"))):
+                if mode == "covers":
+                    denied = denied or "Resource" not in st or any(may_intersect_prefix(r, target) for r in lst(st["Resource"]))
+                else:
+                    denied = denied or any(glob_re(r).fullmatch(target) for r in lst(st.get("Resource")))
+            continue
         if st.get("Effect") != "Allow":
             continue
         if not any(glob_re(a, re.IGNORECASE).fullmatch(action) for a in lst(st.get("Action"))):
@@ -226,7 +252,7 @@ while True:
             scoped = True
         else:
             unscoped = True
-sys.exit(0 if (granted if mode in ("any", "covers") else (scoped and not unscoped)) else 1)
+sys.exit(0 if not denied and (granted if mode in ("any", "covers") else (scoped and not unscoped)) else 1)
 '
 }
 
@@ -256,8 +282,8 @@ role_policy_grants_prefix() {
 # role_policy_grants over a whole key namespace (TEAM-5924): passes only when ONE
 # unconditioned Allow grants <action> on every key under <arn-prefix>, e.g.
 # <bucket>/completions/* or <bucket>/*. Proving one synthetic key let a read
-# hand-narrowed to completions/twin-* pass. Like every check here it reads Allows
-# only; a Deny is not evaluated. See role_policy_match above.
+# hand-narrowed to completions/twin-* pass. A Deny whose Resource could match ANY key
+# under <arn-prefix> fails it (TEAM-5933). See role_policy_match above.
 #
 # Usage: role_policy_grants_under <role> <action> <arn-prefix>
 role_policy_grants_under() {
@@ -268,7 +294,7 @@ role_policy_grants_under() {
 # is the first simulate-principal-policy use in this file, and it answers a
 # different question than role_policy_grants above: that helper string-matches
 # statements across inline AND attached managed policies, but it still cannot
-# see a permissions boundary, an SCP, or NotAction/NotResource — only simulate
+# see a permissions boundary, an SCP, or a NotAction/NotResource Allow — only simulate
 # asks IAM's own evaluator. Read-only — simulate never calls the action.
 #
 # Usage: action_allowed <role> <action> [<resource-arn, default *>]
