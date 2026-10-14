@@ -69,7 +69,11 @@ merged` returns the unified PR), never sync, commit to, or certify the integrati
 branch: `<feature_branch>` in P0, P1, P2a and the legacy steps below is the fix
 ticket's OWN PR head branch (`branch` / `pr_url` in its completion record), and
 the SHA you certify is that PR's head after the P0 sync. Every later mention of
-"the integration branch" in this blueprint means that branch.
+"the integration branch" in this blueprint means that branch. Likewise
+`<default branch>` / `<default_branch>` in P0, the Main-sync rule and the
+legacy steps (the merge source, the regression diff) means the `base_branch:`
+your `## Branch` context names: a fix PR into `release/2.1` syncs from and
+diffs against `release/2.1`, never the repo default branch.
 
 ### P0: Sync the integration branch (you own this — DL-024)
 The SHA you certify must be the SHA that would land, so bring the repo's default

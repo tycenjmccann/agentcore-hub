@@ -667,7 +667,7 @@ describe("6. dev ## Branch — post-merge fixes target the default branch (TEAM-
       if (assignee === DEV) expect(ctx).toContain("branch fresh from release/2.1, PR to release/2.1 — never PR into the merged integration branch");
     });
 
-  it("merged + explicit base pre-merge control: the same dev ticket before the merge is byte-identical to today (base line only, no NOTE)", async () => {
+  it("explicit base pre-merge: a stated non-shared base_branch wins over the integration branch, with no NOTE (the one pre-merge change, DL-037)", async () => {
     await load(REGISTERED);
     const ctx = await buildAgentContext(devTicket(EXPLICIT), h.state.workflow);
     expect(ctx).toContain("## Branch\nfeature_branch: feature/TEAM-3-backend-dev\nbase_branch: release/2.1\n\n");

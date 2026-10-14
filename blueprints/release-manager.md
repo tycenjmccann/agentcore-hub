@@ -605,24 +605,29 @@ rather than the target repo's code, the fix ticket you file for it opens its PR
 against the hub's own default branch directly: pass `base_branch="main"` on
 `Tickets___create_ticket` — never this run's shared integration branch. An infra
 fix is unrelated to this run's feature and must not ride this run's PR into the
-target repo. On every OTHER ticket you file, leave `base_branch` out entirely: a
+target repo. This holds before AND after the unified PR merges. Before the
+merge, on every OTHER ticket you file, leave `base_branch` out entirely: a
 blank value means "no branch was stated", and the run's own integration branch is
 the default. Passing it by habit is how an ordinary phase fix gets retargeted at
 `main` and stops riding the run's PR.
 
 **After the unified PR has merged, the default flips.** Once your merge has
 landed (you hold its `merge_commit`), the run's integration branch is dead: a fix
-merged into it never reaches the default branch. Every fix ticket or
+merged into it never reaches the default branch. Every ordinary fix ticket or
 `follow_ups` fix entry you file from then on passes
 `base_branch="<default_branch>"` (`"baseBranch":"<default_branch>"` on a
 follow-up) — the `default_branch:` of your `## Repository` context, never a
-literal `main` — so the fixer PRs straight to the default branch through review
-→ CI → Merge Approval. State it explicitly even though the orchestrator resolves
-a blank base after the merge: you can file the fix before your own completion
-records the merge, and the explicit line wins. Fallback, if fix work did land on
-the integration branch after the merge: open a fresh unified PR from the feature
-branch to the default branch and take it through Merge Approval — never complete
-with commits stranded on that branch (the completion gate refuses the run until
+literal `main` — unless the work targets another stated base (the
+`base_branch:` your `## Branch` context names, e.g. `release/2.1`), which it
+passes instead; so the fixer PRs straight to that base through review → CI →
+Merge Approval. A hub-infra fix keeps its hub `main` base from the rule above
+(it targets the HUB's repo, not this one); the flip never applies to it. State
+the base explicitly even though the orchestrator resolves a blank base after
+the merge: you can file the fix before your own completion records the merge,
+and the explicit line wins. Fallback, if fix work did land on the integration
+branch after the merge: open a fresh unified PR from the feature branch to the
+default branch and take it through Merge Approval — never complete with
+commits stranded on that branch (the completion gate refuses the run until
 they land or a PR to the default branch is open).
 
 Both kinds share: assignee = the SAME `human:<who>` string as this run's Merge
