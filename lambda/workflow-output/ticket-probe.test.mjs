@@ -988,6 +988,24 @@ describe("TEAM-5830 — briefPending survives concurrent writers", () => {
     expect(eventsOf("workflow.ticket_replay_dropped", BUILD)).toHaveLength(1);
     expect(fake.tickets.get(BUILD).status).toBe("In Progress");
   });
+
+  // TEAM-6056 (QA R4-3): the re-run itself puts the brief on the gate, then a twin refuses
+  // Done on a hold no writer stamped. forceHold correctly resurrects nothing (the record it
+  // conditions on is this call's own delivery), so the status must not claim a hold either.
+  it("TEAM-6056: a brief-hold refusal with no concurrent writer - the status follows the WRITTEN hold, no stale hold resurrected", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    await tick();
+    expect(record()).toMatchObject({ briefPending: true });
+    fake.tickets.get(GATE).status = "To Do";
+    fake.failTool = { Tickets___transition_ticket: (p) => (p.ticket_id === BUILD ? REFUSAL : null) };
+    const res = await rerun();
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE], status: "complete_transition_failed" });
+    expect(record().briefHoldReason).toBeUndefined();
+    expect(record().status === "complete_pending_brief").toBe(record().briefPending === true);
+    expect(res).toMatchObject({ status: "complete_transition_failed", next_action: "retry_report_completion", transition: { ok: false, error: REFUSAL } });
+    expect(res.message).not.toMatch(/merge brief is not on the Merge Approval gate/);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+  });
 });
 
 // TEAM-5926 (TEAM-5799 ship-review F1): a twin's Done guard read the record before the

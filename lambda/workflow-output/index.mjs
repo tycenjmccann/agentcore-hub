@@ -1300,7 +1300,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       });
     } else {
       if (isBriefHoldRefusal(transition.error)) {
-        console.warn(`[report_completion] ${ticket_id}: Done refused - the record holds the merge brief (${transition.error}); answering ${STATUS_PENDING_BRIEF}`);
+        console.warn(`[report_completion] ${ticket_id}: Done refused on a merge-brief hold (${transition.error}) - the rewrite below decides the hold against the record`);
       } else {
         console.error(`[report_completion] ${ticket_id}: Done transition FAILED (${transition.error}) - the record is SAVED but the ticket is NOT closed, the agent must retry report_completion`);
       }
@@ -1319,14 +1319,20 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       // TEAM-5830: and the twin just read `briefPending:true`, so this rewrite carries it
       // (adoptHold forceHold) — the plain rewrite of the stale `report` erased it, and
       // the next direct Done was admitted with no brief on the gate.
+      // TEAM-6056: and the status (record and answer) follows the hold the rewrite WRITES,
+      // not the refusal: forceHold resurrects nothing over this call's own gate delivery,
+      // and a record reading briefPending:false is a failed transition, not a held brief.
       const refusedOnHold = isBriefHoldRefusal(transition.error);
-      if (refusedOnHold) briefHeld = true;
       try {
         // TEAM-5958: the same Done-intent deferral applies (one writeRecord). It is a
         // no-op in practice — a twin that refused ON the hold read briefPending:true,
         // so forceHold introduces nothing — and when it does fire the rewrite is
         // already best-effort: logged, the record stands, the retry restamps.
-        const rewrite = await writeRecord(() => (briefHeld ? STATUS_PENDING_BRIEF : STATUS_TRANSITION_FAILED), { forceHold: refusedOnHold });
+        const rewrite = await writeRecord(() => {
+          briefHeld = report.briefPending === true;
+          if (!briefHeld) delete report.briefHoldReason;
+          return briefHeld ? STATUS_PENDING_BRIEF : STATUS_TRANSITION_FAILED;
+        }, { forceHold: refusedOnHold });
         if (!rewrite.ok) console.error(`[report_completion] ${ticket_id}: could not rewrite the record's status (${rewrite.error}) - the record S3 holds stands, the retry will restamp it`);
       } catch (err) {
         console.error(`[report_completion] ${ticket_id}: could not rewrite the record's status to ${report.status} (${err.name}: ${err.message}) - the record stands at "complete" and the retry will restamp it`);
