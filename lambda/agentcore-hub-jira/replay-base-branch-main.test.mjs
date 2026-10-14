@@ -27,6 +27,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import "./hermetic-s3.mjs"; // TEAM-5892: no S3 call in this file reaches the network
+
 // Env before the import: ARTIFACT_BUCKET unset keeps the roster on its in-module
 // fallback (no S3 call from a unit test), and the module reads both at load.
 delete process.env.ARTIFACT_BUCKET;

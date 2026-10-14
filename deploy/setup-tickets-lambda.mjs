@@ -22,13 +22,24 @@
  *   TICKET_PROVIDER         — "dynamodb" or "jira"
  *   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY
  *                           — required when TICKET_PROVIDER=jira
- *   ARTIFACT_BUCKET         — passed to the Lambda for the shared agent roster
+ *   ARTIFACT_BUCKET         — the artifact bucket the Lambda reads (agent roster,
+ *                             completions/*). REQUIRED: derived from the STS account
+ *                             when unset (TEAM-5867); the deploy refuses to run without one
+ *
+ * The role policy, the bucket derivation and the function env are built by the pure
+ * module deploy/lib/tickets-lambda-config.mjs, which is unit-tested; this script only
+ * sequences the AWS calls.
  */
 
 import { readFileSync } from "fs";
 import { fileURLToPath } from "url";
 import { dirname, join } from "path";
 import { execSync } from "child_process";
+import {
+  resolveArtifactBucket,
+  buildTicketsPolicyStatements,
+  buildTicketsLambdaEnv,
+} from "./lib/tickets-lambda-config.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -76,10 +87,6 @@ if (TICKET_PROVIDER === "jira") {
   }
 }
 
-// Derive artifact bucket (same convention as deploy/config.sh)
-const ACCOUNT_ID = process.env.AWS_ACCOUNT_ID || "";
-const ARTIFACT_BUCKET = process.env.ARTIFACT_BUCKET || (ACCOUNT_ID ? `agentcore-hub-artifacts-${ACCOUNT_ID}-${REGION}` : "");
-
 // TEAM-4739 — the typed gate guard's two OPTIONAL dependencies. NOT derived by
 // convention: both are only forwarded when the deploying shell sets them, so an
 // install that has never heard of them gets today's env and today's IAM policy back,
@@ -113,6 +120,19 @@ const lambda = new LambdaClient({ region: REGION });
 // Get account ID
 const accountId = execSync("aws sts get-caller-identity --query Account --output text").toString().trim();
 
+// TEAM-5867 P1: the artifact bucket is resolved HERE, after STS has answered, not from an
+// AWS_ACCOUNT_ID that is usually unset in a bare shell. It used to be computed at import
+// time, never recomputed, forwarded only when truthy and the Lambda env replaced wholesale
+// - so a standalone re-run stripped ARTIFACT_BUCKET from the live function. Fail before
+// Step 1: nothing below (table, role policy, function) may be touched without a bucket.
+let ARTIFACT_BUCKET;
+try {
+  ARTIFACT_BUCKET = resolveArtifactBucket({ accountId, region: REGION });
+} catch (err) {
+  console.error(`✗ ${err.message}`);
+  process.exit(1);
+}
+
 console.log("\n" + "═".repeat(60));
 console.log(
   TICKET_PROVIDER === "jira"
@@ -132,6 +152,7 @@ console.log(`   Project Key: ${PROJECT_KEY}`);
 console.log(`   Lambda:      ${LAMBDA_NAME}`);
 console.log(`   Gateway:     ${GATEWAY_ID}`);
 console.log(`   Account:     ${accountId}`);
+console.log(`   Bucket:      ${ARTIFACT_BUCKET}`);
 console.log("");
 
 // ============================================================
@@ -247,77 +268,26 @@ try {
   }
 }
 
-// Attach inline policy. DynamoDB statement is only needed for the dynamodb
-// provider; both providers need CloudWatch Logs and S3 read for the agent
-// roster artifact — and, since TEAM-4706 (DL-030), for reading
-// completions/<ticket_id>.json behind the ship-phase Done gate: a ship ticket
-// cannot be closed without its completion record. TEAM-4757 made that guard GET
-// the record's body (it has to read `followUpsPending`, not just prove the key
-// exists), which needs nothing new: the same `s3:GetObject` on the artifact bucket
-// below authorises the roster read, a HeadObject and a GetObject alike, so no extra
-// statement is needed here. scripts/verify-infra.sh asserts this grant is still
-// bucket-wide or explicitly covers completions/*.
-const policyStatements = [
-  {
-    Effect: "Allow",
-    Action: ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
-    Resource: `arn:aws:logs:${REGION}:${accountId}:*`,
-  },
-];
-if (TICKET_PROVIDER === "dynamodb") {
-  policyStatements.push({
-    Effect: "Allow",
-    Action: [
-      "dynamodb:PutItem",
-      "dynamodb:GetItem",
-      "dynamodb:UpdateItem",
-      "dynamodb:Query",
-      "dynamodb:Scan",
-    ],
-    Resource: [
-      `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLE_NAME}`,
-      `arn:aws:dynamodb:${REGION}:${accountId}:table/${TABLE_NAME}/index/*`,
-    ],
-  });
-}
-if (ARTIFACT_BUCKET) {
-  policyStatements.push({
-    Effect: "Allow",
-    Action: ["s3:GetObject"],
-    Resource: `arn:aws:s3:::${ARTIFACT_BUCKET}/*`,
-  });
-}
-// TEAM-4739 — both statements are CONDITIONAL on the matching env var, so an
-// install that has never set either gets a BYTE-IDENTICAL policy to before this
-// ticket. Each grants the narrowest thing the guard needs:
-//   PIPELINE_TOOLS_LAMBDA — invoke the read-only pipeline probe (get_state /
-//     get_build_status / capabilities; the twin's allow-list, not IAM's, is what
-//     keeps start_deploy out of reach — but there is no write here to grant).
-//   EVENTS_TABLE — PutItem only. The gate guard appends journey events; it never
-//     reads, updates or scans the events table.
-if (PIPELINE_TOOLS_LAMBDA) {
-  policyStatements.push({
-    Effect: "Allow",
-    Action: ["lambda:InvokeFunction"],
-    Resource: `arn:aws:lambda:${REGION}:${accountId}:function:${PIPELINE_TOOLS_LAMBDA}`,
-  });
-}
-if (EVENTS_TABLE) {
-  policyStatements.push({
-    Effect: "Allow",
-    Action: ["dynamodb:PutItem"],
-    Resource: `arn:aws:dynamodb:${REGION}:${accountId}:table/${EVENTS_TABLE}`,
-  });
-}
-// TEAM-5716: GetItem only — a claim-stamped park reads agentTasks[<ticket>] to fence
-// on its claim generation. It never writes the workflows table.
-if (WORKFLOWS_TABLE) {
-  policyStatements.push({
-    Effect: "Allow",
-    Action: ["dynamodb:GetItem"],
-    Resource: `arn:aws:dynamodb:${REGION}:${accountId}:table/${WORKFLOWS_TABLE}`,
-  });
-}
+// Attach inline policy. The statements are built by buildTicketsPolicyStatements
+// (deploy/lib/tickets-lambda-config.mjs) and unit-tested there; see its doc comment for
+// what each grants and why. In short: CloudWatch Logs; DynamoDB (dynamodb provider only);
+// s3:GetObject on the artifact bucket's objects (roster + completions/<ticket>.json, the
+// body the Done guard reads since TEAM-4706/TEAM-4757); and - TEAM-5867 - s3:ListBucket on
+// the bucket itself, unconditioned, so S3 reports a MISSING completion record as 404
+// rather than 403. The twins' guard (TEAM-5832) admits a recordless Done only on 404 and
+// refuses on anything else, so without ListBucket no human gate could ever close. The
+// pipeline probe / events / workflows statements stay conditional on their env vars.
+// scripts/verify-infra.sh asserts both S3 grants are still present on the live role.
+const policyStatements = buildTicketsPolicyStatements({
+  provider: TICKET_PROVIDER,
+  region: REGION,
+  accountId,
+  tableName: TABLE_NAME,
+  artifactBucket: ARTIFACT_BUCKET,
+  pipelineToolsLambda: PIPELINE_TOOLS_LAMBDA,
+  eventsTable: EVENTS_TABLE,
+  workflowsTable: WORKFLOWS_TABLE,
+});
 
 await iam.send(
   new PutRolePolicyCommand({
@@ -327,7 +297,7 @@ await iam.send(
   })
 );
 console.log(
-  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs${ARTIFACT_BUCKET ? " + S3 read" : ""}${PIPELINE_TOOLS_LAMBDA ? " + pipeline probe invoke" : ""}${EVENTS_TABLE ? " + events PutItem" : ""}${WORKFLOWS_TABLE ? " + workflows claim read" : ""})`
+  `   ✓ Policy attached (${TICKET_PROVIDER === "dynamodb" ? "DynamoDB + " : ""}CloudWatch Logs + S3 read + S3 list (404 on a missing record)${PIPELINE_TOOLS_LAMBDA ? " + pipeline probe invoke" : ""}${EVENTS_TABLE ? " + events PutItem" : ""}${WORKFLOWS_TABLE ? " + workflows claim read" : ""})`
 );
 
 // ============================================================
@@ -347,35 +317,24 @@ execSync(`cd "${lambdaDir}" && zip -j "${zipPath}" index.mjs fix-contract.mjs ga
 });
 const zipBuffer = readFileSync(zipPath);
 
-// FIX_TICKET_CONTRACT is forwarded ONLY when set in the deploying shell, so an
-// existing install that has never heard of it keeps the code default (off) and
-// its config is unchanged by a redeploy. PIPELINE_TOOLS_LAMBDA / EVENTS_TABLE
-// (TEAM-4739) follow the same rule, in BOTH provider arms — the twins must reach the
-// same verdict, so they must be configurable the same way.
-const lambdaEnvVars =
-  TICKET_PROVIDER === "jira"
-    ? {
-        JIRA_SITE_URL,
-        JIRA_EMAIL,
-        JIRA_API_TOKEN,
-        JIRA_PROJECT_KEY: PROJECT_KEY,
-        AWS_REGION_OVERRIDE: REGION,
-        ...(ARTIFACT_BUCKET && { ARTIFACT_BUCKET }),
-        ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
-        ...(PIPELINE_TOOLS_LAMBDA && { PIPELINE_TOOLS_LAMBDA }),
-        ...(EVENTS_TABLE && { EVENTS_TABLE }),
-        ...(WORKFLOWS_TABLE && { WORKFLOWS_TABLE }),
-      }
-    : {
-        TICKETS_TABLE: TABLE_NAME,
-        PROJECT_KEY,
-        AWS_REGION_OVERRIDE: REGION,
-        ...(ARTIFACT_BUCKET && { ARTIFACT_BUCKET }),
-        ...(process.env.FIX_TICKET_CONTRACT && { FIX_TICKET_CONTRACT: process.env.FIX_TICKET_CONTRACT }),
-        ...(PIPELINE_TOOLS_LAMBDA && { PIPELINE_TOOLS_LAMBDA }),
-        ...(EVENTS_TABLE && { EVENTS_TABLE }),
-        ...(WORKFLOWS_TABLE && { WORKFLOWS_TABLE }),
-      };
+// The env is built by buildTicketsLambdaEnv (deploy/lib/tickets-lambda-config.mjs).
+// ARTIFACT_BUCKET is ALWAYS set (TEAM-5867 P1 - UpdateFunctionConfiguration below replaces
+// the whole env, so a conditional spread is what let a re-run strip it). The optional vars
+// (FIX_TICKET_CONTRACT, PIPELINE_TOOLS_LAMBDA, EVENTS_TABLE, WORKFLOWS_TABLE) are forwarded
+// ONLY when set in the deploying shell, in BOTH provider arms, so an install that has never
+// heard of one keeps the code default - the twins must be configurable the same way.
+const lambdaEnvVars = buildTicketsLambdaEnv({
+  provider: TICKET_PROVIDER,
+  region: REGION,
+  tableName: TABLE_NAME,
+  projectKey: PROJECT_KEY,
+  artifactBucket: ARTIFACT_BUCKET,
+  jira: { siteUrl: JIRA_SITE_URL, email: JIRA_EMAIL, apiToken: JIRA_API_TOKEN },
+  fixTicketContract: process.env.FIX_TICKET_CONTRACT || "",
+  pipelineToolsLambda: PIPELINE_TOOLS_LAMBDA,
+  eventsTable: EVENTS_TABLE,
+  workflowsTable: WORKFLOWS_TABLE,
+});
 
 const lambdaDescription =
   TICKET_PROVIDER === "jira"

@@ -8,6 +8,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import "./hermetic-s3.mjs"; // TEAM-5892: no S3 call in this file reaches the network
 import { resolveChildIssueType } from "./index.mjs";
 
 const EPIC = { name: "Epic", subtask: false, hierarchyLevel: 1 };

@@ -12,13 +12,17 @@
  *     post-create re-scan withdraws the NEWER one (fix:/origin: labels stripped,
  *     duplicate-of:<keeper> added, moved to Done — this workflow has no Cancelled).
  *
- * Stubbed: `fetch`, and the exported S3 client's `send`. Run by the existing
+ * Stubbed: `fetch`, and the exported S3 client's `send` — by default a 404 for every
+ * key (TEAM-5832: every non-ship Done now reads its completion record for the brief
+ * hold, and an unreadable read refuses; doneWithRecord overrides it per test). Run by the existing
  * `node --test lambda/agentcore-hub-jira` step.
  */
 
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
+
+import "./hermetic-s3.mjs"; // TEAM-5892: belt-and-suspenders alongside this file's own s3.send stub below
 
 process.env.ARTIFACT_BUCKET = "test-artifacts";
 delete process.env.EVENTS_TABLE;
@@ -28,6 +32,13 @@ process.env.JIRA_EMAIL = "x";
 process.env.JIRA_API_TOKEN = "x";
 
 const { handler, s3 } = await import("./index.mjs");
+// No real S3: every GetObject is a 404 (no record, fallback roster) unless a test overrides it.
+// TEAM-5959: a PutObject succeeds — the Done-intent fence reserves an absent record
+// create-only, and a 404 answer to that PUT would read as "vanished" and retry to a refusal.
+s3.send = async (cmd) => {
+  if (cmd?.constructor?.name === "PutObjectCommand") return { ETag: '"hermetic-put"' };
+  throw Object.assign(new Error("NoSuchKey"), { name: "NoSuchKey", $metadata: { httpStatusCode: 404 } });
+};
 
 const BOARD = JSON.parse(readFileSync(new URL("../workflow-output/__fixtures__/design-amendment/team-5356-board.json", import.meta.url), "utf8")).jira;
 const EPIC = "TEAM-5353";

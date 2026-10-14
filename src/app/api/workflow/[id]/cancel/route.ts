@@ -18,6 +18,7 @@
  */
 
 import { NextRequest, NextResponse } from "next/server";
+import { isIntentOnlyReservation } from "@/lib/workflow/completion-evidence";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand, QueryCommand, PutCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
@@ -692,7 +693,7 @@ async function sweepTickets(ctx: Ctx, tickets: RunTicket[], sweep: Sweep) {
       if (r.status === "rejected") {
         sweep.failed++;
         console.warn(`[cancel] completions/${t.ticketId}.json read failed: ${errMsg(r.reason)}`);
-      } else if (r.value !== null) {
+      } else if (r.value !== null && !isIntentOnlyReservation(r.value)) { // TEAM-5959: a Done-intent reservation is no record
         sweep.skipped++;
         sweep.keptByRecord.push(t.ticketId);
       } else return true;
@@ -928,7 +929,7 @@ export async function POST(request: NextRequest, { params }: { params: { id: str
       // completion record (or an unreadable one) stays: the sweep keeps it by record like any other.
       const { cdId, followUps: cdBlocked } = cdBlockedFollowUps(tickets);
       const records = await Promise.allSettled(cdBlocked.map((t) => readArtifactJson(`completions/${t.ticketId}.json`)));
-      const moving = cdBlocked.filter((_, i) => records[i].status === "fulfilled" && (records[i] as PromiseFulfilledResult<unknown>).value === null);
+      const moving = cdBlocked.filter((_, i) => records[i].status === "fulfilled" && ((records[i] as PromiseFulfilledResult<unknown>).value === null || isIntentOnlyReservation((records[i] as PromiseFulfilledResult<unknown>).value))); // TEAM-5959
       followUps = await moveFollowUpsOnCancel(ctx, cdId, moving);
       const moved = new Set(moving.map((t) => t.ticketId));
       await sweepTickets(ctx, tickets.filter((t) => !moved.has(t.ticketId)), sweep);

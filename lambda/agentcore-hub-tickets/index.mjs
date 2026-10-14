@@ -32,7 +32,8 @@ import {
   QueryCommand,
   ScanCommand,
 } from "@aws-sdk/lib-dynamodb";
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { randomUUID } from "node:crypto"; // TEAM-5941: the Done-intent fence nonce
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 // TEAM-4121 FR-8: the shared fix-ticket contract. Duplicated byte-for-byte into
 // the jira Lambda + orchestrator (each ships as a self-contained zip, so they
 // cannot share a file); CI byte-compares the copies. Edit one, `cp` the others.
@@ -64,6 +65,20 @@ import {
   gateVerificationSlots,
   invokeProbe,
   judgeCompletionRecord,
+  judgeBriefHold,
+  briefHoldUnknown,
+  judgePostCommitHold,
+  postCommitHoldConflict,
+  postCommitUncheckedWarning,
+  DONE_INTENT_FENCE_ATTEMPTS,
+  DONE_UNFENCED_WHAT,
+  classifyS3WriteError,
+  doneIntentContendedRefusal,
+  doneIntentUnfencedRefusal,
+  rejudgeAdmitted,
+  withDoneIntent,
+  withoutDoneIntent,
+  doneIntentReservation,
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
   designAmendmentRefusal,
@@ -373,7 +388,7 @@ async function isShipPhaseTicket(item) {
  * missing-record and indeterminate texts are byte-unchanged; only a record that
  * exists and says its follow-ups are still pending is newly refused.
  */
-async function completionRecordProven(ticketId, opts = {}) {
+async function completionRecordProven(ticketId, opts = {}, capture = null) {
   const key = `completions/${ticketId}.json`;
   if (!ARTIFACT_BUCKET) {
     return { proven: false, why: `ARTIFACT_BUCKET is unset, so ${key} cannot be read` };
@@ -384,6 +399,8 @@ async function completionRecordProven(ticketId, opts = {}) {
     // Inside the try on purpose: a stream that fails mid-read, or a response with no
     // Body at all, is the same "could not tell" as the GetObject itself throwing.
     bodyText = await res.Body.transformToString();
+    // TEAM-5941: `securityReview` rides along so the fence's re-judge uses the same judge.
+    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText, recordGated: true, securityReview: opts.securityReview === true });
   } catch (err) {
     const status = err?.$metadata?.httpStatusCode;
     if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
@@ -392,6 +409,45 @@ async function completionRecordProven(ticketId, opts = {}) {
     return { proven: false, why: `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})` };
   }
   return judgeCompletionRecord(key, bodyText, opts);
+}
+
+/**
+ * TEAM-5805 / TEAM-5832: the merge-brief hold on a ticket whose Done is NOT otherwise
+ * gated on its record — every ticket but ship-phase and security reviews, because the
+ * writer (workflow-output) stamps `briefPending` on any ticket whose report named the
+ * brief, whoever it is assigned to. The key is the ticket id alone, so it is the same
+ * key for any assignee. null (admit) only when there is provably no hold to read:
+ *   · ARTIFACT_BUCKET unset — deploy-time config (since TEAM-5867 setup-tickets-lambda.mjs
+ *     refuses to deploy without one and always sets it, so this means a function last
+ *     deployed before that, or a hand-edited env), and with no bucket the writer cannot
+ *     stamp a hold either. Refusing here would refuse EVERY non-ship Done fleet-wide, with no retry
+ *     that could ever succeed. Ship-phase and security tickets still refuse an unset
+ *     bucket through completionRecordProven.
+ *   · 404 / NoSuchKey / NotFound — no record, so no hold.
+ * Anything else — AccessDenied, throttling, a 5xx, a timeout, a body stream that fails
+ * mid-read — is "could not tell", not "no hold", and REFUSES (briefHoldUnknown marks it
+ * `unknown: true`, so the caller says so), the same positive-evidence rule as completionRecordProven. A body
+ * that reads but cannot be judged refuses too (judgeBriefHold).
+ */
+async function briefHoldOf(ticketId, capture = null) {
+  const key = `completions/${ticketId}.json`;
+  if (!ARTIFACT_BUCKET) return null;
+  let bodyText;
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+    // Inside the try on purpose, as in completionRecordProven: a stream that fails
+    // mid-read, or no Body at all, is the same "could not tell".
+    bodyText = await res.Body.transformToString();
+    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText });
+  } catch (err) {
+    const status = err?.$metadata?.httpStatusCode;
+    if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
+      if (capture) Object.assign(capture, { key, absent: true });
+      return null;
+    }
+    return briefHoldUnknown(key, `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})`);
+  }
+  return judgeBriefHold(key, bodyText);
 }
 
 /**
@@ -409,6 +465,113 @@ function completionRecordRequired(issueKey, why, what = "a ship-phase ticket") {
       `${COMPLETION_RECORD_REQUIRED.hint} (${why})`
     ),
   };
+}
+
+/**
+ * TEAM-5941 (TEAM-5799 ship-review r2 F1): the Done-intent fence — the LAST awaited
+ * step before the status write. See the "Done-intent fence" section of
+ * gate-contract.mjs for the design. This is the I/O half, in this twin's idiom (returns `{ refusal }`
+ * never throws for a refusal). Twin of the jira Lambda's
+ * fenceDoneIntent. Mutates `admitted` on success: `etag`/`bodyText` become the fenced
+ * record (so postCommitHoldCheck compares against it), `absent` is false and `intent` is set.
+ *
+ *   · a record admitted ⇒ PUT the intent onto it with IfMatch on the admitted ETag;
+ *   · no record admitted (404) ⇒ TEAM-5959 (TEAM-5799 F5): RESERVE the key with a
+ *     create-only PUT (IfNoneMatch:"*") of an intent-only reservation
+ *     (gate-contract.mjs doneIntentReservation) — it used to skip the fence, and a
+ *     record created + hold-stamped inside the commit window then lost the fence;
+ *   · PUT won ⇒ fenced;
+ *   · 412/409 ⇒ re-read and re-judge with the guard's own judge: a hold ⇒ the standard
+ *     refusal; admitted (a hold-free record, or another twin's reservation) ⇒ CAS again
+ *     with IfMatch, DONE_INTENT_FENCE_ATTEMPTS times in all, then refuse;
+ *   · the record vanished (PUT or re-read 404) ⇒ a ship / security ticket refuses as it
+ *     would on "no record" (DL-030); any other ticket RE-RESERVES create-only on the
+ *     next attempt (TEAM-5959: it used to proceed unfenced);
+ *   · AccessDenied, 5xx, a failed re-read ⇒ REFUSE (fail closed: deploy config, not a race).
+ */
+async function fenceDoneIntent(issueKey, admitted) {
+  if (!ARTIFACT_BUCKET || !admitted.key) return null;
+  const key = admitted.key;
+  const vanished = () => {
+    if (admitted.recordGated) {
+      return { refusal: completionRecordRequired(issueKey, `no ${key} in the artifact bucket`, admitted.securityReview ? "a security-review ticket" : "a ship-phase ticket") };
+    }
+    Object.assign(admitted, { absent: true });
+    delete admitted.etag;
+    delete admitted.bodyText;
+    return null;
+  };
+  const errText = (err) => `${err?.name || "S3Error"}${err?.$metadata?.httpStatusCode ? ` ${err.$metadata.httpStatusCode}` : ""}`;
+  for (let attempt = 1; attempt <= DONE_INTENT_FENCE_ATTEMPTS; attempt++) {
+    const at = new Date().toISOString();
+    const nonce = randomUUID();
+    const intent = { provider: "dynamodb", at, nonce };
+    // TEAM-5959: nothing admitted (404, or vanished under an earlier attempt) ⇒ a
+    // create-only reservation; a record ⇒ the intent CASed onto its body.
+    const reserving = admitted.absent === true;
+    const body = JSON.stringify(reserving ? doneIntentReservation(issueKey, intent) : withDoneIntent(JSON.parse(admitted.bodyText), intent), null, 2);
+    let kind;
+    try {
+      const res = await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key, Body: body, ContentType: "application/json", ...(reserving ? { IfNoneMatch: "*" } : { IfMatch: admitted.etag }) }));
+      Object.assign(admitted, { etag: res.ETag, bodyText: body, intent: { at, nonce }, absent: false });
+      return null;
+    } catch (err) {
+      kind = classifyS3WriteError(err);
+      if (kind === "other") {
+        console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing done — the Done-intent fence on ${key} could not be written (${errText(err)})`);
+        return { refusal: completionRecordRequired(issueKey, doneIntentUnfencedRefusal(key, `PutObject ${errText(err)}`), DONE_UNFENCED_WHAT) };
+      }
+      if (kind === "gone") {
+        const refusal = vanished();
+        if (refusal) return refusal;
+        console.warn(`[agentcore-hub-tickets] ${issueKey}: ${key} vanished under the Done-intent fence (attempt ${attempt}/${DONE_INTENT_FENCE_ATTEMPTS}) — reserving it`);
+        continue;
+      }
+    }
+    // The record moved under the fence (or another writer created it first): read what
+    // it says now, with the guard's judge.
+    let bodyText;
+    let etag;
+    try {
+      const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+      bodyText = await res.Body.transformToString();
+      etag = res.ETag;
+    } catch (err) {
+      if (classifyS3WriteError(err) === "gone") {
+        const refusal = vanished();
+        if (refusal) return refusal;
+        console.warn(`[agentcore-hub-tickets] ${issueKey}: ${key} vanished under the Done-intent fence (attempt ${attempt}/${DONE_INTENT_FENCE_ATTEMPTS}) — reserving it`);
+        continue;
+      }
+      console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing done — ${key} changed under the Done-intent fence and could not be re-read (${errText(err)})`);
+      return { refusal: completionRecordRequired(issueKey, doneIntentUnfencedRefusal(key, `re-read ${errText(err)}`), DONE_UNFENCED_WHAT) };
+    }
+    const verdict = rejudgeAdmitted(key, bodyText, admitted);
+    if (verdict) {
+      console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing done on ${verdict.what} — the record changed under the Done-intent fence: ${verdict.why}`);
+      return { refusal: completionRecordRequired(issueKey, verdict.why, verdict.what) };
+    }
+    Object.assign(admitted, { etag, bodyText, absent: false });
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: ${key} changed under the Done-intent fence (${kind}, attempt ${attempt}/${DONE_INTENT_FENCE_ATTEMPTS}) — still admitted, fencing again`);
+  }
+  return { refusal: completionRecordRequired(issueKey, doneIntentContendedRefusal(key, DONE_INTENT_FENCE_ATTEMPTS), DONE_UNFENCED_WHAT) };
+}
+
+/**
+ * TEAM-5941: take the intent back off the record when the status write did not commit.
+ * Best-effort, one conditional PUT, every failure only logged: a stale intent is
+ * harmless (the drain treats one older than DONE_INTENT_TTL_MS as absent).
+ */
+async function clearDoneIntent(issueKey, admitted) {
+  if (!admitted?.intent || !admitted.key || !admitted.bodyText) return;
+  try {
+    const body = JSON.stringify(withoutDoneIntent(JSON.parse(admitted.bodyText)), null, 2);
+    const res = await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: admitted.key, Body: body, ContentType: "application/json", IfMatch: admitted.etag }));
+    Object.assign(admitted, { etag: res.ETag, bodyText: body });
+    delete admitted.intent;
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: the Done did not commit and the Done-intent on ${admitted.key} could not be cleared (${err?.name || "S3Error"}) — it expires on its own`);
+  }
 }
 
 // ─── TEAM-4739: the typed gate guard ─────────────────────────────────────────
@@ -437,14 +600,16 @@ function completionRecordRequired(issueKey, why, what = "a ship-phase ticket") {
 
 /**
  * The ship-phase completion gate, then the typed-gate check.
+ * @param {object} [admitted] TEAM-5926: filled with the completion-record read the
+ *   guard admitted on ({key, etag, absent, bodyText}), for postCommitHoldCheck
  * @returns {Promise<{refusal?:object, verification?:object}>} `refusal` ⇒ return it
  *   verbatim and write NOTHING; `verification` ⇒ fold it into the status update.
  */
-async function gateConditionCleared(issueKey, item) {
+async function gateConditionCleared(issueKey, item, admitted = null) {
   // TEAM-4706 (DL-030), unchanged: a ship-phase ticket cannot reach done without
   // its completion record.
   if (await isShipPhaseTicket(item)) {
-    const proof = await completionRecordProven(issueKey);
+    const proof = await completionRecordProven(issueKey, {}, admitted);
     if (!proof.proven) {
       console.warn(
         `[agentcore-hub-tickets] ${issueKey}: refusing done on a ship-phase ticket — ${proof.why}`
@@ -457,12 +622,23 @@ async function gateConditionCleared(issueKey, item) {
     // (design_amendment_required). A direct `→ done` would walk around that, so
     // the record must carry the securityReview stamp that only an ADMITTED report
     // writes — an existing record alone (say one written on a FAIL) is not enough.
-    const proof = await completionRecordProven(issueKey, { securityReview: true });
+    const proof = await completionRecordProven(issueKey, { securityReview: true }, admitted);
     if (!proof.proven) {
       console.warn(
         `[agentcore-hub-tickets] ${issueKey}: refusing done on a security-review ticket — ${proof.why}`
       );
       return { refusal: completionRecordRequired(issueKey, proof.why, "a security-review ticket") };
+    }
+  } else {
+    // TEAM-5805 / TEAM-5832: any other ticket — whoever it is assigned to, human gates
+    // included — may carry a merge-brief hold (briefPending) that a replay stamped
+    // when it could not put the brief on the gate; a direct `→ done` would release the
+    // gate without it. No record ⇒ admit; a record S3 cannot read ⇒ refuse.
+    const hold = await briefHoldOf(issueKey, admitted);
+    if (hold) {
+      const what = hold.unknown ? "a ticket whose merge-brief hold cannot be read" : "a ticket whose merge brief is held";
+      console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing done on ${what} — ${hold.why}`);
+      return { refusal: completionRecordRequired(issueKey, hold.why, what) };
     }
   }
   return verifyTypedGate(issueKey, item);
@@ -2064,11 +2240,13 @@ async function transitionIssue(args) {
   // refused transition writes nothing at all. The RESOLVED target is what is tested,
   // not the requested transition id, so the `skip` row — which is how a blocked
   // ticket reaches done (TEAM-4130 F1) — cannot walk around either gate. The row is
-  // already in hand, so a non-ship, non-gate ticket costs no extra read, no S3 call
-  // and no probe.
+  // already in hand, so a non-ship, non-gate ticket costs no extra DynamoDB read and
+  // no probe — only, with ARTIFACT_BUCKET set, one S3 read of its completion record
+  // for the brief hold (TEAM-5805; TEAM-5832 made that every ticket, not the operator's).
   let gateVerification = null;
+  const admitted = {};
   if (transition.to === "done") {
-    const gate = await gateConditionCleared(issueKey, current.Item);
+    const gate = await gateConditionCleared(issueKey, current.Item, admitted);
     if (gate.refusal) return gate.refusal;
     gateVerification = gate.verification || null;
   }
@@ -2234,33 +2412,52 @@ async function transitionIssue(args) {
     moved ? preconditionRefusal(actual) : preconditionRefusal(actual, { raced: true });
   const isCondFail = (err) => err?.name === "ConditionalCheckFailedException";
 
-  try {
-    await sendTransition(true);
-  } catch (err) {
-    if (err?.claimRefusal) return err.claimRefusal;
-    if (!isCondFail(err)) throw err;
-    const reread = expectedStatus ? await fenceReread() : null;
-    if (reread?.moved) return preconditionRefusal(reread.actual);
-    if (!labelPlan?.condition) {
-      if (reread) return fenceRefusal(reread);
-      throw err;
-    }
-    // A concurrent writer moved the label list under us. The label bookkeeping is
-    // cosmetic; the status and the verification are not — retry without the label
-    // clause rather than wedge a verified transition on a label race.
-    console.warn(
-      `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
-    );
-    try {
-      await sendTransition(false);
-    } catch (retryErr) {
-      if (retryErr?.claimRefusal) return retryErr.claimRefusal;
-      // The retry carries no label clause: with a fence it is the fence that failed.
-      if (isCondFail(retryErr) && expectedStatus) return fenceRefusal(await fenceReread());
-      throw retryErr;
-    }
+  // TEAM-5941: the Done-intent fence — the LAST awaited step before the status write
+  // (sendTransition awaits nothing before its UpdateCommand on a done; checkClaim only
+  // runs for a park). A refusal here has written nothing to the table. The label-race
+  // retry below is after the fence and needs no second one: the intent is on the record.
+  if (transition.to === "done") {
+    const fence = await fenceDoneIntent(issueKey, admitted);
+    if (fence?.refusal) return fence.refusal;
   }
 
+  let committed = false;
+  try {
+    try {
+      await sendTransition(true);
+    } catch (err) {
+      if (err?.claimRefusal) return err.claimRefusal;
+      if (!isCondFail(err)) throw err;
+      const reread = expectedStatus ? await fenceReread() : null;
+      if (reread?.moved) return preconditionRefusal(reread.actual);
+      if (!labelPlan?.condition) {
+        if (reread) return fenceRefusal(reread);
+        throw err;
+      }
+      // A concurrent writer moved the label list under us. The label bookkeeping is
+      // cosmetic; the status and the verification are not — retry without the label
+      // clause rather than wedge a verified transition on a label race.
+      console.warn(
+        `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
+      );
+      try {
+        await sendTransition(false);
+      } catch (retryErr) {
+        if (retryErr?.claimRefusal) return retryErr.claimRefusal;
+        // The retry carries no label clause: with a fence it is the fence that failed.
+        if (isCondFail(retryErr) && expectedStatus) return fenceRefusal(await fenceReread());
+        throw retryErr;
+      }
+    }
+    committed = true;
+  } finally {
+    // TEAM-5941: every exit that did not commit (a refusal return, a throw) takes the
+    // intent back off the record, best-effort; a committed done keeps it.
+    if (!committed && admitted.intent) await clearDoneIntent(issueKey, admitted);
+  }
+
+  // TEAM-5926: the Done is committed; flag a brief hold that landed since the guard read.
+  const hold = transition.to === "done" && admitted.key ? await postCommitHoldCheck(issueKey, admitted) : {};
   return {
     key: issueKey,
     status: "transitioned",
@@ -2270,7 +2467,48 @@ async function transitionIssue(args) {
     ...(reason ? { skipReason: reason } : {}),
     ...(blockedByAdded.length ? { blockedByAdded } : {}),
     ...(gateVerification ? { gateVerification } : {}),
+    ...(hold.conflict ? { conflict: hold.conflict } : {}),
+    ...(hold.warning ? { warning: hold.warning } : {}),
   };
+}
+
+/**
+ * TEAM-5926 (TEAM-5799 ship-review F1): twin of the jira Lambda's postCommitHoldCheck.
+ * The Done guard read the completion record before the status write; a replay drain
+ * that CAS-stamped `briefPending:true` in between (or `followUpsPending:true` on a ticket
+ * admitted through completionRecordProven) is found by re-reading the record
+ * after the write (judgePostCommitHold in gate-contract.mjs). DETECTION ONLY: the done
+ * stands, a Conflict comment flags it, the result carries `conflict` + `warning`, and
+ * the drain's own post-stamp re-read converges the record. A re-read S3 cannot answer
+ * (one retry) is a warning, never a throw over the committed write.
+ */
+async function postCommitHoldCheck(issueKey, admitted) {
+  const reread = async () => {
+    try {
+      const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: admitted.key }));
+      return { etag: res.ETag, absent: false, bodyText: await res.Body.transformToString() };
+    } catch (err) {
+      const status = err?.$metadata?.httpStatusCode;
+      if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) return { absent: true };
+      return { error: `could not read ${admitted.key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})` };
+    }
+  };
+  let now = await reread();
+  if (now.error) now = await reread();
+  const verdict = judgePostCommitHold(admitted.key, admitted, now);
+  if (!verdict) return {};
+  if (verdict.unchecked) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: post-commit hold check could not run: ${verdict.why}`);
+    return { warning: postCommitUncheckedWarning(verdict.why) };
+  }
+  const fields = postCommitHoldConflict(verdict);
+  console.warn(`[agentcore-hub-tickets] ${issueKey}: Done committed over a concurrent hold on ${admitted.key} (${verdict.kinds.join(", ")})`);
+  try {
+    await addComment({ issue_key: issueKey, body: `Conflict: ${fields.warning}` });
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: ${fields.conflict} comment failed: ${err.message}`);
+  }
+  return fields;
 }
 
 async function getTransitions(args) {

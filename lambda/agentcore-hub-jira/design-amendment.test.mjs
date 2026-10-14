@@ -23,6 +23,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 
+import "./hermetic-s3.mjs"; // TEAM-5892: no S3 call in this file reaches the network
+
 delete process.env.ARTIFACT_BUCKET;
 delete process.env.EVENTS_TABLE;
 process.env.JIRA_PROJECT_KEY = "TEAM";

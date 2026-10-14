@@ -132,7 +132,7 @@ The orchestration pipeline. Self-contained surface.
 - `agentcore-hub-tickets` (`TICKETS_TABLE`)
 
 **Deploy scripts**
-- `deploy/setup-tickets-lambda.mjs` and the orchestrator/Jira/output Lambdas
+- `deploy/setup-tickets-lambda.mjs` and the orchestrator/Jira/output Lambdas. The ticket Lambda's role policy, bucket derivation and env come from the pure module `deploy/lib/tickets-lambda-config.mjs` (unit-tested): `ARTIFACT_BUCKET` is derived from the STS account when unset and the deploy refuses to run without one, the env always carries it, and the role holds `s3:GetObject` on the bucket's objects **and** unconditioned `s3:ListBucket` on the bucket — the latter is what makes S3 report a missing `completions/<ticket>.json` as 404 rather than 403, which the twins' fail-closed Done guard needs to admit a recordless human gate (TEAM-5867)
 - `lambda/cost-report/deploy.sh` (`--backfill [--since-days N]` / `--rebuild-index`)
 - `deploy/ticket-provider-probe/deploy.sh` — replay queue + DLQ, probe Lambda + role, rule and alarm (idempotent); then `deploy/setup-lambda-role.sh` (`sqs:SendMessage`) and `lambda/workflow-output/deploy.sh` (`TICKET_REPLAY_QUEUE_URL`)
 

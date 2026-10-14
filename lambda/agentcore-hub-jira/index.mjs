@@ -8,8 +8,8 @@
  *   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY
  */
 
-import { randomUUID } from "node:crypto"; // TEAM-5723: per-request fence nonce
-import { S3Client, GetObjectCommand } from "@aws-sdk/client-s3";
+import { randomUUID } from "node:crypto"; // TEAM-5723: per-request fence nonce; TEAM-5941: the Done-intent nonce
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
 // TEAM-4740 FR-5 (interim): the ONLY DynamoDB this Lambda touches is the events
 // table, and only to audit an autowired blocker edge — the same write the DynamoDB
 // twin makes, so the twins emit one event vocabulary instead of two. Dark unless
@@ -59,6 +59,20 @@ import {
   gateVerificationSlots,
   invokeProbe,
   judgeCompletionRecord,
+  judgeBriefHold,
+  briefHoldUnknown,
+  judgePostCommitHold,
+  postCommitHoldConflict,
+  postCommitUncheckedWarning,
+  DONE_INTENT_FENCE_ATTEMPTS,
+  DONE_UNFENCED_WHAT,
+  classifyS3WriteError,
+  doneIntentContendedRefusal,
+  doneIntentUnfencedRefusal,
+  rejudgeAdmitted,
+  withDoneIntent,
+  withoutDoneIntent,
+  doneIntentReservation,
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
   designAmendmentRefusal,
@@ -376,7 +390,7 @@ async function isShipPhaseTicket(labels) {
  * missing-record and indeterminate texts are byte-unchanged; only a record that
  * exists and says its follow-ups are still pending is newly refused.
  */
-async function completionRecordProven(ticketId, opts = {}) {
+async function completionRecordProven(ticketId, opts = {}, capture = null) {
   const key = `completions/${ticketId}.json`;
   if (!ARTIFACT_BUCKET) {
     return { proven: false, why: `ARTIFACT_BUCKET is unset, so ${key} cannot be read` };
@@ -387,6 +401,8 @@ async function completionRecordProven(ticketId, opts = {}) {
     // Inside the try on purpose: a stream that fails mid-read, or a response with no
     // Body at all, is the same "could not tell" as the GetObject itself throwing.
     bodyText = await res.Body.transformToString();
+    // TEAM-5941: `securityReview` rides along so the fence's re-judge uses the same judge.
+    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText, recordGated: true, securityReview: opts.securityReview === true });
   } catch (err) {
     const status = err?.$metadata?.httpStatusCode;
     if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
@@ -395,6 +411,45 @@ async function completionRecordProven(ticketId, opts = {}) {
     return { proven: false, why: `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})` };
   }
   return judgeCompletionRecord(key, bodyText, opts);
+}
+
+/**
+ * TEAM-5805 / TEAM-5832: the merge-brief hold on a ticket whose Done is NOT otherwise
+ * gated on its record — every ticket but ship-phase and security reviews, because the
+ * writer (workflow-output) stamps `briefPending` on any ticket whose report named the
+ * brief, whoever it is assigned to. The key is the ticket id alone, so it is the same
+ * key for any assignee. null (admit) only when there is provably no hold to read:
+ *   · ARTIFACT_BUCKET unset — deploy-time config (since TEAM-5867 setup-tickets-lambda.mjs
+ *     refuses to deploy without one and always sets it, so this means a function last
+ *     deployed before that, or a hand-edited env), and with no bucket the writer cannot
+ *     stamp a hold either. Refusing here would refuse EVERY non-ship Done fleet-wide, with no retry
+ *     that could ever succeed. Ship-phase and security tickets still refuse an unset
+ *     bucket through completionRecordProven.
+ *   · 404 / NoSuchKey / NotFound — no record, so no hold.
+ * Anything else — AccessDenied, throttling, a 5xx, a timeout, a body stream that fails
+ * mid-read — is "could not tell", not "no hold", and REFUSES (briefHoldUnknown marks it
+ * `unknown: true`, so the caller says so), the same positive-evidence rule as completionRecordProven. A body
+ * that reads but cannot be judged refuses too (judgeBriefHold).
+ */
+async function briefHoldOf(ticketId, capture = null) {
+  const key = `completions/${ticketId}.json`;
+  if (!ARTIFACT_BUCKET) return null;
+  let bodyText;
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+    // Inside the try on purpose, as in completionRecordProven: a stream that fails
+    // mid-read, or no Body at all, is the same "could not tell".
+    bodyText = await res.Body.transformToString();
+    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText });
+  } catch (err) {
+    const status = err?.$metadata?.httpStatusCode;
+    if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
+      if (capture) Object.assign(capture, { key, absent: true });
+      return null;
+    }
+    return briefHoldUnknown(key, `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})`);
+  }
+  return judgeBriefHold(key, bodyText);
 }
 
 /**
@@ -411,6 +466,112 @@ function completionRecordRequiredError(ticketId, why, what = "a ship-phase ticke
   );
   err.toolResult = { ...COMPLETION_RECORD_REQUIRED };
   return err;
+}
+
+/**
+ * TEAM-5941 (TEAM-5799 ship-review r2 F1): the Done-intent fence — the LAST awaited
+ * step before the transition POST. See the "Done-intent fence" section of
+ * gate-contract.mjs for the design. This is the I/O half, in this twin's idiom (throws
+ * a completionRecordRequiredError to refuse). Twin of the tickets Lambda's
+ * fenceDoneIntent. Mutates `admitted` on success: `etag`/`bodyText` become the fenced
+ * record (so postCommitHoldCheck compares against it), `absent` is false and `intent` is set.
+ *
+ *   · a record admitted ⇒ PUT the intent onto it with IfMatch on the admitted ETag;
+ *   · no record admitted (404) ⇒ TEAM-5959 (TEAM-5799 F5): RESERVE the key with a
+ *     create-only PUT (IfNoneMatch:"*") of an intent-only reservation
+ *     (gate-contract.mjs doneIntentReservation) — it used to skip the fence, and a
+ *     record created + hold-stamped inside the commit window then lost the fence;
+ *   · PUT won ⇒ fenced;
+ *   · 412/409 ⇒ re-read and re-judge with the guard's own judge: a hold ⇒ the standard
+ *     refusal; admitted (a hold-free record, or another twin's reservation) ⇒ CAS again
+ *     with IfMatch, DONE_INTENT_FENCE_ATTEMPTS times in all, then refuse;
+ *   · the record vanished (PUT or re-read 404) ⇒ a ship / security ticket refuses as it
+ *     would on "no record" (DL-030); any other ticket RE-RESERVES create-only on the
+ *     next attempt (TEAM-5959: it used to proceed unfenced);
+ *   · AccessDenied, 5xx, a failed re-read ⇒ REFUSE (fail closed: deploy config, not a race).
+ * A refusal here can leave the reason comment and blocker links written (as the
+ * TEAM-5707 precondition re-read can); the ticket itself has not moved.
+ */
+async function fenceDoneIntent(ticketId, admitted) {
+  if (!ARTIFACT_BUCKET || !admitted.key) return;
+  const key = admitted.key;
+  const vanished = () => {
+    if (admitted.recordGated) {
+      throw completionRecordRequiredError(ticketId, `no ${key} in the artifact bucket`, admitted.securityReview ? "a security-review ticket" : "a ship-phase ticket");
+    }
+    Object.assign(admitted, { absent: true });
+    delete admitted.etag;
+    delete admitted.bodyText;
+  };
+  const errText = (err) => `${err?.name || "S3Error"}${err?.$metadata?.httpStatusCode ? ` ${err.$metadata.httpStatusCode}` : ""}`;
+  for (let attempt = 1; attempt <= DONE_INTENT_FENCE_ATTEMPTS; attempt++) {
+    const at = new Date().toISOString();
+    const nonce = randomUUID();
+    const intent = { provider: "jira", at, nonce };
+    // TEAM-5959: nothing admitted (404, or vanished under an earlier attempt) ⇒ a
+    // create-only reservation; a record ⇒ the intent CASed onto its body.
+    const reserving = admitted.absent === true;
+    const body = JSON.stringify(reserving ? doneIntentReservation(ticketId, intent) : withDoneIntent(JSON.parse(admitted.bodyText), intent), null, 2);
+    let kind;
+    try {
+      const res = await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key, Body: body, ContentType: "application/json", ...(reserving ? { IfNoneMatch: "*" } : { IfMatch: admitted.etag }) }));
+      Object.assign(admitted, { etag: res.ETag, bodyText: body, intent: { at, nonce }, absent: false });
+      return;
+    } catch (err) {
+      kind = classifyS3WriteError(err);
+      if (kind === "other") {
+        console.warn(`[agentcore-hub-jira] ${ticketId}: refusing done — the Done-intent fence on ${key} could not be written (${errText(err)})`);
+        throw completionRecordRequiredError(ticketId, doneIntentUnfencedRefusal(key, `PutObject ${errText(err)}`), DONE_UNFENCED_WHAT);
+      }
+      if (kind === "gone") {
+        vanished();
+        console.warn(`[agentcore-hub-jira] ${ticketId}: ${key} vanished under the Done-intent fence (attempt ${attempt}/${DONE_INTENT_FENCE_ATTEMPTS}) — reserving it`);
+        continue;
+      }
+    }
+    // The record moved under the fence (or another writer created it first): read what
+    // it says now, with the guard's judge.
+    let bodyText;
+    let etag;
+    try {
+      const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
+      bodyText = await res.Body.transformToString();
+      etag = res.ETag;
+    } catch (err) {
+      if (classifyS3WriteError(err) === "gone") {
+        vanished();
+        console.warn(`[agentcore-hub-jira] ${ticketId}: ${key} vanished under the Done-intent fence (attempt ${attempt}/${DONE_INTENT_FENCE_ATTEMPTS}) — reserving it`);
+        continue;
+      }
+      console.warn(`[agentcore-hub-jira] ${ticketId}: refusing done — ${key} changed under the Done-intent fence and could not be re-read (${errText(err)})`);
+      throw completionRecordRequiredError(ticketId, doneIntentUnfencedRefusal(key, `re-read ${errText(err)}`), DONE_UNFENCED_WHAT);
+    }
+    const verdict = rejudgeAdmitted(key, bodyText, admitted);
+    if (verdict) {
+      console.warn(`[agentcore-hub-jira] ${ticketId}: refusing done on ${verdict.what} — the record changed under the Done-intent fence: ${verdict.why}`);
+      throw completionRecordRequiredError(ticketId, verdict.why, verdict.what);
+    }
+    Object.assign(admitted, { etag, bodyText, absent: false });
+    console.warn(`[agentcore-hub-jira] ${ticketId}: ${key} changed under the Done-intent fence (${kind}, attempt ${attempt}/${DONE_INTENT_FENCE_ATTEMPTS}) — still admitted, fencing again`);
+  }
+  throw completionRecordRequiredError(ticketId, doneIntentContendedRefusal(key, DONE_INTENT_FENCE_ATTEMPTS), DONE_UNFENCED_WHAT);
+}
+
+/**
+ * TEAM-5941: take the intent back off the record when the transition did not commit.
+ * Best-effort, one conditional PUT, every failure only logged: a stale intent is
+ * harmless (the drain treats one older than DONE_INTENT_TTL_MS as absent).
+ */
+async function clearDoneIntent(ticketId, admitted) {
+  if (!admitted?.intent || !admitted.key || !admitted.bodyText) return;
+  try {
+    const body = JSON.stringify(withoutDoneIntent(JSON.parse(admitted.bodyText)), null, 2);
+    const res = await s3.send(new PutObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: admitted.key, Body: body, ContentType: "application/json", IfMatch: admitted.etag }));
+    Object.assign(admitted, { etag: res.ETag, bodyText: body });
+    delete admitted.intent;
+  } catch (err) {
+    console.warn(`[agentcore-hub-jira] ${ticketId}: the Done did not commit and the Done-intent on ${admitted.key} could not be cleared (${err?.name || "S3Error"}) — it expires on its own`);
+  }
 }
 
 // ─── The typed gate guard (TEAM-4739) ────────────────────────────────────────
@@ -434,14 +595,16 @@ function completionRecordRequiredError(ticketId, why, what = "a ship-phase ticke
  * Both gates on a `→ Done` transition, in order: TEAM-4706's ship-phase completion
  * record (unchanged), then the typed-gate probe.
  *
+ * @param {object} [admitted] TEAM-5926: filled with the completion-record read the
+ *   guard admitted on ({key, etag, absent, bodyText}), for postCommitHoldCheck
  * @returns {Promise<object|null>} the verification to stamp, or null when this
  *   ticket is not a probed gate. Throws to refuse.
  */
-async function gateConditionCleared(ticketId, labels, description) {
+async function gateConditionCleared(ticketId, labels, description, admitted = null) {
   // TEAM-4706 (DL-030), unchanged: a ship-phase ticket cannot reach Done without
   // its completion record.
   if (await isShipPhaseTicket(labels)) {
-    const proof = await completionRecordProven(ticketId);
+    const proof = await completionRecordProven(ticketId, {}, admitted);
     if (!proof.proven) {
       console.warn(
         `[agentcore-hub-jira] ${ticketId}: refusing done on a ship-phase ticket — ${proof.why}`
@@ -454,12 +617,24 @@ async function gateConditionCleared(ticketId, labels, description) {
     // (design_amendment_required). A direct `→ Done` would walk around that, so
     // the record must carry the securityReview stamp that only an ADMITTED report
     // writes — an existing record alone (say one written on a FAIL) is not enough.
-    const proof = await completionRecordProven(ticketId, { securityReview: true });
+    const proof = await completionRecordProven(ticketId, { securityReview: true }, admitted);
     if (!proof.proven) {
       console.warn(
         `[agentcore-hub-jira] ${ticketId}: refusing done on a security-review ticket — ${proof.why}`
       );
       throw completionRecordRequiredError(ticketId, proof.why, "a security-review ticket");
+    }
+  } else {
+    // TEAM-5805 / TEAM-5832: any other ticket — whatever its `agent:` label says, or
+    // none, human gates included — may carry a merge-brief hold (briefPending) that a
+    // replay stamped when it could not put the brief on the gate; a direct `→ Done`
+    // would release the gate without it. No record ⇒ admit; a record S3 cannot read ⇒
+    // refuse.
+    const hold = await briefHoldOf(ticketId, admitted);
+    if (hold) {
+      const what = hold.unknown ? "a ticket whose merge-brief hold cannot be read" : "a ticket whose merge brief is held";
+      console.warn(`[agentcore-hub-jira] ${ticketId}: refusing done on ${what} — ${hold.why}`);
+      throw completionRecordRequiredError(ticketId, hold.why, what);
     }
   }
   return verifyTypedGate(ticketId, labels, description);
@@ -2141,16 +2316,19 @@ async function transitionTicket(params) {
   // is how a Blocked ticket reaches Done at all — cannot walk around either gate.
   // Labels carry the phase, the assignee AND the gate bindings in Jira mode, so one
   // read answers every half of the predicate; `description` rides along for the
-  // advisory DECISION line, and only a ship-phase ticket costs an S3 call.
+  // advisory DECISION line. With ARTIFACT_BUCKET set every Done costs one S3 GetObject
+  // of its completion record (TEAM-5832: the brief hold is read for every ticket).
   let gateVerification = null;
   let gateLabels = [];
+  const admitted = {};
   if (effectiveStatus.toLowerCase() === "done") {
     const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,description`);
     gateLabels = issue?.fields?.labels || [];
     gateVerification = await gateConditionCleared(
       ticket_id,
       gateLabels,
-      adfToText(issue?.fields?.description)
+      adfToText(issue?.fields?.description),
+      admitted
     );
   }
 
@@ -2235,6 +2413,10 @@ async function transitionTicket(params) {
     }
   }
   await recheckPrecondition();
+  // TEAM-5941: the Done-intent fence — the LAST awaited step before the transition POST
+  // (everything between here and the POST is synchronous). The labels-screen fallback
+  // below runs after it and needs no second fence: the intent is already on the record.
+  if (effectiveStatus.toLowerCase() === "done") await fenceDoneIntent(ticket_id, admitted);
 
   // TEAM-4739: the verification stamp rides in the SAME request as the transition —
   // `POST /transitions` accepts `update.labels` alongside `transition` — so a gate
@@ -2299,10 +2481,16 @@ async function transitionTicket(params) {
     // Remove ONLY the label we added (`remove` of an absent label is a no-op); stale
     // generations the ops stripped stay stripped. The original error propagates.
     if (parkClaimLabel) await removeParkClaimLabel(ticket_id, parkClaimLabel);
+    // TEAM-5941: the Done did not verify — take the intent back off the record,
+    // best-effort. (A throw after a LANDED POST clears it too; harmless, the ticket
+    // reads Done and nothing reads the intent after that.)
+    if (admitted.intent) await clearDoneIntent(ticket_id, admitted);
     throw err;
   }
 
   const conflict = finalStatus === "done" ? await flagDoneOverCancelled(ticket_id) : false;
+  const hold = finalStatus === "done" && admitted.key ? await postCommitHoldCheck(ticket_id, admitted) : {};
+  const warnings = [conflict ? DONE_OVER_CANCELLED_WARNING : null, hold.warning].filter(Boolean);
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
   return {
     ticketId: ticket_id,
@@ -2310,7 +2498,8 @@ async function transitionTicket(params) {
     message: `Transitioned to ${finalStatus}`,
     ...(blockers.length ? { blockedByAdded: blockers } : {}),
     ...(gateVerification ? { gateVerification } : {}),
-    ...(conflict ? { conflict: "done_over_cancelled", warning: DONE_OVER_CANCELLED_WARNING } : {}),
+    ...(conflict ? { conflict: "done_over_cancelled" } : hold.conflict ? { conflict: hold.conflict } : {}),
+    ...(warnings.length ? { warning: warnings.join(" ") } : {}),
   };
 }
 
@@ -2510,6 +2699,46 @@ export async function flagDoneOverCancelled(ticket_id) {
     console.warn(`[jira-tools] ${ticket_id}: done-over-cancelled check failed: ${err.message}`);
     return false;
   }
+}
+
+/**
+ * TEAM-5926 (TEAM-5799 ship-review F1): the Done guard read the completion record,
+ * then the reason comment and the provider calls ran before the Done committed. A
+ * replay drain that CAS-stamped `briefPending:true` inside that window (or, on a ticket
+ * the guard admitted through completionRecordProven, `followUpsPending:true`) is found here,
+ * by re-reading the record after the commit (judgePostCommitHold in gate-contract.mjs).
+ * DETECTION ONLY, like flagDoneOverCancelled: the Done stands, a Conflict comment flags
+ * it, the result carries `conflict` + `warning`, and the drain's own post-stamp
+ * re-read converges the record. A re-read S3 cannot answer (one retry) is a warning,
+ * never a throw over the committed move.
+ */
+export async function postCommitHoldCheck(ticket_id, admitted) {
+  const reread = async () => {
+    try {
+      const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: admitted.key }));
+      return { etag: res.ETag, absent: false, bodyText: await res.Body.transformToString() };
+    } catch (err) {
+      const status = err?.$metadata?.httpStatusCode;
+      if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) return { absent: true };
+      return { error: `could not read ${admitted.key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})` };
+    }
+  };
+  let now = await reread();
+  if (now.error) now = await reread();
+  const verdict = judgePostCommitHold(admitted.key, admitted, now);
+  if (!verdict) return {};
+  if (verdict.unchecked) {
+    console.warn(`[jira-tools] ${ticket_id}: post-commit hold check could not run: ${verdict.why}`);
+    return { warning: postCommitUncheckedWarning(verdict.why) };
+  }
+  const fields = postCommitHoldConflict(verdict);
+  console.warn(`[jira-tools] ${ticket_id}: Done committed over a concurrent hold on ${admitted.key} (${verdict.kinds.join(", ")})`);
+  try {
+    await addComment({ ticket_id, comment: `Conflict: ${fields.warning}` });
+  } catch (err) {
+    console.warn(`[jira-tools] ${ticket_id}: ${fields.conflict} comment failed: ${err.message}`);
+  }
+  return fields;
 }
 
 async function updateTicket(params) {

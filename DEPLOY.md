@@ -355,6 +355,39 @@ stage is now always a real failure:**
 | `lambda/*/deploy.sh`, `deploy/*/deploy.sh`, `deploy/setup-*.{sh,mjs}` | the script itself — these change IAM / env vars / tables, which the pipeline role deliberately cannot |
 | `lambda/cost-report/index.mjs` with a `REPORT_VERSION` bump | code ships via the pipeline, but run `lambda/cost-report/deploy.sh --backfill` afterwards (`--rebuild-index` alone drops every older-version card from the fleet index) |
 
+**Refused before anything ships — the ticket-twin preflight (TEAM-5910).** When a
+deploy plan updates `agentcore-hub-jira` or `agentcore-hub-tickets`, `pre_build`
+runs `deploy/lib/twin-preflight.mjs` before the rollback snapshot and before any
+target. Since TEAM-5832/TEAM-5805 both twins refuse every non-ship Done whose
+`completions/<ticket>.json` S3 cannot prove is missing, and S3 reports a missing key
+as 404 (not 403) only to a role holding `s3:ListBucket` on the bucket — a grant that
+only the handoff `deploy/setup-tickets-lambda.mjs` applies. So for each twin in the
+plan the preflight reads the function's `Role` and `ARTIFACT_BUCKET` (no other env
+value is fetched) and the role's **inline** policies, and refuses the WHOLE deploy
+(non-zero exit, nothing shipped, nothing rolled back, baseline not advanced, so the
+next run re-plans the twin) unless:
+
+- `ARTIFACT_BUCKET` is set on the function and equals the pipeline's bucket;
+- an inline policy has an **unconditioned** `Allow s3:ListBucket` on
+  `arn:aws:s3:::<bucket>`, and an unconditioned `Allow s3:GetObject` whose Resource
+  covers the **whole** `<bucket>/completions/*` namespace (`<bucket>/completions/*`,
+  `<bucket>/*`, `arn:aws:s3:::*` or `*`). A grant on one key, or on a narrower
+  pattern such as `completions/twin-*`, does not count (TEAM-5924);
+- no inline `Deny` may apply: a Deny whose Action matches `s3:ListBucket` on the
+  bucket, or `s3:GetObject` (including `s3:Get*`, `s3:*`, `*`) with a Resource that
+  could match any key under `completions/` (e.g. `completions/TEAM-*.json`), refuses,
+  conditioned or not. A Deny written with `NotAction` or `NotResource` refuses outright.
+
+It fails closed on everything it cannot prove: an IAM or Lambda read that errors
+(AccessDenied, throttling), a conditioned grant, and **a grant that lives only in a
+managed policy** — managed policies are not read, because the setup script writes
+the grant inline. Every refusal names the fix:
+`source deploy/config.sh && TICKET_PROVIDER=<jira|dynamodb> node deploy/setup-tickets-lambda.mjs`,
+then re-run the pipeline. If the refusal is AccessDenied on `ListRolePolicies` /
+`GetRolePolicy`, the Deploy role predates the `TwinPreflightIamRead` statement — run
+`./deploy/pipeline/deploy.sh`. An optional twin that does not exist in the account
+(`agentcore-hub-tickets` on a Jira install) is skipped, as Target 1b skips it.
+
 **This PR (TEAM-4706) needs two of those handoff scripts re-run, in either order:**
 
 | Command | Why |
@@ -366,6 +399,39 @@ stage is now always a real failure:**
 `GITHUB_TOKEN` on the tools Lambda (never its value), `s3:PutObject` on
 `pipeline-artifacts/ship-approvals/*` for its role, and the ticket role's
 `s3:GetObject` cover over `completions/*`.
+
+**This PR (TEAM-5941, TEAM-5799 ship-review r2 F1) needs one handoff script re-run,
+BEFORE merging to `main`:**
+
+| # | Command | Why |
+|---|---|---|
+| 1 | `source deploy/config.sh && TICKET_PROVIDER=<jira\|dynamodb> node deploy/setup-tickets-lambda.mjs` | the ticket role gains the prefix-scoped inline `s3:PutObject` on `completions/*` (`CompletionRecordFence`). Both ticket twins now write a `doneIntent` onto `completions/<ticket>.json` with `IfMatch` as the LAST step before the provider commit (the fence that stops a Done committing over a replay's `briefPending:true` stamp), and a write the role may not make REFUSES the Done, fail closed. So twin code with the fence on a role without the grant refuses every Done on a ticket that has a completion record |
+| 2 | `./scripts/verify-infra.sh` | the new `s3:PutObject covering completions/*` check is green |
+| 3 | merge / release | the Deploy stage's preflight (TEAM-5910, below) now also requires that grant and refuses to ship twin code without it, so the order above is enforced, not advisory |
+
+**This PR (TEAM-5910, TEAM-5799 follow-up) needs two handoff steps, IN THIS ORDER,
+before the first pipeline deploy that carries ticket-twin code (the TEAM-5799 twin
+changes ride in the same release, so do this before merging to `main`):**
+
+| # | Command | Why |
+|---|---|---|
+| 1 | `./deploy/pipeline/deploy.sh` | adds `TwinPreflightIamRead` (`iam:ListRolePolicies` + `iam:GetRolePolicy` on `AgentCoreHubJiraLambdaRole` / `AgentCoreHubTicketsLambdaRole` only) to the Deploy role. Without it the preflight's IAM read is AccessDenied and every deploy touching a twin is refused |
+| 2 | `source deploy/config.sh && node deploy/setup-tickets-lambda.mjs` (with the deployed `TICKET_PROVIDER`) | writes the unconditioned inline `s3:ListBucket` (TEAM-5867, below) and `ARTIFACT_BUCKET` the preflight checks for. A grant you added by hand in a managed policy does NOT satisfy the preflight |
+| 3 | `./scripts/verify-infra.sh` | confirms the grant independently |
+| 4 | merge / release | the Deploy stage's preflight now passes and the twin code ships |
+
+Skipping 1 or 2 is safe — the Deploy stage fails in `pre_build` with
+`TEAM-5910 ticket-twin preflight REFUSED - nothing deployed` and ships nothing — but
+it blocks every surface in that deploy until both are done.
+
+**This PR (TEAM-5867, TEAM-5799 follow-up) needs one handoff script re-run:**
+
+| Command | Why |
+|---|---|
+| `node deploy/setup-tickets-lambda.mjs` (with the deployed `TICKET_PROVIDER`; `source deploy/config.sh` first) | the ticket role gains an unconditioned `s3:ListBucket` on the artifact bucket. Without it S3 answers a GetObject of a MISSING `completions/<ticket>.json` with 403, and since TEAM-5832 (#878) both ticket twins' Done guard admits a recordless ticket only on 404 - so every human gate (Merge Approval included) is refused with `completion_record_required` until the role is updated. The IAM change lands only through this script (`deploy/setup-*.mjs` is a handoff row above); a pipeline code deploy of the twins does not fix it. The same run also fixes the env: `ARTIFACT_BUCKET` is now derived from the STS account after it resolves and is ALWAYS set on the function - the old script derived it before STS, forwarded it only when truthy, and replaced the whole env, so a bare re-run used to strip it. Behaviour change for an install that deliberately ran with NO bucket: non-ship Dones go from "admit, no S3 call" to a live probe (a missing key or `NoSuchBucket` is 404, still admitted), and ship-phase Dones go from "refuse: bucket unset" to real verdicts |
+
+`./scripts/verify-infra.sh` now asserts the new grant: `s3:ListBucket` on the bucket ARN for
+the ticket role, beside the existing `s3:GetObject` cover over `completions/*`.
 
 **This PR (TEAM-4764) needs one of those handoff scripts re-run, plus a sweep-mode promotion:**
 

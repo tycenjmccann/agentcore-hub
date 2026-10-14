@@ -47,6 +47,7 @@ import {
   resolveEnv,
   validateCiProjectName as validateInDeployScript,
 } from "./setup-pipeline-tools-lambda.mjs";
+import { buildTicketsPolicyStatements } from "./lib/tickets-lambda-config.mjs";
 
 // The Lambda constructs three AWS SDK clients at module load; mock the seams so
 // importing it here stays offline (same shape as the Lambda's own test file).
@@ -570,7 +571,7 @@ describe("buildInlinePolicy — the handoff-marker read", () => {
 // get-policy-version answers only for the version get-policy reported, so a
 // helper that skipped DefaultVersionId would fail here too.
 const VERIFY_SH = readFileSync(new URL("../scripts/verify-infra.sh", import.meta.url), "utf8");
-const IAM_FNS = ["role_policy_match", "role_policy_grants", "role_policy_grants_prefix"]
+const IAM_FNS = ["role_policy_match", "role_policy_grants", "role_policy_grants_prefix", "role_policy_grants_under"]
   .map((name) => new RegExp(`^${name}\\(\\) \\{[\\s\\S]*?^\\}$`, "m").exec(VERIFY_SH)?.[0])
   .join("\n");
 const AWS_STUB = String.raw`#!/usr/bin/env python3
@@ -742,23 +743,131 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
       expect(await grants(action, target, inlineOnly(buildInlinePolicy(BASE)))).toBe(0);
     });
 
-    // deploy/setup-tickets-lambda.mjs builds its policy inline at module top
-    // level and runs IAM calls on import, so it cannot be imported here; this is
-    // its ARTIFACT_BUCKET statement verbatim (setup-tickets-lambda.mjs, "S3 read").
-    const ticketsS3Read = {
-      Effect: "Allow",
-      Action: ["s3:GetObject"],
-      Resource: `${ARTIFACT_BUCKET_ARN}/*`,
-    };
+    // TEAM-5867: the tickets Lambda's S3 statements come from the SAME builder its
+    // deploy script now calls (deploy/lib/tickets-lambda-config.mjs), not a hand
+    // copy — so this runs verify-infra.sh's matcher against the policy that is
+    // actually written. Both providers get identical S3 statements.
+    const ticketsStatements = buildTicketsPolicyStatements({
+      provider: "dynamodb",
+      region: REGION,
+      accountId: ACCOUNT,
+      tableName: "agentcore-hub-tickets",
+      artifactBucket: `agentcore-hub-artifacts-${ACCOUNT}-us-east-1`,
+    });
+    const ticketsS3Read = ticketsStatements.find((s) => s.Action.includes("s3:GetObject"));
+    const ticketsS3List = ticketsStatements.find((s) => s.Action.includes("s3:ListBucket"));
+    // TEAM-5941: the Done-intent fence's prefix-scoped write.
+    const ticketsS3Fence = ticketsStatements.find((s) => s.Action.includes("s3:PutObject"));
     const COMPLETIONS_TARGET = `${ARTIFACT_BUCKET_ARN}/completions/verify-infra-probe`;
 
     it("passes for the completions/* caller target against the tickets Lambda's S3 read", async () => {
       expect(await grants("s3:GetObject", COMPLETIONS_TARGET, inlineOnly(doc(ticketsS3Read)))).toBe(0);
     });
 
+    // TEAM-5867 P0: the verify-infra.sh line that catches the regression — a role
+    // with the read but not the list answers a MISSING completions/* key with 403,
+    // and the twins' Done guard then refuses every recordless ticket.
+    it("passes for s3:ListBucket on the bucket ARN against the tickets Lambda's policy", async () => {
+      expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(...ticketsStatements)))).toBe(0);
+    });
+
+    it("fails for s3:ListBucket when the policy only carries the pre-5867 object read", async () => {
+      expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(ticketsS3Read)))).not.toBe(0);
+      // …and the object read alone does not satisfy a bucket-level target by glob either.
+      expect(ticketsS3List.Resource).toBe(ARTIFACT_BUCKET_ARN);
+    });
+
     it("fails for completions/* when the tickets read is hand-narrowed away from it", async () => {
       const narrowed = { ...ticketsS3Read, Resource: `${ARTIFACT_BUCKET_ARN}/config/*` };
       expect(await grants("s3:GetObject", COMPLETIONS_TARGET, inlineOnly(doc(narrowed)))).not.toBe(0);
+    });
+
+    // TEAM-5924 (sibling of ship review F2 on #892): the completions/* check proved
+    // GetObject on ONE synthetic key, so a read hand-narrowed to completions/twin-* or
+    // completions/verify-* passed while no real completions/TEAM-*.json was granted.
+    // role_policy_grants_under asks whether a Resource covers the WHOLE prefix.
+    describe("role_policy_grants_under: a grant must cover all of completions/ (TEAM-5924)", () => {
+      const NS = `${ARTIFACT_BUCKET_ARN}/completions/`;
+      const under = (action, prefix, fixture) => runIamCheck(`role_policy_grants_under role ${action} ${prefix}`, fixture);
+      const read = (Resource, extra = {}) => ({ Effect: "Allow", Action: ["s3:GetObject"], Resource, ...extra });
+
+      it("passes against the tickets Lambda's real read (<bucket>/*)", async () => {
+        expect(await under("s3:GetObject", NS, inlineOnly(doc(ticketsS3Read)))).toBe(0);
+      });
+
+      it.each([`${NS}*`, `${ARTIFACT_BUCKET_ARN}/comp*`, "arn:aws:s3:::*", "*"])(
+        "passes for a Resource of %s",
+        async (Resource) => {
+          expect(await under("s3:GetObject", NS, inlineOnly(doc(read(Resource))))).toBe(0);
+        }
+      );
+
+      it.each([`${NS}twin-*`, `${NS}verify-infra-probe`, `${NS}TEAM-1.json`, `${NS}*.json`, `${ARTIFACT_BUCKET_ARN}/complet?ons/*`, `${ARTIFACT_BUCKET_ARN}/config/*`])(
+        "fails for a read narrowed to %s",
+        async (Resource) => {
+          expect(await under("s3:GetObject", NS, inlineOnly(doc(read(Resource))))).not.toBe(0);
+        }
+      );
+
+      it("fails for a conditioned covering Allow, a NotResource Allow, and a fetch error", async () => {
+        const Condition = { StringEquals: { "aws:RequestedRegion": "eu-west-1" } };
+        expect(await under("s3:GetObject", NS, inlineOnly(doc(read(`${ARTIFACT_BUCKET_ARN}/*`, { Condition }))))).not.toBe(0);
+        expect(await under("s3:GetObject", NS, inlineOnly(doc({ Effect: "Allow", Action: "s3:GetObject", NotResource: `${ARTIFACT_BUCKET_ARN}/other/*` })))).not.toBe(0);
+        expect(await under("s3:GetObject", NS, { ...inlineOnly(doc(ticketsS3Read)), fail: ["get-role-policy"] })).not.toBe(0);
+      });
+
+      it("recognises a covering grant that lives only in an attached managed policy", async () => {
+        expect(
+          await under("s3:GetObject", NS, { managed: { [managedArn("m")]: { version: "v2", doc: doc(ticketsS3Read) } } })
+        ).toBe(0);
+      });
+
+      it("verify-infra.sh checks the tickets role's completions/ read with it, not with a probe key", () => {
+        expect(VERIFY_SH).toMatch(/role_policy_grants_under \$TICKETS_ROLE s3:GetObject arn:aws:s3:::\$ARTIFACT_BUCKET\/completions\/"/);
+        expect(VERIFY_SH).not.toMatch(/completions\/verify-infra-probe/);
+      });
+
+      // TEAM-5941: the Done-intent fence's PutObject is checked the same way — over the
+      // whole completions/ namespace — against the statement the deploy script writes.
+      it("passes for s3:PutObject against the tickets Lambda's real CompletionRecordFence statement", async () => {
+        expect(ticketsS3Fence.Resource).toBe(`${NS}*`);
+        expect(await under("s3:PutObject", NS, inlineOnly(doc(ticketsS3Fence)))).toBe(0);
+      });
+
+      it("fails for s3:PutObject against a pre-TEAM-5941 policy (read + list only), or a write narrowed to completions/twin-*", async () => {
+        expect(await under("s3:PutObject", NS, inlineOnly(doc(ticketsS3Read, ticketsS3List)))).not.toBe(0);
+        expect(await under("s3:PutObject", NS, inlineOnly(doc({ ...ticketsS3Fence, Resource: `${NS}twin-*` })))).not.toBe(0);
+      });
+
+      it("verify-infra.sh checks the tickets role's completions/ write with it (TEAM-5941)", () => {
+        expect(VERIFY_SH).toMatch(/role_policy_grants_under \$TICKETS_ROLE s3:PutObject arn:aws:s3:::\$ARTIFACT_BUCKET\/completions\/"/);
+      });
+    });
+
+    // TEAM-5924 sibling: verify-infra.sh:372 had the SAME probe-key shape for the
+    // ship-approvals write — a read/write narrowed to ship-approvals/verify-* (or any
+    // other single key) passed the old check while no real ship-approval record
+    // (<merge_commit>.json) was ever granted. Same fix, same helper.
+    describe("role_policy_grants_under: a grant must cover all of ship-approvals/ (TEAM-5924 sibling)", () => {
+      const SHIP_NS = `${ARTIFACT_BUCKET_ARN}/pipeline-artifacts/ship-approvals/`;
+      const under = (action, prefix, fixture) => runIamCheck(`role_policy_grants_under role ${action} ${prefix}`, fixture);
+
+      it("passes against buildInlinePolicy's real ShipApprovalRecordWrite grant", async () => {
+        const policy = buildInlinePolicy(BASE);
+        expect(await under("s3:PutObject", SHIP_NS, inlineOnly(policy))).toBe(0);
+      });
+
+      it("fails for a write narrowed to ship-approvals/verify-* only", async () => {
+        const narrow = { Effect: "Allow", Action: ["s3:PutObject"], Resource: `${SHIP_NS}verify-*` };
+        expect(await under("s3:PutObject", SHIP_NS, inlineOnly(doc(narrow)))).not.toBe(0);
+      });
+
+      it("verify-infra.sh checks the pipeline-tools role's ship-approvals/ write with it, not with a probe key", () => {
+        expect(VERIFY_SH).toMatch(
+          /role_policy_grants_under \$PIPELINE_TOOLS_ROLE s3:PutObject arn:aws:s3:::\$ARTIFACT_BUCKET\/pipeline-artifacts\/ship-approvals\/"/
+        );
+        expect(VERIFY_SH).not.toMatch(/ship-approvals\/verify-infra-probe\.json/);
+      });
     });
 
     it("recognises the grant when it lives only in an attached managed policy", async () => {
@@ -800,6 +909,83 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
         const statement = { ...ticketsS3Read, Sid, Resource: `${ARTIFACT_BUCKET_ARN}/completions/*` };
         expect(await grants("s3:GetObject", COMPLETIONS_TARGET, inlineOnly(doc(statement))), Sid).toBe(0);
       }
+    });
+
+    // TEAM-5883: a Condition on the Allow is the OTHER way to hand-narrow a grant.
+    // The mode=any matcher used to set granted before it ever read Condition, so a
+    // ListBucket scoped by s3:prefix passed this check while S3 kept answering a
+    // GetObject of a MISSING completions/* key with 403 (the prefix never binds to
+    // GetObject's implicit list check) and the twins' Done guard refused every
+    // recordless human ticket. A conditioned Allow is not the grant asked about.
+    describe("a conditioned Allow is not a grant (TEAM-5883)", () => {
+      const conditioned = (Condition) => ({ ...ticketsS3List, Condition });
+      const PREFIX_COND = { StringLike: { "s3:prefix": ["completions/*"] } };
+
+      it.each([
+        ["an s3:prefix StringLike", PREFIX_COND],
+        ["an s3:prefix matching everything", { StringLike: { "s3:prefix": ["*"] } }],
+        ["an s3:delimiter StringEquals", { StringEquals: { "s3:delimiter": ["/"] } }],
+        ["a non-S3 key (aws:SourceVpce)", { StringEquals: { "aws:SourceVpce": "vpce-0123" } }],
+      ])("fails for s3:ListBucket on the bucket when the only grant carries %s", async (_label, Condition) => {
+        expect(
+          await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(ticketsS3Read, conditioned(Condition))))
+        ).not.toBe(0);
+      });
+
+      it("fails when the conditioned grant is a wildcard, or lives only in a managed policy", async () => {
+        const wide = { Effect: "Allow", Action: "s3:*", Resource: "*", Condition: PREFIX_COND };
+        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(wide)))).not.toBe(0);
+        expect(
+          await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, {
+            inline: { inline: doc(ticketsS3Read) },
+            managed: { [managedArn("m")]: { version: "v1", doc: doc(conditioned(PREFIX_COND)) } },
+          })
+        ).not.toBe(0);
+      });
+
+      it.each([
+        ["s3:GetObject", COMPLETIONS_TARGET, ticketsS3Read],
+        ["s3:PutObject", PUT_TARGET, sid(buildInlinePolicy(BASE), "ShipApprovalRecordWrite")],
+        [
+          "codepipeline:GetPipeline",
+          `arn:aws:codepipeline:${REGION}:${ACCOUNT}:agentcore-hub-deploy`,
+          sid(buildInlinePolicy(BASE), "PipelineReadAndTrigger"),
+        ],
+        [
+          "codebuild:BatchGetBuilds",
+          `arn:aws:codebuild:${REGION}:${ACCOUNT}:project/agentcore-hub-runtime-image-deploy`,
+          sid(buildInlinePolicy(BASE), "BuildRead"),
+        ],
+      ])("applies to every mode=any caller: %s fails once a Condition is added to the real statement", async (action, target, statement) => {
+        const narrowed = { ...statement, Condition: { StringEquals: { "aws:RequestedRegion": "eu-west-1" } } };
+        expect(await grants(action, target, inlineOnly(doc(narrowed)))).not.toBe(0);
+        // …and the real, unconditioned statement still passes.
+        expect(await grants(action, target, inlineOnly(doc(statement)))).toBe(0);
+      });
+
+      it("still passes when an unconditioned grant sits beside a conditioned one", async () => {
+        expect(
+          await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(conditioned(PREFIX_COND), ticketsS3List)))
+        ).toBe(0);
+      });
+
+      it("treats an empty Condition object as no condition (IAM semantics)", async () => {
+        expect(
+          await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc({ ...ticketsS3List, Condition: {} })))
+        ).toBe(0);
+      });
+
+      it("does not regress Deny handling: a conditioned Deny is still ignored, and still not a grant", async () => {
+        const deny = { Effect: "Deny", Action: "s3:*", Resource: "*", Condition: PREFIX_COND };
+        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(ticketsS3List, deny)))).toBe(0);
+        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(deny)))).not.toBe(0);
+      });
+
+      it("the policy the deploy script actually writes carries no Condition on either S3 grant", () => {
+        // What makes the conservative rule safe: if this ever fails, verify-infra
+        // would start failing on a healthy install.
+        for (const s of [ticketsS3Read, ticketsS3List]) expect(s.Condition, s.Sid).toBeUndefined();
+      });
     });
 
     it.each(IAM_STEPS)("fails closed when %s is refused", async (step) => {
@@ -1078,6 +1264,14 @@ describe("buildInlinePolicy — the ship-rejection marker probe (TEAM-4740, TEAM
       for (const Sid of ["VerifyInfraFetchError", "!verify-infra-fetch-error"]) {
         expect(await verify(mutate((_p, s) => (s.Sid = Sid))), Sid).toBe(0);
       }
+    });
+
+    it("mode=any does not count the conditioned marker list as an unconditioned grant (TEAM-5883)", async () => {
+      // The two modes must disagree exactly here: the real policy satisfies the
+      // prefix check (above) and must NOT satisfy a plain role_policy_grants.
+      expect(
+        await runIamCheck(`role_policy_grants role s3:ListBucket ${bucketArn}`, { inline: { inline: buildInlinePolicy(BASE) } })
+      ).not.toBe(0);
     });
 
     it("ignores a Deny statement — it is not a grant (TEAM-5821)", async () => {

@@ -933,6 +933,52 @@ export function descriptionCarriesConsoleLink(description, { pipeline, region } 
 //     `followUpsPending` false, because the follow-ups ARE filed and only the Done
 //     write failed; closing that ticket directly is a legitimate recovery this
 //     reader must not refuse.
+//
+// TEAM-5805: `briefPending` is the second hold, with the same `=== true` rule. The
+// ticket-replay drain (workflow-output drainCompletion) stamps it when the merge
+// brief could not be put on the Merge Approval gate: a Done would make the gate
+// Ready without the brief in front of the approver. A delivery to the gate (the
+// drain's step 6, or a re-run report_completion) restamps it `false`; a record
+// without the field never held a brief. TEAM-5832: the writer stamps the hold on
+// ANY ticket whose report named the brief (no assignee check), so every Done that
+// is not ship-phase or a security review reads it through judgeBriefHold — and
+// that read is in THIS band too: the hold comes from a durable writer, so "could
+// not tell" is not "no hold". A body it cannot judge refuses (briefHoldUnknown);
+// only a provable 404 (and an unset bucket, which is deploy config — see the
+// twins' briefHoldOf) admits.
+
+/** The brief-hold refusal text, or null — shared by both judges below. */
+function briefHoldRefusal(k, record) {
+  if (record.briefPending !== true) return null;
+  const delivered =
+    typeof record.briefDelivered === "string" && record.briefDelivered.trim()
+      ? record.briefDelivered.trim()
+      : "unstated";
+  return (
+    `${k} has briefPending:true (brief ${delivered}) — the merge brief has not reached ` +
+    `the Merge Approval gate; re-run WorkflowOutput___report_completion with the same ` +
+    `arguments to deliver the brief (it clears briefPending once the brief is on the gate)`
+  );
+}
+
+/**
+ * TEAM-5832: the brief hold could not be judged. `cause` names what failed
+ * (`could not read <key> (AccessDenied 403)`, `could not judge <key> (no body)`).
+ * Deliberately never contains `has briefPending:true (brief `, so workflow-output's
+ * isBriefHoldRefusal does not read it as a proven hold: the drain retries it and
+ * report_completion answers complete_transition_failed (retry), with no forced hold.
+ * `unknown: true` lets the twins say "cannot be read" rather than "is held".
+ */
+export function briefHoldUnknown(key, cause) {
+  return {
+    proven: false,
+    unknown: true,
+    why:
+      `${cause} — whether briefPending is set is UNKNOWN, so the merge brief may not be on ` +
+      `the Merge Approval gate; retry the transition, or re-run WorkflowOutput___report_completion ` +
+      `with the same arguments`,
+  };
+}
 
 /**
  * Anything that is not a readable JSON object. Fails CLOSED: an unreadable record
@@ -948,6 +994,17 @@ function completionRecordUnreadable(key, detail) {
       `follow-ups are still pending is UNKNOWN. Re-run WorkflowOutput___report_completion ` +
       `with the same arguments to rewrite it`,
   };
+}
+
+/** judgeCompletionRecord's follow-ups refusal, on a parsed record; null when none. */
+function followUpsPendingRefusal(k, record) {
+  if (record.followUpsPending !== true) return null;
+  const status =
+    typeof record.status === "string" && record.status.trim() ? record.status.trim() : "unstated";
+  return (
+    `${k} has followUpsPending:true (status ${status}) — re-run ` +
+    `WorkflowOutput___report_completion with the same arguments to materialize the follow-ups`
+  );
 }
 
 /**
@@ -985,16 +1042,18 @@ export function judgeCompletionRecord(key, bodyText, { securityReview = false } 
     return completionRecordUnreadable(k, `parsed to ${shape}, not an object`);
   }
 
-  if (record.followUpsPending === true) {
-    const status =
-      typeof record.status === "string" && record.status.trim() ? record.status.trim() : "unstated";
-    return {
-      proven: false,
-      why:
-        `${k} has followUpsPending:true (status ${status}) — re-run ` +
-        `WorkflowOutput___report_completion with the same arguments to materialize the follow-ups`,
-    };
-  }
+  const followUpsWhy = followUpsPendingRefusal(k, record);
+  if (followUpsWhy) return { proven: false, why: followUpsWhy };
+
+  const briefWhy = briefHoldRefusal(k, record);
+  if (briefWhy) return { proven: false, why: briefWhy };
+
+  // TEAM-5959 (TEAM-5799 F5): a Done-intent reservation is NOT a completion record. It
+  // is judged exactly as a 404 is: a ship / security ticket refuses "no record" (DL-030).
+  // AFTER the hold checks on purpose - a record carrying a hold is not intent-only, and
+  // the marker must never hide a hold. (Non-gated tickets never reach this judge; their
+  // judgeBriefHold admits a hold-free reservation, as it admits a 404.)
+  if (isIntentOnlyReservation(record)) return { proven: false, why: reservationNotARecord(k) };
 
   if (securityReview) {
     const why = securityReviewRecordRefusal(k, record);
@@ -1002,6 +1061,290 @@ export function judgeCompletionRecord(key, bodyText, { securityReview = false } 
   }
 
   return { proven: true, why: `${k} exists` };
+}
+
+/**
+ * TEAM-5805: the brief hold alone, for a ticket whose Done is NOT otherwise gated on
+ * its completion record (every ticket but ship-phase and security reviews).
+ * `{proven:false, why}` on a record that reads `briefPending:true`, and (TEAM-5832)
+ * on a body it cannot judge — none, empty, unparseable or not an object — via
+ * briefHoldUnknown. null only for a readable object with `briefPending !== true`.
+ * The caller handles "no record" (404 ⇒ admit) before it gets here.
+ *
+ * @param {string} key      completions/<ticketId>.json
+ * @param {string} bodyText the object body, or undefined/null when there is none
+ * @returns {{proven: false, why: string} | null}
+ */
+export function judgeBriefHold(key, bodyText) {
+  const k = String(key || "");
+  const text = typeof bodyText === "string" ? bodyText : "";
+  if (!text.trim()) {
+    return briefHoldUnknown(k, `could not judge ${k} (${bodyText === undefined || bodyText === null ? "no body" : "an empty body"})`);
+  }
+  let record;
+  try {
+    record = JSON.parse(text);
+  } catch (err) {
+    return briefHoldUnknown(k, `could not judge ${k} (unparseable JSON (${err?.message || "no message"}))`);
+  }
+  if (!record || typeof record !== "object" || Array.isArray(record)) {
+    const shape = record === null ? "null" : Array.isArray(record) ? "an array" : typeof record;
+    return briefHoldUnknown(k, `could not judge ${k} (parsed to ${shape}, not an object)`);
+  }
+  const why = briefHoldRefusal(k, record);
+  return why ? { proven: false, why } : null;
+}
+
+// ── Post-commit hold check (TEAM-5926; TEAM-5799 ship-review F1) ────────────
+// The Done guard reads the completion record, then awaits the reason comment and
+// the provider before the Done commits. A replay drain can CAS-stamp
+// `briefPending:true` inside that window, or `followUpsPending:true` on a ticket whose
+// guard read the whole record (completionRecordProven: ship-phase and security
+// reviews), so the guard admitted on a record that no longer says what it read. After
+// the commit each twin re-reads the record and asks judgePostCommitHold. The hub does
+// not undo moves (as with DONE_OVER_CANCELLED): a hold that appeared is FLAGGED on the
+// ticket and in the result (postCommitHoldConflict), and the drain's own post-stamp
+// re-read converges the record. No text below contains `has briefPending:true (brief `,
+// so workflow-output's isBriefHoldRefusal never reads a committed Done as a refused one.
+export const DONE_OVER_BRIEF_HOLD = "done_over_brief_hold";
+export const DONE_OVER_FOLLOW_UPS_HOLD = "done_over_follow_ups_hold";
+
+// TEAM-5941: since the Done-intent fence below, this fires only when a writer walked
+// around the fence. A re-run of report_completion does NOT close or converge a Done
+// ticket (it answers complete_pending_brief and queues nothing), so it is not advised.
+export const DONE_OVER_BRIEF_HOLD_WARNING =
+  "Done committed while a concurrent ticket-provider replay held this ticket's merge brief " +
+  "off the Merge Approval gate (the completion record changed after the Done guard read it). " +
+  "The hub does not undo moves: a human must put the merge brief on the Merge Approval gate " +
+  "before approving; the ticket-provider replay converges the completion record only while " +
+  "its message is still queued.";
+
+export const DONE_OVER_FOLLOW_UPS_HOLD_WARNING =
+  "Done committed while a concurrent ticket-provider replay held this ticket open for " +
+  "follow-ups it could not file (the completion record changed after the Done guard read it " +
+  "and now says followUpsPending:true). The hub does not undo moves: file the follow-ups the " +
+  "completion record lists, or re-run WorkflowOutput___report_completion so the replay files them.";
+
+export function postCommitUncheckedWarning(cause) {
+  return (
+    `Done committed, but the post-commit completion-record check could not run (${cause}); ` +
+    `a merge-brief or follow-ups hold a concurrent replay stamped, if any, is not flagged here.`
+  );
+}
+
+/**
+ * Whether a hold appeared on the completion record between the Done guard's read and
+ * the committed Done.
+ *
+ * @param {string} key completions/<ticketId>.json
+ * @param {{etag?: string, absent?: boolean, bodyText?: string, recordGated?: boolean}} admitted
+ *   what the guard admitted on; `recordGated` when it was completionRecordProven, whose
+ *   followUpsPending refusal the Done then walked past too
+ * @param {{etag?: string, absent?: boolean, bodyText?: string} | {error: string}} reread
+ *   the post-commit read
+ * @returns {{held: true, kinds: string[]} | {unchecked: true, why: string} | null} null
+ *   when the record is unchanged, or changed into anything that is not a PROVEN hold (an
+ *   unjudgeable body is doubt, and doubt is not flagged over a committed move). `kinds`
+ *   are the conflict codes, follow-ups first.
+ */
+export function judgePostCommitHold(key, admitted, reread) {
+  if (!reread || reread.error) {
+    return { unchecked: true, why: String(reread?.error || "no re-read") };
+  }
+  const was = admitted || {};
+  if (reread.absent) return null;
+  if (!was.absent) {
+    if (was.etag && reread.etag && was.etag === reread.etag) return null;
+    if (was.bodyText === reread.bodyText) return null;
+  }
+  // The guard admitted, so what it read was not a hold: a proven hold now is new.
+  const kinds = [];
+  if (was.recordGated) {
+    let record = null;
+    try {
+      record = JSON.parse(reread.bodyText);
+    } catch {
+      record = null;
+    }
+    if (record && typeof record === "object" && !Array.isArray(record) && followUpsPendingRefusal(String(key || ""), record)) {
+      kinds.push(DONE_OVER_FOLLOW_UPS_HOLD);
+    }
+  }
+  const hold = judgeBriefHold(key, reread.bodyText);
+  if (hold && hold.proven === false && !hold.unknown) kinds.push(DONE_OVER_BRIEF_HOLD);
+  return kinds.length > 0 ? { held: true, kinds } : null;
+}
+
+/** The result fields for a `held` verdict: the first kind is the conflict, every kind's warning is said. */
+export function postCommitHoldConflict(verdict) {
+  const warnings = { [DONE_OVER_FOLLOW_UPS_HOLD]: DONE_OVER_FOLLOW_UPS_HOLD_WARNING, [DONE_OVER_BRIEF_HOLD]: DONE_OVER_BRIEF_HOLD_WARNING };
+  return { conflict: verdict.kinds[0], warning: verdict.kinds.map((k) => warnings[k]).join(" ") };
+}
+
+// ── Done-intent fence (TEAM-5941; TEAM-5799 ship-review r2 F1) ──────────────
+// The post-commit check above DETECTS a hold that landed between the guard's read and
+// the committed Done. This section is what PREVENTS it. Before the provider commit — as
+// the last awaited step — each twin writes `doneIntent` onto the completion record with
+// an S3 IfMatch on the ETag the guard admitted. That conditional write is the fence:
+//   · a hold the replay drain stamped after the guard read moved the ETag, so the PUT
+//     412s; the twin re-reads, re-judges with the SAME judge the guard used
+//     (rejudgeAdmitted) and refuses with the standard hold text, so workflow-output's
+//     isBriefHoldRefusal still answers complete_pending_brief;
+//   · a fence that won moved the ETag under the drain's own IfMatch stamp, which 412s;
+//     the drain re-reads, sees a FRESH intent on a ticket that is not Done yet, and
+//     backs off (retry, no stamp, no notice) until the ticket reads Done or the intent
+//     goes stale (lambda/workflow-output/index.mjs doneIntentFresh, which mirrors
+//     doneIntentOf below — the two cannot share a file; the parity test pins the TTL).
+// Exactly one side wins every interleaving, because both write the same key with CAS.
+//
+// The fence is written on EVERY admission (TEAM-5959, TEAM-5799 F5). A record that
+// exists is fenced with IfMatch on its ETag. A 404 admission used to skip the fence on
+// the premise "no record ⇒ no hold can appear"; that premise was false: any create-only
+// writer (report_completion's first write, the hub route's mark-done) can create a clean
+// record inside the twin's commit window and the replay drain can CAS-stamp a hold onto
+// it, with no intent on the record for holdDeferredOnDoneIntent to defer on. So on a 404
+// the twin RESERVES the key with PutObject IfNoneMatch:"*" whose body is an intent-only
+// reservation (doneIntentReservation): the marker, the ticket id and the intent, nothing
+// else. The same create-only write re-reserves a record that vanished under the fence.
+// Every creator's IfNoneMatch then 412s, re-reads, and writes IfMatch carrying the intent
+// (the present-record path), so the deferral applies. A reservation is judged EXACTLY
+// like a 404 by every reader (isIntentOnlyReservation): completionRecordProven refuses
+// it on a ship / security ticket, judgeBriefHold admits it on any other (and the next
+// fence CASes onto it), completionRecordHasEvidence (hub + orchestrator), the cancel
+// sweep and cost-report read it as "no record". The marker is explicit so it cannot be
+// mistaken for a blank record; "intent-only" means the marker AND no key outside
+// {reservation, ticketId, doneIntent} - the moment any writer adds a field (a hold, a
+// summary, ticketWrites) it is a record and is judged as one; holds are never masked.
+// A fence write the role may not make (AccessDenied), or any other write error, REFUSES:
+// it is deploy config (deploy/lib/tickets-lambda-config.mjs grants the prefix-scoped
+// s3:PutObject; deploy/lib/twin-preflight.mjs refuses to ship twin code onto a role
+// without it), and "could not fence" is not "no hold" — the same positive-evidence band
+// as the hold reads above. No text here contains `has briefPending:true (brief `, so a
+// fence refusal is a retry to workflow-output.
+//
+// Lifecycle: WRITTEN by the twin before its commit (IfMatch on a record, IfNoneMatch
+// create-only when there is none); CARRIED by every record writer (workflow-output
+// adoptHold, the drain's spreads, the hub route's refill - which strips the reservation
+// marker); CLEARED best-effort by the twin when its commit fails (on a reservation that
+// leaves `{reservation, ticketId}`, still "no record" to every reader, admitted and
+// fenced again by the next Done); otherwise it STAYS on the record (an audit of when the
+// Done was fenced) and simply goes stale after DONE_INTENT_TTL_MS, at which point the
+// drain strips it on its next stamp. Nothing reads it after a Done. The twin role has no
+// s3:DeleteObject, so a reservation behind a committed recordless Done persists - one
+// small object - until a real writer replaces it.
+export const DONE_INTENT_TTL_MS = 10 * 60_000;
+export const DONE_INTENT_FENCE_ATTEMPTS = 3;
+
+/**
+ * The record's `doneIntent`, judged now. `fresh` only for a plain object whose `at`
+ * parses and is younger than DONE_INTENT_TTL_MS (a future `at` — clock skew — is
+ * fresh). An unparseable `at` is present but stale: the twin that wrote it is gone.
+ *
+ * @returns {{present: boolean, fresh: boolean, intent: object|null}}
+ */
+export function doneIntentOf(record, now = Date.now()) {
+  const intent = record && typeof record === "object" && !Array.isArray(record) ? record.doneIntent : undefined;
+  if (!intent || typeof intent !== "object" || Array.isArray(intent)) return { present: false, fresh: false, intent: null };
+  const at = Date.parse(intent.at);
+  return { present: true, fresh: Number.isFinite(at) && now - at < DONE_INTENT_TTL_MS, intent };
+}
+
+/** A copy of `record` carrying the intent. `provider` is "jira" | "dynamodb". Never mutates. */
+export function withDoneIntent(record, { provider, at, nonce }) {
+  return { ...record, doneIntent: { at, provider, nonce } };
+}
+
+/** A copy of `record` without the intent. Never mutates. */
+export function withoutDoneIntent(record) {
+  const { doneIntent: _dropped, ...rest } = record;
+  return rest;
+}
+
+// ── Done-intent reservation (TEAM-5959; TEAM-5799 F5) ───────────────────────
+// The body a twin creates on a 404 admission. Mirrored (the marker field/value and the
+// intent-only rule) in src/lib/workflow/completion-evidence.ts and lambda/cost-report/
+// index.mjs, neither of which can import this file; src/lib/workflow/gate-contract-
+// parity.test.ts pins the literals to each other. The orchestrator needs no mirror: its
+// completionRecordHasEvidence field rule already reads a reservation as "no evidence".
+export const RESERVATION_FIELD = "reservation";
+export const DONE_INTENT_RESERVATION = "done-intent";
+const RESERVATION_KEYS = new Set([RESERVATION_FIELD, "ticketId", "doneIntent"]);
+
+/** The intent-only reservation: marker + ticket id + intent, nothing else. */
+export function doneIntentReservation(ticketId, { provider, at, nonce }) {
+  return { [RESERVATION_FIELD]: DONE_INTENT_RESERVATION, ticketId, doneIntent: { at, provider, nonce } };
+}
+
+/**
+ * Marker present AND no key outside {reservation, ticketId, doneIntent}. A reservation
+ * whose intent was cleared is still intent-only; one any writer added a field to (a
+ * hold, a summary, ticketWrites) is a record, whatever the marker says.
+ */
+export function isIntentOnlyReservation(record) {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+  if (record[RESERVATION_FIELD] !== DONE_INTENT_RESERVATION) return false;
+  return Object.keys(record).every((k) => RESERVATION_KEYS.has(k));
+}
+
+/** judgeCompletionRecord's refusal on a reservation: the 404 text, saying why an object is there. */
+export function reservationNotARecord(key) {
+  return `no ${key} in the artifact bucket (only a Done-intent reservation, not a completion record)`;
+}
+
+/**
+ * What an S3 PutObject refusal means. S3 answers an IfMatch write on a MISSING key with
+ * 404 (not 412), so "gone" is its own outcome. The twins cannot import workflow-output's
+ * classifiers (zip manifest), hence this copy.
+ *
+ * @returns {"precondition"|"conflict"|"gone"|"other"}
+ */
+export function classifyS3WriteError(err) {
+  const status = err?.$metadata?.httpStatusCode;
+  const name = String(err?.name || "");
+  if (name === "PreconditionFailed" || status === 412) return "precondition";
+  if (name === "ConditionalRequestConflict" || status === 409) return "conflict";
+  if (name === "NoSuchKey" || name === "NotFound" || status === 404) return "gone";
+  return "other";
+}
+
+/**
+ * Re-judge a re-read record body with the SAME judge the Done guard used on the body it
+ * admitted: completionRecordProven's (`admitted.recordGated`, with its securityReview
+ * opt) or judgeBriefHold. null admits. A refusal carries the guard's own `why` text —
+ * byte-identical to what the guard would have said had it read this body — and the
+ * `what` phrase the twins put in front of it.
+ *
+ * @returns {{why: string, what: string, unknown: boolean} | null}
+ */
+export function rejudgeAdmitted(key, bodyText, admitted = {}) {
+  if (admitted.recordGated) {
+    const securityReview = admitted.securityReview === true;
+    const proof = judgeCompletionRecord(key, bodyText, { securityReview });
+    return proof.proven ? null : { why: proof.why, what: securityReview ? "a security-review ticket" : "a ship-phase ticket", unknown: false };
+  }
+  const hold = judgeBriefHold(key, bodyText);
+  if (!hold) return null;
+  const unknown = hold.unknown === true;
+  return { why: hold.why, what: unknown ? "a ticket whose merge-brief hold cannot be read" : "a ticket whose merge brief is held", unknown };
+}
+
+/** The `what` phrase for a Done the fence could not place. */
+export const DONE_UNFENCED_WHAT = "a ticket whose Done could not be fenced on its completion record";
+
+/** The fence lost DONE_INTENT_FENCE_ATTEMPTS conditional writes to other writers of the record. */
+export function doneIntentContendedRefusal(key, attempts) {
+  return (
+    `${key} changed under ${attempts} conditional writes while fencing the Done on it — ` +
+    `another writer owns the record right now; retry the transition`
+  );
+}
+
+/** The fence write itself failed for a reason that is not a lost race (AccessDenied, 5xx, timeout). */
+export function doneIntentUnfencedRefusal(key, cause) {
+  return (
+    `could not fence the Done on ${key} (${cause}) — whether a merge-brief or follow-ups hold is ` +
+    `on it is UNKNOWN; retry the transition, or re-run WorkflowOutput___report_completion with the same arguments`
+  );
 }
 
 // ── Terminal status (TEAM-5421; TEAM-5396 F2 / TEAM-5413) ───────────────────
@@ -1032,6 +1375,8 @@ export function terminalMoveRefusal(fromInternal, toInternal) {
 
 /** The agent whose review ticket owns the amendment slot (and needs a completion record to close). */
 export const SECURITY_REVIEWER_AGENT = "agentcore_hub_security_reviewer";
+/** TEAM-5805: the non-ship agent that writes the merge brief. TEAM-5832: the Done guard no longer keys on it — every non-ship Done reads the hold. */
+export const MERGE_BRIEF_AUTHOR_AGENT = "agentcore_hub_operator";
 export const DESIGN_AMENDMENT_KIND = "review_fix";
 export const DESIGN_AMENDMENT_PHASE = "design";
 export const DESIGN_AMENDMENT_EXHAUSTED = "design_amendment_exhausted";
