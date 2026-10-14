@@ -73,7 +73,11 @@ scoped for your role immediately below.
 `base_branch` after your own PR is merged into it (see the delivery step). A
 non-trivial conflict that survives the `model="opus"` retry → report BLOCKED
 naming the conflicting files; never a silent handoff, and never a fix ticket for
-staleness alone.
+staleness alone. `<default branch>` in the Main-sync rule above (and the sync
+step below) means this PR's resolved base: the `base_branch:` your `## Branch`
+context names when your ticket stated one (a fix PR into `release/2.1` syncs
+from `release/2.1`), the repo default branch only when no base is stated —
+never merge the default branch into a stated non-default base.
 
 ## Sibling-sweep rule (a defect is a CLASS, not one site)
 A defect is a pattern until proven unique. Before a fix ticket is filed, and
@@ -257,9 +261,15 @@ A session that dies after the deliverable but before the report leaves the run u
    lifecycle-table rule).
 4. Merge your PR into `base_branch` once your evidence is complete.
 5. **Sync `base_branch` on main — the LAST development step.** After merging your
-   PR into `base_branch`, merge `origin/<default branch>` INTO `base_branch` (see
-   the Main-sync rule) and push it. The sync is part of the deliverable, so the
-   ship-then-report ordering above is unchanged: sync, then report.
+   PR into `base_branch`, merge the PR's resolved base (see Your scope) INTO
+   `base_branch` per the Main-sync rule and push it: `origin/<default branch>`
+   for the integration branch, whose unified PR targets the default branch.
+   When your PR targets `base_branch` directly instead (the `## Branch` NOTE says
+   the unified PR already merged, or your ticket stated a base that is not the
+   integration branch) nothing merges into base_branch: sync `origin/<base_branch>`
+   INTO your `feature_branch` before you open the PR, and never merge the
+   default branch into a stated non-default base. The sync is part of the
+   deliverable, so the ship-then-report ordering above is unchanged: sync, then report.
 6. **Fix tickets: sweep before you report.** Re-run the Sibling-sweep rule's
    search for the pattern you just fixed; every occurrence is fixed (or refuted on
    the ticket with evidence) BEFORE `report_completion`.
@@ -281,7 +291,7 @@ A session that dies after the deliverable but before the report leaves the run u
 - Before deleting/weakening/proxying ANY existing check: state what it enforces and grep every writer of the replacement value across all tiers (client + backend handlers + schema). A check you can't explain is a check you don't remove.
 - Never `try` → `try?` in a write path unless you prove the failure case can't clobber good state
 - Never guess an external protocol — real docs or BLOCKED (Step 2b)
-- Never hand off to review with `base_branch` behind the repo default branch — a branch that only needs a main-merge is your job to sync (Main-sync rule), not a fix ticket
+- Never hand off to review with `base_branch` (or, when your PR targets it directly, your `feature_branch`) behind its resolved base — the repo default branch unless a base is stated — a branch that only needs a base-merge is your job to sync (Main-sync rule), not a fix ticket
 - iOS changes MUST be built + tested on the macOS gateway before merge; gateway tools missing/failing = BLOCKED, never a silent merge
 - Never mark done without working code + passing test on a branch, with real command output as evidence
 - A fix is class-wide: sweep for siblings of the pattern, fix them all, prefer one shared helper over duplicated edits (Sibling-sweep rule) — a known sibling left behind means the ticket is not Done

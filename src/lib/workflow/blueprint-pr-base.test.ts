@@ -93,4 +93,55 @@ describe("blueprint PR-base rules (TEAM-5854)", () => {
     expect(t).not.toContain("names the default branch as base_branch");
     expect(t).toContain("its base_branch is the base your fix PR targets");
   });
+
+  // TEAM-5934 S2-2: every persona that merges a sync maps `<default branch>` in the shared
+  // Main-sync block to the PR's resolved base (the stated `base_branch:`, else the repo
+  // default branch). The reviewer/CI wording (TEAM-5915) is the template; the block itself
+  // is byte-identical in nine files (scripts/check-blueprint-main-sync.sh) so the mapping
+  // lives in each role's own prose.
+  const SCOPE_DEV = "**Your scope:** you PUSH the sync — this is the LAST development step";
+  const PLACEHOLDER_MAP = /`<default branch>`[^.]*?Main-sync rule[^.]*?\bmeans\b/;
+  it.each([
+    ["code-reviewer", DEAD, "## Main-sync rule"],
+    ["ci-agent", DEAD, "### P0:"],
+    ["release-manager", "**Your scope:** you PUSH the sync — but ONLY during the ship review", "### Step 1:"],
+    ["api-dev", SCOPE_DEV, "## Sibling-sweep rule"],
+    ["backend-dev", SCOPE_DEV, "## Sibling-sweep rule"],
+    ["frontend-dev", SCOPE_DEV, "## Sibling-sweep rule"],
+    ["bug-fixer", SCOPE_DEV, "## Sibling-sweep rule"],
+  ])("%s maps `<default branch>` in the Main-sync rule to the stated base_branch", (name, from, to) => {
+    const para = between(read(name), from, to);
+    expect(para).toMatch(PLACEHOLDER_MAP);
+    expect(para).toContain(BRANCH_BASE);
+  });
+
+  it.each(["api-dev", "backend-dev", "frontend-dev", "bug-fixer"])("%s delivery step syncs from the resolved base, never the default branch into a stated base", (name) => {
+    const t = read(name);
+    const start = t.search(/Sync `?base_branch`? on main/);
+    expect(start).toBeGreaterThanOrEqual(0);
+    const end = t.indexOf("sync, then report", start);
+    expect(end).toBeGreaterThan(start);
+    const step = t.slice(start, end);
+    expect(step).toContain("resolved base");
+    expect(step).toContain("`origin/<base_branch>` INTO your `feature_branch`");
+    expect(step).not.toContain("merge `origin/<default branch>` INTO `base_branch`");
+  });
+
+  it("release-manager CONFLICTING sync merges the resolved base into the PR head", () => {
+    const step = between(read("release-manager"), "`CONFLICTING` → YOU sync it", "Never a dev fix ticket for staleness");
+    expect(step).toContain("resolved base");
+    expect(step).toContain("`origin/<base_branch>`");
+  });
+
+  // TEAM-5934 S2-3: after the merge, QA's "head you are verifying" is the fix PR's pushed
+  // head (its completion record's branch / pr_url), and base_branch is only the diff and
+  // ci_head_sha comparison target — `origin/<base_branch>` is the BASE's tip then.
+  it("qa-verifier derives the post-merge head from the fix PR and uses base_branch only as the comparison target", () => {
+    const scope = between(read("qa-verifier"), "**Your scope:** NOT YOUR CONCERN", "### Step 2: Build Verification");
+    expect(scope).toContain("pushed integration-branch head (`git rev-parse origin/<base_branch>`)");
+    expect(scope).toContain("`branch` in its completion record");
+    expect(scope).toContain("`pr_url`");
+    expect(scope).toContain("`base_branch` is ONLY the base you diff and compare against");
+    expect(scope).not.toContain("is ALWAYS the pushed integration-branch head");
+  });
 });

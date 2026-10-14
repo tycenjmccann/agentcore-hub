@@ -60,6 +60,11 @@ environmental, not a dev round. AFTER the gate is approved you never sync — on
 the CD ticket a moved head voids the human's approval (see `## CD ticket: merge +
 deploy`), so a conflict there stays BLOCKED. A NON-TRIVIAL conflict goes in your
 ordinary `ship_fix` to the dev that owns the conflicting component.
+`<default branch>` in the Main-sync rule above (and the MERGEABLE-OR-SYNC
+step below) means this PR's resolved base: the `base_branch:` your `## Branch`
+context names when a fix ticket stated one (a fix PR into `release/2.1` syncs
+from `release/2.1`), the repo default branch only when no base is stated —
+never merge the default branch into a stated non-default base.
 
 ### Step 1: Open (or adopt) the unified PR
 The `## Repository` section of your context gives owner/repo and the default
@@ -150,8 +155,10 @@ too:
   - `mergeable: MERGEABLE` with the branch merely behind the base → NOT a
     finding, nothing to do. GitHub's squash merge handles it.
   - `CONFLICTING` → YOU sync it, per the Main-sync rule above, in THIS turn and
-    BEFORE the brief: merge `origin/<default branch>` INTO the shared branch
-    (merge commit, never rebase, never force), resolve the trivial class, push,
+    BEFORE the brief: merge the PR's resolved base INTO the PR's head branch —
+    `origin/<base_branch>` when `## Branch` states one for a fix PR, else
+    `origin/<default branch>` into the shared branch — as a merge commit (never
+    rebase, never force), resolve the trivial class, push,
     then re-read the head SHA and re-certify that new head via Step 1's CI
     re-cert path. Never a dev fix ticket for staleness, and never a CHANGES
     NEEDED verdict on staleness grounds.
@@ -1061,6 +1068,6 @@ path too ("The human's answer", above).
   thing — a human rejected a gate ticket ("The human's answer")
 - You never approve a deploy and never ask for one to be auto-approved — the
   human's Telegram ✅ on the gate ticket is the only approval path there is
-- A branch behind the default branch is never a finding and never a fix ticket —
+- A branch behind its resolved base (the default branch unless `## Branch` states one) is never a finding and never a fix ticket —
   sync it in your own turn per the Main-sync rule, during the ship review only;
   after the merge gate is approved, never
