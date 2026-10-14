@@ -658,6 +658,19 @@ export function adoptHold(report, current, { deliveredNow = false, forceHold = f
 }
 
 /**
+ * TEAM-6024: a brief now on its gate is no longer undelivered: its `part:"brief"`
+ * entries come off `undelivered` (every other part stays; an empty list is deleted).
+ * Mutates and returns `record`.
+ */
+export function pruneDeliveredBrief(record) {
+  if (!Array.isArray(record?.undelivered)) return record;
+  const rest = record.undelivered.filter((u) => u?.part !== "brief");
+  if (rest.length > 0) record.undelivered = rest;
+  else delete record.undelivered;
+  return record;
+}
+
+/**
  * TEAM-5805: the twins' Done guard refused because the record still holds the merge
  * brief (gate-contract.mjs briefHoldRefusal: `<key> has briefPending:true (brief …`).
  * No retry of the same write lifts it: the brief has to reach the gate first.
@@ -1181,6 +1194,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       }
       if (brief?.ok && brief.gate) {
         Object.assign(report, { briefPending: false, briefDelivered: "gate", briefTargets: [brief.gate] });
+        pruneDeliveredBrief(report);
         deliveredNow = true;
         console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} is on the gate ${brief.gate} (${brief.outcome}) - briefPending cleared`);
       } else {
@@ -1990,6 +2004,8 @@ export async function drainCompletion(msg) {
     // twins' Done guard below must read it as delivered. `false`, not deleted: the
     // record keeps the history that it was held.
     if (record.briefPending === true && brief?.gate) record.briefPending = false;
+    // TEAM-6024: and the hold's `part:"brief"` entry in undelivered[] is stale with it.
+    if (brief?.gate) pruneDeliveredBrief(record);
     // TEAM-5958: a hold a concurrent Done landed over (doneOverHold) stays `true` — that
     // is the ONLY clear above: gate delivery. The ticket is Done; nothing reads the hold
     // until a new Done is attempted, and then it is the refusal a reopen needs.

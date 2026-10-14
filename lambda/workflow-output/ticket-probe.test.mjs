@@ -438,6 +438,53 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     expect(fake.tickets.get(BUILD).status).toBe("Done");
   });
 
+  // TEAM-6024: the hold stamped `undelivered:[{part:"brief"}]`; once the brief is on the
+  // gate that entry is stale and comes off, while any other undelivered part stays.
+  const RESIDUAL = { part: "residual_findings", ticketId: "TEAM-5603", reason: "Jira API 400: ticket is archived" };
+  const holdBrief = async ({ withResidual = false } = {}) => {
+    fake.tickets.get(GATE).status = "Done";
+    await tick();
+    expect(record()).toMatchObject({ briefPending: true, undelivered: [expect.objectContaining({ part: "brief" })] });
+    if (withResidual) {
+      fake.objects.set(`completions/${BUILD}.json`, JSON.stringify({ ...record(), undelivered: [...record().undelivered, RESIDUAL] }));
+      fake.etags.set(`completions/${BUILD}.json`, `"e${++fake.etagSeq}"`);
+    }
+    fake.tickets.get(GATE).status = "To Do";
+  };
+
+  it("TEAM-6024 re-run delivers the held brief to the gate ⇒ the stale brief entry is gone from undelivered", async () => {
+    await holdBrief();
+    const res = result(await output.handler({ tool_name: call0.tool_name, arguments: call0.arguments }));
+    expect(res.status).toBe("complete");
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE] });
+    expect(record().undelivered).toBeUndefined();
+  });
+
+  it("TEAM-6024 re-run delivers the held brief to the gate ⇒ only the brief entry comes off, other parts stay", async () => {
+    await holdBrief({ withResidual: true });
+    await output.handler({ tool_name: call0.tool_name, arguments: call0.arguments });
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate" });
+    expect(record().undelivered).toEqual([RESIDUAL]);
+  });
+
+  it("TEAM-6024 drain step 6 lands the held brief on the gate ⇒ the stale brief entry is gone from undelivered", async () => {
+    const body = fake.queue[0].Body;
+    await holdBrief();
+    fake.queue.push({ MessageId: "redelivered", Body: body, group: "wf_db9sx9", inFlight: null, receives: 0 });
+    expect((await tick()).out.drained).toMatchObject({ applied: 1, dropped: 0 });
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE], ticketWrites: "applied" });
+    expect(record().undelivered).toBeUndefined();
+  });
+
+  it("TEAM-6024 drain step 6 lands the held brief on the gate ⇒ only the brief entry comes off, other parts stay", async () => {
+    const body = fake.queue[0].Body;
+    await holdBrief({ withResidual: true });
+    fake.queue.push({ MessageId: "redelivered", Body: body, group: "wf_db9sx9", inFlight: null, receives: 0 });
+    expect((await tick()).out.drained).toMatchObject({ applied: 1, dropped: 0 });
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", ticketWrites: "applied" });
+    expect(record().undelivered).toEqual([RESIDUAL]);
+  });
+
   it("a Done the twins refuse on the brief hold is a surfaced drop, not a retry to the DLQ (step 7)", async () => {
     fake.failTool = { Tickets___transition_ticket: (p) => (p.ticket_id === BUILD ? `Cannot move ${BUILD} to Done: a ticket whose merge brief is held needs its completion record first — call WorkflowOutput___report_completion(ticket_id=…) (completions/${BUILD}.json has briefPending:true (brief off_gate) — the merge brief has not reached the Merge Approval gate; …)` : null) };
     const t = await tick();
