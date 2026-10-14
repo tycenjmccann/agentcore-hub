@@ -59,6 +59,28 @@ export interface ResolveEvidenceDeps {
 const nonEmptyString = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0;
 
 /**
+ * TEAM-5959 (TEAM-5799 F5): the ticket twins' Done-intent RESERVATION — the body a twin
+ * creates at completions/<ticketId>.json (PutObject IfNoneMatch:"*") when its Done guard
+ * admitted on a 404, so a record created + hold-stamped inside its commit window cannot
+ * lose the fence. It is NOT a completion record: every reader treats it exactly as a
+ * 404. Mirror of gate-contract.mjs (RESERVATION_FIELD / DONE_INTENT_RESERVATION /
+ * isIntentOnlyReservation) — gate-contract-parity.test.ts pins the literals. Deliberately
+ * NOT ported to lambda/orchestrator/completion.mjs (DL-009 line budget): its
+ * completionRecordHasEvidence field rule already reads a reservation as no evidence.
+ * "Intent-only" = the marker AND no key outside {reservation, ticketId, doneIntent}: the
+ * moment any writer adds a field (a hold, a summary) it is a record and is judged as one.
+ */
+export const RESERVATION_FIELD = "reservation";
+export const DONE_INTENT_RESERVATION = "done-intent";
+const RESERVATION_KEYS = new Set([RESERVATION_FIELD, "ticketId", "doneIntent"]);
+export function isIntentOnlyReservation(record: unknown): boolean {
+  if (!record || typeof record !== "object" || Array.isArray(record)) return false;
+  const r = record as Record<string, unknown>;
+  if (r[RESERVATION_FIELD] !== DONE_INTENT_RESERVATION) return false;
+  return Object.keys(r).every((k) => RESERVATION_KEYS.has(k));
+}
+
+/**
  * Does a completions/{ticketId}.json record (written by lambda/workflow-output
  * reportCompletion) prove the ticket produced a deliverable? A blank/empty
  * record is NOT evidence (TEAM-3690 / AC-D4.1).

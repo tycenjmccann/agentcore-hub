@@ -283,6 +283,7 @@ describe.each(Object.keys(TWINS))("TEAM-5941 e2e — the %s twin's Done-intent f
   let handler;
   let drainCompletion;
   let judgeBriefHold;
+  let isIntentOnlyReservation;
 
   beforeEach(async () => {
     vi.restoreAllMocks();
@@ -298,7 +299,7 @@ describe.each(Object.keys(TWINS))("TEAM-5941 e2e — the %s twin's Done-intent f
     vi.resetModules();
     handler = await twin.load();
     ({ drainCompletion } = await import("./index.mjs"));
-    ({ judgeBriefHold } = await import("../agentcore-hub-tickets/gate-contract.mjs"));
+    ({ judgeBriefHold, isIntentOnlyReservation } = await import("../agentcore-hub-tickets/gate-contract.mjs"));
   });
 
   it("(e1) the drain stamps the hold before the fence ⇒ the Done is REFUSED with the hold text; the ticket stays open under the hold; no conflict, no intent", async () => {
@@ -447,6 +448,125 @@ describe.each(Object.keys(TWINS))("TEAM-5941 e2e — the %s twin's Done-intent f
     expect(record().doneIntent).toBeUndefined(); // stripped with the stamp
     for (const id of [T, EPIC]) expect(dropNotices(id)).toHaveLength(1);
     expect(h.ticket.status).toBe("in_progress");
+  });
+
+  it("(e5, TEAM-5959 F5) the guard reads NO record ⇒ the fence RESERVES the key create-only; a rival creator 412s, re-reads and writes IfMatch carrying the intent; the drain DEFERS its hold; the Done commits clean", async () => {
+    // (1) the ticket has no completion record yet: the guard's briefHoldOf reads 404 and admits.
+    h.objects.delete(KEY);
+    h.history.length = 0;
+    const commit = barrier();
+    h.beforeCommit = commit.wait;
+    const done = twin.done(handler);
+    // (2) the twin is paused right before its provider commit. On the base build
+    //     fenceDoneIntent returned early on `admitted.absent` and nothing was on the key;
+    //     now an intent-only reservation is.
+    await commit.arrived;
+    expect(h.objects.has(KEY), "the 404 admission reserved the key").toBe(true);
+    expect(isIntentOnlyReservation(record())).toBe(true);
+    expect(record().doneIntent).toMatchObject({ provider: name === "jira" ? "jira" : "dynamodb" });
+    const reservedEtag = h.objects.get(KEY).etag;
+
+    // (3) another writer (report_completion's first write, or the hub route) tries the
+    //     create-only PUT — and loses: the key is taken.
+    const { S3Client, PutObjectCommand } = await import("@aws-sdk/client-s3");
+    const s3 = new S3Client({});
+    const clean = { ticketId: T, workflowId: "wf_1", status: "complete", followUpsPending: false, ticketWrites: "queued", summary: "operator done" };
+    await expect(s3.send(new PutObjectCommand({ Bucket: "bkt", Key: KEY, ContentType: "application/json", IfNoneMatch: "*", Body: JSON.stringify(clean) })))
+      .rejects.toMatchObject({ name: "PreconditionFailed" });
+    //     So it does what every creator does on 412: re-read, write IfMatch, carry the
+    //     intent verbatim (adoptHold / the hub route's spread) and drop the marker.
+    await s3.send(new PutObjectCommand({ Bucket: "bkt", Key: KEY, ContentType: "application/json", IfMatch: reservedEtag, Body: JSON.stringify({ ...clean, doneIntent: record().doneIntent }) }));
+    expect(isIntentOnlyReservation(record())).toBe(false);
+    expect(record().reservation).toBeUndefined();
+
+    // (4) the drain reads a record with a FRESH intent on a ticket not yet Done: the hold is
+    //     not stamped (holdDeferredOnDoneIntent), no LEFT OPEN notice, retry.
+    const drained = await drainCompletion(MSG);
+    expect(drained).toMatchObject({ outcome: "retry", reason: expect.stringMatching(/has a Done in flight \(doneIntent /) });
+    expect(record().briefPending).toBeUndefined();
+    for (const id of [T, EPIC]) expect(dropNotices(id)).toHaveLength(0);
+
+    // (5) the twin resumes and commits over a record that still has no hold.
+    commit.open();
+    const res = await done;
+    expect({
+      ticketStatus: h.ticket.status,
+      committed: twin.committed(res),
+      briefPending: record().briefPending,
+      conflict: res.conflict,
+    }).toEqual({ ticketStatus: "done", committed: true, briefPending: undefined, conflict: undefined });
+    expect(res.warning).toBeUndefined();
+
+    // The next tick applies over the Done ticket with no hold; the record never carried one.
+    const next = await drainCompletion(MSG);
+    expect(next).toMatchObject({ outcome: "applied", alreadyDone: true });
+    expect(record().briefPending).not.toBe(true);
+    expect(h.history.every((b) => JSON.parse(b).briefPending !== true)).toBe(true);
+  });
+
+  it("(e5b, TEAM-5959 F5) the same interleaving with the drain as the only writer after the reservation ⇒ it defers on the reservation itself; the Done commits; the reservation stays", async () => {
+    h.objects.delete(KEY);
+    const commit = barrier();
+    h.beforeCommit = commit.wait;
+    const done = twin.done(handler);
+    await commit.arrived;
+    expect(isIntentOnlyReservation(record())).toBe(true);
+
+    const drained = await drainCompletion(MSG);
+    expect(drained).toMatchObject({ outcome: "retry", reason: expect.stringMatching(/has a Done in flight/) });
+    expect(isIntentOnlyReservation(record())).toBe(true); // untouched
+
+    commit.open();
+    const res = await done;
+    expect(twin.committed(res)).toBe(true);
+    expect(res.conflict).toBeUndefined();
+    expect(h.ticket.status).toBe("done");
+    expect(isIntentOnlyReservation(record())).toBe(true); // a committed recordless Done leaves the reservation as audit
+  });
+
+  it("(e4-reservation, TEAM-5959) the commit fails on a reserved key ⇒ the clear leaves `{reservation, ticketId}`; the next Done on the build ticket is admitted, fenced IfMatch onto it, and commits", async () => {
+    h.objects.delete(KEY);
+    h.history.length = 0;
+    h.failCommitOnce = true;
+    const first = await twin.done(handler);
+    expect(twin.committed(first)).toBe(false);
+    expect(twin.refusal(first)).toMatch(twin.commitFailure);
+    expect(h.ticket.status).toBe("in_progress");
+    expect(record()).toEqual({ reservation: "done-intent", ticketId: T });
+    expect(isIntentOnlyReservation(record())).toBe(true);
+    expect(h.history.some((b) => JSON.parse(b).doneIntent)).toBe(true); // it had been written
+    const clearedEtag = h.objects.get(KEY).etag;
+
+    const second = await twin.done(handler);
+    expect(twin.committed(second)).toBe(true);
+    expect(second.conflict).toBeUndefined();
+    expect(h.ticket.status).toBe("done");
+    expect(h.objects.get(KEY).etag).not.toBe(clearedEtag); // one IfMatch fence onto the reservation
+    expect(isIntentOnlyReservation(record())).toBe(true);
+    expect(record().doneIntent).toMatchObject({ provider: name === "jira" ? "jira" : "dynamodb" });
+    expect(h.history.filter((b) => JSON.parse(b).reservation === "done-intent")).toHaveLength(3); // reserve, clear, fence
+  });
+
+  it("(e7, TEAM-5959) the drain stamps its hold onto an intent-cleared reservation ⇒ the record is a HOLD, not a reservation: both twins refuse the next Done with the standard text", async () => {
+    h.objects.delete(KEY);
+    h.failCommitOnce = true;
+    await twin.done(handler); // leaves {reservation, ticketId}
+    expect(record()).toEqual({ reservation: "done-intent", ticketId: T });
+
+    const drained = await drainCompletion(MSG); // no intent ⇒ nothing defers the stamp
+    expect(drained).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(record()).toMatchObject({ reservation: "done-intent", briefPending: true, ticketWrites: "dropped" });
+    expect(isIntentOnlyReservation(record())).toBe(false);
+
+    const res = await twin.done(handler);
+    expect(twin.committed(res)).toBe(false);
+    expect(twin.refusal(res)).toMatch(HOLD_REFUSAL_RE);
+    expect(h.ticket.status).toBe("in_progress");
+    for (const gate of TWIN_GATE_CONTRACTS) {
+      const m = await gate();
+      expect(m.judgeBriefHold(KEY, h.objects.get(KEY).body)).toMatchObject({ proven: false });
+      expect(m.judgeCompletionRecord(KEY, h.objects.get(KEY).body).why).toMatch(HOLD_REFUSAL_RE); // ship: hold first, never the reservation text
+    }
   });
 });
 
@@ -732,6 +852,41 @@ describe.each(Object.keys(TWINS))("TEAM-5958 F6 e2e — the %s twin's Done-inten
     expect(record()).toMatchObject({ followUpsPending: true, status: "complete_pending_follow_ups" });
     expect(record().doneIntent).toBeTruthy(); // carried, never erased
     expect(h.ticket.status).toBe("done");
+  });
+
+  it("(e6, TEAM-5959 F5) the ticket has NO record: the twin reserves the key on its 404 admission ⇒ report_completion's create-only write 412s, re-reads the reservation and DEFERS its hold; the Done commits clean; the retry writes the real record with the marker gone", async () => {
+    // A build ticket (not ship-phase): on the base build its 404 admission skipped the
+    // fence and report_completion's first write could create a held record in the window.
+    h.ship = false;
+    h.objects.delete(KEY);
+    h.history.length = 0;
+    const { isIntentOnlyReservation } = await import("../agentcore-hub-tickets/gate-contract.mjs");
+    const commit = barrier();
+    h.beforeCommit = commit.wait;
+    const done = twin.done(handler);
+    await commit.arrived;
+    expect(isIntentOnlyReservation(record())).toBe(true);
+    const reservedEtag = h.objects.get(KEY).etag;
+
+    const first = answer(await output.handler({ ...REPORT, arguments: { ...REPORT.arguments, agent_id: "agentcore_hub_operator" } }));
+    expect(first).toMatchObject({ ok: false, reason: "completion_record_done_in_flight", next_action: "retry_report_completion" });
+    expect(h.objects.get(KEY).etag).toBe(reservedEtag); // not one record write
+    expect(holdEverWritten()).toBe(false);
+    expect(isIntentOnlyReservation(record())).toBe(true);
+    expect(h.ticket.status).toBe("in_progress");
+
+    commit.open();
+    const res = await done;
+    expect(twin.committed(res)).toBe(true);
+    expect(res.conflict).toBeUndefined();
+    expect(h.ticket.status).toBe("done");
+
+    const second = answer(await output.handler({ ...REPORT, arguments: { ...REPORT.arguments, agent_id: "agentcore_hub_operator" } }));
+    expect(second).toMatchObject({ status: "complete_pending_follow_ups", next_action: "retry_report_completion" });
+    expect(record()).toMatchObject({ followUpsPending: true, status: "complete_pending_follow_ups", summary: REPORT.arguments.summary });
+    expect(record().reservation).toBeUndefined(); // the real writer's record carries no marker
+    expect(isIntentOnlyReservation(record())).toBe(false);
+    expect(record().doneIntent).toBeTruthy(); // carried, never erased
   });
 
   it("(f2) report_completion read the record BEFORE the fence and writes after it ⇒ its CAS re-read sees the fresh intent and DEFERS; the Done commits clean", async () => {

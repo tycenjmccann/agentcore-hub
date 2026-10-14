@@ -28,8 +28,7 @@ import {
   isShipTicket,
   mergeEvidence,
   runOutcome,
-  summarize,
-} from "./index.mjs";
+  summarize, isIntentOnlyReservation } from "./index.mjs";
 
 const RM = "agentcore_hub_release_manager";
 const OP = "agentcore_hub_operator";
@@ -149,6 +148,21 @@ describe("runOutcome — from structured workflow-record fields only", () => {
     const { outcome, delivery } = assembleQuality(w, [], tasks, { records, ci });
     assert.equal(outcome, "complete");
     assert.equal(delivery.mergedSha, "abc1234");
+  });
+
+  test("TEAM-5959: a twin's Done-intent reservation at completions/<id>.json is no completion record - the task is not recorded and has no object", async () => {
+    const w = row({ completeReason: "closed" });
+    const tasks = computeAgentTasks(w, []);
+    const reservation = { reservation: "done-intent", ticketId: "T-1", doneIntent: { at: "2026-10-14T06:00:00.000Z", provider: "jira", nonce: "n" } };
+    const get = async (id) => (id === "T-1" ? reservation : id === "T-2" ? { outcome: "shipped", merge_commit: "abc1234" } : null);
+    const records = await completionRecords([], tasks, get, [], { workflow: w });
+    assert.equal(records.recorded.has("T-1"), false, "a reservation does not count as completed work");
+    assert.equal(records.objects.has("T-1"), false);
+    assert.equal(records.recorded.has("T-2"), true, "a real record still does");
+    assert.equal(isIntentOnlyReservation(reservation), true);
+    assert.equal(isIntentOnlyReservation({ reservation: "done-intent", ticketId: "T-1" }), true, "intent cleared: still a reservation");
+    assert.equal(isIntentOnlyReservation({ ...reservation, briefPending: true }), false, "a hold ends intent-only");
+    assert.equal(isIntentOnlyReservation({ ...reservation, summary: "did it" }), false, "a real writer ends intent-only");
   });
 
   test("a non-ship ticket's merge_commit is not a merge; a ship record must say shipped (round 2 #2)", async () => {

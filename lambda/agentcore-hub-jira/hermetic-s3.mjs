@@ -8,6 +8,12 @@
 // only walks index.mjs's import closure, so this file never ships.
 import { S3Client } from "@aws-sdk/client-s3";
 
-S3Client.prototype.send = async () => {
+//
+// TEAM-5959: a PutObject succeeds (the twin's Done-intent fence RESERVES an absent record
+// create-only; a 404 answer to a PUT would read as "the record vanished" and the fence
+// would retry to its contended refusal). Tests that assert on the fence's writes install
+// their own `s3.send`; this default only keeps a recordless Done closable.
+S3Client.prototype.send = async (cmd) => {
+  if (cmd?.constructor?.name === "PutObjectCommand") return { ETag: '"hermetic-put"' };
   throw Object.assign(new Error("NoSuchKey"), { name: "NoSuchKey", $metadata: { httpStatusCode: 404 } });
 };

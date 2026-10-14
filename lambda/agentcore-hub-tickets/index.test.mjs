@@ -1787,14 +1787,23 @@ describe("transition_ticket — the Done-intent fence (TEAM-5941)", () => {
     expect(h.state.s3Objects[KEY]).toEqual(CLEAN);
   });
 
-  it("(f7) no record ⇒ no fence (no PUT); the done commits exactly as before", async () => {
+  it("(f7) → TEAM-5959: no record ⇒ ONE create-only PUT (IfNoneMatch:\"*\") of an intent-only reservation, then the done; no conflict; the reservation stays as audit", async () => {
     h.state.items[ID] = devTicket();
 
     const res = await transition({ ticket_id: ID, to_status: "done" });
 
     expect(res).toMatchObject({ status: "transitioned", to: "done" });
-    expect(h.state.s3RecordPuts).toHaveLength(0);
+    expect("conflict" in res).toBe(false);
+    expect(h.state.s3RecordPuts).toHaveLength(1);
+    expect(h.state.s3RecordPuts[0].IfNoneMatch).toBe("*");
+    expect(h.state.s3RecordPuts[0].IfMatch).toBeUndefined();
+    const body = JSON.parse(String(h.state.s3RecordPuts[0].Body));
+    expect(gateContract.isIntentOnlyReservation(body)).toBe(true);
+    expect(Object.keys(body).sort()).toEqual(["doneIntent", "reservation", "ticketId"]);
+    expect(body).toMatchObject({ reservation: "done-intent", ticketId: ID, doneIntent: { provider: "dynamodb", nonce: expect.stringMatching(UUID_RE) } });
     expect(h.state.statusUpdates).toHaveLength(1);
+    expect(gateContract.isIntentOnlyReservation(stored(KEY))).toBe(true); // a committed done keeps it
+    expect(h.state.s3RecordReads).toEqual([KEY, KEY]); // the guard read (404) and the post-commit re-read
   });
 
   it("(f8) the status write throws ⇒ the error propagates and the intent is CAS-cleared: puts = [fence, clear], the record ends with no doneIntent", async () => {
@@ -1871,7 +1880,7 @@ describe("transition_ticket — the Done-intent fence (TEAM-5941)", () => {
     expect(h.state.statusUpdates).toHaveLength(0);
   });
 
-  it("(f13) the record vanishes between the guard read and the fence — a ship ticket is refused as on 'no record' (DL-030); a dev ticket commits unfenced", async () => {
+  it("(f13) → TEAM-5959: the record vanishes between the guard read and the fence — a ship ticket is refused as on 'no record' (DL-030); a dev ticket RE-RESERVES the key create-only and commits fenced", async () => {
     h.state.items[SHIP] = shipTicket();
     h.state.s3Objects[SHIP_KEY] = { ticketId: SHIP, summary: "shipped" };
     h.state.onRecordPut = () => { delete h.state.s3Objects[SHIP_KEY]; };
@@ -1882,11 +1891,99 @@ describe("transition_ticket — the Done-intent fence (TEAM-5941)", () => {
 
     h.state.items[ID] = devTicket();
     h.state.s3Objects[KEY] = CLEAN;
-    h.state.onRecordPut = () => { delete h.state.s3Objects[KEY]; };
+    h.state.s3RecordPuts.length = 0;
+    let deleted = false;
+    h.state.onRecordPut = () => { if (!deleted) { deleted = true; delete h.state.s3Objects[KEY]; } };
     const dev = await transition({ ticket_id: ID, to_status: "done" });
     expect(dev).toMatchObject({ key: ID, status: "transitioned", to: "done" });
     expect("conflict" in dev).toBe(false);
+    expect(h.state.s3RecordPuts).toHaveLength(2); // the IfMatch fence (404), then the create-only reservation
+    expect(h.state.s3RecordPuts[0].IfMatch).toBeTruthy();
+    expect(h.state.s3RecordPuts[1].IfNoneMatch).toBe("*");
+    expect(gateContract.isIntentOnlyReservation(stored(KEY))).toBe(true);
     expect(h.state.statusUpdates).toHaveLength(1);
+  });
+
+  const reservation = (id, provider = "jira") => gateContract.doneIntentReservation(id, { provider, at: new Date().toISOString(), nonce: "rival-nonce" });
+
+  it("(f14) TEAM-5959: an intent-only reservation never satisfies a ship or security done — refused as 'no record' (DL-030), no PUT, no status write", async () => {
+    h.state.items[SHIP] = shipTicket();
+    h.state.s3Objects[SHIP_KEY] = reservation(SHIP);
+    const ship = await transition({ ticket_id: SHIP, to_status: "done" });
+    expect(ship.reason).toBe("completion_record_required");
+    expect(text(ship)).toMatch(/a ship-phase ticket needs its completion record first/);
+    expect(text(ship)).toMatch(new RegExp(`no ${SHIP_KEY.replace(/[./]/g, "\\$&")} in the artifact bucket \\(only a Done-intent reservation, not a completion record\\)`));
+
+    h.state.items[SEC] = { ticketId: SEC, status: "in_progress", assignee: gateContract.SECURITY_REVIEWER_AGENT, phase: "design" };
+    h.state.s3Objects[SEC_KEY] = reservation(SEC);
+    const sec = await transition({ ticket_id: SEC, to_status: "done" });
+    expect(sec.reason).toBe("completion_record_required");
+    expect(text(sec)).toMatch(/a security-review ticket needs its completion record first/);
+    expect(text(sec)).toMatch(/only a Done-intent reservation, not a completion record/);
+
+    expect(h.state.s3RecordPuts).toHaveLength(0);
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
+  it("(f15b) TEAM-5959: the status write throws on a reserved key ⇒ puts = [create-only reservation, IfMatch clear], `{reservation, ticketId}` stays; the next done on the build ticket is ADMITTED, fenced IfMatch onto it, and commits", async () => {
+    h.state.items[ID] = devTicket();
+    h.state.onStatusWrite = () => { throw Object.assign(new Error("ProvisionedThroughputExceededException"), { name: "ProvisionedThroughputExceededException" }); };
+
+    const first = await transition({ ticket_id: ID, to_status: "done" });
+
+    expect(first.error ?? text(first)).toMatch(/ProvisionedThroughputExceededException/);
+    expect(h.state.s3RecordPuts).toHaveLength(2);
+    expect(h.state.s3RecordPuts[0].IfNoneMatch).toBe("*");
+    expect(h.state.s3RecordPuts[1].IfMatch).toBe(etagOf(String(h.state.s3RecordPuts[0].Body)));
+    expect(intentOf(h.state.s3RecordPuts[1])).toBeUndefined();
+    expect(stored(KEY)).toEqual({ reservation: "done-intent", ticketId: ID });
+    expect(gateContract.isIntentOnlyReservation(stored(KEY))).toBe(true);
+    expect(gateContract.judgeBriefHold(KEY, JSON.stringify(stored(KEY)))).toBeNull(); // a build ticket's guard admits it
+    expect(gateContract.judgeCompletionRecord(KEY, JSON.stringify(stored(KEY))).proven).toBe(false); // a ship ticket's refuses it
+
+    h.state.onStatusWrite = null;
+    const clearedBody = String(h.state.s3RecordPuts[1].Body);
+    const second = await transition({ ticket_id: ID, to_status: "done" });
+
+    expect(second).toMatchObject({ key: ID, status: "transitioned", to: "done" });
+    expect("conflict" in second).toBe(false);
+    expect(h.state.s3RecordPuts).toHaveLength(3); // one IfMatch fence on the reservation, no create-only
+    expect(h.state.s3RecordPuts[2].IfMatch).toBe(etagOf(clearedBody));
+    expect(h.state.s3RecordPuts[2].IfNoneMatch).toBeUndefined();
+    expect(gateContract.isIntentOnlyReservation(stored(KEY))).toBe(true);
+    expect(stored(KEY).doneIntent.provider).toBe("dynamodb");
+  });
+
+  it("(f16) TEAM-5959: a hold stamped onto a reservation ({reservation, briefPending:true}) is a HOLD — refused with the standard text before any fence; the marker never masks it", async () => {
+    h.state.items[ID] = devTicket();
+    const held = { ...reservation(ID), briefPending: true, briefDelivered: "off_gate", ticketWrites: "dropped" };
+    h.state.s3Objects[KEY] = held;
+
+    const res = await transition({ ticket_id: ID, to_status: "done" });
+
+    expect(res.reason).toBe("completion_record_required");
+    expect(text(res)).toMatch(BRIEF_HOLD_REFUSAL_RE);
+    expect(h.state.s3RecordPuts).toHaveLength(0);
+    expect(h.state.statusUpdates).toHaveLength(0);
+    expect(gateContract.isIntentOnlyReservation(held)).toBe(false);
+    expect(gateContract.judgeCompletionRecord(KEY, JSON.stringify(held)).why).toMatch(BRIEF_HOLD_REFUSAL_RE); // ship: the hold text, not the reservation text
+  });
+
+  it("(f17) TEAM-5959: two twins reserve the same absent key ⇒ the loser's create-only 412s, it re-reads a hold-free reservation, fences IfMatch onto it and commits", async () => {
+    h.state.items[ID] = devTicket();
+    const rival = reservation(ID, "jira");
+    h.state.onRecordPut = (input) => { if (input.IfNoneMatch === "*" && !(KEY in h.state.s3Objects)) h.state.s3Objects[KEY] = rival; };
+
+    const res = await transition({ ticket_id: ID, to_status: "done" });
+
+    expect(res).toMatchObject({ key: ID, status: "transitioned", to: "done" });
+    expect("conflict" in res).toBe(false);
+    expect(h.state.s3RecordPuts).toHaveLength(2);
+    expect(h.state.s3RecordPuts[0].IfNoneMatch).toBe("*"); // lost the create-only race (412)
+    expect(h.state.s3RecordPuts[1].IfMatch).toBe(etagOf(rival)); // the CAS onto the rival's reservation
+    expect(gateContract.isIntentOnlyReservation(stored(KEY))).toBe(true);
+    expect(stored(KEY).doneIntent.provider).toBe("dynamodb");
+    expect(h.state.s3RecordReads).toEqual([KEY, KEY, KEY]); // the guard read (404), the fence's re-read, the post-commit re-read
   });
 });
 
