@@ -775,6 +775,48 @@ export function finalizeSecurityReview(record) {
 }
 
 /**
+ * TEAM-6151: the twin of finalizeSecurityReview - puts the marker back on a stamp. The
+ * drain's step 6 re-marks a replayed admission PROVISIONALLY (in its own CAS write) before
+ * step 7 re-confirms the amendment, so the confirm, the drop notice and the Done all act on
+ * a record every reader already refuses. Idempotent; a record with no stamp is returned as is.
+ */
+export function holdSecurityReviewProvisional(record) {
+  if (record?.securityReview && typeof record.securityReview === "object") record.securityReview.provisional = true;
+  return record;
+}
+
+/** TEAM-6151: does `record` carry the provisional marker `what` names (`"brief"` | `"securityReview"`)? */
+export function carriesProvisional(record, what) {
+  if (what === "brief") return record?.briefPending === true && record?.briefDisposition?.provisional === true;
+  return record?.securityReview?.provisional === true;
+}
+
+/**
+ * TEAM-6151: the ONE finalize write (DL-039). `base` is `{ record, etag }` exactly as THIS
+ * caller's provisional write left it; `apply(copy)` turns it trusted (clearBriefHoldOnRelease /
+ * finalizeSecurityReview, plus status). One PutObject with IfMatch on that ETag - never a
+ * re-read-and-retry: a 412 (or a 404) means a NEWER record exists (a drain's hold, a gate
+ * delivery, a revocation, another finalizer, a twin's Done-intent fence) and that record WINS.
+ * The caller withholds the Done and answers retryably; the next decision starts from a fresh
+ * read. Nothing is mutated on any failure (`apply` runs on a deep copy), and a base that does
+ * not carry the marker is refused without a write - a finalize of something never made
+ * provisional is a programming error, not a race.
+ *
+ *   { ok: true, etag, record }              the trusted record, as written, and its ETag
+ *   { ok: false, superseded: true, error }  412/404: a newer record stands, untouched
+ *   { ok: false, error }                    S3 could not answer, or the base is not provisional
+ */
+export async function finalizeProvisionalRecord({ key, base, what, apply }) {
+  if (!base || base.etag === undefined) return { ok: false, error: `${key}: no ETag for the provisional write to finalize on` };
+  if (!carriesProvisional(base.record, what)) return { ok: false, error: `${key}: the record this call wrote carries no provisional ${what} to finalize` };
+  const record = apply(JSON.parse(JSON.stringify(base.record)));
+  const r = await conditionalPut(key, JSON.stringify(record, null, 2), { ifMatch: base.etag });
+  if (r.outcome === "won") return { ok: true, etag: r.etag, record };
+  if (r.outcome === "error") return { ok: false, error: `${r.err?.name || "Error"}: ${r.err?.message || ""}` };
+  return { ok: false, superseded: true, error: `${key} changed since the provisional write (${r.outcome}) - a newer hold, delivery or revocation stands and is left as is` };
+}
+
+/**
  * TEAM-5805: the twins' Done guard refused because the record still holds the merge
  * brief (gate-contract.mjs briefHoldRefusal: `<key> has briefPending:true (brief …`).
  * No retry of the same write lifts it: the brief has to reach the gate first.
@@ -1128,6 +1170,16 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     for (let attempt = 1; attempt <= RECORD_CAS_ATTEMPTS; attempt++) {
       adoptHold(report, recordBase.record, { deliveredNow, forceHold });
       report.status = statusOf();
+      // TEAM-6151: this write is never a FINALIZE. A finalize is one CAS on the provisional
+      // write's own ETag (finalizeProvisionalRecord); this loop re-reads and re-applies the
+      // same `report`, which is exactly how a stale admission was rebased over a newer
+      // provisional stamp. Narrow on the amendment: a PASS re-review over a prior provisional
+      // FAIL writes a different admission and is not a finalize.
+      const curStamp = recordBase.record?.securityReview;
+      if (curStamp?.provisional === true && report.securityReview && typeof report.securityReview === "object"
+        && report.securityReview.provisional !== true && report.securityReview.amendmentTicketId === curStamp.amendmentTicketId) {
+        return { ok: false, error: `${key} carries a PROVISIONAL securityReview admission this write would finalize - a finalize goes through finalizeProvisionalRecord, never the record write` };
+      }
       const holdWritten = (report.followUpsPending === true && recordBase.record?.followUpsPending !== true)
         || (report.briefPending === true && recordBase.record?.briefPending !== true);
       // TEAM-5994: on EVERY attempt, against the record this attempt conditions on — never
@@ -1405,19 +1457,31 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   if (releasedNow && mayTransition) {
     const confirm = await confirmDoneAtCommit({ ticketIds: releasedNow.observed.map((o) => o.ticketId) });
     if (confirm.ok && confirm.done) {
-      clearBriefHoldOnRelease(report, releasedNow.disposition);
-      const final = await writeRecord(() => {
-        briefHeld = report.briefPending === true;
-        if (!briefHeld) delete report.briefHoldReason;
-        return !mayTransition ? STATUS_PENDING_FOLLOW_UPS : briefHeld ? STATUS_PENDING_BRIEF : "complete";
+      // TEAM-6151: ONE conditional write on the provisional record's own ETag - never the
+      // record-write loop, which re-read and re-applied this stale release over a newer hold
+      // (a drain re-held the brief after the gate reopened), a newer gate delivery, or a
+      // newer revocation. A lost CAS leaves the newer record standing and withholds the Done.
+      const final = await finalizeProvisionalRecord({
+        key, base: recordBase, what: "brief",
+        apply: (rec) => {
+          clearBriefHoldOnRelease(rec, releasedNow.disposition);
+          delete rec.briefHoldReason;
+          rec.status = !mayTransition ? STATUS_PENDING_FOLLOW_UPS : "complete";
+          return rec;
+        },
       });
       if (final.ok) {
+        recordBase = { record: final.record, etag: final.etag };
+        for (const f of BRIEF_HOLD_FIELDS) { if (final.record[f] !== undefined) report[f] = final.record[f]; else delete report[f]; }
+        delete report.briefHoldReason;
+        report.status = final.record.status;
+        briefHeld = false;
         console.log(`[report_completion] ${ticket_id}: the Merge Approval gate(s) re-confirmed Done after the write - release FINALIZED (briefPending:false)`);
       } else {
-        holdBriefOnProvisionalRelease(report, releasedNow.disposition);
+        // `report` still is the provisional hold the first write made; nothing to take back.
         report.briefHoldReason = `provisional release not finalized (${final.error}) - the record holds the release provisionally (briefPending:true); the retry re-chooses the gate`;
         briefHeld = true;
-        console.error(`[report_completion] ${ticket_id}: the release was confirmed but could not be FINALIZED on ${key} (${final.error}) - the record stays provisional (briefPending:true), Done withheld; the retry re-chooses the gate`);
+        console.error(`[report_completion] ${ticket_id}: the release was confirmed but could not be FINALIZED on ${key} (${final.error}) - ${final.superseded ? "a newer record stands and is left as is" : "the record stays provisional (briefPending:true)"}, Done withheld; the retry re-chooses the gate`);
       }
     } else {
       const why = confirm.ok ? `the Merge Approval gate ${confirm.why} after the release was recorded` : `the Merge Approval gate ${confirm.ticketId} could not be re-read after the release was recorded (${confirm.error})`;
@@ -1510,13 +1574,16 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     if (amendment) {
       const confirm = await confirmDoneAtCommit({ ticketIds: [amendment] });
       if (!confirm.ok || !confirm.done) return takeBackAdmission(confirm, { note: "after the residual findings were posted", detail: "after the residual findings were posted", posted: true });
-      finalizeSecurityReview(report);
-      const final = await writeRecord(() => report.status);
+      // TEAM-6151: ONE conditional write on the provisional record's own ETag (see the brief
+      // finalize above) - a lost CAS means a newer stamp (a drain's re-mark, a revocation)
+      // stands; it is left as is and no Done is made.
+      const final = await finalizeProvisionalRecord({ key, base: recordBase, what: "securityReview", apply: finalizeSecurityReview });
       if (!final.ok) {
-        report.securityReview.provisional = true;
-        console.error(`[report_completion] REFUSED ${ticket_id}: the design amendment re-confirmed done but the admission could not be FINALIZED on ${key} (${final.error}) - the record keeps the PROVISIONAL stamp (both twins refuse it), residual findings already posted (marker-deduped), ticket not transitioned; retry`);
+        console.error(`[report_completion] REFUSED ${ticket_id}: the design amendment re-confirmed done but the admission could not be FINALIZED on ${key} (${final.error}) - ${final.superseded ? "a newer record stands and is left as is" : "the record keeps the PROVISIONAL stamp"} (both twins refuse a provisional stamp), residual findings already posted (marker-deduped), ticket not transitioned; retry`);
         return { ...admissionNotFinalized(ticket_id, key, final.error, { posted: true }), residualFindings };
       }
+      recordBase = { record: final.record, etag: final.etag };
+      delete report.securityReview.provisional;
       console.log(`[report_completion] ${ticket_id}: design amendment ${amendment} re-confirmed done after the residual posts - securityReview admission FINALIZED`);
     }
     transition = await transitionToDone(ticket_id);
@@ -2524,7 +2591,7 @@ export async function drainCompletion(msg) {
 
   // 6. The record, BEFORE the Done: every retryable follow-up is filed now, and the
   //    twins' Done guard refuses a record that still says followUpsPending:true.
-  const record = rec.record;
+  let record = rec.record;
   if (record) {
     Object.assign(record, { status: "complete", followUpsPending: false, ticketWrites: "queued" });
     if (entries.length > 0) record.followUpsMaterialized = materialized;
@@ -2552,6 +2619,15 @@ export async function drainCompletion(msg) {
     // TEAM-5958: a hold a concurrent Done landed over (doneOverHold) stays `true` — that
     // is the ONLY clear above: gate delivery (or a verified release, TEAM-6097). The ticket is Done; nothing reads the hold
     // until a new Done is attempted, and then it is the refusal a reopen needs.
+    // TEAM-6151: a residual-findings message is a non-PASS admission the Done below rests on.
+    // Its stamp is made PROVISIONAL in this same write - whether it was never finalized (the
+    // report queued it with follow-ups unfiled) or finalized by the report_completion whose
+    // Done 503'd (a replay) - so step 7's re-confirm, its drop notice and the Done all act on
+    // a record both twins already refuse, and the finalize after the confirm is what makes it
+    // trusted again. Never on a PASS (no amendment to re-confirm; both twins would refuse it)
+    // and never on a ticket already Done (nothing to protect; a reopen refuses until a re-run).
+    if (msg.residual && !alreadyDone && record.securityReview && typeof record.securityReview === "object"
+      && String(record.securityReview.verdict || "").toUpperCase() !== "PASS") holdSecurityReviewProvisional(record);
     // TEAM-5941: a stale Done-intent comes off with this write; a fresh one stays.
     stripStaleDoneIntent(record);
     // TEAM-5830: conditional on the step-0 read, like drop() above.
@@ -2574,10 +2650,13 @@ export async function drainCompletion(msg) {
     if (provisionalRelease) {
       const confirm = await confirmDoneAtCommit({ ticketIds: settledGates });
       if (confirm.ok && confirm.done) {
-        clearBriefHoldOnRelease(record, briefDelivery.briefDisposition);
-        delete record.briefHoldReason;
-        const final = await putRecordIfUnchanged(reportKey, record, recordEtag);
+        // TEAM-6151: through the ONE finalize (the same single CAS this always was).
+        const final = await finalizeProvisionalRecord({
+          key: reportKey, base: { record, etag: recordEtag }, what: "brief",
+          apply: (rec) => { clearBriefHoldOnRelease(rec, briefDelivery.briefDisposition); delete rec.briefHoldReason; return rec; },
+        });
         if (!final.ok) return retry(`the Merge Approval gate(s) re-confirmed Done but the release could not be FINALIZED on ${reportKey} (${final.error}); the record holds it PROVISIONALLY (briefPending:true) and no Done is made - the next tick re-chooses the gate`);
+        record = rec.record = final.record;
         recordEtag = final.etag;
       } else {
         const reason = confirm.ok ? `the Merge Approval gate ${confirm.why} after the release was recorded` : `the Merge Approval gate ${confirm.ticketId} could not be re-read after the release was recorded (${confirm.error})`;
@@ -2602,13 +2681,14 @@ export async function drainCompletion(msg) {
     // message queued before TEAM-6142 has none, so it is the record's own stamp
     // (securityReview.amendmentTicketId, the admission the twins' guard will honour).
     // Neither (no record, or a record without the stamp): fail closed, a surfaced drop -
-    // never a Done on an admission nothing can re-read. Reopened (or permanently
-    // unreadable): the record's stamp (finalized by the report_completion that queued this
-    // message) is marked `provisional:true` again with the drop - the DL-039 shape both twins
-    // refuse - so a direct Done is refused too; a stamp drop() cannot write is drop()'s own
-    // retry (no Done, no notice; the next tick re-reads). Transiently unreadable: retry.
+    // never a Done on an admission nothing can re-read. TEAM-6151: step 6 already made the
+    // record's stamp PROVISIONAL (both twins refuse it) BEFORE this read, so a reopen (or a
+    // permanently unreadable amendment) is a surfaced drop whose notice is truthful and whose
+    // stamp is a restatement - a drop stamp that loses its CAS leaves a record every reader
+    // already refuses. Done ⇒ the ONE finalize (a single CAS on step 6's ETag) makes the stamp
+    // trusted again; a lost finalize is a retry, no Done. Transiently unreadable: retry.
     // Residual window, as on the report path: a reopen between this read and transitionToDone
-    // still goes Done; nothing is awaited in between.
+    // still goes Done; the finalize is the only await in between.
     if (msg.residual) {
       const amendment = asText(msg.residual.amendmentTicketId) || asText(rec.record?.securityReview?.amendmentTicketId) || null;
       if (!amendment) return drop("amendment", "the queued residual findings name no design amendment and the record carries no securityReview.amendmentTicketId - the admission cannot be re-confirmed", { epicKey });
@@ -2619,6 +2699,12 @@ export async function drainCompletion(msg) {
         return drop("amendment", `design amendment ${confirm.why} - the security review's admission is PROVISIONAL again (securityReview.provisional:true, which both ticket providers refuse); re-review the amended design and re-run WorkflowOutput___report_completion`, {
           epicKey, record: stamp,
         });
+      }
+      if (rec.record && carriesProvisional(rec.record, "securityReview")) {
+        const final = await finalizeProvisionalRecord({ key: reportKey, base: { record: rec.record, etag: recordEtag }, what: "securityReview", apply: finalizeSecurityReview });
+        if (!final.ok) return retry(`the design amendment ${amendment} re-confirmed done but the admission could not be FINALIZED on ${reportKey} (${final.error}); the record keeps the PROVISIONAL stamp (both ticket providers refuse it) and no Done is made - the next tick re-confirms`);
+        record = rec.record = final.record;
+        recordEtag = final.etag;
       }
     }
     const transition = await transitionToDone(ticketId);
