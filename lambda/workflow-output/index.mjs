@@ -638,9 +638,15 @@ export const RECORD_CAS_ATTEMPTS = 3;
  *     over this call's own delivery, unless the CURRENT record proves one newer than
  *     that refusal (`false` with the brief on the gate). Every other ambiguous case
  *     fails closed; the next re-run re-delivers (already_posted) and clears it.
+ *   - TEAM-6042: `forceHold` over this call's own delivery, when the current record
+ *     holds the brief ⇒ that hold is adopted whole. The refusal read it, it is newer
+ *     than this call's delivery, and it carries the brief's `undelivered` entry — the
+ *     s3Key the next re-run re-delivers from. Forcing `true` onto this call's gate
+ *     fields (entry pruned) left a hold no re-run could find the brief for.
  */
 export function adoptHold(report, current, { deliveredNow = false, forceHold = false } = {}) {
-  if (!deliveredNow && current && typeof current === "object" && current.briefPending !== undefined) {
+  const adopt = !deliveredNow || (forceHold && current?.briefPending === true);
+  if (adopt && current && typeof current === "object" && current.briefPending !== undefined) {
     for (const f of BRIEF_HOLD_FIELDS) {
       if (current[f] !== undefined) report[f] = current[f];
       else delete report[f];
@@ -660,9 +666,12 @@ export function adoptHold(report, current, { deliveredNow = false, forceHold = f
 /**
  * TEAM-6024: a brief now on its gate is no longer undelivered: its `part:"brief"`
  * entries come off `undelivered` (every other part stays; an empty list is deleted).
+ * TEAM-6042: and the off-gate hold's `briefFallbackReason` goes with them — a record
+ * reading `briefDelivered:"gate"` keeps no reason the brief was not on it.
  * Mutates and returns `record`.
  */
 export function pruneDeliveredBrief(record) {
+  if (record && typeof record === "object") delete record.briefFallbackReason;
   if (!Array.isArray(record?.undelivered)) return record;
   const rest = record.undelivered.filter((u) => u?.part !== "brief");
   if (rest.length > 0) record.undelivered = rest;
