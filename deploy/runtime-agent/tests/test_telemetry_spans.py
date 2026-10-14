@@ -562,7 +562,9 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
             "_stream_retry_sleep",
             "_comment_transient_exhaustion",
             # TEAM-5976: the in-flight heartbeat knob + its wait seam (F1), the
-            # restart notice (F5) and the exception-chain walk (F2).
+            # restart notice (F5) and the exception-chain walk (F2). TEAM-6022:
+            # the lease TTL mirror that clamps and caps the in-flight heartbeat.
+            "_LEASE_TTL_S",
             "_STREAM_RETRY_INFLIGHT_HEARTBEAT_S",
             "_stream_heartbeat_wait",
             "_STREAM_RETRY_NOTICE",
