@@ -400,7 +400,7 @@ describe("TEAM-5884 R3-1 — replayed done of the OLD head does not re-order the
     h.state.tickets["TEAM-1"] = { ticketId: "TEAM-1", parentId: PARENT, workflowId: "wf_1", assignee: DEV, status: "done" };
   }
 
-  it("(DDB-stream path) TEAM-1 (H) replayed: completedAt kept, F stays the last head, 404 proof withheld → no github stamp, run NOT completed", async () => {
+  it("(DDB-stream path) TEAM-1 (H) replayed: completedAt kept, F is not contained in the merged head, 404 proof withheld → no github stamp, run NOT completed", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     replayFixture();
     await loadWithShipDef();
@@ -409,7 +409,7 @@ describe("TEAM-5884 R3-1 — replayed done of the OLD head does not re-order the
 
     expect(h.state.workflow.agentTasks["TEAM-1"].completedAt).toBe("2026-09-01T00:00:00Z");
     expect(h.state.workflow.agentTasks["TEAM-1"].status).toBe("complete");
-    expect(warn.mock.calls.some((c) => String(c[0]).includes("head head000 is not the last head this run recorded (fff0000)"))).toBe(true);
+    expect(warn.mock.calls.some((c) => String(c[0]).includes("recorded head fff0000 is not contained in merged PR #846 head head000"))).toBe(true);
     expect(h.state.merges.some(({ fields }) => fields.mergeVerifiedBy === "github")).toBe(false);
     expect(h.state.completions).toHaveLength(0); // no GREEN close over the unlanded F
     // merged:null → the RM's own (empty) verdict decides: honest static-ci-only close.

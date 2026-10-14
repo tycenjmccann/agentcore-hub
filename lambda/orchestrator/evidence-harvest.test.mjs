@@ -428,7 +428,7 @@ describe("late re-harvest on an evidence-less complete entry (TEAM-3976)", () =>
 // running -> complete). An inert mock cannot show whether a replayed or
 // stale-read completion moves the stamp, so these tests apply the real
 // workflow-store write against `row`, which plays the live table.
-import { latestRecordedHead, featureBranchLanding } from "./completion.mjs";
+import { recordedHeads, featureBranchLanding } from "./completion.mjs";
 
 function miniDdb(row) {
   const resolve = (path, names) => path.split(".").map((seg) => names?.[seg] ?? seg);
@@ -474,9 +474,9 @@ const T1 = "2026-10-01T00:01:00.000Z", T2 = "2026-10-01T00:02:00.000Z", T3 = "20
 /**
  * TEAM-5884 R3-1 / TEAM-5890 — the DDB-stream twin has no dedup guard, so a
  * replayed done reaches markTaskComplete again. It must NOT re-stamp
- * completedAt: latestRecordedHead (completion.mjs) orders the run's recorded
- * heads by it, and a refreshed stamp on an OLD head's ticket would make that
- * head "the latest". Since TEAM-5890 the rule is enforced by the STORE's
+ * completedAt: it records when the task completed (TEAM-5707 compares it to
+ * startedAt). TEAM-5913: the 404 proof no longer orders heads by it — it needs
+ * every recorded head contained in the merged head — but the stamp stays honest. Since TEAM-5890 the rule is enforced by the STORE's
  * condition (stamp only on running -> complete) and mirrored in memory.
  */
 describe("replayed done keeps the original completedAt (TEAM-5884 R3-1, TEAM-5890)", () => {
@@ -513,8 +513,8 @@ describe("replayed done keeps the original completedAt (TEAM-5884 R3-1, TEAM-589
 });
 
 /**
- * TEAM-5890 — completedAt is latestRecordedHead's ordering key and must be
- * unrewritable. Two residuals left by TEAM-5884, end-to-end through the stream
+ * TEAM-5890 — completedAt was latestRecordedHead's ordering key and stays
+ * unrewritable (TEAM-5913 removed that ordering from the 404 proof). Two residuals left by TEAM-5884, end-to-end through the stream
  * done path (real markTaskComplete, real completeTaskEntry, row as the table):
  *   1. legacy backfill: a complete entry with NO stamp was re-stamped `now` on a
  *      replay, so the old merged head H sorted newest and the deleted-branch 404
@@ -522,7 +522,7 @@ describe("replayed done keeps the original completedAt (TEAM-5884 R3-1, TEAM-589
  *   2. stale read: handler A read H as running while B completed it; A's late
  *      unconditional write moved H's stamp after F's.
  */
-describe("TEAM-5890 — completedAt is never backfilled and never moved, so latestRecordedHead cannot be steered to an old head", () => {
+describe("TEAM-5890 — completedAt is never backfilled and never moved, and the 404 proof (every recorded head, TEAM-5913) is not steered to an old head", () => {
   const H = DONE;        // old head, merged PR #846
   const F = "TEAM-2";    // the branch advanced to F after H merged
   const HEAD_H = "old111abcdef0123456789abcdef0123456789ab";
@@ -531,9 +531,10 @@ describe("TEAM-5890 — completedAt is never backfilled and never moved, so late
   const api = async (path) => {
     if (path.includes("/pulls?")) return [mergedPr];
     if (path.includes("/branches/")) throw Object.assign(new Error("GitHub GET branches 404: Branch not found"), { status: 404 });
+    if (path.includes("/compare/fff0000bbbb...")) return { status: "diverged", ahead_by: 1, behind_by: 1 }; // F never landed in H
     throw new Error(`unexpected ${path}`);
   };
-  const probe = (agentTasks) => featureBranchLanding({ owner: "o", repo: "r", base: "main", head: "feature/x", api, lastKnownHead: latestRecordedHead(agentTasks) });
+  const probe = (agentTasks) => featureBranchLanding({ owner: "o", repo: "r", base: "main", head: "feature/x", api, recordedHeads: recordedHeads(agentTasks) });
 
   function twoTicketRun(agentTasks) {
     h.state.tickets = {
@@ -557,7 +558,6 @@ describe("TEAM-5890 — completedAt is never backfilled and never moved, so late
       [H]: { id: "t1", agentId: DEV, ticketId: H, status: "complete", output: "done", commitSha: HEAD_H.slice(0, 12) }, // legacy: no completedAt
       [F]: { id: "t2", agentId: DEV, ticketId: F, status: "complete", output: "done", commitSha: "fff0000bbbb", completedAt: T1 },
     }));
-    expect(latestRecordedHead(row.agentTasks)).toBe(null);
     expect((await probe(row.agentTasks)).merged).toBe(null);
 
     vi.setSystemTime(new Date(T2));
@@ -567,10 +567,9 @@ describe("TEAM-5890 — completedAt is never backfilled and never moved, so late
     expect(row.agentTasks[H].completedAt).toBeUndefined();
     expect(h.state.workflow.agentTasks[H].completedAt).toBeUndefined();
     expect(h.state.workflow.agentTasks[H].status).toBe("complete");
-    expect(latestRecordedHead(row.agentTasks)).toBe(null);
     const r = await probe(row.agentTasks);
     expect(r.merged).toBe(null); // base: merged:true — H's old PR accepted as the landing of a branch whose last head is unknown
-    expect(r.reason).toMatch(/not the last head this run recorded \(none\)/);
+    expect(r.reason).toMatch(/recorded head fff0000bbbb is not contained in merged PR #846/);
   });
 
   it("Residual 2 (concurrent stale read): A read H as running while B completed it; A's late write cannot move H after F", async () => {
@@ -588,14 +587,14 @@ describe("TEAM-5890 — completedAt is never backfilled and never moved, so late
     vi.setSystemTime(new Date(T2));       // F completes — the branch advanced past H
     h.state.workflow = snapshot(row);
     await handleTicketDone(F, streamImage());
-    expect(latestRecordedHead(row.agentTasks)).toBe("fff0000bbbb");
+    expect(row.agentTasks[H].completedAt < row.agentTasks[F].completedAt).toBe(true);
 
     vi.setSystemTime(new Date(T3));       // A's delayed duplicate lands with its stale snapshot
     h.state.workflow = staleSnapshotA;
     await handleTicketDone(H, streamImage());
 
     expect(row.agentTasks[H].completedAt).toBe(T1);
-    expect(latestRecordedHead(row.agentTasks)).toBe("fff0000bbbb");
+    expect(row.agentTasks[H].completedAt < row.agentTasks[F].completedAt).toBe(true);
     expect(staleSnapshotA.agentTasks[H].completedAt).not.toBe(T3); // memory mirrors the refused stamp (nothing to carry -> unstamped)
     expect(staleSnapshotA.agentTasks[H].status).toBe("complete");
     expect((await probe(row.agentTasks)).merged).toBe(null); // F is the last head, so H's PR is not the landing
