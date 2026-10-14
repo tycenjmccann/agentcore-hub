@@ -756,6 +756,8 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
     });
     const ticketsS3Read = ticketsStatements.find((s) => s.Action.includes("s3:GetObject"));
     const ticketsS3List = ticketsStatements.find((s) => s.Action.includes("s3:ListBucket"));
+    // TEAM-5941: the Done-intent fence's prefix-scoped write.
+    const ticketsS3Fence = ticketsStatements.find((s) => s.Action.includes("s3:PutObject"));
     const COMPLETIONS_TARGET = `${ARTIFACT_BUCKET_ARN}/completions/verify-infra-probe`;
 
     it("passes for the completions/* caller target against the tickets Lambda's S3 read", async () => {
@@ -823,6 +825,22 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
       it("verify-infra.sh checks the tickets role's completions/ read with it, not with a probe key", () => {
         expect(VERIFY_SH).toMatch(/role_policy_grants_under \$TICKETS_ROLE s3:GetObject arn:aws:s3:::\$ARTIFACT_BUCKET\/completions\/"/);
         expect(VERIFY_SH).not.toMatch(/completions\/verify-infra-probe/);
+      });
+
+      // TEAM-5941: the Done-intent fence's PutObject is checked the same way — over the
+      // whole completions/ namespace — against the statement the deploy script writes.
+      it("passes for s3:PutObject against the tickets Lambda's real CompletionRecordFence statement", async () => {
+        expect(ticketsS3Fence.Resource).toBe(`${NS}*`);
+        expect(await under("s3:PutObject", NS, inlineOnly(doc(ticketsS3Fence)))).toBe(0);
+      });
+
+      it("fails for s3:PutObject against a pre-TEAM-5941 policy (read + list only), or a write narrowed to completions/twin-*", async () => {
+        expect(await under("s3:PutObject", NS, inlineOnly(doc(ticketsS3Read, ticketsS3List)))).not.toBe(0);
+        expect(await under("s3:PutObject", NS, inlineOnly(doc({ ...ticketsS3Fence, Resource: `${NS}twin-*` })))).not.toBe(0);
+      });
+
+      it("verify-infra.sh checks the tickets role's completions/ write with it (TEAM-5941)", () => {
+        expect(VERIFY_SH).toMatch(/role_policy_grants_under \$TICKETS_ROLE s3:PutObject arn:aws:s3:::\$ARTIFACT_BUCKET\/completions\/"/);
       });
     });
 

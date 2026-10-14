@@ -49,15 +49,25 @@ vi.mock("@aws-sdk/client-lambda", () => ({
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
-    async send() {
-      if (h.state.record !== null) return { Body: { transformToString: async () => h.state.record } };
-      const err = new Error("NoSuchKey");
-      err.name = "NoSuchKey";
-      err.$metadata = { httpStatusCode: 404 };
-      throw err;
+    async send(cmd) {
+      // One record, served with an ETag per body (as S3 does). TEAM-5941: the twin's
+      // Done-intent fence is a conditional PutObject of that record right before the
+      // status write — honour IfMatch (412 on a moved ETag, 404 on a missing key) and
+      // store the body, so an admitted done still fences and commits here.
+      const etagOf = (text) => `"${Buffer.from(String(text)).toString("base64").slice(-16)}${String(text).length}"`;
+      const s3Error = (name, status) => Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } });
+      if (cmd?.__type === "PutObject") {
+        if (cmd.input.IfMatch !== undefined && h.state.record === null) throw s3Error("NoSuchKey", 404);
+        if (cmd.input.IfMatch !== undefined && etagOf(h.state.record) !== cmd.input.IfMatch) throw s3Error("PreconditionFailed", 412);
+        h.state.record = String(cmd.input.Body);
+        return { ETag: etagOf(h.state.record) };
+      }
+      if (h.state.record !== null) return { ETag: etagOf(h.state.record), Body: { transformToString: async () => h.state.record } };
+      throw s3Error("NoSuchKey", 404);
     }
   },
   GetObjectCommand: class { constructor(i) { this.input = i; } },
+  PutObjectCommand: class { constructor(i) { this.input = i; this.__type = "PutObject"; } },
   HeadObjectCommand: class { constructor(i) { this.input = i; } },
 }));
 vi.mock("@aws-sdk/lib-dynamodb", () => {

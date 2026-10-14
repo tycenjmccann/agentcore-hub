@@ -27,6 +27,10 @@
  *   - GetObject is proven over the WHOLE completions/ namespace, never one probe key
  *     (TEAM-5924): an Allow counts only when its Resource covers every key under
  *     completions/, and any GetObject Deny whose Resource could match one of them refuses.
+ *   - TEAM-5941: the same for s3:PutObject over completions/ — the twins' Done-intent
+ *     fence writes the record (IfMatch) right before the commit and REFUSES the Done when
+ *     the write is denied, so fence-carrying twin code onto a role without the grant
+ *     would refuse every Done on a ticket with a record.
  * The twins' own fail-closed semantics are untouched; this only decides whether their
  * code may ship.
  *
@@ -180,6 +184,11 @@ export function decideTwin({ fn, optional, expectedBucket, config, policies }) {
       () => policyDenies(policies.docs, "s3:ListBucket", bucketArn), () => policyGrants(policies.docs, "s3:ListBucket", bucketArn)],
     ["s3:GetObject", `${completions}*`, "the Done guard reads completion records",
       () => policyMayDenyUnder(policies.docs, "s3:GetObject", completions), () => policyGrantsUnder(policies.docs, "s3:GetObject", completions)],
+    // TEAM-5941: the Done-intent fence is a conditional PutObject of the record right
+    // before the provider commit, and a denied write REFUSES the Done (fail closed) —
+    // twin code that carries it must not ship onto a role that cannot make the write.
+    ["s3:PutObject", `${completions}*`, "the Done-intent fence writes the completion record before the commit (TEAM-5941); a denied write refuses every Done on a ticket with a record",
+      () => policyMayDenyUnder(policies.docs, "s3:PutObject", completions), () => policyGrantsUnder(policies.docs, "s3:PutObject", completions)],
   ];
   for (const [action, arn, why, denied, granted] of need) {
     if (denied()) {
@@ -194,7 +203,7 @@ export function decideTwin({ fn, optional, expectedBucket, config, policies }) {
     );
     return { action: "block", reasons };
   }
-  return { action: "proceed", reasons: [`role ${config.role} grants unconditioned s3:ListBucket on ${bucketArn} and s3:GetObject over ${completions}*, with no Deny that may apply; ARTIFACT_BUCKET is set`] };
+  return { action: "proceed", reasons: [`role ${config.role} grants unconditioned s3:ListBucket on ${bucketArn}, and s3:GetObject and s3:PutObject over ${completions}*, with no Deny that may apply; ARTIFACT_BUCKET is set`] };
 }
 
 // ── the thin wrapper over the aws CLI ───────────────────────────────────────────

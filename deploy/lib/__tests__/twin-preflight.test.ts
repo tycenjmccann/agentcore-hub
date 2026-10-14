@@ -177,6 +177,27 @@ describe("decideTwin", () => {
     const doc = { Statement: [{ Effect: "Allow", Action: "s3:ListBucket", Resource: BUCKET_ARN }] };
     expect(decideTwin({ ...good, policies: { state: "ok", docs: docs(doc) } }).action).toBe("block");
   });
+  // TEAM-5941: the Done-intent fence writes completions/<ticket>.json before the commit and
+  // REFUSES the Done when the write is denied, so twin code must not ship onto a role
+  // whose policy pre-dates the CompletionRecordFence statement.
+  it("missing completions/* write (a pre-TEAM-5941 policy) → block, naming s3:PutObject and the setup script", () => {
+    const preFence = { ...policyFor("jira"), Statement: policyFor("jira").Statement.filter((s) => s.Sid !== "CompletionRecordFence") };
+    const v = decideTwin({ ...good, policies: { state: "ok", docs: docs(preFence) } });
+    expect(v.action).toBe("block");
+    expect(v.reasons.join(" ")).toMatch(/s3:PutObject covering .*completions\/\*/);
+    expect(v.reasons.join(" ")).toMatch(/Done-intent fence/);
+    expect(v.reasons.join(" ")).toMatch(/setup-tickets-lambda\.mjs/);
+  });
+  it("a PutObject narrowed to completions/twin-* or a Deny on completions/TEAM-* → block", () => {
+    const base = policyFor("jira").Statement.filter((s) => s.Sid !== "CompletionRecordFence");
+    const narrowed = { Statement: [...base, { Effect: "Allow", Action: "s3:PutObject", Resource: `${BUCKET_ARN}/completions/twin-*` }] };
+    expect(decideTwin({ ...good, policies: { state: "ok", docs: docs(narrowed) } }).action).toBe("block");
+    const denied = { Statement: [...policyFor("jira").Statement, { Effect: "Deny", Action: "s3:PutObject", Resource: `${BUCKET_ARN}/completions/TEAM-*` }] };
+    expect(decideTwin({ ...good, policies: { state: "ok", docs: docs(denied) } }).action).toBe("block");
+  });
+  it("the proceed reason names all three grants", () => {
+    expect(decideTwin(good).reasons.join(" ")).toMatch(/s3:GetObject and s3:PutObject over/);
+  });
   it("explicit Deny → block", () => {
     const doc = { Statement: [...policyFor("jira").Statement, { Effect: "Deny", Action: "s3:ListBucket", Resource: BUCKET_ARN }] };
     expect(decideTwin({ ...good, policies: { state: "ok", docs: docs(doc) } }).action).toBe("block");
@@ -207,6 +228,9 @@ describe("decideTwin", () => {
 describe("TEAM-5924: GetObject proven over completions/*, not a probe key", () => {
   const NS = `${BUCKET_ARN}/completions/`;
   const LIST = { Effect: "Allow", Action: "s3:ListBucket", Resource: BUCKET_ARN };
+  // TEAM-5941: the fence write is a third requirement; these GetObject cases carry it so
+  // they keep testing the READ rule alone.
+  const FENCE = { Effect: "Allow", Action: "s3:PutObject", Resource: `${NS}*` };
   const good = {
     fn: "agentcore-hub-jira",
     optional: false,
@@ -218,7 +242,7 @@ describe("TEAM-5924: GetObject proven over completions/*, not a probe key", () =
     ...good,
     policies: { state: "ok", docs: docs({ Statement: [...policyFor("jira").Statement, ...extra] }) },
   });
-  const only = (...Statement: Statement[]) => ({ ...good, policies: { state: "ok", docs: docs({ Statement }) } });
+  const only = (...Statement: Statement[]) => ({ ...good, policies: { state: "ok", docs: docs({ Statement: [FENCE, ...Statement] }) } });
   const helper = <T extends keyof typeof twinPreflight>(name: T) => {
     const fn = twinPreflight[name] as unknown;
     expect(typeof fn, `twin-preflight.mjs exports ${String(name)}`).toBe("function");
@@ -288,10 +312,18 @@ describe("TEAM-5924: GetObject proven over completions/*, not a probe key", () =
     ["s3:GetObject", `${BUCKET_ARN}/config/*`],
     ["s3:GetObject", "arn:aws:s3:::other-bucket/*"],
     ["s3:GetObject", BUCKET_ARN],
-    ["s3:PutObject", `${NS}*`],
+    ["s3:PutObject", `${BUCKET_ARN}/config/*`],
     ["s3:DeleteObject", "*"],
-  ])("a Deny with Action %s on %s cannot touch a completion read → proceed", (Action, Resource) => {
+  ])("a Deny with Action %s on %s cannot touch a completion read or the fence write → proceed", (Action, Resource) => {
     expect(decideTwin(withStatements({ Effect: "Deny", Action, Resource })).action).toBe("proceed");
+  });
+
+  // TEAM-5941: a Deny that may touch the fence WRITE under completions/ blocks too — the
+  // twins refuse every Done on a ticket with a record when that write is denied.
+  it.each([`${NS}*`, `${NS}TEAM-*.json`, `${BUCKET_ARN}/*`])("a Deny with Action s3:PutObject on %s → block", (Resource) => {
+    const v = decideTwin(withStatements({ Effect: "Deny", Action: "s3:PutObject", Resource }));
+    expect(v.action).toBe("block");
+    expect(v.reasons.join(" ")).toMatch(/Deny that may cover s3:PutObject/);
   });
 
   it("coversPrefix: only a pattern matching EVERY key under the prefix covers it", () => {

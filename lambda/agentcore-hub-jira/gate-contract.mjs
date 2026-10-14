@@ -1102,11 +1102,15 @@ export function judgeBriefHold(key, bodyText) {
 export const DONE_OVER_BRIEF_HOLD = "done_over_brief_hold";
 export const DONE_OVER_FOLLOW_UPS_HOLD = "done_over_follow_ups_hold";
 
+// TEAM-5941: since the Done-intent fence below, this fires only when a writer walked
+// around the fence. A re-run of report_completion does NOT close or converge a Done
+// ticket (it answers complete_pending_brief and queues nothing), so it is not advised.
 export const DONE_OVER_BRIEF_HOLD_WARNING =
   "Done committed while a concurrent ticket-provider replay held this ticket's merge brief " +
   "off the Merge Approval gate (the completion record changed after the Done guard read it). " +
-  "The hub does not undo moves: put the merge brief on the gate, or re-run " +
-  "WorkflowOutput___report_completion so the replay converges the record.";
+  "The hub does not undo moves: a human must put the merge brief on the Merge Approval gate " +
+  "before approving; the ticket-provider replay converges the completion record only while " +
+  "its message is still queued.";
 
 export const DONE_OVER_FOLLOW_UPS_HOLD_WARNING =
   "Done committed while a concurrent ticket-provider replay held this ticket open for " +
@@ -1168,6 +1172,121 @@ export function judgePostCommitHold(key, admitted, reread) {
 export function postCommitHoldConflict(verdict) {
   const warnings = { [DONE_OVER_FOLLOW_UPS_HOLD]: DONE_OVER_FOLLOW_UPS_HOLD_WARNING, [DONE_OVER_BRIEF_HOLD]: DONE_OVER_BRIEF_HOLD_WARNING };
   return { conflict: verdict.kinds[0], warning: verdict.kinds.map((k) => warnings[k]).join(" ") };
+}
+
+// ── Done-intent fence (TEAM-5941; TEAM-5799 ship-review r2 F1) ──────────────
+// The post-commit check above DETECTS a hold that landed between the guard's read and
+// the committed Done. This section is what PREVENTS it. Before the provider commit — as
+// the last awaited step — each twin writes `doneIntent` onto the completion record with
+// an S3 IfMatch on the ETag the guard admitted. That conditional write is the fence:
+//   · a hold the replay drain stamped after the guard read moved the ETag, so the PUT
+//     412s; the twin re-reads, re-judges with the SAME judge the guard used
+//     (rejudgeAdmitted) and refuses with the standard hold text, so workflow-output's
+//     isBriefHoldRefusal still answers complete_pending_brief;
+//   · a fence that won moved the ETag under the drain's own IfMatch stamp, which 412s;
+//     the drain re-reads, sees a FRESH intent on a ticket that is not Done yet, and
+//     backs off (retry, no stamp, no notice) until the ticket reads Done or the intent
+//     goes stale (lambda/workflow-output/index.mjs doneIntentFresh, which mirrors
+//     doneIntentOf below — the two cannot share a file; the parity test pins the TTL).
+// Exactly one side wins every interleaving, because both write the same key with CAS.
+//
+// The fence is written only onto a record that EXISTS: no record ⇒ no hold can appear
+// (every creator of completions/<id>.json writes a hold-free first record), and an
+// intent-only record would read to completionRecordProven as an existing record on a
+// ship ticket. A fence write the role may not make (AccessDenied), or any other write
+// error, REFUSES: it is deploy config (deploy/lib/tickets-lambda-config.mjs grants the
+// prefix-scoped s3:PutObject; deploy/lib/twin-preflight.mjs refuses to ship twin code
+// onto a role without it), and "could not fence" is not "no hold" — the same positive-
+// evidence band as the hold reads above. No text here contains
+// `has briefPending:true (brief `, so a fence refusal is a retry to workflow-output.
+//
+// Lifecycle: WRITTEN by the twin before its commit; CARRIED by every record writer
+// (workflow-output adoptHold, the drain's spreads, the hub route's refill); CLEARED
+// best-effort by the twin when its commit fails; otherwise it STAYS on the record (an
+// audit of when the Done was fenced) and simply goes stale after DONE_INTENT_TTL_MS,
+// at which point the drain strips it on its next stamp. Nothing reads it after a Done.
+export const DONE_INTENT_TTL_MS = 10 * 60_000;
+export const DONE_INTENT_FENCE_ATTEMPTS = 3;
+
+/**
+ * The record's `doneIntent`, judged now. `fresh` only for a plain object whose `at`
+ * parses and is younger than DONE_INTENT_TTL_MS (a future `at` — clock skew — is
+ * fresh). An unparseable `at` is present but stale: the twin that wrote it is gone.
+ *
+ * @returns {{present: boolean, fresh: boolean, intent: object|null}}
+ */
+export function doneIntentOf(record, now = Date.now()) {
+  const intent = record && typeof record === "object" && !Array.isArray(record) ? record.doneIntent : undefined;
+  if (!intent || typeof intent !== "object" || Array.isArray(intent)) return { present: false, fresh: false, intent: null };
+  const at = Date.parse(intent.at);
+  return { present: true, fresh: Number.isFinite(at) && now - at < DONE_INTENT_TTL_MS, intent };
+}
+
+/** A copy of `record` carrying the intent. `provider` is "jira" | "dynamodb". Never mutates. */
+export function withDoneIntent(record, { provider, at, nonce }) {
+  return { ...record, doneIntent: { at, provider, nonce } };
+}
+
+/** A copy of `record` without the intent. Never mutates. */
+export function withoutDoneIntent(record) {
+  const { doneIntent: _dropped, ...rest } = record;
+  return rest;
+}
+
+/**
+ * What an S3 PutObject refusal means. S3 answers an IfMatch write on a MISSING key with
+ * 404 (not 412), so "gone" is its own outcome. The twins cannot import workflow-output's
+ * classifiers (zip manifest), hence this copy.
+ *
+ * @returns {"precondition"|"conflict"|"gone"|"other"}
+ */
+export function classifyS3WriteError(err) {
+  const status = err?.$metadata?.httpStatusCode;
+  const name = String(err?.name || "");
+  if (name === "PreconditionFailed" || status === 412) return "precondition";
+  if (name === "ConditionalRequestConflict" || status === 409) return "conflict";
+  if (name === "NoSuchKey" || name === "NotFound" || status === 404) return "gone";
+  return "other";
+}
+
+/**
+ * Re-judge a re-read record body with the SAME judge the Done guard used on the body it
+ * admitted: completionRecordProven's (`admitted.recordGated`, with its securityReview
+ * opt) or judgeBriefHold. null admits. A refusal carries the guard's own `why` text —
+ * byte-identical to what the guard would have said had it read this body — and the
+ * `what` phrase the twins put in front of it.
+ *
+ * @returns {{why: string, what: string, unknown: boolean} | null}
+ */
+export function rejudgeAdmitted(key, bodyText, admitted = {}) {
+  if (admitted.recordGated) {
+    const securityReview = admitted.securityReview === true;
+    const proof = judgeCompletionRecord(key, bodyText, { securityReview });
+    return proof.proven ? null : { why: proof.why, what: securityReview ? "a security-review ticket" : "a ship-phase ticket", unknown: false };
+  }
+  const hold = judgeBriefHold(key, bodyText);
+  if (!hold) return null;
+  const unknown = hold.unknown === true;
+  return { why: hold.why, what: unknown ? "a ticket whose merge-brief hold cannot be read" : "a ticket whose merge brief is held", unknown };
+}
+
+/** The `what` phrase for a Done the fence could not place. */
+export const DONE_UNFENCED_WHAT = "a ticket whose Done could not be fenced on its completion record";
+
+/** The fence lost DONE_INTENT_FENCE_ATTEMPTS conditional writes to other writers of the record. */
+export function doneIntentContendedRefusal(key, attempts) {
+  return (
+    `${key} changed under ${attempts} conditional writes while fencing the Done on it — ` +
+    `another writer owns the record right now; retry the transition`
+  );
+}
+
+/** The fence write itself failed for a reason that is not a lost race (AccessDenied, 5xx, timeout). */
+export function doneIntentUnfencedRefusal(key, cause) {
+  return (
+    `could not fence the Done on ${key} (${cause}) — whether a merge-brief or follow-ups hold is ` +
+    `on it is UNKNOWN; retry the transition, or re-run WorkflowOutput___report_completion with the same arguments`
+  );
 }
 
 // ── Terminal status (TEAM-5421; TEAM-5396 F2 / TEAM-5413) ───────────────────

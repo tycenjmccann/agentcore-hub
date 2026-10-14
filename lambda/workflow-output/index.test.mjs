@@ -390,7 +390,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord, doneIntentFresh, DONE_INTENT_TTL_MS } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -1662,6 +1662,35 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(adoptHold({ ...fresh(), briefPending: false, briefDelivered: "gate" }, { briefPending: true, briefDelivered: "off_gate" }, { deliveredNow: true, forceHold: true }).briefPending).toBe(true);
     // …except a delivery to the gate newer than the refusal
     expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "gate" }, { forceHold: true }).briefPending).toBe(false);
+  });
+
+  it("TEAM-5941: adoptHold carries the twins' doneIntent verbatim — hold or no hold, delivered or not — and drops a copy the current record no longer has", () => {
+    const fresh = () => ({ ticket_id: "T", status: "complete" });
+    const intent = { at: "2026-10-14T12:00:00.000Z", provider: "jira", nonce: "0f8fad5b-d9cb-469f-a165-70867728950e" };
+    expect(adoptHold(fresh(), { status: "complete", doneIntent: intent }).doneIntent).toEqual(intent);
+    expect(adoptHold(fresh(), { briefPending: true, briefDelivered: "off_gate", doneIntent: intent }).doneIntent).toEqual(intent);
+    // deliveredNow skips the hold-field adoption; the intent is NOT a hold field and still rides along
+    expect(adoptHold({ ...fresh(), briefPending: false, briefDelivered: "gate" }, { briefPending: true, doneIntent: intent }, { deliveredNow: true })).toMatchObject({ briefPending: false, doneIntent: intent });
+    expect(adoptHold(fresh(), { status: "complete", doneIntent: intent }, { forceHold: true })).toMatchObject({ briefPending: true, doneIntent: intent });
+    // a stale copy on `report` goes when the current record carries none
+    expect(adoptHold({ ...fresh(), doneIntent: intent }, { status: "complete" }).doneIntent).toBeUndefined();
+    expect(adoptHold({ ...fresh(), doneIntent: intent }, null).doneIntent).toBeUndefined();
+    expect(adoptHold(fresh(), { status: "complete" }).doneIntent).toBeUndefined();
+  });
+
+  it("TEAM-5941: doneIntentFresh mirrors gate-contract's doneIntentOf — fresh under the 10-minute TTL, stale at or past it, absent/unparseable never fresh", () => {
+    const NOW = Date.parse("2026-10-14T12:00:00.000Z");
+    const at = (msAgo) => new Date(NOW - msAgo).toISOString();
+    expect(DONE_INTENT_TTL_MS).toBe(10 * 60_000);
+    expect(doneIntentFresh({ doneIntent: { at: at(1000) } }, NOW)).toBe(true);
+    expect(doneIntentFresh({ doneIntent: { at: at(DONE_INTENT_TTL_MS - 1) } }, NOW)).toBe(true);
+    expect(doneIntentFresh({ doneIntent: { at: at(-60_000) } }, NOW)).toBe(true); // clock skew: a future `at`
+    expect(doneIntentFresh({ doneIntent: { at: at(DONE_INTENT_TTL_MS) } }, NOW)).toBe(false);
+    expect(doneIntentFresh({ doneIntent: { at: "yesterday" } }, NOW)).toBe(false);
+    expect(doneIntentFresh({ doneIntent: {} }, NOW)).toBe(false);
+    expect(doneIntentFresh({ doneIntent: "soon" }, NOW)).toBe(false);
+    expect(doneIntentFresh({}, NOW)).toBe(false);
+    expect(doneIntentFresh(null, NOW)).toBe(false);
   });
 
   it("TEAM-5866 (1): a body stream that fails after S3 answered is an UNREADABLE record - refused, no IfMatch write over the hold, no Done", async () => {
@@ -3827,6 +3856,32 @@ describe("report_completion — FR-10 empty_sweep", () => {
     for (const p of h.puts.filter((p) => p.Key?.startsWith("completions/") && p.Key !== "completions/TEAM-4640.json")) {
       expect(p.IfNoneMatch, p.Key).toBe("*");
     }
+  });
+
+  it("TEAM-5941: a sibling whose record carries a FRESH doneIntent (a twin is committing its Done) is NOT skipped - no overwrite, no transition, reported in emptySweepFailed; a STALE one is skipped as before", async () => {
+    const FENCED = "completions/TEAM-4645.json";
+    const fenced = JSON.stringify({ ticket_id: "TEAM-4645", status: "complete", doneIntent: { at: new Date().toISOString(), provider: "dynamodb", nonce: "n1" } });
+    h.objects.set(FENCED, fenced);
+    h.etags.set(FENCED, '"fenced-4645"');
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    expect(h.puts.filter((p) => p.Key === FENCED)).toHaveLength(0);
+    expect(calls("Tickets___transition_ticket").map((p) => p.ticket_id)).not.toContain("TEAM-4645");
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4644", "TEAM-4643"]);
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4645", reason: expect.stringMatching(/has a Done in flight \(doneIntent .*\) - not skipped; it closes on its own/) }]);
+    expect(h.objects.get(FENCED)).toBe(fenced);
+
+    // Stale: the twin that wrote it is gone; the skip overwrites it (IfMatch), as any record.
+    h.puts.length = 0;
+    const stale = JSON.stringify({ ticket_id: "TEAM-4645", status: "complete", doneIntent: { at: new Date(Date.now() - DONE_INTENT_TTL_MS - 1).toISOString(), provider: "dynamodb", nonce: "n1" } });
+    h.objects.set(FENCED, stale);
+    h.etags.set(FENCED, '"stale-4645"');
+    const res2 = result(await sweep());
+    expect(res2.emptySweepSkipped).toContain("TEAM-4645");
+    expect(res2).not.toHaveProperty("emptySweepFailed");
+    const put = h.puts.find((p) => p.Key === FENCED);
+    expect(put.IfMatch).toBe('"stale-4645"');
+    expect(JSON.parse(h.objects.get(FENCED)).doneIntent).toBeUndefined();
   });
 
   it.each(["null", "[]", '"string"', "42"])("TEAM-5925: a sibling whose record parses to a non-object (%s) is NOT skipped - no overwrite, no transition, reported in emptySweepFailed", async (body) => {

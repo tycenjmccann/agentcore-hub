@@ -105,12 +105,33 @@ describe("buildTicketsPolicyStatements — the S3 grants (TEAM-5867 P0)", () => 
     }
   });
 
-  it("ListBucket is the only non-GetObject S3 action - still no s3:PutObject / s3:Delete* anywhere", () => {
+  it("the S3 actions are exactly GetObject, ListBucket and the TEAM-5941 fence PutObject - no s3:Delete*, no other write", () => {
     for (const provider of ["dynamodb", "jira"] as const) {
       const s3Actions = s3Statements(statements(provider)).flatMap(actionsOf).sort();
-      expect(s3Actions).toEqual(["s3:GetObject", "s3:ListBucket"]);
+      expect(s3Actions).toEqual(["s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
     }
   });
+
+  // TEAM-5941: the Done-intent fence is a conditional PutObject of completions/<ticket>.json
+  // right before the provider commit, and a denied write REFUSES the Done (fail closed).
+  it.each(["dynamodb", "jira"] as const)(
+    "%s: the fence PutObject is one unconditioned statement scoped to completions/* and nothing wider",
+    (provider) => {
+      const list = statements(provider).filter((s) => actionsOf(s).includes("s3:PutObject"));
+      expect(list).toHaveLength(1);
+      const { Sid, ...rest } = list[0];
+      expect(Sid).toBe("CompletionRecordFence");
+      expect(rest).toEqual({
+        Effect: "Allow",
+        Action: ["s3:PutObject"],
+        Resource: `${BUCKET_ARN}/completions/*`,
+      });
+      // ArtifactRead is NOT widened to carry the write: the read stays bucket-wide, the
+      // write stays prefix-scoped.
+      const read = statements(provider).find((s) => s.Sid === "ArtifactRead");
+      expect(actionsOf(read!)).toEqual(["s3:GetObject"]);
+    }
+  );
 
   it("is additive: every non-S3 statement is what the script wrote before", () => {
     const ddb = statements("dynamodb", {
@@ -155,6 +176,7 @@ describe("buildTicketsPolicyStatements — the S3 grants (TEAM-5867 P0)", () => 
       "logs:CreateLogGroup",
       "ArtifactRead",
       "ArtifactBucketList",
+      "CompletionRecordFence", // TEAM-5941
     ]);
   });
 
