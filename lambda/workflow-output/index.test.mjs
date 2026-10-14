@@ -1670,6 +1670,18 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "gate" }, { forceHold: true }).briefPending).toBe(false);
   });
 
+  it("TEAM-5995 T4: adoptHold — a hold released with no gate needed (briefDisposition) counts as delivered: a refusal does not re-force it, and it is carried", () => {
+    const fresh = () => ({ ticket_id: "T", status: "complete" });
+    const released = { briefPending: false, briefDelivered: "off_gate", briefDisposition: { release: true, kind: "gate_settled", at: "2026-10-14T00:00:00.000Z", by: "drain" } };
+    expect(adoptHold(fresh(), released, { forceHold: true }).briefPending).toBe(false);
+    expect(adoptHold(fresh(), released)).toMatchObject({ briefPending: false, briefDisposition: released.briefDisposition });
+    // anything short of a recorded release is still forced
+    expect(adoptHold(fresh(), { ...released, briefDisposition: { release: false } }, { forceHold: true }).briefPending).toBe(true);
+    expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "off_gate" }, { forceHold: true }).briefPending).toBe(true);
+    // a stale disposition on `report` goes when the current record's hold has none
+    expect(adoptHold({ ...fresh(), briefDisposition: released.briefDisposition }, { briefPending: true, briefDelivered: "off_gate" }).briefDisposition).toBeUndefined();
+  });
+
   it("TEAM-5941: adoptHold carries the twins' doneIntent verbatim — hold or no hold, delivered or not — and drops a copy the current record no longer has", () => {
     const fresh = () => ({ ticket_id: "T", status: "complete" });
     const intent = { at: "2026-10-14T12:00:00.000Z", provider: "jira", nonce: "0f8fad5b-d9cb-469f-a165-70867728950e" };
@@ -4915,5 +4927,43 @@ describe("TEAM-6057 — clearUndeliveredBriefTargets", () => {
     expect(clearUndeliveredBriefTargets(rec)).toBe(rec);
     expect(rec).toEqual({ briefPending: true, briefDelivered: "undelivered", undelivered: [{ part: "brief", s3Key: "b.md" }] });
     expect(clearUndeliveredBriefTargets({ briefDelivered: "undelivered" })).toEqual({ briefDelivered: "undelivered" });
+  });
+});
+
+describe("TEAM-6097 — clearBriefHoldOnRelease / clearBriefHoldOnGate", () => {
+  const OTHER = { part: "residual_findings", ticketId: "TEAM-5603", reason: "Jira API 400: ticket is archived" };
+  const held = () => ({
+    briefPending: true, briefDelivered: "off_gate", briefTargets: ["T", "E"], briefFallbackReason: "2 open Merge Approval gates",
+    undelivered: [{ part: "brief", s3Key: "b.md" }, OTHER],
+  });
+  const DISPOSITION = { release: true, kind: "gate_settled", why: "every gate Done", at: "2026-10-14T00:00:00.000Z", by: "drain" };
+
+  it("release: hold false, disposition set, brief entry and briefFallbackReason pruned, other undelivered parts kept", async () => {
+    const { clearBriefHoldOnRelease } = await import("./index.mjs");
+    const rec = held();
+    expect(clearBriefHoldOnRelease(rec, DISPOSITION)).toBe(rec);
+    expect(rec.briefPending).toBe(false);
+    expect(rec.briefDisposition).toEqual(DISPOSITION);
+    expect(rec.briefFallbackReason).toBeUndefined();
+    expect(rec.undelivered).toEqual([OTHER]);
+    // A brief-only undelivered list goes entirely.
+    const only = clearBriefHoldOnRelease({ ...held(), undelivered: [{ part: "brief" }] }, DISPOSITION);
+    expect(only.undelivered).toBeUndefined();
+  });
+
+  it("gate delivery supersedes a release: clearBriefHoldOnGate deletes briefDisposition", async () => {
+    const { clearBriefHoldOnGate, clearBriefHoldOnRelease } = await import("./index.mjs");
+    const rec = clearBriefHoldOnRelease(held(), DISPOSITION);
+    Object.assign(rec, { briefDelivered: "gate", briefTargets: ["G"] });
+    clearBriefHoldOnGate(rec);
+    expect(rec.briefDisposition).toBeUndefined();
+    expect(rec.briefPending).toBe(false);
+    expect(rec.undelivered).toEqual([OTHER]);
+  });
+
+  it("an undelivered brief cannot claim a release: clearUndeliveredBriefTargets deletes briefDisposition", async () => {
+    const { clearUndeliveredBriefTargets } = await import("./index.mjs");
+    const rec = { briefDelivered: "undelivered", briefDisposition: DISPOSITION };
+    expect(clearUndeliveredBriefTargets(rec).briefDisposition).toBeUndefined();
   });
 });

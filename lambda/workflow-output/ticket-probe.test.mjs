@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import fixture from "./__fixtures__/db9sx9-provider-503.json";
+import workflowsConfig from "../../src/config/workflows.json";
 import { fake, resetFake, seedTicket, expireVisibility, PROVIDER_503, SUSPENDED_BODY, awsError } from "./__fixtures__/ticket-fakes.mjs";
 
 /**
@@ -16,7 +17,7 @@ import { fake, resetFake, seedTicket, expireVisibility, PROVIDER_503, SUSPENDED_
  */
 
 const FAKES = "./__fixtures__/ticket-fakes.mjs";
-const h = vi.hoisted(() => ({ workflow: null, ddbUpdates: [], fetches: [], fetchStatus: 200 }));
+const h = vi.hoisted(() => ({ workflow: null, ddbUpdates: [], fetches: [], fetchStatus: 200, workflowRow: null, workflowRowError: null }));
 
 vi.mock("@aws-sdk/client-s3", async () => (await import(FAKES)).s3Module());
 vi.mock("@aws-sdk/client-lambda", async () => (await import(FAKES)).lambdaModule());
@@ -52,6 +53,11 @@ vi.mock("@aws-sdk/lib-dynamodb", async () => {
         send: async (c) => {
           const name = c.constructor.name;
           if (name === "GetCommand") {
+            // TEAM-5995: workflow-output's GetItem on the run row (workflowDefId, repoConfig).
+            if (c.input.TableName === "agentcore-hub-workflows" && c.input.Key?.workflowId !== undefined) {
+              if (h.workflowRowError) throw h.workflowRowError;
+              return { Item: h.workflowRow?.workflowId === c.input.Key.workflowId ? h.workflowRow : undefined };
+            }
             const t = f.tickets.get(c.input.Key?.ticketId);
             return { Item: t ? ddbRow(t) : undefined };
           }
@@ -91,7 +97,7 @@ vi.stubGlobal("fetch", async (url, init) => {
 const QUEUE_URL = "https://sqs.us-east-1.amazonaws.com/000000000000/agentcore-hub-ticket-replay.fifo";
 Object.assign(process.env, {
   ARTIFACT_BUCKET: "test-bucket", TICKET_PROVIDER: "jira", TICKET_REPLAY_QUEUE_URL: QUEUE_URL,
-  FOLLOW_UP_CLAIM_WAIT_MS: "1", CLAIM_RETRY_WAIT_MS: "1", EVENTS_TABLE: "agentcore-hub-events",
+  FOLLOW_UP_CLAIM_WAIT_MS: "1", CLAIM_RETRY_WAIT_MS: "1", EVENTS_TABLE: "agentcore-hub-events", WORKFLOWS_TABLE: "agentcore-hub-workflows",
   JIRA_SITE_URL: "example.atlassian.net", JIRA_EMAIL: "bot@example.com", JIRA_API_TOKEN: "t0ken",
 });
 const probe = await import("./ticket-probe.mjs");
@@ -110,6 +116,20 @@ const result = (res) => JSON.parse(res.content[0].text);
 const record = () => JSON.parse(fake.objects.get(`completions/${BUILD}.json`));
 const tools = (name) => fake.calls.filter((c) => c.tool === name);
 const eventsOf = (type, ticketId) => fake.events.filter((e) => e.type === type && (!ticketId || e.detail?.ticketId === ticketId));
+/**
+ * A hold the drain stamps because the gate cannot be NAMED: two open Merge Approval
+ * gates and neither blocked by the ticket (the "two open gates" row below). TEAM-5995:
+ * a Done gate is no longer a hold (every gate Done releases it, gate_settled), so the
+ * tests that need a hold arrange this instead; gateIdentifiable() undoes it.
+ */
+const gateUnidentifiable = () => {
+  fake.tickets.get(GATE).blockedBy = [];
+  seedTicket({ ticketId: "TEAM-5604", title: "Merge Approval: db9sx9 (hotfix)", status: "To Do", assignee: "human:approver", parentKey: "TEAM-5600" });
+};
+const gateIdentifiable = () => {
+  fake.tickets.delete("TEAM-5604");
+  fake.tickets.get(GATE).blockedBy = [BUILD];
+};
 
 /** One EventBridge tick, then every webhook Jira fired during it, delivered to the orchestrator. */
 async function tick(event = { source: "ticket-provider-probe" }) {
@@ -129,6 +149,8 @@ beforeEach(async () => {
   };
   h.ddbUpdates.length = 0;
   h.fetches.length = 0;
+  h.workflowRow = null;
+  h.workflowRowError = null;
   // The outage: report_completion queues the operator's writes.
   fake.down = true;
   const res = result(await output.handler({ tool_name: call0.tool_name, arguments: call0.arguments }));
@@ -287,7 +309,7 @@ describe("TEAM-5592 — drain order and idempotency", () => {
       fake.tickets.get(GATE).blockedBy = [];
       seedTicket({ ticketId: "TEAM-5604", title: "Merge Approval: db9sx9 (hotfix)", status: "To Do", assignee: "human:approver", parentKey: "TEAM-5600" });
     }, "off_gate", /2 open Merge Approval gates \(TEAM-5602, TEAM-5604\)/],
-    ["no open gate", () => { fake.tickets.get(GATE).status = "Done"; }, "off_gate", /no open Merge Approval gate/],
+    ["no human gate, and whether the run owes one is unknown (TEAM-5995: fail closed)", () => { fake.tickets.get(GATE).assignee = "agentcore_hub_operator"; }, "off_gate", /no Merge Approval gate exists under TEAM-5600 but whether this run owes one could not be determined/],
     ["the gate write Jira refuses permanently (400)", () => {
       fake.failTool = { Tickets___update_ticket: "Jira API 400: description is too long" };
     }, "off_gate", /the gate TEAM-5602 refused it \(update_ticket TEAM-5602: Jira API 400/],
@@ -357,7 +379,7 @@ describe("TEAM-5592 — drain order and idempotency", () => {
   });
 
   it("a follow-up refused AND a brief off the gate ⇒ one follow_ups+brief hold, and the guard still refuses Done", async () => {
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable();
     fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
     const t = await tick();
     expect(t.out.drained).toMatchObject({ dropped: 1 });
@@ -368,7 +390,7 @@ describe("TEAM-5592 — drain order and idempotency", () => {
   });
 
   it("a re-run report_completion after a brief hold keeps briefPending on the record", async () => {
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable();
     await tick();
     expect(record()).toMatchObject({ briefPending: true, briefDelivered: "off_gate" });
     await output.handler({ tool_name: call0.tool_name, arguments: call0.arguments });
@@ -378,25 +400,25 @@ describe("TEAM-5592 — drain order and idempotency", () => {
   // TEAM-5805: the re-run is the clearing path. It re-delivers the brief through the
   // drain's own postQueuedBrief; only a brief on the gate lets the Done through.
   it("re-run with the gate still not identifiable ⇒ complete_pending_brief, no Done attempted, no throw", async () => {
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable();
     await tick();
     fake.calls.length = 0;
     const res = result(await output.handler({ tool_name: call0.tool_name, arguments: call0.arguments }));
     expect(res).toMatchObject({ status: "complete_pending_brief", next_action: "retry_report_completion" });
     expect(res.message).toContain("merge brief is not on the Merge Approval gate");
-    expect(res.message).toContain("no open Merge Approval gate");
+    expect(res.message).toMatch(/2 open Merge Approval gates/);
     expect(tools("Tickets___transition_ticket")).toHaveLength(0);
     expect(fake.queue).toHaveLength(0);
     expect(fake.tickets.get(BUILD).status).toBe("In Progress");
-    expect(record()).toMatchObject({ status: "complete_pending_brief", followUpsPending: false, briefPending: true, briefHoldReason: expect.stringMatching(/^off_gate: no open Merge Approval gate/) });
+    expect(record()).toMatchObject({ status: "complete_pending_brief", followUpsPending: false, briefPending: true, briefHoldReason: expect.stringMatching(/^off_gate: 2 open Merge Approval gates/) });
     // The off-gate fallback comments are marker-deduped: the re-run posted none again.
     for (const id of [BUILD, "TEAM-5600"]) expect(briefComments(id)).toHaveLength(1);
   });
 
   it("re-run once the gate is open again ⇒ brief on the gate, briefPending:false, ticket Done", async () => {
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable();
     await tick();
-    fake.tickets.get(GATE).status = "To Do";
+    gateIdentifiable();
     fake.calls.length = 0;
     const res = result(await output.handler({ tool_name: call0.tool_name, arguments: call0.arguments }));
     expect(res).toMatchObject({ status: "complete" });
@@ -412,9 +434,9 @@ describe("TEAM-5592 — drain order and idempotency", () => {
   });
 
   it("re-run after a human put the brief on the gate by hand ⇒ already_posted clears the hold, nothing posted twice", async () => {
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable();
     await tick();
-    fake.tickets.get(GATE).status = "To Do";
+    gateIdentifiable();
     fake.tickets.get(GATE).comments.push(`Pasted by hand\n\n${fixture.mergeBrief.body.trim()}`);
     fake.calls.length = 0;
     const res = result(await output.handler({ tool_name: call0.tool_name, arguments: call0.arguments }));
@@ -427,10 +449,10 @@ describe("TEAM-5592 — drain order and idempotency", () => {
 
   it("the drain clears a hold once a later message lands the brief on the gate (step 6), then Done", async () => {
     const body = fake.queue[0].Body;
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable();
     await tick();
     expect(record()).toMatchObject({ briefPending: true });
-    fake.tickets.get(GATE).status = "To Do";
+    gateIdentifiable();
     fake.queue.push({ MessageId: "redelivered", Body: body, group: "wf_db9sx9", inFlight: null, receives: 0 });
     const t = await tick();
     expect(t.out.drained).toMatchObject({ applied: 1, dropped: 0 });
@@ -442,14 +464,14 @@ describe("TEAM-5592 — drain order and idempotency", () => {
   // gate that entry is stale and comes off, while any other undelivered part stays.
   const RESIDUAL = { part: "residual_findings", ticketId: "TEAM-5603", reason: "Jira API 400: ticket is archived" };
   const holdBrief = async ({ withResidual = false } = {}) => {
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable(); // TEAM-6097: a Done gate is a release now (TEAM-5995), not a hold
     await tick();
     expect(record()).toMatchObject({ briefPending: true, undelivered: [expect.objectContaining({ part: "brief" })] });
     if (withResidual) {
       fake.objects.set(`completions/${BUILD}.json`, JSON.stringify({ ...record(), undelivered: [...record().undelivered, RESIDUAL] }));
       fake.etags.set(`completions/${BUILD}.json`, `"e${++fake.etagSeq}"`);
     }
-    fake.tickets.get(GATE).status = "To Do";
+    gateIdentifiable();
   };
 
   it("TEAM-6024 re-run delivers the held brief to the gate ⇒ the stale brief entry is gone from undelivered", async () => {
@@ -489,7 +511,7 @@ describe("TEAM-5592 — drain order and idempotency", () => {
   // stale with the brief entry, and a record reading briefDelivered:"gate" must not keep it.
   it("TEAM-6042 re-run delivers the held brief to the gate ⇒ the off-gate briefFallbackReason is gone", async () => {
     await holdBrief();
-    expect(record().briefFallbackReason).toEqual(expect.stringMatching(/no open Merge Approval gate/));
+    expect(record().briefFallbackReason).toEqual(expect.stringMatching(/2 open Merge Approval gates/));
     const res = result(await output.handler({ tool_name: call0.tool_name, arguments: call0.arguments }));
     expect(res.status).toBe("complete");
     expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE] });
@@ -499,7 +521,7 @@ describe("TEAM-5592 — drain order and idempotency", () => {
   it("TEAM-6042 drain step 6 lands the held brief on the gate ⇒ the off-gate briefFallbackReason is gone", async () => {
     const body = fake.queue[0].Body;
     await holdBrief();
-    expect(record().briefFallbackReason).toEqual(expect.stringMatching(/no open Merge Approval gate/));
+    expect(record().briefFallbackReason).toEqual(expect.stringMatching(/2 open Merge Approval gates/));
     fake.queue.push({ MessageId: "redelivered", Body: body, group: "wf_db9sx9", inFlight: null, receives: 0 });
     expect((await tick()).out.drained).toMatchObject({ applied: 1, dropped: 0 });
     expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE], ticketWrites: "applied" });
@@ -541,13 +563,13 @@ describe("TEAM-5592 — drain order and idempotency", () => {
   it("TEAM-6052 a redelivered drain lands the held brief on the gate while a follow-up still cannot be filed ⇒ briefPending:false, briefFallbackReason and the brief entry gone", async () => {
     const body = fake.queue[0].Body;
     fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable(); // TEAM-6097: a Done gate is a release now (TEAM-5995), not a hold
     await tick();
     expect(record()).toMatchObject({
-      followUpsPending: true, briefPending: true, briefFallbackReason: expect.stringMatching(/no open Merge Approval gate/),
+      followUpsPending: true, briefPending: true, briefFallbackReason: expect.stringMatching(/2 open Merge Approval gates/),
       undelivered: [expect.objectContaining({ part: "brief" })], replayDropped: { step: "follow_ups+brief" },
     });
-    fake.tickets.get(GATE).status = "To Do";
+    gateIdentifiable();
     fake.queue.push({ MessageId: "redelivered", Body: body, group: "wf_db9sx9", inFlight: null, receives: 0 });
     expect((await tick()).out.drained).toMatchObject({ applied: 0, dropped: 1 });
     expect(record()).toMatchObject({ followUpsPending: true, briefPending: false, briefDelivered: "gate", briefTargets: [GATE], ticketWrites: "dropped", replayDropped: { step: "follow_ups" } });
@@ -590,7 +612,7 @@ describe("TEAM-5592 — drain order and idempotency", () => {
   });
 
   it("a fallback brief is not posted twice when the message comes back (marker dedup)", async () => {
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable();
     fake.failTool = { Tickets___add_comment: (p) => (p.comment.startsWith("[replay-dropped:") ? PROVIDER_503 : null) };
     const t1 = await tick();
     expect(t1.out.drained).toMatchObject({ dropped: 0, retried: 1 });
@@ -766,7 +788,7 @@ describe("TEAM-5830 — briefPending survives concurrent writers", () => {
     fake.objects.set(KEY, JSON.stringify({ ...JSON.parse(fake.objects.get(KEY)), ...fields }));
     fake.etags.set(KEY, `"e${++fake.etagSeq}"`);
   };
-  const HOLD = { briefPending: true, briefDelivered: "off_gate", briefHoldReason: "off_gate: no open Merge Approval gate under TEAM-5600" };
+  const HOLD = { briefPending: true, briefDelivered: "off_gate", briefHoldReason: "off_gate: 2 open Merge Approval gates (TEAM-5602, TEAM-5604) and none is blocked by TEAM-5601" };
   const REFUSAL = `Cannot move ${BUILD} to Done: a ticket whose merge brief is held needs its completion record first — call WorkflowOutput___report_completion(ticket_id=…) (${KEY} has briefPending:true (brief off_gate) — the merge brief has not reached the Merge Approval gate; …)`;
   /** Calls `fn` once, on the first completion-record PUT made from now on. */
   const onFirstRecordPut = (fn) => {
@@ -813,10 +835,10 @@ describe("TEAM-5830 — briefPending survives concurrent writers", () => {
   });
 
   it("3. a stale re-run does not overwrite the drain's clear: briefPending:false stands and the ticket goes Done", async () => {
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable();
     await tick();
     expect(record()).toMatchObject({ briefPending: true });
-    // The re-run still sees no open gate (hold stands for it) — but before its write
+    // The re-run still cannot name a gate (hold stands for it) — but before its write
     // lands, a drain put the brief on the reopened gate and cleared the hold.
     onFirstRecordPut(() => stamp({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE] }));
     const res = await rerun();
@@ -827,10 +849,10 @@ describe("TEAM-5830 — briefPending survives concurrent writers", () => {
 
   it("4. the drain's step-6 write is conditional: a record that moved since step 0 is a retry, not an overwrite", async () => {
     const body = fake.queue[0].Body;
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable();
     await tick();
     expect(record()).toMatchObject({ briefPending: true });
-    fake.tickets.get(GATE).status = "To Do";
+    gateIdentifiable();
     fake.queue.push({ MessageId: "redelivered", Body: body, group: "wf_db9sx9", inFlight: null, receives: 0 });
     // A re-run's write lands while the drain is posting the brief to the gate.
     let moved = false;
@@ -871,10 +893,10 @@ describe("TEAM-5830 — briefPending survives concurrent writers", () => {
 
   it("9. concurrent drain + re-run on a held brief: both may post, the hold ends cleared, Done once, and two copies still dedupe", async () => {
     const body = fake.queue[0].Body;
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable();
     await tick();
     expect(record()).toMatchObject({ briefPending: true });
-    fake.tickets.get(GATE).status = "To Do";
+    gateIdentifiable();
     fake.queue.push({ MessageId: "redelivered", Body: body, group: "wf_db9sx9", inFlight: null, receives: 0 });
     fake.calls.length = 0;
     // Barrier: both actors read the gate before either posts.
@@ -922,10 +944,10 @@ describe("TEAM-5830 — briefPending survives concurrent writers", () => {
   // rewrite must keep THAT hold whole — with its brief s3Key — not force `true` over the
   // re-run's own gate fields, which left a hold no later re-run could find the brief for.
   it("TEAM-6042 a brief-hold refusal after the re-run delivered: the record keeps the drain's hold WITH its brief key, and converges", async () => {
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable(); // TEAM-6097: a Done gate is a release now (TEAM-5995), not a hold
     await tick();
     expect(record()).toMatchObject({ briefPending: true, undelivered: [expect.objectContaining({ part: "brief" })] });
-    fake.tickets.get(GATE).status = "To Do";
+    gateIdentifiable();
     const DRAIN_HOLD = {
       briefPending: true, briefDelivered: "off_gate", briefTargets: [BUILD, "TEAM-5600"], briefFallbackReason: "no open Merge Approval gate under TEAM-5600",
       undelivered: [{ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: "not on the gate: no open Merge Approval gate under TEAM-5600", postedOn: [BUILD, "TEAM-5600"] }],
@@ -959,7 +981,7 @@ describe("TEAM-5830 — briefPending survives concurrent writers", () => {
     const dropNotices = () => fake.tickets.get(BUILD).comments.filter((c) => c.startsWith(`[replay-dropped:${BUILD}:brief]`));
     // No open gate ⇒ the brief is off_gate and the drain holds the Done (as :290) — but
     // every PUT of the record 409s until conditionalPut gives up (CLAIM_CONFLICT_ATTEMPTS).
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable();
     fake.putError = (input) => (input.Key === KEY ? awsError("ConditionalRequestConflict", 409, "conflict") : null);
     const putsBefore = fake.puts.length;
     const t = await tick();
@@ -993,10 +1015,10 @@ describe("TEAM-5830 — briefPending survives concurrent writers", () => {
   // Done on a hold no writer stamped. forceHold correctly resurrects nothing (the record it
   // conditions on is this call's own delivery), so the status must not claim a hold either.
   it("TEAM-6056: a brief-hold refusal with no concurrent writer - the status follows the WRITTEN hold, no stale hold resurrected", async () => {
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable(); // TEAM-6097: a Done gate is a release now (TEAM-5995), not a hold
     await tick();
     expect(record()).toMatchObject({ briefPending: true });
-    fake.tickets.get(GATE).status = "To Do";
+    gateIdentifiable();
     fake.failTool = { Tickets___transition_ticket: (p) => (p.ticket_id === BUILD ? REFUSAL : null) };
     const res = await rerun();
     expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE], status: "complete_transition_failed" });
@@ -1031,7 +1053,7 @@ describe("TEAM-5926 — a Done that lands over the brief hold", () => {
   beforeEach(() => {
     fake.down = false;
     h.fetchStatus = 200;
-    fake.tickets.get(GATE).status = "Done"; // no open gate ⇒ the brief goes off_gate ⇒ a hold
+    gateUnidentifiable(); // no nameable gate ⇒ the brief goes off_gate ⇒ a hold
   });
 
   it("(d1) the ticket reaches Done right after the hold stamp ⇒ retry, then the next tick converges the record and says so - keeping the hold (TEAM-5958)", async () => {
@@ -1159,7 +1181,7 @@ describe("TEAM-5926 — a Done that lands over the brief hold", () => {
   it("(d6) a follow-ups hold stamped, then the ticket reaches Done ⇒ retry, then the already-Done follow_ups drop is final", async () => {
     // TEAM-5926 sibling: the brief is on its gate, a follow-up no retry can file holds
     // the ticket, and a twin's Done commits right after the followUpsPending:true stamp.
-    fake.tickets.get(GATE).status = "To Do";
+    gateIdentifiable();
     fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
     let fired = false;
     fake.putError = (input) => {
@@ -1220,7 +1242,7 @@ describe("TEAM-5941 — the drain and a twin's Done-intent fence", () => {
   beforeEach(() => {
     fake.down = false;
     h.fetchStatus = 200;
-    fake.tickets.get(GATE).status = "Done"; // no open gate ⇒ the brief goes off_gate ⇒ a hold
+    gateUnidentifiable(); // no nameable gate ⇒ the brief goes off_gate ⇒ a hold
   });
 
   it("(g1) a fresh intent on an open ticket ⇒ retry: no hold stamped, no LEFT OPEN notice, no metric; the off-gate brief notice is still posted", async () => {
@@ -1315,7 +1337,7 @@ describe("TEAM-5941 — the drain and a twin's Done-intent fence", () => {
   });
 
   it("(g5) a follow-ups hold (an unfilable follow-up) with a fresh intent on an open ticket ⇒ retry, nothing stamped, no notice", async () => {
-    fake.tickets.get(GATE).status = "To Do"; // the brief has its gate: no brief hold
+    gateIdentifiable(); // the brief has its gate: no brief hold
     fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
     fenceRecord();
     const etag = fake.etags.get(KEY);
@@ -1329,7 +1351,7 @@ describe("TEAM-5941 — the drain and a twin's Done-intent fence", () => {
   });
 
   it("(g6) a follow-ups hold on a ticket ALREADY Done at step 1, fresh intent or not ⇒ stamped as before (nothing left to fence)", async () => {
-    fake.tickets.get(GATE).status = "To Do";
+    gateIdentifiable();
     fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
     fake.tickets.get(BUILD).status = "Done";
     fenceRecord();
@@ -1342,7 +1364,7 @@ describe("TEAM-5941 — the drain and a twin's Done-intent fence", () => {
   });
 
   it("(g8) the drain's OWN Done is fenced by the twin (the record is rewritten under the transition) ⇒ the applied stamp still lands and keeps the intent; a redelivered message is `already applied`", async () => {
-    fake.tickets.get(GATE).status = "To Do"; // brief on its gate, follow-up filed: a clean Done
+    gateIdentifiable(); // brief on its gate, follow-up filed: a clean Done
     fake.onTransition = () => fenceRecord(); // what the real twin does inside transition_ticket
 
     const t = await tick();
@@ -1413,16 +1435,509 @@ describe("TEAM-6057 — an undelivered brief keeps no earlier outcome's targets"
   });
 
   it("TEAM-6057 off the gate, then undelivered ⇒ the off-gate briefTargets and briefFallbackReason are gone", async () => {
-    fake.tickets.get(GATE).status = "Done";
+    gateUnidentifiable(); // TEAM-6097: a Done gate is a release now (TEAM-5995), not a hold
     await tick();
     expect(record()).toMatchObject({
       briefPending: true, briefDelivered: "off_gate", briefTargets: [BUILD, "TEAM-5600"],
-      briefFallbackReason: expect.stringMatching(/no open Merge Approval gate/),
+      briefFallbackReason: expect.stringMatching(/2 open Merge Approval gates/),
     });
     expect(await redeliverWithoutBrief()).toMatchObject({ applied: 0, dropped: 1 });
     expect(record()).toMatchObject({ briefPending: true, briefDelivered: "undelivered", ticketWrites: "dropped" });
     expect(record().briefTargets).toBeUndefined();
     expect(record().briefFallbackReason).toBeUndefined();
     expect(record().undelivered).toEqual([expect.objectContaining({ part: "brief", reason: expect.stringMatching(/does not exist/) })]);
+  });
+});
+
+// TEAM-5995 (TEAM-5799 F9): a brief hold the drain stamped because no OPEN gate exists
+// never converged — the gate was already Done, or the run never gets one — since only a
+// gate delivery cleared it. A hold is released WITHOUT a gate only on verified evidence
+// that no gate needs the brief (briefDisposition); anything unknown keeps it.
+describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
+  const KEY = `completions/${BUILD}.json`;
+  const REPO = { repos: [{ url: "https://github.com/owner/repo" }] };
+  const resolvedNotices = (id) => (fake.tickets.get(id)?.comments || []).filter((c) => c.startsWith(`[brief-resolved:${BUILD}]`));
+  const briefComments = (id) => fake.tickets.get(id).comments.filter((c) => /^\[brief:[0-9a-f]{12}\]/.test(c));
+  const rerun = async (args = {}) => result(await output.handler({ tool_name: call0.tool_name, arguments: { ...call0.arguments, ...args } }));
+  const allGatesDone = () => { for (const t of fake.tickets.values()) if (/^Merge Approval:/.test(t.title)) t.status = "Done"; };
+  /** The run's row as start/route.ts persists it: the def id and the target repo. */
+  const runOf = (workflowDefId, repoConfig = REPO) => { h.workflowRow = { workflowId: "db9sx9", workflowDefId, repoConfig }; };
+  const registry = (repos) => fake.objects.set("config/cd-registry.json", JSON.stringify({ version: 1, repos }));
+  const noGate = () => fake.tickets.delete(GATE);
+  const s3Refuses = (key, name, status) => {
+    fake.getError = (input) => (input.Key === key ? Object.assign(new Error(name), { name, $metadata: { httpStatusCode: status } }) : null);
+  };
+  const twinsAdmit = async () => {
+    for (const twin of TWIN_GUARDS) {
+      const m = await twin();
+      expect(m.judgeCompletionRecord(KEY, fake.objects.get(KEY))).toMatchObject({ proven: true });
+      expect(m.judgeBriefHold(KEY, fake.objects.get(KEY))).toBeNull();
+    }
+  };
+  const twinsRefuse = async () => {
+    for (const twin of TWIN_GUARDS) expect((await twin()).judgeBriefHold(KEY, fake.objects.get(KEY))).toMatchObject({ proven: false });
+  };
+  /** list_tickets answers, but says its roster is truncated (TEAM-5168 `complete:false`). */
+  const truncateRoster = async () => {
+    const { LambdaClient } = await import("@aws-sdk/client-lambda");
+    const real = LambdaClient.prototype.send;
+    return vi.spyOn(LambdaClient.prototype, "send").mockImplementation(async function (c) {
+      const out = await real.call(this, c);
+      const raw = c?.input?.Payload;
+      const call = JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw));
+      if (call.tool_name !== "Tickets___list_tickets" || !out?.Payload) return out;
+      const payload = JSON.parse(new TextDecoder().decode(out.Payload));
+      return { ...out, Payload: new TextEncoder().encode(JSON.stringify({ ...payload, complete: false })) };
+    });
+  };
+
+  beforeEach(() => {
+    fake.down = false;
+    h.fetchStatus = 200;
+    fake.objects.set("config/workflows.json", JSON.stringify(workflowsConfig));
+  });
+
+  it("T1 drain: every Merge Approval gate Done ⇒ applied with no hold, briefDisposition gate_settled, audit on ticket/epic/gate, twins admit", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ applied: 1, dropped: 0, retried: 0 });
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    expect(record().briefPending).toBeUndefined();
+    expect(record()).toMatchObject({
+      ticketWrites: "applied", briefDelivered: "off_gate",
+      briefDisposition: { release: true, kind: "gate_settled", by: "drain", observed: [{ ticketId: GATE, status: "Done" }] },
+    });
+    expect(Date.parse(record().briefDisposition.at)).not.toBeNaN();
+    for (const id of [BUILD, "TEAM-5600", GATE]) expect(resolvedNotices(id)).toHaveLength(1);
+    expect(resolvedNotices(GATE)[0]).toContain(`${GATE}:Done`);
+    expect(resolvedNotices(BUILD)[0]).toContain(KEY);
+    for (const id of [BUILD, "TEAM-5600"]) {
+      expect(briefComments(id)).toHaveLength(1);
+      expect(briefComments(id)[0]).toContain("no gate needs it");
+      expect(briefComments(id)[0]).not.toContain("MERGE BRIEF NOT ON THE GATE");
+    }
+    await twinsAdmit();
+  });
+
+  it("T2 retry: a hold installed under ambiguous gates releases once every gate is Done ⇒ complete, briefPending:false, Done, one [brief-resolved]; a second retry is idempotent", async () => {
+    gateUnidentifiable();
+    await tick();
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "off_gate" });
+    allGatesDone();
+    fake.calls.length = 0;
+    const res = await rerun();
+    expect(res).toMatchObject({ status: "complete" });
+    expect(res.next_action).toBeUndefined();
+    expect(tools("Tickets___transition_ticket")).toHaveLength(1);
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    expect(record()).toMatchObject({
+      status: "complete", briefPending: false, briefDelivered: "off_gate",
+      briefDisposition: { release: true, kind: "gate_settled", by: "report_completion" },
+    });
+    expect(record().briefDisposition.observed).toHaveLength(2);
+    expect(record().briefDisposition.observed).toEqual(expect.arrayContaining([{ ticketId: GATE, status: "Done" }, { ticketId: "TEAM-5604", status: "Done" }]));
+    expect(record().briefHoldReason).toBeUndefined();
+    for (const id of [BUILD, "TEAM-5600", GATE, "TEAM-5604"]) expect(resolvedNotices(id)).toHaveLength(1);
+    await twinsAdmit();
+    const again = await rerun();
+    expect(again.status).toBe("complete");
+    for (const id of [BUILD, "TEAM-5600", GATE, "TEAM-5604"]) expect(resolvedNotices(id)).toHaveLength(1);
+    expect(record()).toMatchObject({ briefPending: false, briefDisposition: { kind: "gate_settled" } });
+  });
+
+  it("T3 a later re-run carries briefDisposition (BRIEF_HOLD_FIELDS)", async () => {
+    gateUnidentifiable();
+    await tick();
+    allGatesDone();
+    await rerun();
+    const disposition = record().briefDisposition;
+    expect(disposition).toMatchObject({ release: true, kind: "gate_settled" });
+    await rerun({ summary: `${call0.arguments.summary} (re-run)` });
+    expect(record().briefDisposition).toEqual(disposition);
+    expect(record().briefPending).toBe(false);
+  });
+
+  it("T5 a drain hold stamped over a released record drops briefDisposition and sets briefPending:true", async () => {
+    fake.objects.set(KEY, JSON.stringify({ ...JSON.parse(fake.objects.get(KEY)), briefPending: false, briefDelivered: "off_gate", briefDisposition: { release: true, kind: "gate_settled", observed: [{ ticketId: GATE, status: "Done" }], at: "2026-10-14T00:00:00.000Z", by: "report_completion" } }));
+    fake.etags.set(KEY, `"e${++fake.etagSeq}"`);
+    // A second, open gate appeared since the release, and neither names the ticket.
+    gateUnidentifiable();
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 1 });
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "off_gate", replayDropped: { step: "brief" } });
+    expect(record().briefDisposition).toBeUndefined();
+    await twinsRefuse();
+  });
+
+  it("T6a gate Done but the roster is truncated (complete:false) ⇒ the hold stays (roster_incomplete)", async () => {
+    gateUnidentifiable();
+    await tick();
+    allGatesDone();
+    const spy = await truncateRoster();
+    try {
+      const res = await rerun({ follow_ups: undefined });
+      expect(res.status).not.toBe("complete");
+      expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+      expect(record()).toMatchObject({ briefPending: true });
+      expect(record().briefDisposition).toBeUndefined();
+      expect(record().briefHoldReason).toMatch(/roster is incomplete/);
+    } finally {
+      spy.mockRestore();
+    }
+    await twinsRefuse();
+  });
+
+  it("T6b no gate, and the run owes one (operator def) ⇒ the hold stays and says how to create the gate (no_gate)", async () => {
+    noGate();
+    runOf("operator");
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 1 });
+    expect(record()).toMatchObject({ briefPending: true });
+    expect(record().briefDisposition).toBeUndefined();
+    expect(record().replayDropped.error).toMatch(/this run owes one \(def operator/);
+    expect(record().replayDropped.error).toMatch(/create ONE 'Merge Approval:' ticket/);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    await twinsRefuse();
+  });
+
+  it("T6c a Done gate plus an open one that does not name the ticket ⇒ the hold stays (gate_open)", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    seedTicket({ ticketId: "TEAM-5604", title: "Merge Approval: db9sx9 (hotfix)", status: "To Do", assignee: "human:approver", parentKey: "TEAM-5600", blockedBy: ["TEAM-5699"] });
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 1 });
+    expect(record()).toMatchObject({ briefPending: true });
+    expect(record().briefDisposition).toBeUndefined();
+    expect(record().replayDropped.error).toMatch(/1 open Merge Approval gates \(TEAM-5604\) and none is blocked by TEAM-5601/);
+    expect(resolvedNotices(BUILD)).toHaveLength(0);
+    await twinsRefuse();
+  });
+
+  it("T6d briefGateDisposition: only a complete roster with every gate Done, or a verified never-gated run, releases", () => {
+    const g = (ticketId, status, assignee = "human:approver") => ({ ticketId, summary: `Merge Approval: ${ticketId}`, status, assignee });
+    const d = (over) => output.briefGateDisposition({ ticketId: BUILD, epicKey: "TEAM-5600", siblings: [], scanComplete: true, gateOwed: null, ...over });
+    expect(d({ epicKey: null })).toMatchObject({ release: false, kind: "no_epic" });
+    expect(d({ scanComplete: false, siblings: [g(GATE, "Done")] })).toMatchObject({ release: false, kind: "roster_incomplete" });
+    expect(d({ scanComplete: undefined, siblings: [g(GATE, "Done")] })).toMatchObject({ release: false, kind: "roster_incomplete" });
+    expect(d({ siblings: [g(GATE, "Done")] })).toMatchObject({ release: true, kind: "gate_settled", observed: [{ ticketId: GATE, status: "Done" }] });
+    expect(d({ siblings: [g(GATE, "done"), g("TEAM-5604", "DONE")] })).toMatchObject({ release: true, kind: "gate_settled" });
+    expect(d({ siblings: [g(GATE, "Done"), g("TEAM-5604", "In Review")] })).toMatchObject({ release: false, kind: "gate_open" });
+    expect(d({ gateOwed: { owed: false, detail: "x" } })).toMatchObject({ release: true, kind: "absent_never_gated" });
+    expect(d({ gateOwed: { owed: true, detail: "x" } })).toMatchObject({ release: false, kind: "no_gate" });
+    expect(d({ gateOwed: { owed: "unknown", detail: "x" } })).toMatchObject({ release: false, kind: "gate_owed_unknown" });
+    expect(d({ gateOwed: null })).toMatchObject({ release: false, kind: "gate_owed_unknown" });
+    expect(d({ gateOwed: { owed: "false", detail: "x" } })).toMatchObject({ release: false, kind: "gate_owed_unknown" });
+    // An agent-assigned "Merge Approval:" row is not a gate, and neither is the ticket itself.
+    expect(d({ siblings: [g("TEAM-5605", "Done", "agentcore_hub_operator")], gateOwed: { owed: true, detail: "x" } })).toMatchObject({ release: false, kind: "no_gate" });
+    expect(d({ siblings: [g(BUILD, "Done")], gateOwed: { owed: "unknown", detail: "x" } })).toMatchObject({ release: false, kind: "gate_owed_unknown" });
+  });
+
+  it.each([
+    ["the run's row is missing", () => {}],
+    ["the run's row is unreadable", () => { h.workflowRowError = Object.assign(new Error("throttled"), { name: "ProvisionedThroughputExceededException" }); }],
+    ["config/workflows.json is refused (403)", () => { runOf("software-delivery"); s3Refuses("config/workflows.json", "AccessDenied", 403); }],
+    ["config/cd-registry.json cannot be read (503)", () => { runOf("software-delivery"); s3Refuses("config/cd-registry.json", "ServiceUnavailable", 503); }],
+    ["the def id is unknown", () => { runOf("no-such-def"); }],
+  ])("T6e no gate and %s ⇒ the hold stays (gate_owed_unknown)", async (_name, arrange) => {
+    noGate();
+    arrange();
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 1 });
+    expect(record()).toMatchObject({ briefPending: true });
+    expect(record().briefDisposition).toBeUndefined();
+    expect(record().replayDropped.error).toMatch(/whether this run owes one could not be determined/);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+  });
+
+  it("T7 a 503 on the [brief-resolved] comment keeps the hold: the drain retries with the record untouched, and a retry answers complete_pending_brief", async () => {
+    // Drain: nothing is recorded until the audit comment is on the board.
+    fake.tickets.get(GATE).status = "Done";
+    fake.failTool = { Tickets___add_comment: (p) => (p.comment.startsWith("[brief-resolved:") ? PROVIDER_503 : null) };
+    const putsBefore = fake.puts.filter((p) => p.Key === KEY).length;
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expect(fake.puts.filter((p) => p.Key === KEY)).toHaveLength(putsBefore);
+    expect(record().ticketWrites).toBe("queued");
+    expect(record().briefDisposition).toBeUndefined();
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    // The comment lands on the next tick, then the release does.
+    fake.failTool = null;
+    expireVisibility();
+    const t2 = await tick();
+    expect(t2.out.drained).toMatchObject({ applied: 1 });
+    expect(record()).toMatchObject({ briefDisposition: { kind: "gate_settled" } });
+  });
+
+  it("T7 (retry path) a 503 on the [brief-resolved] comment ⇒ the hold stays, no Done", async () => {
+    gateUnidentifiable();
+    await tick();
+    allGatesDone();
+    fake.failTool = { Tickets___add_comment: (p) => (p.comment.startsWith("[brief-resolved:") ? PROVIDER_503 : null) };
+    fake.calls.length = 0;
+    const res = await rerun();
+    expect(res.status).not.toBe("complete");
+    expect(tools("Tickets___transition_ticket")).toHaveLength(0);
+    expect(record()).toMatchObject({ briefPending: true });
+    expect(record().briefDisposition).toBeUndefined();
+    await twinsRefuse();
+    fake.failTool = null;
+    expect((await rerun()).status).toBe("complete");
+    expect(record()).toMatchObject({ briefPending: false, briefDisposition: { kind: "gate_settled" } });
+  });
+
+  it("T8 the ticket is reopened during the retry with every gate Done ⇒ the release still lands (the evidence is the gates, not the ticket) and the twins admit its Done", async () => {
+    gateUnidentifiable();
+    await tick();
+    allGatesDone();
+    fake.tickets.get(BUILD).status = "Done";
+    let reopened = false;
+    fake.beforeTool = async (tool, p) => {
+      if (!reopened && tool === "Tickets___add_comment" && String(p.comment).startsWith("[brief-resolved:")) {
+        reopened = true;
+        fake.tickets.get(BUILD).status = "In Progress";
+      }
+    };
+    await rerun();
+    fake.beforeTool = null;
+    expect(reopened).toBe(true);
+    expect(record()).toMatchObject({ briefPending: false, briefDisposition: { release: true, kind: "gate_settled" } });
+    await twinsAdmit();
+  });
+
+  it.each([
+    ["software-delivery on a repo the CD registry does not list (handoff: the ship gate is stripped)", () => { runOf("software-delivery"); registry([{ repo: "acme/other", pipeline: "hub-other-deploy" }]); }, /handoff/],
+    ["software-delivery with no CD registry in S3 (every repo is HANDOFF)", () => { runOf("software-delivery"); }, /handoff/],
+    ["software-delivery with an empty CD registry", () => { runOf("software-delivery"); registry([]); }, /handoff/],
+    ["legal (the def declares no Merge Approval gate)", () => { runOf("legal"); }, /def legal declares no Merge Approval gate/],
+  ])("T9 verified absent: %s ⇒ released (absent_never_gated), audited, Done", async (_name, arrange, detail) => {
+    noGate();
+    arrange();
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ applied: 1, dropped: 0 });
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    expect(record().briefPending).toBeUndefined();
+    expect(record()).toMatchObject({ briefDelivered: "off_gate", briefDisposition: { release: true, kind: "absent_never_gated", observed: [], gateOwed: { owed: false } } });
+    expect(record().briefDisposition.gateOwed.detail).toMatch(detail);
+    for (const id of [BUILD, "TEAM-5600"]) expect(resolvedNotices(id)).toHaveLength(1);
+    await twinsAdmit();
+  });
+
+  it("T9 the same repo, CD-registered ⇒ the run owes the gate: the hold stays (no_gate)", async () => {
+    noGate();
+    runOf("software-delivery");
+    registry([{ repo: "Owner/Repo", pipeline: "hub-repo-deploy" }]);
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 1 });
+    expect(record()).toMatchObject({ briefPending: true });
+    expect(record().replayDropped.error).toMatch(/this run owes one \(def software-delivery: CD-registered/);
+    await twinsRefuse();
+  });
+
+  it("T9 runOwesMergeGate: owed only by the effective def; every read it cannot make is unknown", async () => {
+    const owed = async () => (await output.runOwesMergeGate("db9sx9")).owed;
+    expect((await output.runOwesMergeGate("")).owed).toBe("unknown");
+    expect(await owed()).toBe("unknown"); // no row
+    runOf("no-such-def");
+    expect(await owed()).toBe("unknown");
+    for (const id of ["legal", "marketing", "sales"]) { runOf(id); expect(await owed()).toBe(false); }
+    runOf("operator");
+    expect(await owed()).toBe(true); // afterPhase development: never stripped
+    for (const id of ["software-delivery", "bug-fix", "dead-code-sweep"]) {
+      runOf(id);
+      fake.objects.delete("config/cd-registry.json");
+      expect(await owed()).toBe(false);
+      registry([]);
+      expect(await owed()).toBe(false);
+      registry(["https://github.com/OWNER/repo.git"]);
+      expect(await owed()).toBe(true);
+      registry([{ repo: "owner/repo" }]);
+      expect(await owed()).toBe(true);
+      registry([{ repo: "owner/other" }]);
+      expect(await owed()).toBe(false);
+    }
+    runOf("software-delivery", { repos: [] });
+    registry([{ repo: "owner/repo" }]);
+    expect(await owed()).toBe(false); // no repo URL: the orchestrator's findCdEntry says HANDOFF too
+    runOf("software-delivery");
+    fake.objects.set("config/cd-registry.json", "{ truncated");
+    expect(await owed()).toBe("unknown");
+    fake.objects.set("config/cd-registry.json", JSON.stringify({ version: 1, repos: "owner/repo" }));
+    expect(await owed()).toBe("unknown");
+    registry([{ repo: "owner/repo" }]);
+    s3Refuses("config/cd-registry.json", "SlowDown", 503);
+    expect(await owed()).toBe("unknown");
+    s3Refuses("config/workflows.json", "AccessDenied", 403);
+    expect(await owed()).toBe("unknown");
+    fake.getError = null;
+    fake.objects.set("config/workflows.json", "not json");
+    expect(await owed()).toBe("unknown");
+    fake.objects.delete("config/workflows.json");
+    expect(await owed()).toBe("unknown");
+    fake.objects.set("config/workflows.json", JSON.stringify(workflowsConfig));
+    h.workflowRowError = Object.assign(new Error("boom"), { name: "InternalServerError" });
+    expect(await owed()).toBe("unknown");
+  });
+
+  // ─── TEAM-6097: the release on #927's step 6 / drop() / retry — same clear on every path ───
+  // A release from a STANDING hold (the drain's off-gate stamp: briefPending:true, a
+  // `part:"brief"` undelivered entry and a briefFallbackReason) must leave the record
+  // exactly as a gate delivery would (TEAM-6024/6042/6052): hold false, entry pruned,
+  // reason gone — the reason a release was made lives in briefDisposition.why.
+  const expectReleased = (kind) => {
+    const r = record();
+    expect(r.briefPending).toBe(false);
+    expect(r.briefDisposition).toMatchObject({ release: true, kind });
+    expect((r.undelivered || []).some((u) => u?.part === "brief")).toBe(false);
+    expect(r.briefFallbackReason).toBeUndefined();
+  };
+  const expectHeld = () => {
+    expect(record().briefPending).toBe(true);
+    expect(record().briefDisposition).toBeUndefined();
+  };
+  const RESIDUAL_6097 = { part: "residual_findings", ticketId: "TEAM-5603", reason: "Jira API 400: ticket is archived" };
+  /** The drain's off-gate hold, from two unnamed open gates; returns the message body to redeliver. */
+  const holdUnnamed = async ({ withResidual = false } = {}) => {
+    const body = fake.queue[0].Body;
+    gateUnidentifiable();
+    await tick();
+    expectHeld();
+    expect(record()).toMatchObject({ briefFallbackReason: expect.any(String), undelivered: [expect.objectContaining({ part: "brief" })] });
+    if (withResidual) {
+      fake.objects.set(KEY, JSON.stringify({ ...record(), undelivered: [...record().undelivered, RESIDUAL_6097] }));
+      fake.etags.set(KEY, `"e${++fake.etagSeq}"`);
+    }
+    return body;
+  };
+  const redeliver = async (body) => {
+    fake.queue.push({ MessageId: "redelivered-6097", Body: body, group: "wf_db9sx9", inFlight: null, receives: 0 });
+    return (await tick()).out.drained;
+  };
+  /** Both gates gone, and the run's def (legal) never gets one: absent_never_gated. */
+  const neverGated = () => { fake.tickets.delete(GATE); fake.tickets.delete("TEAM-5604"); runOf("legal"); };
+  const RELEASES = [["gate_settled", () => allGatesDone()], ["absent_never_gated", neverGated]];
+
+  it.each(RELEASES)("TEAM-6097 drain step 6: a standing hold released (%s) ⇒ briefPending:false, no part:brief entry, no briefFallbackReason, Done", async (kind, arrange) => {
+    const body = await holdUnnamed();
+    arrange();
+    expect(await redeliver(body)).toMatchObject({ applied: 1, dropped: 0 });
+    expectReleased(kind);
+    expect(record()).toMatchObject({ briefDelivered: "off_gate", ticketWrites: "applied", briefDisposition: { by: "drain" } });
+    expect(record().undelivered).toBeUndefined();
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    await twinsAdmit();
+  });
+
+  it.each(RELEASES)("TEAM-6097 retry path: a standing hold released (%s) ⇒ briefPending:false, no part:brief entry, no briefFallbackReason, Done", async (kind, arrange) => {
+    await holdUnnamed();
+    arrange();
+    const res = await rerun();
+    expect(res.status).toBe("complete");
+    expectReleased(kind);
+    expect(record()).toMatchObject({ briefDelivered: "off_gate", briefDisposition: { by: "report_completion" } });
+    expect(record().undelivered).toBeUndefined();
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    await twinsAdmit();
+  });
+
+  it("TEAM-6097 a release prunes ONLY the brief entry: other undelivered parts stay (drain and retry)", async () => {
+    const body = await holdUnnamed({ withResidual: true });
+    allGatesDone();
+    expect(await redeliver(body)).toMatchObject({ applied: 1 });
+    expectReleased("gate_settled");
+    expect(record().undelivered).toEqual([RESIDUAL_6097]);
+  });
+
+  it("TEAM-6097 retry path release keeps other undelivered parts", async () => {
+    await holdUnnamed({ withResidual: true });
+    allGatesDone();
+    expect((await rerun()).status).toBe("complete");
+    expectReleased("gate_settled");
+    expect(record().undelivered).toEqual([RESIDUAL_6097]);
+  });
+
+  it.each(RELEASES)("TEAM-6097 drop(): a follow-ups-only hold whose brief is released (%s) clears the brief hold like a gate delivery", async (kind, arrange) => {
+    fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    const body = await holdUnnamed();
+    expect(record()).toMatchObject({ followUpsPending: true, replayDropped: { step: "follow_ups+brief" } });
+    arrange();
+    expect(await redeliver(body)).toMatchObject({ applied: 0, dropped: 1 });
+    expect(record()).toMatchObject({ followUpsPending: true, briefDelivered: "off_gate", ticketWrites: "dropped", replayDropped: { step: "follow_ups" } });
+    expectReleased(kind);
+    for (const twin of TWIN_GUARDS) {
+      const v = (await twin()).judgeCompletionRecord(KEY, fake.objects.get(KEY));
+      expect(v).toMatchObject({ proven: false });
+      expect(v.why).not.toMatch(/has briefPending:true/);
+    }
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+  });
+
+  // Every hold disposition keeps the hold — on BOTH the drain and the retry path.
+  const HOLDS = [
+    ["gate_open", () => { fake.tickets.get(GATE).status = "Done"; fake.tickets.get("TEAM-5604").blockedBy = ["TEAM-5699"]; }, /1 open Merge Approval gates \(TEAM-5604\) and none is blocked by/],
+    ["roster_incomplete", () => allGatesDone(), /roster is incomplete/, { truncate: true }],
+    ["no_epic", () => { allGatesDone(); fake.tickets.get(BUILD).parentKey = null; }, /epic is unknown/, { dropEpic: true }],
+    ["no_gate", () => { fake.tickets.delete(GATE); fake.tickets.delete("TEAM-5604"); runOf("operator"); }, /this run owes one \(def operator/],
+    ["gate_owed_unknown (no run row)", () => { fake.tickets.delete(GATE); fake.tickets.delete("TEAM-5604"); }, /whether this run owes one could not be determined/],
+    ["gate_owed_unknown (config/workflows.json refused)", () => { fake.tickets.delete(GATE); fake.tickets.delete("TEAM-5604"); runOf("software-delivery"); s3Refuses("config/workflows.json", "AccessDenied", 403); }, /whether this run owes one could not be determined/],
+    ["gate_owed_unknown (cd-registry unreadable)", () => { fake.tickets.delete(GATE); fake.tickets.delete("TEAM-5604"); runOf("software-delivery"); s3Refuses("config/cd-registry.json", "ServiceUnavailable", 503); }, /whether this run owes one could not be determined/],
+  ];
+
+  it.each(HOLDS)("TEAM-6097 drain: %s keeps the hold", async (_kind, arrange, why, opts = {}) => {
+    let body = await holdUnnamed();
+    arrange();
+    if (opts.dropEpic) body = JSON.stringify({ ...JSON.parse(body), epicKey: null });
+    const spy = opts.truncate ? await truncateRoster() : null;
+    try {
+      expect(await redeliver(body)).toMatchObject({ applied: 0, dropped: 1 });
+    } finally {
+      spy?.mockRestore();
+    }
+    expectHeld();
+    expect(record().replayDropped.error).toMatch(why);
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    await twinsRefuse();
+  });
+
+  it.each(HOLDS)("TEAM-6097 retry path: %s keeps the hold (complete_pending_brief, no Done)", async (_kind, arrange, why, opts = {}) => {
+    await holdUnnamed();
+    arrange();
+    const spy = opts.truncate ? await truncateRoster() : null;
+    let res;
+    try {
+      fake.calls.length = 0;
+      res = await rerun();
+    } finally {
+      spy?.mockRestore();
+    }
+    expect(res.status).not.toBe("complete");
+    expect(tools("Tickets___transition_ticket")).toHaveLength(0);
+    expectHeld();
+    expect(record().briefHoldReason).toMatch(why);
+    await twinsRefuse();
+  });
+
+  // A release is superseded by any later brief outcome: the record never claims a
+  // release (briefDisposition) next to a gate delivery or an undelivered brief.
+  it("TEAM-6097 a released record whose brief later lands on a gate ⇒ gate fields, briefDisposition gone", async () => {
+    const body = await holdUnnamed();
+    allGatesDone();
+    await rerun();
+    expectReleased("gate_settled");
+    // A gate is reopened for the run and names the ticket: the next drain delivers to it.
+    fake.tickets.get(GATE).status = "To Do";
+    fake.tickets.get(GATE).blockedBy = [BUILD];
+    expect(await redeliver(body)).toMatchObject({ applied: 1 });
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE] });
+    expect(record().briefDisposition).toBeUndefined();
+  });
+
+  it("TEAM-6097 a released record whose brief object is later gone ⇒ undelivered, briefDisposition gone", async () => {
+    const body = await holdUnnamed();
+    allGatesDone();
+    await rerun();
+    expectReleased("gate_settled");
+    fake.objects.delete(fixture.mergeBrief.s3Key);
+    await redeliver(body);
+    expect(record()).toMatchObject({ briefDelivered: "undelivered" });
+    expect(record().briefDisposition).toBeUndefined();
   });
 });
