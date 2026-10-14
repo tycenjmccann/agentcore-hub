@@ -851,11 +851,19 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
 
   // TEAM-5828: `headSha` serves /branches/<head>; `compares` routes a compare by
   // its "<base>...<head>" range (decoded), falling back to compareStatus/aheadBy.
-  // TEAM-5913: /git/commits/<sha> serves a distinct tree per commit (so tip and head differ).
-  const mockGitHub = ({ prs = [], compareStatus = "ahead", aheadBy = 3, headSha = "head000", compares = {}, branch404 = false } = {}) => {
+  // TEAM-5913: /git/commits/<sha> serves a distinct tree per commit (so the equal-tree shortcut never fires).
+  // TEAM-5935: `contents` keyed "<ref>:<path>" carries the per-file proof — a sha serves a file,
+  // null serves 404 (absent); a missing key (or no `contents`) serves {} = unresolvable.
+  const mockGitHub = ({ prs = [], compareStatus = "ahead", aheadBy = 3, headSha = "head000", compares = {}, branch404 = false, contents = null } = {}) => {
     global.fetch = vi.fn(async (url) => {
       const u = decodeURIComponent(String(url));
       if (branch404 && u.includes("/branches/")) return { ok: false, status: 404, text: async () => JSON.stringify({ message: "Branch not found" }) };
+      if (u.includes("/contents/")) {
+        const [path, ref] = u.split("/contents/")[1].split("?ref=");
+        const sha = contents?.[`${ref}:${path}`];
+        if (sha === null) return { ok: false, status: 404, text: async () => JSON.stringify({ message: "Not Found" }) };
+        return { ok: true, status: 200, text: async () => JSON.stringify(sha ? { type: "file", sha } : {}) };
+      }
       const range = u.includes("/compare/") ? u.split("/compare/")[1] : null;
       const body = u.includes("/pulls?")
         ? prs
@@ -901,6 +909,7 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     mockGitHub({
       prs: [MERGED_PR], headSha: "head222",
       compares: { "head000...head222": { status: "ahead", ahead_by: 2, files: [{ filename: "a.js" }] }, "main...feature/EPIC-1-fix": { status: "diverged", ahead_by: 5, files: [{ filename: "a.js" }], base_commit: { sha: "tip" } } },
+      contents: { "tip:a.js": "a0", "head000:a.js": "a0", "head222:a.js": "a1" }, // TEAM-5935: main holds the pre-merge a.js
     });
     await loadShip();
     await completeWorkflow({ ...SHIP_WF });
@@ -1070,7 +1079,7 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
       "main...feature/EPIC-1-fix": { status: "diverged", ahead_by: 2, behind_by: 1, files: [], merge_base_commit: { sha: "C" }, base_commit: { sha: "tip" } },
       "m846...C": { status: "behind", ahead_by: 0, behind_by: 1 },
       "head000...R": { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "feature.txt", status: "removed" }] },
-    } });
+    }, contents: { "tip:feature.txt": "f0", "head000:feature.txt": "f0", "R:feature.txt": null } }); // TEAM-5935: main keeps H's file, R removed it
     await loadShip();
     await completeWorkflow({ ...SHIP_WF });
     expect(h.state.storeCompletions.length).toBe(0);
@@ -1085,6 +1094,7 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     mockGitHub({
       prs: [MERGED_PR], headSha: "head222",
       compares: { "head000...head222": { status: "ahead", ahead_by: 2, files: [{ filename: "a.js" }] }, "main...feature/EPIC-1-fix": { status: "diverged", ahead_by: 5, files: [{ filename: "a.js" }], base_commit: { sha: "tip" } } },
+      contents: { "tip:a.js": "a0", "head000:a.js": "a0", "head222:a.js": "a1" }, // TEAM-5935: main holds the pre-merge a.js
     });
     await loadShip();
     await Promise.all([completeWorkflow({ ...SHIP_WF }), completeWorkflow({ ...SHIP_WF })]);

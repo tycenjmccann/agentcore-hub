@@ -26,6 +26,12 @@ import {
 // TEAM-5828: namespace import so a missing export fails per test, not the whole file.
 import * as completion from "./completion.mjs";
 
+// TEAM-5935: per-file proof fixtures — contents routes for one path at the three refs the
+// landing probe reads (base tip, merged head, branch tip); a null sha → 404 (absent).
+const CONTENTS_404 = () => { throw Object.assign(new Error("GitHub GET contents 404: Not Found"), { status: 404 }); };
+const CONTENTS = (path, { base, before, tip }) =>
+  [base, before, tip].map(([ref, sha]) => [`/contents/${path}?ref=${ref}`, sha === null ? CONTENTS_404 : { type: "file", sha }]);
+
 /**
  * TEAM-3619 D4c — per-phase completion re-verify. These pin the three rules
  * (done work + approved blocking gates + no open spawned fixes), the AC-D4.3
@@ -1394,7 +1400,7 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
     return {};
   };
   const land = (routes) => completion.featureBranchLanding({ owner: "o", repo: "r", base: "main", head: HEAD, api: apiFor(routes) });
-  // TEAM-5913: a proven strand needs base's tip tree to differ from the head's.
+  // TEAM-5913/TEAM-5935: DIFF_TREES only defeats the equal-tree shortcut; a proven strand needs per-file evidence (CONTENTS).
   const DIFF_TREES = (sha) => [["/git/commits/tip", { tree: { sha: "tipTree" } }], [`/git/commits/${sha}`, { tree: { sha: "headTree" } }]];
   const merged = { number: 846, merged_at: "2026-10-01T00:00:00Z", state: "closed", head: { sha: "old111" }, base: { ref: "main" }, merge_commit_sha: "m846", html_url: "https://github.com/o/r/pull/846" };
 
@@ -1409,9 +1415,12 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
       ["/compare/old111...new222", { status: "ahead", ahead_by: 2, files: [{ filename: "a.js" }] }],
       ["/compare/main...", { status: "diverged", ahead_by: 6, files: [{ filename: "a.js" }], base_commit: { sha: "tip" } }],
       ...DIFF_TREES("new222"),
+      // TEAM-5935: main still holds a.js at its pre-merge content — the positive proof of a strand.
+      ...CONTENTS("a.js", { base: ["tip", "a0"], before: ["old111", "a0"], tip: ["new222", "a1"] }),
     ]);
     expect(r.merged).toBe(false);
-    expect(r.reason).toBe(`feature branch ${HEAD} has 2 commit(s) after its merged PR #846 not contained in main and no open PR to main`);
+    expect(r.reason).toContain(`feature branch ${HEAD} has 2 commit(s) after its merged PR #846 not contained in main and no open PR to main`);
+    expect(r.reason).toContain("main still holds the pre-merge content of: a.js");
   });
 
   it("same, but an open PR to main carries them → not refused (merged:null)", async () => {
@@ -1443,6 +1452,7 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
       ["/compare/old111...M999", { status: "ahead", ahead_by: 2, files: [{ filename: "a.js" }] }],
       ["/compare/main...", { status: "diverged", ahead_by: 2, files: [{ filename: "a.js" }], base_commit: { sha: "tip" } }],
       ...DIFF_TREES("M999"),
+      ...CONTENTS("a.js", { base: ["tip", "a0"], before: ["old111", "a0"], tip: ["M999", "a1"] }),
     ]);
     expect(r.merged).toBe(false);
   });
@@ -1498,7 +1508,7 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
   const PROOF = { merged: true, mergeCommit: "m846", prUrl: merged.html_url };
   const gone = () => { throw Object.assign(new Error("GitHub GET branches 404: Branch not found"), { status: 404 }); };
   const filler = Array.from({ length: 100 }, (_, i) => ({ number: 1000 + i, merged_at: null, state: "closed", head: { sha: `f${i}` }, base: { ref: "main" } }));
-  // TEAM-5913: a proven strand needs base's tip tree to differ from the head's.
+  // TEAM-5913/TEAM-5935: DIFF_TREES only defeats the equal-tree shortcut; a proven strand needs per-file evidence (CONTENTS).
   const DIFF_TREES = (sha) => [["/git/commits/tip", { tree: { sha: "tipTree" } }], [`/git/commits/${sha}`, { tree: { sha: "headTree" } }]];
 
   // ── N1: an empty THREE-dot diff only proves tree(head) == tree(merge-base) ──
@@ -1509,9 +1519,12 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
       ["/compare/m846...C", { status: "behind", ahead_by: 0, behind_by: 1 }],
       ["/compare/old111...R", { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "feature.txt", status: "removed" }] }],
       ...DIFF_TREES("R"),
+      // TEAM-5935: main (post-squash) still has feature.txt exactly as H left it; R removed it → stranded.
+      ...CONTENTS("feature.txt", { base: ["tip", "f0"], before: ["old111", "f0"], tip: ["R", null] }),
     ]);
     expect(r.merged).toBe(false);
     expect(r.reason).toContain("1 commit(s) after its merged PR #846");
+    expect(r.reason).toContain("feature.txt");
   });
 
   it("N1 P2: commits after the merged head whose merged-head..head diff is EMPTY (no-op commits) → merged", async () => {
@@ -1552,6 +1565,7 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
       ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 1, files: [], base_commit: { sha: "tip" } }],
       ["/compare/old111...R", { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "feature.txt" }] }],
       ...DIFF_TREES("R"),
+      ...CONTENTS("feature.txt", { base: ["tip", "f0"], before: ["old111", "f0"], tip: ["R", null] }),
     ]);
     expect(r.merged).toBe(false);
   });
@@ -1619,6 +1633,8 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
       ["/compare/old111...new222", { status: "ahead", ahead_by: 2, behind_by: 0, files: [{ filename: "a.js" }] }],
       ["/compare/main...", { status: "diverged", ahead_by: 6, behind_by: 3, files: [{ filename: "a.js" }], base_commit: { sha: "tip" } }],
       ...DIFF_TREES("new222"),
+      // TEAM-5935: a.js IS provably stranded — only the truncated PR history downgrades it to null.
+      ...CONTENTS("a.js", { base: ["tip", "a0"], before: ["old111", "a0"], tip: ["new222", "a1"] }),
     ]);
     expect(r.merged).toBe(null);
     expect(r.reason).toMatch(/truncated at 10 pages/);
@@ -1659,7 +1675,7 @@ describe("featureBranchLanding — TEAM-5913 (404 binds every recorded head; fal
     expect(r.reason).toMatch(/no proof of unlanded content/);
   });
 
-  it("TEAM-5913: a tree lookup that fails → merged:null; files present + trees differ → merged:false", async () => {
+  it("TEAM-5913 → TEAM-5935: a tree lookup that fails → merged:null; files present + trees differ with no per-file evidence → merged:null, never false", async () => {
     const routes = (treeF) => [
       ["/pulls?", [merged]], ["/branches/", { commit: { sha: "F" } }],
       ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 2, files: [{ filename: "f.js" }], base_commit: { sha: "T" } }],
@@ -1667,7 +1683,9 @@ describe("featureBranchLanding — TEAM-5913 (404 binds every recorded head; fal
       ["/git/commits/T", { tree: { sha: "tree1" } }], ["/git/commits/F", treeF],
     ];
     expect((await land(routes(() => { throw Object.assign(new Error("500"), { status: 500 }); }))).merged).toBe(null);
-    expect((await land(routes({ tree: { sha: "tree2" } }))).merged).toBe(false);
+    const differ = await land(routes({ tree: { sha: "tree2" } }));
+    expect(differ.merged).toBe(null); // base (TEAM-5913): merged:false on tree inequality alone
+    expect(differ.reason).toMatch(/no proof of unlanded content/);
   });
 
   it("TEAM-5913: 404 — every recorded head contained (equal or ancestor) → proof; one not contained, or a short sha → null", async () => {
@@ -1688,5 +1706,106 @@ describe("featureBranchLanding — TEAM-5913 (404 binds every recorded head; fal
       "B-4": { mergeCommit: "m846" },
     }).sort()).toEqual(["fff0000bbbb", "head000aaaa"]);
     expect(recordedHeads(undefined)).toEqual([]);
+  });
+});
+
+describe("featureBranchLanding — TEAM-5935 (per-file proof; tree inequality is not a strand)", () => {
+  const HEAD = "feature/EPIC-1-x";
+  const apiFor = (routes, calls = []) => async (path) => {
+    calls.push(path);
+    for (const [k, v] of routes) if (path.includes(k)) return typeof v === "function" ? v(path) : v;
+    return {};
+  };
+  const land = (routes, extra = {}, calls = []) =>
+    completion.featureBranchLanding({ owner: "o", repo: "r", base: "main", head: HEAD, api: apiFor(routes, calls), ...extra });
+  // integration C-H-F (PR #846 squashed H as S); main C-S-T-U. T independently lands F's change, U adds unrelated.js.
+  const merged = { number: 846, merged_at: "2026-10-01T00:00:00Z", state: "closed", head: { sha: "H" }, base: { ref: "main" }, merge_commit_sha: "S", html_url: "https://github.com/o/r/pull/846" };
+  const SHAPE = (afterFiles = [{ filename: "f.js" }]) => [
+    ["/pulls?", [merged]], ["/branches/", { commit: { sha: "F" } }],
+    ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 3, files: [{ filename: "h.js" }, { filename: "f.js" }], merge_base_commit: { sha: "C" }, base_commit: { sha: "U" } }],
+    ["/compare/S...C", { status: "behind", ahead_by: 0, behind_by: 1 }],
+    ["/compare/H...F", { status: "ahead", ahead_by: 1, behind_by: 0, files: afterFiles }],
+    ["/git/commits/U", { tree: { sha: "treeU" } }], ["/git/commits/F", { tree: { sha: "treeF" } }],
+  ];
+  const PREFIX = `feature branch ${HEAD} has 1 commit(s) after its merged PR #846 not contained in main and no open PR to main`;
+
+  it("regression: F's change landed via T, U adds an unrelated file → trees differ but f.js identical on main → merged:true", async () => {
+    const r = await land([...SHAPE(), ...CONTENTS("f.js", { base: ["U", "f1"], before: ["H", "f0"], tip: ["F", "f1"] })]);
+    expect(r).toEqual({ merged: true, mergeCommit: "U", prUrl: "" }); // base: merged:false
+  });
+
+  it("T lands F's change, then U edits f.js further → third state on main → merged:null, never false", async () => {
+    const r = await land([...SHAPE(), ...CONTENTS("f.js", { base: ["U", "f2"], before: ["H", "f0"], tip: ["F", "f1"] })]);
+    expect(r.merged).toBe(null);
+    expect(r.reason).toMatch(/unresolvable on base: f\.js/);
+  });
+
+  it("genuinely stranded: main still holds f.js at its pre-merge content, tip differs → merged:false naming the file", async () => {
+    const r = await land([...SHAPE(), ...CONTENTS("f.js", { base: ["U", "f0"], before: ["H", "f0"], tip: ["F", "f1"] })]);
+    expect(r.merged).toBe(false);
+    expect(r.reason).toContain(PREFIX);
+    expect(r.reason).toContain("main still holds the pre-merge content of: f.js");
+  });
+
+  it("new file added after the merge and never on main (absent at base AND before) → merged:false", async () => {
+    const r = await land([...SHAPE([{ filename: "new.js", status: "added" }]), ...CONTENTS("new.js", { base: ["U", null], before: ["H", null], tip: ["F", "n1"] })]);
+    expect(r.merged).toBe(false);
+    expect(r.reason).toContain("new.js");
+  });
+
+  it("mixed: one landed + one stranded → false naming only the stranded path; one landed + one unknown → null", async () => {
+    const two = SHAPE([{ filename: "f.js" }, { filename: "g.js" }]);
+    const landedF = CONTENTS("f.js", { base: ["U", "f1"], before: ["H", "f0"], tip: ["F", "f1"] });
+    const r1 = await land([...two, ...landedF, ...CONTENTS("g.js", { base: ["U", "g0"], before: ["H", "g0"], tip: ["F", "g1"] })]);
+    expect(r1.merged).toBe(false);
+    expect(r1.reason).toContain("pre-merge content of: g.js");
+    expect(r1.reason).not.toContain("f.js");
+    const r2 = await land([...two, ...landedF, ...CONTENTS("g.js", { base: ["U", "g2"], before: ["H", "g0"], tip: ["F", "g1"] })]);
+    expect(r2.merged).toBe(null);
+  });
+
+  it("contents returns a directory (array) or a non-404 error for the file → merged:null, never false", async () => {
+    const dir = await land([...SHAPE(), ["/contents/f.js?ref=U", [{ name: "x" }]], ["/contents/f.js?ref=H", { type: "file", sha: "f0" }], ["/contents/f.js?ref=F", { type: "file", sha: "f1" }]]);
+    expect(dir.merged).toBe(null);
+    const boom = () => { throw Object.assign(new Error("500"), { status: 500 }); };
+    const err = await land([...SHAPE(), ["/contents/f.js?ref=U", boom], ["/contents/f.js?ref=H", { type: "file", sha: "f0" }], ["/contents/f.js?ref=F", { type: "file", sha: "f1" }]]);
+    expect(err.merged).toBe(null);
+    // and with NO contents evidence at all (routes fall through to {}) → null
+    expect((await land(SHAPE())).merged).toBe(null);
+  });
+
+  it("renamed: new path identical on main AND old path absent on main → true; old path still on main → null", async () => {
+    const ren = SHAPE([{ filename: "b.js", status: "renamed", previous_filename: "a.js" }]);
+    const newPath = CONTENTS("b.js", { base: ["U", "b1"], before: ["H", null], tip: ["F", "b1"] });
+    expect(await land([...ren, ...newPath, ["/contents/a.js?ref=U", CONTENTS_404]])).toEqual({ merged: true, mergeCommit: "U", prUrl: "" });
+    expect((await land([...ren, ...newPath, ["/contents/a.js?ref=U", { type: "file", sha: "a0" }]])).merged).toBe(null);
+  });
+
+  it("truncation: 300 files all landed → null (list may be truncated); 300 files with one stranded in the first 50 → false", async () => {
+    const files = Array.from({ length: 300 }, (_, i) => ({ filename: `p${i}.js` }));
+    const landedAll = (p) => (p.includes("/contents/") ? { type: "file", sha: "same" } : undefined);
+    const r = await land([...SHAPE(files), ["/contents/", landedAll]]);
+    expect(r.merged).toBe(null);
+    expect(r.reason).toMatch(/truncated/);
+    const r2 = await land([...SHAPE(files), ...CONTENTS("p3.js", { base: ["U", "x0"], before: ["H", "x0"], tip: ["F", "x1"] }), ["/contents/", landedAll]]);
+    expect(r2.merged).toBe(false);
+  });
+
+  it("cap: 51 files all landed → null (probe cap); 51 files with the first stranded → false", async () => {
+    const files = Array.from({ length: 51 }, (_, i) => ({ filename: `p${i}.js` }));
+    const landedAll = (p) => (p.includes("/contents/") ? { type: "file", sha: "same" } : undefined);
+    const r = await land([...SHAPE(files), ["/contents/", landedAll]]);
+    expect(r.merged).toBe(null);
+    expect(r.reason).toMatch(/probe cap/);
+    const r2 = await land([...SHAPE(files), ...CONTENTS("p0.js", { base: ["U", "x0"], before: ["H", "x0"], tip: ["F", "x1"] }), ["/contents/", landedAll]]);
+    expect(r2.merged).toBe(false);
+  });
+
+  it("URL-encodes every path segment of the contents lookup", async () => {
+    const calls = [];
+    await land([...SHAPE([{ filename: "src/a b/c#.js" }]), ["/contents/", { type: "file", sha: "same" }]], {}, calls);
+    expect(calls).toContain("/repos/o/r/contents/src/a%20b/c%23.js?ref=U");
+    expect(calls).toContain("/repos/o/r/contents/src/a%20b/c%23.js?ref=H");
+    expect(calls).toContain("/repos/o/r/contents/src/a%20b/c%23.js?ref=F");
   });
 });

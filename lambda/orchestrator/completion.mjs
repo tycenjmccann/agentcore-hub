@@ -676,14 +676,67 @@ export function recordedHeads(agentTasks) {
  *                                         only tree(head) == tree(merge-base) — and the
  *                                         merge-base may predate the squash (N1). Or
  *                                         base's tip tree IS the head's tree (TEAM-5913).
+ *                                         Or every file the branch changed AFTER its
+ *                                         merged PR has identical content on base's tip
+ *                                         (per-file proof, TEAM-5935; list complete).
  *   { merged: false, reason }             provably not on base and nothing open to
  *                                         carry it — incl. commits pushed AFTER the
- *                                         unified PR merged (the TEAM-5828 strand);
- *                                         needs files on both compares, and trees that
- *                                         differ, else null (P2/P3 are not exhaustive);
+ *                                         unified PR merged (the TEAM-5828 strand):
+ *                                         at least one such file whose content on base's
+ *                                         tip EQUALS its pre-merge content and differs
+ *                                         from the branch tip, i.e. base demonstrably
+ *                                         never took the change. Trees that merely differ
+ *                                         prove nothing — an unrelated commit on base
+ *                                         differs them (TEAM-5935) — so that is null.
  *   { merged: null,  reason? }            unknown, or an open PR still carries it.
  * Only `merged === false` refuses completion (TEAM-3721 fail-open).
  */
+// TEAM-5935 — per-file landing proof. GitHub compare lists at most 300 files; a contents
+// 404 means the path is absent at that ref.
+const COMPARE_FILES_MAX = 300, FILE_PROBE_CAP = 50;
+const ABSENT = Symbol("absent"), UNKNOWN = Symbol("unknown");
+
+// Blob sha of `path` at `ref`: a sha, ABSENT (404) or UNKNOWN (directory, symlink, submodule,
+// malformed body, any non-404 error). UNKNOWN can never become a `false`.
+async function blobAt({ owner, repo, api }, path, ref) {
+  const p = String(path).split("/").map(encodeURIComponent).join("/");
+  try {
+    const r = await api(`/repos/${owner}/${repo}/contents/${p}?ref=${encodeURIComponent(ref)}`);
+    return r && !Array.isArray(r) && r.type === "file" && nonEmptyString(r.sha) ? r.sha : UNKNOWN;
+  } catch (err) { return err?.status === 404 ? ABSENT : UNKNOWN; }
+}
+
+// Classify each post-merge feature change (`files` = mergedHead...tip compare files):
+//   LANDED  base == tip (both ABSENT counts)
+//   ABSENT  base == before && before != tip  (base holds exactly the pre-change content)
+//   UNKNOWN anything else (base moved the file to a third state, or a lookup was unresolvable)
+// Renamed: LANDED only if new path base == tip AND previous path ABSENT on base; else UNKNOWN.
+// Beyond FILE_PROBE_CAP only an ABSENT found within the cap may be returned; `landed` also
+// needs the list untruncated (< COMPARE_FILES_MAX).
+async function perFileLanding(ctx, files, { base, before, tip }) {
+  const absent = [], unknown = [];
+  for (const f of files.slice(0, FILE_PROBE_CAP)) {
+    const path = f?.filename;
+    if (!nonEmptyString(path)) { unknown.push("(unnamed)"); continue; }
+    const [m, b, t] = await Promise.all([blobAt(ctx, path, base), blobAt(ctx, path, before), blobAt(ctx, path, tip)]);
+    if (f.status === "renamed") {
+      const prev = nonEmptyString(f.previous_filename) ? await blobAt(ctx, f.previous_filename, base) : UNKNOWN;
+      if (m !== UNKNOWN && t !== UNKNOWN && m === t && prev === ABSENT) continue;
+      unknown.push(path); continue;
+    }
+    if (m === UNKNOWN || t === UNKNOWN) { unknown.push(path); continue; }
+    if (m === t) continue;
+    if (b !== UNKNOWN && m === b && b !== t) { absent.push(path); continue; }
+    unknown.push(path);
+  }
+  const truncated = files.length >= COMPARE_FILES_MAX, capped = files.length > FILE_PROBE_CAP;
+  const landed = absent.length === 0 && unknown.length === 0 && !truncated && !capped;
+  const why = truncated ? `post-merge diff lists ${files.length} files (truncated)`
+    : capped ? `${files.length} post-merge files exceed the ${FILE_PROBE_CAP}-file probe cap`
+    : `unresolvable on base: ${unknown.join(", ")}`;
+  return { absent, landed, why };
+}
+
 export async function featureBranchLanding({ owner, repo, base, head, api, recordedHeads = [] }) {
   const enc = encodeURIComponent;
   const list = [];
@@ -746,15 +799,24 @@ export async function featureBranchLanding({ owner, repo, base, head, api, recor
   if (open) return { merged: null, reason: `open PR #${open.number} to ${base}` };
   if (!after) return { merged: null };
   // TEAM-5913: P2/P3 are sufficient, not exhaustive — refuse only on positive evidence.
+  const tipSha = cmp?.base_commit?.sha || null;
   const treeOf = async (sha) => (sha ? (await api(`/repos/${owner}/${repo}/git/commits/${enc(sha)}`).catch(() => null))?.tree?.sha || null : null);
-  const tipTree = await treeOf(cmp?.base_commit?.sha), headTree = await treeOf(headSha);
-  if (tipTree && tipTree === headTree) return { merged: true, mergeCommit: cmp.base_commit.sha, prUrl: "" };
-  if (!tipTree || !headTree || !Array.isArray(cmp?.files) || !(after.files?.length > 0)) {
-    return { merged: null, reason: `no landing proof for ${head} on ${base}, but no proof of unlanded content either (files/trees unavailable)` };
+  const tipTree = await treeOf(tipSha), headTree = await treeOf(headSha);
+  if (tipTree && tipTree === headTree) return { merged: true, mergeCommit: tipSha, prUrl: "" };
+  // TEAM-5935: trees that DIFFER prove nothing (an unrelated commit on base differs them).
+  // Prove per file over the post-merge feature changes instead.
+  const files = Array.isArray(after.files) ? after.files : [];
+  const inconclusive = (why) => ({ merged: null, reason: `no landing proof for ${head} on ${base}, but no proof of unlanded content either (${why})` });
+  if (files.length === 0 || !tipSha || !headSha) return inconclusive("post-merge file list or tip unavailable");
+  const v = await perFileLanding({ owner, repo, api }, files, { base: tipSha, before: mergedHead, tip: headSha });
+  if (v.absent.length > 0) {
+    return unmerged(
+      `feature branch ${head} has ${after.ahead_by ?? "?"} commit(s) after its merged PR #${mergedPr.number} not contained in ${base} and no open PR to ${base}` +
+      `; ${base} still holds the pre-merge content of: ${v.absent.join(", ")}`
+    );
   }
-  return unmerged(
-    `feature branch ${head} has ${after?.ahead_by ?? "?"} commit(s) after its merged PR #${mergedPr.number} not contained in ${base} and no open PR to ${base}`
-  );
+  if (v.landed) return { merged: true, mergeCommit: tipSha, prUrl: "" };
+  return inconclusive(v.why);
 }
 
 /**
