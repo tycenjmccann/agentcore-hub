@@ -13,7 +13,7 @@ import { withDefaultDecision } from "@/lib/workflow/gate-decision";
 // completions record proves a deliverable. Imported (not replicated) so a blank
 // record we are allowed to fill is defined identically here and at the gate.
 import { completionRecordHasEvidence, RESERVATION_FIELD } from "@/lib/workflow/completion-evidence";
-import { rejectedDetails } from "@/lib/workflow/ticket-transition-refusal";
+import { rejectedDetails, provesTransitioned } from "@/lib/workflow/ticket-transition-refusal";
 
 export const dynamic = "force-dynamic";
 
@@ -627,12 +627,13 @@ export async function POST(
     // that never moved misleads every caller (console optimistically repaints the
     // status; intervene.py records a manager.intervention) and, worse, leaves the
     // evidence record this call just wrote attached to work that did not close.
+    const responseText = response.Payload ? Buffer.from(response.Payload).toString() : "";
     let responsePayload: unknown = null;
-    if (response.Payload) {
+    if (responseText) {
       try {
-        responsePayload = JSON.parse(Buffer.from(response.Payload).toString());
+        responsePayload = JSON.parse(responseText);
       } catch {
-        // Unreadable payload proves nothing — fall through as before.
+        // Unreadable payload proves nothing — falls through to the unproven 502 below.
       }
     }
     const refusal = rejectedDetails(responsePayload, targetStatus);
@@ -659,6 +660,27 @@ export async function POST(
           ...(wantsEvidenceRecord ? { completionRecordWritten: false, completionRecordReverted } : {}),
         },
         { status: 409 }
+      );
+    }
+
+    // TEAM-6123: the absence of a recognized refusal is not proof of success — an
+    // unparseable payload, "null", "{}", or any shape rejectedDetails doesn't
+    // recognize all fell through to success:true above. provesTransitioned is the
+    // allow-list counterpart: it requires one of the two real success shapes. Left
+    // UNREVERTED, same reasoning as the FunctionError/throw branches above — this is
+    // ambiguous, not a proven refusal, so reverting on a guess risks undoing a
+    // ticket that really did move.
+    if (!provesTransitioned(responsePayload, targetStatus)) {
+      console.warn(`[transition] ${ticketId}: tickets Lambda did not confirm the transition to ${targetStatus}: ${responseText.slice(0, 500)}`);
+      return NextResponse.json(
+        {
+          error: "Ticket transition unconfirmed",
+          ...(wantsEvidenceRecord ? { completionRecordWritten, completionRecordReverted: false } : {}),
+          details: responseText.slice(0, 500),
+          ticketId,
+          targetStatus,
+        },
+        { status: 502 }
       );
     }
 

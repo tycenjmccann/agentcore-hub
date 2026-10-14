@@ -75,6 +75,10 @@ const h = vi.hoisted(() => {
     afterGet: (() => void) | null;
     // What the tickets Lambda replies with (dynamodb-mode success by default).
     lambdaPayload: unknown;
+    // TEAM-6123 — when set, overrides lambdaPayload with this EXACT raw text
+    // (not JSON.stringify'd), so a test can hand the route payload text that is
+    // not valid JSON at all, which lambdaPayload alone cannot produce.
+    lambdaRawPayload: string | null;
     // When set, getTicketsForWorkflowFromJira throws it.
     jiraListError: Error | null;
     // TEAM-4286: when set, LambdaClient.send THROWS it (an invoke that never got a
@@ -87,7 +91,7 @@ const h = vi.hoisted(() => {
     tickets: [], workflow: { workflowId: "wf_1" }, calls: [], bucket: {},
     ctorLog: [], ctorKeys: [], putCtorKeys: [], jiraListCalls: [], dynamoListCalls: [],
     s3PutError: null, s3PutErrors: [], s3DeleteErrors: [], s3GetError: null, afterGet: null,
-    lambdaPayload: { status: "transitioned" }, jiraListError: null,
+    lambdaPayload: { status: "transitioned" }, lambdaRawPayload: null, jiraListError: null,
     lambdaError: null, lambdaFunctionError: null, etagSeq: 0,
   };
   const precondition = () => {
@@ -198,13 +202,16 @@ vi.mock("@aws-sdk/client-lambda", () => {
       // evidence record alone; neither was reachable while this mock always resolved
       // a clean payload.
       if (h.state.lambdaError) throw h.state.lambdaError;
+      const payloadText = h.state.lambdaRawPayload !== null
+        ? h.state.lambdaRawPayload
+        : JSON.stringify(h.state.lambdaPayload);
       if (h.state.lambdaFunctionError) {
         return {
           FunctionError: h.state.lambdaFunctionError,
-          Payload: Buffer.from(JSON.stringify(h.state.lambdaPayload)),
+          Payload: Buffer.from(payloadText),
         };
       }
-      return { Payload: Buffer.from(JSON.stringify(h.state.lambdaPayload)) };
+      return { Payload: Buffer.from(payloadText) };
     }
   }
   return { LambdaClient, InvokeCommand };
@@ -268,6 +275,7 @@ beforeEach(() => {
   h.state.s3GetError = null;
   h.state.afterGet = null;
   h.state.lambdaPayload = { status: "transitioned" };
+  h.state.lambdaRawPayload = null;
   h.state.jiraListError = null;
   h.state.lambdaError = null;
   h.state.lambdaFunctionError = null;
@@ -567,6 +575,89 @@ describe("transition route — a refused transition is not a success (TEAM-4282 
     expect(dels()).toHaveLength(0);
     expect(puts()[2].input.IfMatch).toBe('"etag-1"'); // the version our refill wrote
     expect(stored()).toEqual({ [KEY]: original });
+  });
+});
+
+/**
+ * TEAM-6123 (P2) — rejectedDetails is a DENY-list: it answers null for any
+ * payload it doesn't recognize as a refusal, and the route treated that null as
+ * "the ticket moved" — reporting success:true (and keeping the evidence record)
+ * for a ticket that was never proven to have transitioned. None of these shapes
+ * prove anything, so each must now 502 — and, like the pre-existing FunctionError/
+ * throw branches, must NOT revert the evidence record: an unproven response is
+ * ambiguous, not a proven refusal.
+ */
+describe("transition route — an unproven transition is not a success (TEAM-6123)", () => {
+  it.each([
+    ["unparseable payload text", "not json"],
+    ["empty payload", ""],
+    ['literal JSON "null" payload', "null"],
+    ['"{}" payload', "{}"],
+  ])("%s → 502, record left in place (not reverted)", async (_label, raw) => {
+    await load();
+    h.state.lambdaRawPayload = raw;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).not.toHaveProperty("success");
+    expect(json).toMatchObject({ ticketId: "TEAM-X", completionRecordWritten: true, completionRecordReverted: false });
+    expect(dels()).toHaveLength(0);
+    expect(Object.keys(stored())).toEqual([KEY]);
+  });
+
+  it('a refusal-shaped-but-unrecognized object ({ok:true,status:"blocked"}) → 502, record left in place', async () => {
+    await load();
+    h.state.lambdaPayload = { ok: true, status: "blocked" };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).toMatchObject({ completionRecordWritten: true, completionRecordReverted: false });
+    expect(dels()).toHaveLength(0);
+  });
+
+  it("the real tickets-Lambda success shape still 200s (regression guard)", async () => {
+    await load();
+    h.state.lambdaPayload = { key: "TEAM-X", status: "transitioned", from: "in_progress", to: "done" };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ success: true, completionRecordWritten: true });
+  });
+
+  it("the real jira-Lambda success shape still 200s (regression guard)", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = { ticketId: "TEAM-X", status: "done", message: "Transitioned to done" };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ success: true, completionRecordWritten: true });
+  });
+
+  it("a real refusal is still 409 and reverts, not 502 (the two codes stay distinct)", async () => {
+    await load();
+    h.state.lambdaPayload = DDB_REFUSAL;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ completionRecordReverted: true });
+  });
+
+  it("unproven, with NO evidence → 502 with zero S3 traffic (detection is independent of the write)", async () => {
+    await load();
+    h.state.lambdaRawPayload = "{}";
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done" });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).not.toHaveProperty("completionRecordWritten");
+    expect(json).not.toHaveProperty("completionRecordReverted");
+    expect(s3calls()).toHaveLength(0);
   });
 });
 
