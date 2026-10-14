@@ -2209,3 +2209,48 @@ describe("TEAM-6133 follow-up PR host anchoring", () => {
     }
   });
 });
+
+// TEAM-6148 — the PR-number segment is a WHOLE positive integer, not a numeric prefix:
+// `/pull/1not-a-pr` and `/pull/1%2Fnot-a-pr` are not PR #1 (pathname is not percent-decoded,
+// so `%2F` is one segment of junk, same class as `1not-a-pr`). Prose punctuation glued to the
+// url (`…/pull/12.`, `(…/pull/12)`) still parses because it is stripped off the TOKEN first.
+describe("TEAM-6148 PR-number segment is a whole positive integer", () => {
+  const R = [{ owner: "o", repo: "r", defaultBranch: "main" }];
+  const ref = (t) => completionMod.githubPrRef(t);
+  const refsOf = (prUrl) => completionMod.followUpPrRefs({ F: { prUrl } }, R);
+
+  it("TEAM-6148 githubPrRef: trailing junk after the digits is not a PR number", () => {
+    expect(ref("https://github.com/o/r/pull/1not-a-pr")).toBeNull();
+    expect(ref("https://github.com/o/r/pull/1%2Fnot-a-pr")).toBeNull();
+  });
+
+  it("TEAM-6148 githubPrRef: /pull/0 is not a PR", () => {
+    expect(ref("https://github.com/o/r/pull/0")).toBeNull();
+  });
+
+  it("TEAM-6148 githubPrRef: every legitimate PR url shape still parses", () => {
+    const want = { owner: "o", repo: "r", number: 12 };
+    for (const ok of [
+      "https://github.com/o/r/pull/12/",
+      "https://github.com/o/r/pull/12/files",
+      "https://github.com/o/r/pull/12/commits",
+      "https://github.com/o/r/pull/12?x=1",
+      "https://github.com/o/r/pull/12#issuecomment-1",
+      "HTTPS://GITHUB.COM/o/r/pull/12",
+      "http://github.com/o/r/pull/12",
+      "see https://github.com/o/r/pull/12.",
+      "(see https://github.com/o/r/pull/12)",
+    ]) {
+      expect(ref(ok), ok).toEqual(want);
+    }
+  });
+
+  it("TEAM-6148 followUpPrRefs: a prUrl with junk after the number yields no ref", () => {
+    expect(refsOf("https://github.com/o/r/pull/1not-a-pr")).toEqual([]);
+  });
+
+  it("TEAM-6148 followUpPrRefs: a junk record pr_url is dropped while the good cached prUrl survives", () => {
+    const refs = completionMod.followUpPrRefs({ F: { prUrl: "https://github.com/o/r/pull/9" } }, R, { F: { pr_url: "https://github.com/o/r/pull/1%2Fnot-a-pr" } });
+    expect(refs).toEqual([{ ...R[0], number: 9, url: "https://github.com/o/r/pull/9" }]);
+  });
+});
