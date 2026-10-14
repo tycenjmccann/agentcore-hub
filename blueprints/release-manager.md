@@ -631,6 +631,19 @@ blank value means "no branch was stated", and the run's own integration branch i
 the default. Passing it by habit is how an ordinary phase fix gets retargeted at
 `main` and stops riding the run's PR.
 
+**Who ships a hub-infra fix PR.** A hub-infra PR is an orphan class. It is not
+this run's post-merge follow-up PR (it targets the HUB's repo). `followUpPrRefs`
+drops other-repo PRs by design, so no completion-gate backstop
+(`open_follow_up_pr`) covers it. This run's chain cannot certify it (wrong
+`ci_project`/pipeline). So the fixer always files its chain against the HUB's
+pipeline, with every description carrying `ci_project: agentcore-hub-ci` and
+`pipeline: agentcore-hub-deploy` lines (your follow-up Ship/CD pair uses that
+`pipeline:` in place of the run's). If the hub pipeline is not
+registered/usable from this run, the fixer instead files an explicit human
+handoff ticket (`human:engineer`) naming the PR. Either one is required
+regardless of whether this run's unified PR merged, and is mandatory. See
+`load_blueprint("bug-fixer")` → "Hub-infra fix PR".
+
 **After the unified PR has merged, the default flips.** Once your merge has
 landed (you hold its `merge_commit`), the run's integration branch is dead: a fix
 merged into it never reaches the default branch. Every ordinary fix ticket or
@@ -639,8 +652,10 @@ merged into it never reaches the default branch. Every ordinary fix ticket or
 follow-up) — the `default_branch:` of your `## Repository` context, never a
 literal `main` — unless the work targets another stated base (the
 `base_branch:` your `## Branch` context names, e.g. `release/2.1`), which it
-passes instead; so the fixer PRs straight to that base through review → CI →
-Merge Approval. A hub-infra fix keeps its hub `main` base from the rule above
+passes instead. The fixer PRs straight to that base and files that PR's own
+CI → Ship → Merge Approval → CD chain (`load_blueprint("bug-fixer")` →
+"Post-merge follow-up PR: file its ship chain"). Opening the PR ships nothing.
+A hub-infra fix keeps its hub `main` base from the rule above
 (it targets the HUB's repo, not this one); the flip never applies to it. State
 the base explicitly even though the orchestrator resolves a blank base after
 the merge: you can file the fix before your own completion records the merge,

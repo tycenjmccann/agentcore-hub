@@ -69,6 +69,19 @@ first and never re-file a chain whose titles already name your `pr_url`. Then
 without it). Pre-merge fixes — a PR into the live integration branch — are
 unchanged: you merge them yourself (Step 4) and the unified PR carries them.
 
+**Hub-infra fix PR.** A PR you open against the HUB's own repo from another
+repo's run (your ticket carries the hub's `main` base per release-manager.md
+"Hub-infra fix tickets are targeted") is an orphan class regardless of whether
+the target unified PR merged. The section above covers only PRs opened AFTER
+the unified PR merged, `followUpPrRefs` drops other-repo PRs, and this run's
+pipeline cannot certify it. File the same four-ticket chain against the HUB's
+pipeline, with every description also carrying `ci_project: agentcore-hub-ci`
+and `pipeline: agentcore-hub-deploy` lines. If the hub pipeline is not
+registered/usable from this run, file ONE explicit human handoff ticket
+`Handoff: hub-infra PR <pr_url>` assigned `human:engineer`, naming the PR, its
+head SHA and base. One of the two is mandatory before `report_completion`; no
+completion-gate backstop covers it.
+
 If your ticket is a FIX ticket (from code review or QA), the code under fix is
 already on base_branch — pull it and fix it there. A fix ticket is a NEW ticket
 and starts in its OWN fresh coding session (siblings run in parallel; one

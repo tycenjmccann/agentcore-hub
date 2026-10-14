@@ -191,6 +191,12 @@ live; treating a code-read or a mocked run as that proof is exactly the
   follow-up PR: file its ship chain"). Never treat it as delivered when its PR
   opens or its fix ticket goes Done — only when its `CD: follow-up PR` ticket
   reports a `merge_commit`.
+  You are re-invoked when that fix ticket goes Done, which is PR-open time,
+  before the merge. On that invocation, find its `CD: follow-up PR <pr_url>`
+  ticket (`Tickets___list_tickets(<epic>)`). If it is not Done, PARK YOURSELF:
+  `Tickets___transition_ticket(ticket_id=<your QA ticket>, transition_id="blocked", blocked_by="<CD ticket id>", reason="QA: post-merge fix not merged yet")`
+  (DL-024) and exit WITHOUT `report_completion`. Verify only when you are
+  re-invoked after it reports a `merge_commit`.
 
 ### Step 5: Deliver Verdict
 **Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists

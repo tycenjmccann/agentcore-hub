@@ -155,7 +155,8 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
   const SECTION = "Post-merge follow-up PR: file its ship chain";
 
   it("no blueprint claims a post-merge PR goes through Merge Approval on its own", () => {
-    const offenders = blueprints.filter(({ text }) => text.includes("Merge Approval like any change")).map((b) => b.file);
+    const BANNED = ["Merge Approval like any change", "through review → CI → Merge Approval"];
+    const offenders = blueprints.flatMap(({ file, text }) => BANNED.filter((p) => text.includes(p)).map((p) => `${file}: ${p}`));
     expect(offenders).toEqual([]);
   });
 
@@ -191,5 +192,40 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     const t = read("qa-verifier");
     expect(t).toContain(SECTION);
     expect(t).toMatch(/`CD: follow-up PR` ticket reports a `merge_commit`/);
+  });
+
+  // TEAM-6063 finding 1: a `CI: Certify follow-up PR` ticket may carry no fix-ticket
+  // blocker, so ci-agent cannot resolve "the fix ticket's own PR" the normal way. It
+  // must read the PR named in the ticket itself.
+  it("ci-agent certifies the PR a `CI: Certify follow-up PR` ticket names (TEAM-6063)", () => {
+    const t = read("ci-agent");
+    const para = t.slice(t.indexOf("**After the unified PR has merged, the integration branch is dead.**"), t.indexOf("### P0:"));
+    expect(para).toContain("**On a `CI: Certify follow-up PR <pr_url>` ticket**");
+    expect(para).toContain("gh pr view <pr_url> --json headRefName,headRefOid,baseRefName");
+    expect(para).toContain("never the integration branch or a guessed fix ticket");
+    expect(para).toContain("`ci_head_sha` must equal that PR's head SHA");
+  });
+
+  // TEAM-6063 finding 2: QA is re-invoked when the fix ticket goes Done, which is
+  // PR-open time, before the merge. It must park on the fix's CD ticket instead of
+  // verifying (and delivering a verdict) early.
+  it("qa-verifier parks on the fix's CD: follow-up PR ticket until it merges (TEAM-6063)", () => {
+    const t = read("qa-verifier");
+    expect(t).toContain("find its `CD: follow-up PR <pr_url>` ticket");
+    expect(t).toContain('transition_id="blocked", blocked_by="<CD ticket id>"');
+    expect(t).toMatch(/blocked_by="<CD ticket id>"[^`]*\)`\s*\(DL-024\) and exit WITHOUT `report_completion`/);
+  });
+
+  // TEAM-6063 finding 3: a hub-infra fix PR is an orphan class the existing chain and
+  // completion-gate backstop don't cover (wrong repo, wrong ci_project/pipeline). Someone
+  // must still ship or hand it off.
+  it.each(["bug-fixer", "release-manager"])("%s names who ships a hub-infra fix PR (TEAM-6063)", (name) => {
+    const t = read(name);
+    expect(t).toContain("orphan class");
+    expect(t).toContain("`ci_project: agentcore-hub-ci`");
+    expect(t).toContain("`pipeline: agentcore-hub-deploy`");
+    expect(t).toContain("`human:engineer`");
+    expect(t).toContain("regardless of whether");
+    expect(t).toContain("no completion-gate backstop");
   });
 });
