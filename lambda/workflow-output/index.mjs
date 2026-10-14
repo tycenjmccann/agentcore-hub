@@ -1680,6 +1680,18 @@ export async function drainCompletion(msg) {
       // the twins then admitted a Done with no brief on the gate. The journey event and
       // the TicketReplayDropped metric wait for the stamp.
       if (!stamped.ok) return retry(stamped.moved ? stamped.error : `the drop could not be stamped on ${reportKey} (${stamped.error})`);
+      // TEAM-5926 (TEAM-5799 ship-review F1): a twin's Done guard may have read the
+      // record BEFORE this stamp and committed the Done after it. Re-read the ticket now
+      // that the hold is durable: a Done that landed is converged on the next tick
+      // (step 1 sees it Done, the released notice goes out and step 6 restamps
+      // briefPending:false), so this drop is not final and the message stays. A ticket
+      // that cannot be read is the same retry: the hold is on the record, the safe side.
+      if (extra?.briefPending === true) {
+        const after = await ticketTool("Tickets___get_issue", { ticket_id: ticketId });
+        const now = after.ok ? normalizeIssue(after.payload) : null;
+        if (!now) return retry(`post-stamp re-read of ${ticketId} failed (${after.error || "the ticket payload carried no ticket key"}); the brief hold is stamped`);
+        if (isDoneStatus(now.status)) return retry(`${ticketId} reached Done concurrently with the brief hold; converging on the next tick`);
+      }
     }
     await publishJourneyEvent(workflowId || ticketId, "workflow.ticket_replay_dropped", { ticketId, agentId: msg.agentId || null, step, error, notice });
     return { outcome: "dropped", reason: `${step}: ${error}`, permanent: true, notice };
@@ -1757,6 +1769,21 @@ export async function drainCompletion(msg) {
       : brief.outcome === "undelivered" ? { briefDelivered: "undelivered" }
         : { briefDelivered: "gate", briefTargets: [brief.gate] };
 
+  // TEAM-5926: a brief hold this drain stamped while a twin's Done went through
+  // (drop()'s post-stamp re-read sends the message back to land here). The Done
+  // already released the gate, so the hold has nothing left to hold: say so where the
+  // "LEFT OPEN" drop notice went, BEFORE the record lets go of it, then restamp
+  // briefPending:false below. The brief stays off_gate and undelivered on the record.
+  const releasedHold = alreadyDone && rec.record?.briefPending === true && !!brief && !brief.gate;
+  if (releasedHold) {
+    const marker = `[brief-hold-released:${ticketId}]`;
+    for (const target of [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])]) {
+      const r = await postMarkedComment(target, marker,
+        `${marker}\n\n${ticketId} reached Done while the ticket-provider replay was holding it open for its merge brief, so the earlier "LEFT OPEN" replay notice is superseded: the Done stands (the hub does not undo moves). The merge brief ${msg.brief.s3Key} is still NOT on the Merge Approval gate (${brief.outcome === "off_gate" ? `posted on ${brief.targets.join(", ")} instead: ${brief.reason}` : brief.reason}); a human must put it in front of the approver before approving the merge. The completion record s3://${BUCKET}/${reportKey} no longer holds the ticket.`);
+      if (!r.ok && !isPermanentTicketRefusal(r.cause)) return retry(`brief-hold-released notice on ${target} not posted (${r.error})`);
+    }
+  }
+
   // 5. Residual security findings, before the Done that releases the dev lanes.
   if (msg.residual) {
     const out = await postResidualFindings({ ticketId, ...msg.residual, siblings: scan.siblings });
@@ -1774,6 +1801,8 @@ export async function drainCompletion(msg) {
         followUpsPending: stillUnfiled, status: stillUnfiled ? STATUS_PENDING_FOLLOW_UPS : "complete",
         ...(entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
         ...(briefDelivery ? { ...briefDelivery, ...(holds.some((h) => h.step === "brief") ? { briefPending: true } : {}) } : {}),
+        // TEAM-5926: `{...rec.record, ...extra}` would otherwise keep the released hold.
+        ...(releasedHold ? { briefPending: false } : {}),
         ...(undelivered.length > 0 ? { undelivered } : {}),
       },
     });
@@ -1791,6 +1820,8 @@ export async function drainCompletion(msg) {
     // twins' Done guard below must read it as delivered. `false`, not deleted: the
     // record keeps the history that it was held.
     if (record.briefPending === true && brief?.gate) record.briefPending = false;
+    // TEAM-5926: and a hold a concurrent Done released (the notice above said so).
+    if (releasedHold) record.briefPending = false;
     // TEAM-5830: conditional on the step-0 read, like drop() above.
     const restamped = await putRecordIfUnchanged(reportKey, record, recordEtag);
     if (!restamped.ok) return retry(restamped.moved ? restamped.error : `record ${reportKey} not restamped (${restamped.error})`);

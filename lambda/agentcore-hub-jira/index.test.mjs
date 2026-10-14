@@ -13,10 +13,12 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 import "./hermetic-s3.mjs"; // TEAM-5892: no S3 call in this file reaches the network
 import { adfToText, getIssue, handler, clampSummary, SEARCH_MAX_PAGES, mapStatusToInternal, findCancelTransition } from "./index.mjs";
 import { parseFixContractBlock } from "./fix-contract.mjs";
+import * as gateContract from "./gate-contract.mjs"; // TEAM-5926 (namespace: the suite still loads where an export is missing)
 
 // ─── Finding 1: adfToText ──────────────────────────────────────────────────────
 
@@ -1954,6 +1956,9 @@ const SHIP_ROSTER = {
  * field existed assumed. `recordBodies[key]` overrides with a RAW STRING, so a
  * pending record, a non-JSON body and an empty body are all expressible.
  * `recordBodyError` (TEAM-5832) makes GetObject succeed and the body stream throw.
+ * TEAM-5926: `recordBodies` is read on every GET, so a test may mutate it mid-call (a
+ * concurrent writer); `recordError` may be a function of the 0-based record-read
+ * index; each body is served with an ETag derived from it, as S3 does.
  */
 async function loadShipGate({ records = [], recordBodies = {}, recordError = null, recordBodyError = null, bucket = "test-bucket" } = {}) {
   process.env.ARTIFACT_BUCKET = bucket;
@@ -1963,7 +1968,8 @@ async function loadShipGate({ records = [], recordBodies = {}, recordError = nul
     const key = cmd?.input?.Key;
     if (String(key).startsWith("completions/")) {
       s3Calls.records.push(key);
-      if (recordError) throw recordError;
+      const readError = typeof recordError === "function" ? recordError(s3Calls.records.length - 1) : recordError;
+      if (readError) throw readError;
       if (recordBodyError) return { Body: { transformToString: async () => { throw recordBodyError; } } };
       if (!(key in recordBodies) && !records.includes(key)) {
         const err = new Error("NoSuchKey");
@@ -1975,7 +1981,7 @@ async function loadShipGate({ records = [], recordBodies = {}, recordError = nul
         key in recordBodies
           ? recordBodies[key]
           : JSON.stringify({ ticketId: key.slice("completions/".length).replace(/\.json$/, ""), summary: "shipped" });
-      return { Body: { transformToString: async () => body } };
+      return { ETag: `"${createHash("md5").update(String(body)).digest("hex")}"`, Body: { transformToString: async () => body } };
     }
     s3Calls.gets.push(key);
     if (key === "config/agents.json") {
@@ -1993,7 +1999,7 @@ async function loadShipGate({ records = [], recordBodies = {}, recordError = nul
  * a transition list containing Done, and records every POST so a refusal can be
  * proven to have written NOTHING.
  */
-function installDoneStub({ labels = [], ticketId = SHIP_TICKET } = {}) {
+function installDoneStub({ labels = [], ticketId = SHIP_TICKET, onComment = null } = {}) {
   const calls = { labelReads: [], transitions: [], comments: [], restore: null };
   const originalFetch = globalThis.fetch;
   calls.restore = () => { globalThis.fetch = originalFetch; };
@@ -2019,6 +2025,8 @@ function installDoneStub({ labels = [], ticketId = SHIP_TICKET } = {}) {
     }
     if (u.includes("/comment") && method === "POST") {
       calls.comments.push(JSON.parse(init.body));
+      // TEAM-5926: lets a test land a concurrent write while the comment is in flight.
+      if (onComment) await onComment(calls.comments.length - 1);
       return new Response(JSON.stringify({ id: "1" }), { status: 201 });
     }
     throw new Error(`unexpected ${method} ${u}`);
@@ -2079,7 +2087,8 @@ test("TEAM-4706 (b): the same ship ticket WITH the record transitions normally",
     assert.equal(res.ticketId, SHIP_TICKET);
     assert.equal(res.reason, undefined);
     assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
-    assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY]);
+    // TEAM-5926: the guard read, then the post-commit brief-hold re-read.
+    assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY, SHIP_RECORD_KEY]);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
@@ -2095,7 +2104,8 @@ test("TEAM-4706 (c): a NON-ship ticket closes with no record — one brief-hold 
     assert.equal(res.status, "done");
     assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
     // TEAM-5832: every non-ship Done reads its record for the brief hold; no record ⇒ admit.
-    assert.deepEqual(s3Calls.records, ["completions/TEAM-4067.json"]);
+    // TEAM-5926: and re-reads it once the Done is committed.
+    assert.deepEqual(s3Calls.records, ["completions/TEAM-4067.json", "completions/TEAM-4067.json"]);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
@@ -2116,7 +2126,8 @@ test("TEAM-4706 (d): a human-review gate closes with no record — the UI/Telegr
     assert.equal(res.status, "done");
     assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
     // TEAM-5832: the gate reads its (absent) record for the brief hold — the 404 admits.
-    assert.deepEqual(s3Calls.records, ["completions/TEAM-4068.json"]);
+    // TEAM-5926: and re-reads it once the Done is committed.
+    assert.deepEqual(s3Calls.records, ["completions/TEAM-4068.json", "completions/TEAM-4068.json"]);
   } finally {
     cap.restore();
     delete process.env.ARTIFACT_BUCKET;
@@ -4396,3 +4407,118 @@ test("TEAM-5785: a failed post-POST claim read is unknown, not moved: park kept,
     globalThis.fetch = originalFetch;
   }
 });
+
+// ─── TEAM-5926 (TEAM-5799 ship-review F1): a Done over a concurrent brief hold ───
+// The guard reads the record, then the reason comment is awaited before the Done POST.
+// A replay drain's CAS stamp of briefPending:true landing in that window used to leave
+// a Done ticket under a held record with nothing said. The Done stands (the hub does not
+// undo moves); the post-commit re-read flags it.
+{
+  const KEY = "completions/TEAM-4067.json";
+  const DEV_LABELS = ["agent:agentcore_hub_backend_dev", "phase:development"];
+  const HOLD_BODY = JSON.stringify({ ticketId: "TEAM-4067", briefPending: true, briefDelivered: "off_gate", ticketWrites: "dropped" });
+  const BRIEF_HOLD_REFUSAL_RE = /\bhas briefPending:true \(brief /; // workflow-output's isBriefHoldRefusal
+  const commentTexts = (cap) => cap.comments.map((c) => adfToText(c.body).trim());
+  const s3Unavailable = () => Object.assign(new Error("ServiceUnavailable"), { name: "ServiceUnavailable", $metadata: { httpStatusCode: 503 } });
+
+  test("TEAM-5926 (j1): a brief hold stamped during the reason comment ⇒ the Done stands, flagged conflict + Conflict comment", async () => {
+    const recordBodies = {};
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({
+      labels: DEV_LABELS, ticketId: "TEAM-4067",
+      onComment: (i) => { if (i === 0) recordBodies[KEY] = HOLD_BODY; },
+    });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+
+      assert.equal(res.error, undefined, "a committed Done is never reported as refused");
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, "done_over_brief_hold");
+      assert.equal(res.warning, gateContract.DONE_OVER_BRIEF_HOLD_WARNING);
+      assert.doesNotMatch(res.warning, BRIEF_HOLD_REFUSAL_RE);
+      assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+      assert.deepEqual(commentTexts(cap), ["implemented", `Conflict: ${gateContract.DONE_OVER_BRIEF_HOLD_WARNING}`]);
+      assert.deepEqual(s3Calls.records, [KEY, KEY]);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5926 (j1b): a ship ticket whose proven record turns into a hold mid-call is flagged too", async () => {
+    const recordBodies = { [SHIP_RECORD_KEY]: JSON.stringify({ ticketId: SHIP_TICKET, summary: "shipped" }) };
+    const { mod } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({
+      labels: ["agent:agentcore_hub_release_manager", "phase:ship"],
+      onComment: (i) => { if (i === 0) recordBodies[SHIP_RECORD_KEY] = JSON.stringify({ ticketId: SHIP_TICKET, summary: "shipped", briefPending: true, briefDelivered: "off_gate" }); },
+    });
+    try {
+      const res = await doneTransition(mod.handler, SHIP_TICKET, { reason: "PR merged" });
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, "done_over_brief_hold");
+      assert.equal(cap.comments.length, 2);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5926 (j2): no concurrent stamp ⇒ no conflict, no Conflict comment", async () => {
+    const { mod, s3Calls } = await loadShipGate();
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.equal(res.warning, undefined);
+      assert.deepEqual(commentTexts(cap), ["implemented"]);
+      assert.deepEqual(s3Calls.records, [KEY, KEY]);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5926 (j3): the post-commit re-read fails twice ⇒ still a success, with a could-not-run warning", async () => {
+    const { mod, s3Calls } = await loadShipGate({ recordError: (n) => (n >= 1 ? s3Unavailable() : null) });
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.error, undefined);
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.match(res.warning, /post-commit completion-record check could not run \(could not read completions\/TEAM-4067\.json \(ServiceUnavailable 503\)\)/);
+      assert.doesNotMatch(res.warning, BRIEF_HOLD_REFUSAL_RE);
+      assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+      assert.deepEqual(commentTexts(cap), ["implemented"]);
+      assert.deepEqual(s3Calls.records, [KEY, KEY, KEY], "one guard read, the re-read and its one retry");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  for (const [name, body] of [
+    ["a record that is not a hold (briefPending:false)", JSON.stringify({ ticketId: "TEAM-4067", briefPending: false, briefDelivered: "gate" })],
+    ["a body that cannot be judged (doubt is not flagged)", "{not json"],
+  ]) {
+    test(`TEAM-5926 (j4): the record changed into ${name} ⇒ no conflict`, async () => {
+      const recordBodies = {};
+      const { mod } = await loadShipGate({ recordBodies });
+      const cap = installDoneStub({
+        labels: DEV_LABELS, ticketId: "TEAM-4067",
+        onComment: (i) => { if (i === 0) recordBodies[KEY] = body; },
+      });
+      try {
+        const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+        assert.equal(res.status, "done");
+        assert.equal(res.conflict, undefined);
+        assert.equal(res.warning, undefined);
+        assert.equal(cap.comments.length, 1);
+      } finally {
+        cap.restore();
+        delete process.env.ARTIFACT_BUCKET;
+      }
+    });
+  }
+}

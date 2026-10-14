@@ -1085,6 +1085,59 @@ export function judgeBriefHold(key, bodyText) {
   return why ? { proven: false, why } : null;
 }
 
+// ── Post-commit brief-hold check (TEAM-5926; TEAM-5799 ship-review F1) ──────
+// The Done guard reads the completion record, then awaits the reason comment and
+// the provider before the Done commits. A replay drain can CAS-stamp
+// `briefPending:true` inside that window, so the guard admitted on a record that
+// no longer says what it read. After the commit each twin re-reads the record and
+// asks judgePostCommitHold. The hub does not undo moves (as with DONE_OVER_CANCELLED):
+// a hold that appeared is FLAGGED on the ticket and in the result, and the drain's
+// own post-stamp re-read converges the record. Neither text below contains
+// `has briefPending:true (brief `, so workflow-output's isBriefHoldRefusal never
+// reads a committed Done as a refused one.
+export const DONE_OVER_BRIEF_HOLD = "done_over_brief_hold";
+
+export const DONE_OVER_BRIEF_HOLD_WARNING =
+  "Done committed while a concurrent ticket-provider replay held this ticket's merge brief " +
+  "off the Merge Approval gate (the completion record changed after the Done guard read it). " +
+  "The hub does not undo moves: put the merge brief on the gate, or re-run " +
+  "WorkflowOutput___report_completion so the replay converges the record.";
+
+export function postCommitUncheckedWarning(cause) {
+  return (
+    `Done committed, but the post-commit completion-record check could not run (${cause}); ` +
+    `a merge-brief hold a concurrent replay stamped, if any, is not flagged here.`
+  );
+}
+
+/**
+ * Whether a brief hold appeared on the completion record between the Done guard's
+ * read and the committed Done.
+ *
+ * @param {string} key completions/<ticketId>.json
+ * @param {{etag?: string, absent?: boolean, bodyText?: string}} admitted what the
+ *   guard admitted on
+ * @param {{etag?: string, absent?: boolean, bodyText?: string} | {error: string}} reread
+ *   the post-commit read
+ * @returns {{held: true} | {unchecked: true, why: string} | null} null when the record
+ *   is unchanged, or changed into anything that is not a PROVEN hold (an unjudgeable
+ *   body is doubt, and doubt is not flagged over a committed move)
+ */
+export function judgePostCommitHold(key, admitted, reread) {
+  if (!reread || reread.error) {
+    return { unchecked: true, why: String(reread?.error || "no re-read") };
+  }
+  const was = admitted || {};
+  if (reread.absent) return null;
+  if (!was.absent) {
+    if (was.etag && reread.etag && was.etag === reread.etag) return null;
+    if (was.bodyText === reread.bodyText) return null;
+  }
+  // The guard admitted, so what it read was not a hold: a proven hold now is new.
+  const hold = judgeBriefHold(key, reread.bodyText);
+  return hold && hold.proven === false && !hold.unknown ? { held: true } : null;
+}
+
 // ── Terminal status (TEAM-5421; TEAM-5396 F2 / TEAM-5413) ───────────────────
 // `cancelled` is terminal: a cancelled run's ticket never re-enters the board,
 // and a done ticket is never cancelled over its record (only reopen leaves done).
