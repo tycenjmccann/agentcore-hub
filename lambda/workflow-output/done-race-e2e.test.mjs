@@ -939,4 +939,33 @@ describe.each(Object.keys(TWINS))("TEAM-5958 F6 e2e — the %s twin's Done-inten
     expect(twin.refusal(refused)).toMatch(/has followUpsPending:true/);
     expect(h.ticket.status).toBe("in_progress");
   });
+
+  it("(f4, TEAM-5994) report_completion's get_issue read Done, then the ticket is reopened and a twin fences a NEW intent before the hold write ⇒ the CAS re-read adopts the intent and DEFERS on a fresh status read (the earlier Done observation never exempts a newer intent)", async () => {
+    h.ticket.status = "done"; // what report_completion's get_issue at the start of the call reads
+    const commit = barrier();
+    h.beforeCommit = commit.wait;
+    let done = null;
+    h.beforeRecordPut = async (body) => {
+      // The hold write is about to land on the ETag read at the start of the call: a human
+      // reopens the ticket, a twin's Done reads the still-clean record, fences a fresh
+      // intent onto it, and parks before its commit.
+      if (body?.followUpsPending !== true || done) return;
+      h.ticket.status = "in_progress";
+      done = twin.done(handler);
+      await commit.arrived;
+    };
+
+    const first = answer(await output.handler(REPORT));
+    expect(done, "the hold write must have been intercepted").not.toBeNull();
+    expect(record().doneIntent).toBeTruthy();
+    expect(first).toMatchObject({ ok: false, reason: "completion_record_done_in_flight", next_action: "retry_report_completion" });
+    expect(holdEverWritten()).toBe(false);
+
+    commit.open();
+    const res = await done;
+    expect(twin.committed(res)).toBe(true);
+    expect(res.conflict).toBeUndefined(); // no done_over_follow_ups_hold
+    expect(h.ticket.twinComments.filter((c) => c.startsWith("Conflict: "))).toHaveLength(0);
+    expect(h.ticket.status).toBe("done");
+  });
 });

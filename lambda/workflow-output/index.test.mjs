@@ -390,7 +390,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord, doneIntentFresh, DONE_INTENT_TTL_MS, holdDeferredOnDoneIntent } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord, doneIntentFresh, DONE_INTENT_TTL_MS, holdDeferredOnDoneIntent, deferHoldOnDoneIntent } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -1693,18 +1693,56 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(doneIntentFresh(null, NOW)).toBe(false);
   });
 
-  it("TEAM-5958: holdDeferredOnDoneIntent - defers ONLY a hold written onto a record with a FRESH intent while the ticket is not Done; shared by drop() and report_completion", () => {
+  it("TEAM-5958/TEAM-5994: holdDeferredOnDoneIntent - pure, takes NO ticket status: fires on a hold written onto a record with a FRESH intent; shared by drop() and report_completion", () => {
     const NOW = Date.parse("2026-10-14T12:00:00.000Z");
     const now = vi.spyOn(Date, "now").mockReturnValue(NOW);
     try {
       const fresh = { status: "complete", doneIntent: { at: new Date(NOW - 1000).toISOString(), provider: "jira", nonce: "n" } };
       const stale = { status: "complete", doneIntent: { at: new Date(NOW - DONE_INTENT_TTL_MS).toISOString(), provider: "jira", nonce: "n" } };
-      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: true, ticketDone: false })).toBe(fresh.doneIntent.at);
-      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: false, ticketDone: false })).toBeNull(); // no hold written: nothing to defer
-      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: true, ticketDone: true })).toBeNull(); // a committed Done keeps its intent as audit
-      expect(holdDeferredOnDoneIntent({ current: stale, holdWritten: true, ticketDone: false })).toBeNull(); // the twin is gone
-      expect(holdDeferredOnDoneIntent({ current: { status: "complete" }, holdWritten: true, ticketDone: false })).toBeNull();
-      expect(holdDeferredOnDoneIntent({ current: null, holdWritten: true, ticketDone: false })).toBeNull();
+      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: true })).toBe(fresh.doneIntent.at);
+      // TEAM-5994: a caller-supplied status is IGNORED — an earlier Done never exempts the intent.
+      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: true, ticketDone: true })).toBe(fresh.doneIntent.at);
+      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: false })).toBeNull(); // no hold written: nothing to defer
+      expect(holdDeferredOnDoneIntent({ current: stale, holdWritten: true })).toBeNull(); // the twin is gone
+      expect(holdDeferredOnDoneIntent({ current: { status: "complete" }, holdWritten: true })).toBeNull();
+      expect(holdDeferredOnDoneIntent({ current: null, holdWritten: true })).toBeNull();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it("TEAM-5994: deferHoldOnDoneIntent - a fresh intent under a hold forces a FRESH ticket read; only a ticket that reads Done now proceeds", async () => {
+    const NOW = Date.parse("2026-10-14T12:00:00.000Z");
+    const now = vi.spyOn(Date, "now").mockReturnValue(NOW);
+    try {
+      const fresh = { status: "complete", doneIntent: { at: new Date(NOW - 1000).toISOString(), provider: "dynamodb", nonce: "n" } };
+      const reader = (answer) => vi.fn(async () => (answer instanceof Error ? Promise.reject(answer) : answer));
+      const ask = (readDone, extra = {}) => deferHoldOnDoneIntent({ current: fresh, holdWritten: true, ticketId: "TEAM-1", readDone, ...extra });
+
+      const done = reader({ ok: true, done: true });
+      expect(await ask(done)).toBeNull(); // the Done committed: its intent is audit
+      expect(done).toHaveBeenCalledWith("TEAM-1");
+      const open = reader({ ok: true, done: false });
+      expect(await ask(open)).toEqual({ at: fresh.doneIntent.at, fresh: { ok: true, done: false } });
+      const unreadable = reader({ ok: false, error: "Jira API 503" });
+      expect(await ask(unreadable)).toEqual({ at: fresh.doneIntent.at, fresh: { ok: false, error: "Jira API 503" } });
+      const throws = reader(new Error("boom"));
+      expect(await ask(throws)).toMatchObject({ at: fresh.doneIntent.at, fresh: { ok: false, error: "Error: boom" } });
+
+      // The regression invariant: a caller that SAW Done earlier cannot skip the read —
+      // there is no parameter that says so, and the read decides.
+      const reopened = reader({ ok: true, done: false });
+      expect(await ask(reopened, { ticketDone: true, alreadyDone: true })).toMatchObject({ at: fresh.doneIntent.at });
+      expect(reopened).toHaveBeenCalledTimes(1);
+      // An earlier OPEN observation may defer without a read (the safe direction).
+      const unused = reader({ ok: true, done: true });
+      expect(await ask(unused, { openSeen: true })).toMatchObject({ at: fresh.doneIntent.at });
+      expect(unused).not.toHaveBeenCalled();
+      // Nothing to defer ⇒ no read at all.
+      const none = reader({ ok: true, done: false });
+      expect(await deferHoldOnDoneIntent({ current: fresh, holdWritten: false, ticketId: "TEAM-1", readDone: none })).toBeNull();
+      expect(await deferHoldOnDoneIntent({ current: { status: "complete" }, holdWritten: true, ticketId: "TEAM-1", readDone: none })).toBeNull();
+      expect(none).not.toHaveBeenCalled();
     } finally {
       now.mockRestore();
     }

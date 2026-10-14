@@ -997,15 +997,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       report.status = statusOf();
       const holdWritten = (report.followUpsPending === true && recordBase.record?.followUpsPending !== true)
         || (report.briefPending === true && recordBase.record?.briefPending !== true);
-      const inFlight = holdDeferredOnDoneIntent({ current: recordBase.record, holdWritten, ticketDone: issue ? isDoneStatus(issue.status) : false });
-      if (inFlight) {
-        const fresh = await readTicketDone(ticket_id);
-        if (!fresh.ok || !fresh.done) {
-          const hold = report.followUpsPending === true && recordBase.record?.followUpsPending !== true ? "followUpsPending:true" : "briefPending:true";
-          console.warn(`[report_completion] ${ticket_id}: ${key} carries a fresh Done-intent (${inFlight}) and ${ticket_id} ${fresh.ok ? "does not read Done yet" : `could not be re-read (${fresh.error})`} - a Done is in flight, so this write (${hold}) is DEFERRED; nothing written`);
-          return { ok: false, deferred: true, reason: "completion_record_done_in_flight", error: `a Done on ${ticket_id} is being committed by the ticket provider (Done-intent ${inFlight}) and this write would put ${hold} on ${key}, a hold the committing provider can no longer see` };
-        }
-        console.log(`[report_completion] ${ticket_id}: ${key} carries a fresh Done-intent (${inFlight}) but ${ticket_id} reads Done - the Done committed; writing`);
+      // TEAM-5994: on EVERY attempt, against the record this attempt conditions on — never
+      // the get_issue above, which predates every re-read below.
+      const deferred = await deferHoldOnDoneIntent({ current: recordBase.record, holdWritten, ticketId: ticket_id });
+      if (deferred) {
+        const hold = report.followUpsPending === true && recordBase.record?.followUpsPending !== true ? "followUpsPending:true" : "briefPending:true";
+        console.warn(`[report_completion] ${ticket_id}: ${key} carries a fresh Done-intent (${deferred.at}) and ${ticket_id} ${deferred.fresh.ok ? "does not read Done yet" : `could not be re-read (${deferred.fresh.error})`} - a Done is in flight, so this write (${hold}) is DEFERRED; nothing written`);
+        return { ok: false, deferred: true, reason: "completion_record_done_in_flight", error: `a Done on ${ticket_id} is being committed by the ticket provider (Done-intent ${deferred.at}) and this write would put ${hold} on ${key}, a hold the committing provider can no longer see` };
       }
       const r = await conditionalPut(key, JSON.stringify(report, null, 2), recordBase.etag !== undefined ? { ifMatch: recordBase.etag } : {});
       if (r.outcome === "won") {
@@ -1669,17 +1667,51 @@ function stripStaleDoneIntent(record) {
 /**
  * TEAM-5958 (TEAM-5799 F6): the ONE rule for a writer about to put a hold on the record
  * (`briefPending:true` / `followUpsPending:true`) while a twin's Done may be committing.
- * The drain's drop() and report_completion's record write both decide through it:
- * `holdWritten` (this write introduces or stamps a hold), the ticket does not read Done
- * (a committed Done keeps its intent as audit — nothing is in flight then), and the
- * record carries a FRESH `doneIntent` ⇒ the twin's guard admitted on a record with no
- * hold and its commit may land any moment; a hold written now is one it can no longer
- * see. Returns the intent's `at` to defer on (write nothing, answer retryable), or null
- * to proceed. Stale (TTL) ⇒ the twin died or its clear failed: proceed, as drop() does.
+ * The drain's drop() and report_completion's record write both decide through it (via
+ * deferHoldOnDoneIntent below): `holdWritten` (this write introduces or stamps a hold)
+ * and the record carries a FRESH `doneIntent` ⇒ the twin's guard may have admitted on a
+ * record with no hold and its commit may land any moment; a hold written now is one it
+ * can no longer see. Returns the intent's `at` to check on, or null to proceed. Stale
+ * (TTL) ⇒ the twin died or its clear failed: proceed, as drop() does.
+ *
+ * TEAM-5994: it takes NO ticket status. A fresh doneIntent forces a fresh ticket-status
+ * check on every CAS attempt that introduces a hold; an earlier Done observation never
+ * exempts a newer intent. (report_completion passed the status it read at the start of
+ * the call: after a 412 re-read adopted a twin's NEWER intent, a Done read before a
+ * reopen skipped the check and the hold landed under the commit.)
  */
-export function holdDeferredOnDoneIntent({ current, holdWritten, ticketDone }) {
-  if (!holdWritten || ticketDone || !doneIntentFresh(current)) return null;
+export function holdDeferredOnDoneIntent({ current, holdWritten }) {
+  if (!holdWritten || !doneIntentFresh(current)) return null;
   return current.doneIntent.at;
+}
+
+/**
+ * TEAM-5994: holdDeferredOnDoneIntent plus the status check it forces, so no caller can
+ * answer it with a snapshot. Only when the predicate fires, the ticket is read NOW —
+ * after `current` was read — and a ticket that reads Done proceeds (a committed Done
+ * keeps its intent as audit: nothing is in flight). `readDone` is readTicketDone's shape.
+ * Returns null to proceed, or `{ at, fresh }` to defer (`fresh`: the read's answer —
+ * `ok:false` when the ticket could not be read, the safe side).
+ *
+ * `openSeen`: the caller read the ticket open AFTER `current` (the drain's step 1 follows
+ * its step-0 record read). That may only DEFER — without a read, as drop() always has —
+ * never exempt; there is deliberately no way to pass a Done.
+ */
+export async function deferHoldOnDoneIntent({ current, holdWritten, ticketId, openSeen = false, readDone = readTicketDone }) {
+  const at = holdDeferredOnDoneIntent({ current, holdWritten });
+  if (!at) return null;
+  if (openSeen) return { at, fresh: { ok: true, done: false } };
+  let fresh;
+  try {
+    fresh = await readDone(ticketId);
+  } catch (err) {
+    fresh = { ok: false, error: `${err?.name || "Error"}: ${err?.message || ""}` };
+  }
+  if (fresh?.ok && fresh.done) {
+    console.log(`[done-intent] ${ticketId}: the record carries a fresh Done-intent (${at}) but ${ticketId} reads Done - the Done committed; the hold proceeds`);
+    return null;
+  }
+  return { at, fresh: fresh?.ok ? fresh : { ok: false, error: fresh?.error || "no answer" } };
 }
 
 /** Read a completion record; `{ record: null }` when absent, `{ error }` when S3 could not say or the body is not a JSON object. */
@@ -1767,9 +1799,10 @@ export async function drainCompletion(msg) {
     // the next tick decides on the ticket as it is then (Done ⇒ no hold to push; a stale
     // intent ⇒ the twin died, and the hold is stamped as usual).
     // TEAM-5958: the same predicate report_completion's record write defers on.
-    const inFlight = holdDeferredOnDoneIntent({ current: rec.record, holdWritten: !!held, ticketDone: alreadyDone });
+    // TEAM-5994: and the same fresh status read — not `alreadyDone` — decides it.
+    const inFlight = await deferHoldOnDoneIntent({ current: rec.record, holdWritten: !!held, ticketId, openSeen: !alreadyDone });
     if (inFlight) {
-      return retry(`${ticketId} has a Done in flight (doneIntent ${inFlight}); the ${held} is not stamped and no notice is posted - the next tick decides`);
+      return retry(`${ticketId} has a Done in flight (doneIntent ${inFlight.at}); the ${held} is not stamped and no notice is posted - the next tick decides`);
     }
     console.error(`[ticket-replay] ${ticketId}: DROPPED - ${step} could not be applied (${error}); the ticket is left open for a human`);
     const targets = ticketReadable ? [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])] : [asText(msg.epicKey) || null].filter(Boolean);
