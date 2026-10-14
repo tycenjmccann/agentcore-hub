@@ -45,7 +45,7 @@ LAMBDA_ROLE="${LAMBDA_ROLE_NAME:-agentcore-hub-lambda-role}"
 # simulate-principal-policy needs the account in --policy-source-arn. Derived,
 # never hardcoded — AWS_ACCOUNT_ID short-circuits STS (deploy/config.sh:23 idiom).
 ACCOUNT_ID="${AWS_ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text 2>/dev/null || echo '')}"
-if [ "${TICKET_PROVIDER:-dynamodb}" = "jira" ]; then
+if [ "${TICKET_PROVIDER:-jira}" = "jira" ]; then
   TICKETS_ROLE="${TICKETS_ROLE:-AgentCoreHubJiraLambdaRole}"
 else
   TICKETS_ROLE="${TICKETS_ROLE:-AgentCoreHubTicketsLambdaRole}"
