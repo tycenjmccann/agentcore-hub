@@ -678,6 +678,7 @@ export const handler = async (event) => {
   // a timer: a record written between two invocations must be visible to the
   // second one, otherwise re-Done'ing a ticket could not pick up late evidence.
   resetCompletionRecordCache();
+  blockedFallbackPublished.clear(); // TEAM-5914: same per-invocation lifetime, see notifyCompletionBlockedOnce
   // Load roster + workflow defs from S3 on first invocation (cached for warm starts)
   await loadAgentRoster();
   await loadWorkflowDefs();
@@ -3261,14 +3262,15 @@ async function evaluateCompletionSnapshot(epicId, workflow) {
  * a human re-driving any ticket (re-Done) re-runs the check and, once the
  * evidence is in, the run completes and the escalation is history.
  */
+const blockedFallbackPublished = new Set(); // TEAM-5914: notification ids published WITHOUT a persisted row, this invocation
 async function notifyCompletionBlockedOnce(workflow, offenders, reason = "missing_evidence") {
   const notice = completionBlockedNotice(reason, offenders, workflow);
   const id = `notif_completion_${notice.slug}_${workflow.id}`;
   const list = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
   if (list.some((n) => n.id === id && !n.acknowledged)) return false;
-  // TEAM-5853: the snapshot check above is only a fast path; appendEscalationOnce re-reads
-  // under a notifVersion CAS so exactly one racer appends. TEAM-5914: only its verified
-  // `false` (open row) suppresses the event — a throw or null (not persisted) still publishes.
+  // TEAM-5853: the snapshot check is a fast path; the notifVersion CAS lets exactly one racer append.
+  // TEAM-5914: only its verified `false` (open row) suppresses the event. A throw or null (not
+  // persisted) still publishes, once per handler invocation per id (a batch can repeat a run).
   const appended = await store.appendEscalationOnce(workflow.id, id, {
     type: "manager_escalation",
     title: notice.title,
@@ -3280,7 +3282,8 @@ async function notifyCompletionBlockedOnce(workflow, offenders, reason = "missin
     console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification write failed (event still published): ${err?.message || err}`);
     return null;
   });
-  if (appended === false) return false;
+  if (appended === false || (appended === null && blockedFallbackPublished.has(id))) return false;
+  if (appended === null) blockedFallbackPublished.add(id);
   await publishEvent(workflow.epicId, "workflow.completion_blocked", { workflowId: workflow.id, reason, offenders }); // never throws
   console.log(`[orchestrator] ${workflow.id}: completion blocked (${reason}) — manager_escalation ${appended ? "appended" : "NOT persisted"} (${offenders})`);
   return appended === true;

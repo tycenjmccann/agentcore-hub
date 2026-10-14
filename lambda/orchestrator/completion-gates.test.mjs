@@ -195,6 +195,9 @@ vi.mock("./workflow-store.mjs", () => ({
     if (tasks) tasks[tid] = { ...(tasks[tid] || { ticketId: tid }), ...fields };
   }),
   appendNotification: vi.fn(async (id, n) => { h.state.notifications.push({ id, n }); }),
+  // TEAM-5914: the stream Done path (handleTicketDone) before it reaches completeWorkflow.
+  completeTaskEntry: vi.fn(async () => true),
+  ackNotifications: vi.fn(async () => 0),
   // TEAM-5853: the CAS-backed once-append. The open-id check and the push run with
   // no await between them, so concurrent callers see each other — as the real CAS does.
   appendEscalationOnce: vi.fn(async (wfId, id, n, { maxCount = 6 } = {}) => {
@@ -1224,6 +1227,26 @@ describe("completeWorkflow — late evidence is re-harvested; a real gap escalat
     await completeWorkflow({ ...WF });
     expect(h.state.storeCompletions).toHaveLength(0);
     expect(evidenceBlocked()).toHaveLength(1);
+    spies.forEach((s) => s.mockRestore());
+  });
+
+  // TEAM-5914: "at most once per invocation". Two Done records of one run in ONE stream
+  // batch, with the escalation write failing both times → one event; the next handler
+  // invocation (the guard is cleared at entry) is a fresh re-observation and publishes again.
+  const doneRecord = (ticketId) => ({ eventName: "MODIFY", dynamodb: {
+    OldImage: { ticketId: { S: ticketId }, status: { S: "in_progress" } },
+    NewImage: { ticketId: { S: ticketId }, status: { S: "done" }, parentId: { S: "EPIC-1" }, workflowId: { S: "wf_1" }, assignee: { S: "agentcore_hub_qa_verifier" } },
+  } });
+  it("TEAM-5914: one handler invocation, two Done records, failing write → ONE event; a new invocation publishes again", async () => {
+    const spies = quiet();
+    h.state.snapshots = [CHILDREN];
+    h.state.freshWorkflow = { ...WF, agentTasks: TASKS_MISSING_D1(), humanNotifications: [] };
+    h.state.escalationOverride = () => { throw new Error("ProvisionedThroughputExceededException"); };
+    await handler({ Records: [doneRecord("D-2"), doneRecord("D-3")] });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(evidenceBlocked()).toHaveLength(1);
+    await handler({ Records: [doneRecord("D-2")] });
+    expect(evidenceBlocked()).toHaveLength(2);
     spies.forEach((s) => s.mockRestore());
   });
 
