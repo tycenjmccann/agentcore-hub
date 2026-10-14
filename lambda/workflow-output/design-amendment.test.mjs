@@ -24,6 +24,10 @@ const BOARD = fixture("team-5356-board.json");
 
 const h = vi.hoisted(() => ({
   puts: [], calls: [], issue: null, siblings: [], comments: new Map(), listFails: false, listIncomplete: false,
+  // TEAM-6124: what get_issue (the strong read) says, per ticket, when it differs
+  // from the list_tickets row — `issueStatus` rewrites the status, `issueError`
+  // answers `{ error }` in the jira twin's `Jira API <status>:` idiom.
+  issueStatus: new Map(), issueError: new Map(),
 }));
 
 vi.mock("@aws-sdk/client-s3", () => ({
@@ -64,7 +68,12 @@ vi.mock("@aws-sdk/client-lambda", () => ({
         return row.fields ? { ...row, fields: { ...row.fields, comment: { total: comments.length, comments } } } : { ...row, comments };
       };
       if (tool === "Tickets___get_issue") {
-        const row = idOf(h.issue) === params.ticket_id ? h.issue : h.siblings.find((s) => idOf(s) === params.ticket_id);
+        if (h.issueError.has(params.ticket_id)) return reply({ error: h.issueError.get(params.ticket_id) });
+        let row = idOf(h.issue) === params.ticket_id ? h.issue : h.siblings.find((s) => idOf(s) === params.ticket_id);
+        if (row && h.issueStatus.has(params.ticket_id)) {
+          const st = h.issueStatus.get(params.ticket_id);
+          row = row.fields ? { ...row, fields: { ...row.fields, status: { name: st } } } : { ...row, status: st };
+        }
         return reply(row ? withComments(row) : { content: [{ type: "text", text: `Issue ${params.ticket_id} not found.` }] });
       }
       if (tool === "Tickets___list_tickets") {
@@ -102,6 +111,8 @@ beforeEach(() => {
   h.comments = new Map();
   h.listFails = false;
   h.listIncomplete = false;
+  h.issueStatus = new Map();
+  h.issueError = new Map();
 });
 
 for (const twin of ["dynamodb", "jira"]) {
@@ -169,6 +180,58 @@ for (const twin of ["dynamodb", "jira"]) {
       expect(again.residualFindings).toEqual({ posted: [], skipped: ["TEAM-5358", "TEAM-5359"], failed: [] });
       expect(h.comments.get("TEAM-5358")).toHaveLength(1);
       expect(h.comments.get("TEAM-5359")).toHaveLength(1);
+    });
+
+    // TEAM-6124 (sibling of F1): the listed Done is eventually consistent; the
+    // admission is final, so get_issue on the amendment must confirm it.
+    it("TEAM-6124 (a) list_tickets shows the amendment done but get_issue reads it To Do ⇒ refused naming it: no record, no residual comments, no transition", async () => {
+      load("done");
+      h.issueStatus.set("TEAM-5399", "To Do");
+      const res = await report();
+      expect(res).toMatchObject({ ok: false, reason: "design_amendment_required", missing: ["design_amendment"], amendmentTicketId: "TEAM-5399" });
+      expect(res.detail).toMatch(/^amendment TEAM-5399 is still open \(listed done, but it reads To Do on get_issue\)$/);
+      expect(res.message).toContain("its design amendment TEAM-5399 is not done yet");
+      expect(wroteRecord()).toBe(false);
+      expect(h.comments.size, "no residual findings reach the dev lanes").toBe(0);
+      expect(tools()).not.toContain("Tickets___add_comment");
+      expect(transitioned()).toBe(false);
+      expect(h.calls.filter((c) => c.tool === "Tickets___get_issue").map((c) => c.params.ticket_id)).toEqual(["TEAM-5357", "TEAM-5399"]);
+    });
+
+    it("TEAM-6124 (b) get_issue on the amendment answers 503 ⇒ sibling_scan_failed (retryable), nothing written", async () => {
+      load("done");
+      h.issueError.set("TEAM-5399", 'Jira API 503: {"errorMessage":"Service Unavailable"}');
+      const res = await report();
+      expect(res.reason).toBe("sibling_scan_failed");
+      expect(res.detail).toMatch(/^get_issue TEAM-5399 \(confirming the design amendment is done\): Jira API 503/);
+      expect(res.message).toContain("retry WorkflowOutput___report_completion");
+      expect(wroteRecord()).toBe(false);
+      expect(h.comments.size).toBe(0);
+      expect(transitioned()).toBe(false);
+    });
+
+    it("TEAM-6124 (b2) get_issue on the amendment refuses permanently (404) ⇒ not confirmed, design_amendment_required naming it", async () => {
+      load("done");
+      h.issueError.set("TEAM-5399", 'Jira API 404: {"errorMessages":["Issue does not exist"]}');
+      const res = await report();
+      expect(res).toMatchObject({ reason: "design_amendment_required", amendmentTicketId: "TEAM-5399" });
+      expect(res.detail).toMatch(/listed done, but it could not be read to confirm it is done \(Jira API 404/);
+      expect(wroteRecord()).toBe(false);
+      expect(h.comments.size).toBe(0);
+      expect(transitioned()).toBe(false);
+    });
+
+    it("TEAM-6124 (c) list and get_issue both read the amendment done ⇒ admitted as before (stamp, residual findings, Done)", async () => {
+      load("done");
+      const res = await report();
+      expect(res.status).toBe("complete");
+      expect(record().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399" });
+      expect(res.residualFindings).toEqual({ posted: ["TEAM-5358", "TEAM-5359"], skipped: [], failed: [] });
+      expect(transitioned()).toBe(true);
+      const order = tools();
+      const confirm = h.calls.findIndex((c) => c.tool === "Tickets___get_issue" && c.params.ticket_id === "TEAM-5399");
+      expect(confirm, "the strong read precedes the record write and the Done").toBeGreaterThan(order.indexOf("Tickets___list_tickets"));
+      expect(confirm).toBeLessThan(order.indexOf("Tickets___transition_ticket"));
     });
 
     it("(b) PASS goes Done with exactly the calls of any other ticket — no list_tickets", async () => {

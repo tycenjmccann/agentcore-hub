@@ -4658,15 +4658,30 @@ async function designAmendmentGate({ ticketId, isSynthetic, issue, issueError, a
   const scan = await loadSiblings(issue.parentKey);
   if (!scan.ok) return scanRefusal(`list_tickets under ${issue.parentKey}: ${scan.error}`);
   const amendments = designAmendmentsOf(scan.siblings, ticketId);
-  const done = amendments.find((a) => isDoneStatus(a.status));
-  if (done) return { verdict, residual: true, amendmentTicketId: done.ticketId, siblings: scan.siblings };
+  const listedDone = amendments.find((a) => isDoneStatus(a.status));
+  // TEAM-6124 (sibling of F1): list_tickets is eventually consistent, and this
+  // admission is final (the review's Done releases the dev lanes; the twins trust
+  // the stamp's amendmentTicketId without re-reading it). So a listed Done is only
+  // a candidate: get_issue must read it Done too. A transient failure refuses
+  // retryably; a permanent one, or a strong read that is not Done, is "still open".
+  let open = amendments[0];
+  let unconfirmed = null;
+  if (listedDone) {
+    const read = await readTicketDone(listedDone.ticketId);
+    if (!read.ok && !isPermanentTicketRefusal(read.error)) {
+      return scanRefusal(`get_issue ${listedDone.ticketId} (confirming the design amendment is done): ${read.error}`);
+    }
+    if (read.ok && read.done) return { verdict, residual: true, amendmentTicketId: listedDone.ticketId, siblings: scan.siblings };
+    open = listedDone;
+    unconfirmed = read.ok ? `reads ${read.issue.status} on get_issue` : `could not be read to confirm it is done (${read.error})`;
+    console.warn(`[report_completion] ${ticketId}: list_tickets shows amendment ${listedDone.ticketId} done but it ${unconfirmed} - treated as still open`);
+  }
   // An absent amendment on a truncated roster proves nothing; an OPEN one does.
   if (!amendments.length && !scan.complete) return scanRefusal(`list_tickets under ${issue.parentKey}: roster truncated (complete:false)`);
-  const open = amendments[0];
   return { refusal: {
     ok: false,
     reason: DESIGN_AMENDMENT_REQUIRED,
-    detail: open ? `amendment ${open.ticketId} is still open` : "no design amendment exists",
+    detail: open ? `amendment ${open.ticketId} is still open${unconfirmed ? ` (listed done, but it ${unconfirmed})` : ""}` : "no design amendment exists",
     missing: ["design_amendment"],
     findings_count: findings,
     ...(open ? { amendmentTicketId: open.ticketId } : {}),
