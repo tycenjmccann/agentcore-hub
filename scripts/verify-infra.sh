@@ -129,7 +129,7 @@ check_schema() {
 # string or array, `*`/`?` wildcards, case-insensitive action (IAM action names
 # are case-insensitive; resource ARNs are not). Only an Allow statement counts —
 # Deny is ignored, same as IAM itself would still need an Allow to exist — and in
-# mode=any an Allow carrying ANY Condition does not count either (TEAM-5883): the
+# mode=any/covers an Allow carrying ANY Condition does not count either (TEAM-5883): the
 # checks below ask for an UNCONDITIONED grant, and a conditioned one is exactly
 # the hand-narrowed policy they exist to catch. Any
 # failed IAM read fails the WHOLE check closed (does not silently judge a partial
@@ -141,8 +141,12 @@ check_schema() {
 #              Condition.StringLike."s3:prefix" == [<prefix>] exactly, in the
 #              SAME statement, and no Allow statement grants it unconditioned or
 #              differently-scoped (an unconditioned grant must fail this mode).
+# mode=covers: <target-arn> is a literal ARN PREFIX; exits 0 iff some unconditioned
+#              Allow grants <action> with a Resource matching EVERY key under it
+#              (TEAM-5924: a literal prefix of it followed only by `*`), so a grant
+#              on one probe key or a narrower glob (completions/twin-*) does not count.
 #
-# Usage: role_policy_match <any|prefix> <role> <action> <target-arn> [<prefix>]
+# Usage: role_policy_match <any|prefix|covers> <role> <action> <target-arn> [<prefix>]
 role_policy_match() {
   local mode=$1
   local role=$2
@@ -178,6 +182,11 @@ def glob_re(pattern, flags=0):
     body = re.escape(pattern).replace(r"\*", ".*").replace(r"\?", ".")
     return re.compile(body, flags)
 
+# The python port of coversPrefix in deploy/lib/twin-preflight.mjs (TEAM-5924).
+def covers_prefix(pattern, ns):
+    k = pattern.find("*")
+    return 0 <= k <= len(ns) and pattern[:k] == ns[:k] and set(pattern[k:]) == {"*"}
+
 mode, action, target, prefix = os.environ["MODE"], os.environ["ACTION"], os.environ["TARGET"], os.environ["PREFIX"]
 lst = lambda v: v if isinstance(v, list) else ([] if v is None else [v])
 text = sys.stdin.read()
@@ -198,10 +207,14 @@ while True:
             continue
         if not any(glob_re(a, re.IGNORECASE).fullmatch(action) for a in lst(st.get("Action"))):
             continue
-        if not any(glob_re(r).fullmatch(target) for r in lst(st.get("Resource"))):
+        resources = lst(st.get("Resource"))
+        if mode == "covers":
+            if not any(covers_prefix(r, target) for r in resources):
+                continue
+        elif not any(glob_re(r).fullmatch(target) for r in resources):
             continue
         cond = st.get("Condition") or {}
-        if mode == "any":
+        if mode in ("any", "covers"):
             # TEAM-5883: a conditioned Allow is not the grant the caller asks about
             # (e.g. ListBucket under s3:prefix never binds to the implicit list check
             # behind GetObject, so S3 still answers 403 for a missing key).
@@ -213,7 +226,7 @@ while True:
             scoped = True
         else:
             unscoped = True
-sys.exit(0 if (granted if mode == "any" else (scoped and not unscoped)) else 1)
+sys.exit(0 if (granted if mode in ("any", "covers") else (scoped and not unscoped)) else 1)
 '
 }
 
@@ -238,6 +251,17 @@ role_policy_grants() {
 # Usage: role_policy_grants_prefix <role> <action> <target-arn> <prefix>
 role_policy_grants_prefix() {
   role_policy_match prefix "$@"
+}
+
+# role_policy_grants over a whole key namespace (TEAM-5924): passes only when ONE
+# unconditioned Allow grants <action> on every key under <arn-prefix>, e.g.
+# <bucket>/completions/* or <bucket>/*. Proving one synthetic key let a read
+# hand-narrowed to completions/twin-* pass. Like every check here it reads Allows
+# only; a Deny is not evaluated. See role_policy_match above.
+#
+# Usage: role_policy_grants_under <role> <action> <arn-prefix>
+role_policy_grants_under() {
+  role_policy_match covers "$@"
 }
 
 # Assert that IAM's own evaluator ALLOWS <action> on <resource> for a role. This
@@ -325,7 +349,7 @@ check "Lambda: agentcore-hub-tickets" \
 # the matcher refuses a conditioned one (TEAM-5883).
 if [ -n "$ARTIFACT_BUCKET" ]; then
   check "IAM: $TICKETS_ROLE grants s3:GetObject covering completions/*" \
-    "role_policy_grants $TICKETS_ROLE s3:GetObject arn:aws:s3:::$ARTIFACT_BUCKET/completions/verify-infra-probe"
+    "role_policy_grants_under $TICKETS_ROLE s3:GetObject arn:aws:s3:::$ARTIFACT_BUCKET/completions/"
   check "IAM: $TICKETS_ROLE grants s3:ListBucket on $ARTIFACT_BUCKET (a missing completions/* record must read as 404, not 403 - TEAM-5867)" \
     "role_policy_grants $TICKETS_ROLE s3:ListBucket arn:aws:s3:::$ARTIFACT_BUCKET"
 else
@@ -345,7 +369,7 @@ if aws lambda get-function-configuration --function-name "$PIPELINE_TOOLS_FUNCTI
 
   if [ -n "$ARTIFACT_BUCKET" ]; then
     check "IAM: $PIPELINE_TOOLS_ROLE grants s3:PutObject on pipeline-artifacts/ship-approvals/*" \
-      "role_policy_grants $PIPELINE_TOOLS_ROLE s3:PutObject arn:aws:s3:::$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/verify-infra-probe.json"
+      "role_policy_grants_under $PIPELINE_TOOLS_ROLE s3:PutObject arn:aws:s3:::$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/"
     # TEAM-5600: the third prerequisite. The veto probe lists the marker's exact
     # key; without ListBucket on the bucket S3 answers a missing marker with 403,
     # and every clean deploy reports preapproval reason "rejection_unverified".

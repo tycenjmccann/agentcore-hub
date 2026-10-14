@@ -29,6 +29,9 @@ import {
   policyGrants,
   runPreflight,
 } from "../twin-preflight.mjs";
+// TEAM-5924's helpers are read off the namespace so this file still loads on a head
+// that lacks them, and each case fails on its own instead of the whole file.
+import * as twinPreflight from "../twin-preflight.mjs";
 
 const ACCOUNT = "123456789012";
 const REGION = "us-east-1";
@@ -193,6 +196,130 @@ describe("decideTwin", () => {
   it("absent function → skip only when optional", () => {
     expect(decideTwin({ ...good, optional: true, config: { state: "absent" } }).action).toBe("skip-absent");
     expect(decideTwin({ ...good, optional: false, config: { state: "absent" } }).action).toBe("block");
+  });
+});
+
+// ── TEAM-5924: GetObject is proven over completions/*, not over one probe key ─────
+// Ship review F2 on #892: the check used to prove GetObject only on the synthetic
+// completions/twin-preflight-probe.json, so a Deny on completions/TEAM-*.json (every
+// real record 403s) or an Allow on completions/twin-* (no real record is granted)
+// read as ready. Both must refuse.
+describe("TEAM-5924: GetObject proven over completions/*, not a probe key", () => {
+  const NS = `${BUCKET_ARN}/completions/`;
+  const LIST = { Effect: "Allow", Action: "s3:ListBucket", Resource: BUCKET_ARN };
+  const good = {
+    fn: "agentcore-hub-jira",
+    optional: false,
+    expectedBucket: BUCKET,
+    config: { state: "ok", role: ROLE["agentcore-hub-jira"], bucket: BUCKET },
+    policies: { state: "ok", docs: docs(policyFor("jira")) },
+  };
+  const withStatements = (...extra: Statement[]) => ({
+    ...good,
+    policies: { state: "ok", docs: docs({ Statement: [...policyFor("jira").Statement, ...extra] }) },
+  });
+  const only = (...Statement: Statement[]) => ({ ...good, policies: { state: "ok", docs: docs({ Statement }) } });
+  const helper = <T extends keyof typeof twinPreflight>(name: T) => {
+    const fn = twinPreflight[name] as unknown;
+    expect(typeof fn, `twin-preflight.mjs exports ${String(name)}`).toBe("function");
+    return fn as (...args: unknown[]) => unknown;
+  };
+
+  it("a Deny on completions/TEAM-*.json → block (the probe key is not what the Done guard reads)", () => {
+    const v = decideTwin(withStatements({ Effect: "Deny", Action: "s3:GetObject", Resource: `${NS}TEAM-*.json` }));
+    expect(v.action).toBe("block");
+    expect(v.reasons.join(" ")).toMatch(/Deny/);
+    expect(v.reasons.join(" ")).toMatch(/completions\/\*/);
+  });
+
+  it.each([
+    ["s3:Get*", `${NS}TEAM-*.json`],
+    ["*", `${NS}TEAM-*.json`],
+    [["s3:*"], `${NS}TEAM-*.json`],
+    ["s3:GetObject", "arn:aws:s3:::agentcore-hub-*"],
+    ["s3:GetObject", `${NS}TEAM-5924.json`],
+    ["s3:GetObject", `${BUCKET_ARN}/complet?ons/*`],
+  ])("a Deny with Action %j on %s → block", (Action, Resource) => {
+    expect(decideTwin(withStatements({ Effect: "Deny", Action, Resource })).action).toBe("block");
+  });
+
+  it("a conditioned Deny on completions/TEAM-* → block; a NotAction Deny → block", () => {
+    const Condition = { Bool: { "aws:SecureTransport": "false" } };
+    expect(decideTwin(withStatements({ Effect: "Deny", Action: "s3:GetObject", Resource: `${NS}TEAM-*`, Condition })).action).toBe("block");
+    expect(decideTwin(withStatements({ Effect: "Deny", NotAction: "s3:ListBucket", Resource: `${NS}TEAM-*` })).action).toBe("block");
+  });
+
+  // Pin, not a head regression: head's policyDenies already fails closed on ANY
+  // NotResource Deny. The helper assertion is what is new.
+  it("a NotResource Deny → block (fail closed: its complement may cover completions/*)", () => {
+    const deny = { Effect: "Deny", Action: "s3:GetObject", NotResource: `${NS}twin-preflight-probe.json` };
+    expect(decideTwin(withStatements(deny)).action).toBe("block");
+    expect(helper("policyMayDenyUnder")(docs({ Statement: [deny] }), "s3:GetObject", NS)).toBe(true);
+  });
+
+  // Pin, not a head regression: head's policyGrants already ignores every NotResource
+  // Allow, so this was never counted as granting the probe key.
+  it("a NotResource Allow is not a grant → block", () => {
+    const allow = { Effect: "Allow", Action: "s3:GetObject", NotResource: `${BUCKET_ARN}/other/*` };
+    expect(decideTwin(only(LIST, allow)).action).toBe("block");
+  });
+
+  it("an Allow on completions/twin-* only → block (it matches the probe key, not completions/TEAM-1.json)", () => {
+    const v = decideTwin(only(LIST, { Effect: "Allow", Action: "s3:GetObject", Resource: `${NS}twin-*` }));
+    expect(v.action).toBe("block");
+    expect(v.reasons.join(" ")).toMatch(/completions\/\*/);
+  });
+
+  it.each([`${NS}TEAM-1.json`, `${NS}*.json`, `${NS}twin-preflight-probe.json`, `${BUCKET_ARN}/complet?ons/*`])(
+    "an Allow on %s only → block",
+    (Resource) => {
+      expect(decideTwin(only(LIST, { Effect: "Allow", Action: "s3:GetObject", Resource })).action).toBe("block");
+    }
+  );
+
+  it.each([`${NS}*`, `${BUCKET_ARN}/*`, `${BUCKET_ARN}/comp*`, "arn:aws:s3:::*", "*"])(
+    "an Allow on %s covers the namespace → proceed",
+    (Resource) => {
+      expect(decideTwin(only(LIST, { Effect: "Allow", Action: "s3:GetObject", Resource })).action).toBe("proceed");
+    }
+  );
+
+  it.each([
+    ["s3:GetObject", `${BUCKET_ARN}/config/*`],
+    ["s3:GetObject", "arn:aws:s3:::other-bucket/*"],
+    ["s3:GetObject", BUCKET_ARN],
+    ["s3:PutObject", `${NS}*`],
+    ["s3:DeleteObject", "*"],
+  ])("a Deny with Action %s on %s cannot touch a completion read → proceed", (Action, Resource) => {
+    expect(decideTwin(withStatements({ Effect: "Deny", Action, Resource })).action).toBe("proceed");
+  });
+
+  it("coversPrefix: only a pattern matching EVERY key under the prefix covers it", () => {
+    const covers = helper("coversPrefix");
+    for (const p of [`${NS}*`, `${BUCKET_ARN}/*`, `${BUCKET_ARN}/comp*`, `${NS}**`, "arn:aws:s3:::*", "*"]) {
+      expect(covers(p, NS), p).toBe(true);
+    }
+    for (const p of [`${NS}TEAM-1.json`, `${NS}twin-*`, `${NS}*.json`, `${BUCKET_ARN}/complet?ons/*`, BUCKET_ARN, `${BUCKET_ARN}/config/*`]) {
+      expect(covers(p, NS), p).toBe(false);
+    }
+  });
+
+  it("mayIntersectPrefix: any pattern some key under the prefix could match", () => {
+    const meets = helper("mayIntersectPrefix");
+    for (const p of [`${NS}TEAM-*.json`, `${NS}TEAM-1.json`, `${BUCKET_ARN}/*`, "*", "arn:aws:s3:::agentcore-*", `${BUCKET_ARN}/complet?ons/x`]) {
+      expect(meets(p, NS), p).toBe(true);
+    }
+    for (const p of [`${BUCKET_ARN}/config/*`, "arn:aws:s3:::other/*", BUCKET_ARN, `${BUCKET_ARN}/completions`]) {
+      expect(meets(p, NS), p).toBe(false);
+    }
+  });
+
+  it("runPreflight: the TEAM-* Deny refuses the deploy (exit 1)", async () => {
+    const doc = { ...policyFor("jira") };
+    doc.Statement = [...doc.Statement, { Effect: "Deny", Action: "s3:GetObject", Resource: `${NS}TEAM-*.json` }];
+    const r = await preflight(plan(JIRA_ROW), fakeAws({ get: { "agentcore-hub-jira": ok(doc) } }));
+    expect(r.exitCode).toBe(1);
+    expect(r.out).toMatch(/agentcore-hub-jira: BLOCK/);
   });
 });
 

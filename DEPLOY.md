@@ -369,8 +369,14 @@ next run re-plans the twin) unless:
 
 - `ARTIFACT_BUCKET` is set on the function and equals the pipeline's bucket;
 - an inline policy has an **unconditioned** `Allow s3:ListBucket` on
-  `arn:aws:s3:::<bucket>` and `s3:GetObject` over `<bucket>/completions/*`, with no
-  matching `Deny`.
+  `arn:aws:s3:::<bucket>`, and an unconditioned `Allow s3:GetObject` whose Resource
+  covers the **whole** `<bucket>/completions/*` namespace (`<bucket>/completions/*`,
+  `<bucket>/*`, `arn:aws:s3:::*` or `*`). A grant on one key, or on a narrower
+  pattern such as `completions/twin-*`, does not count (TEAM-5924);
+- no inline `Deny` may apply: a Deny whose Action matches `s3:ListBucket` on the
+  bucket, or `s3:GetObject` (including `s3:Get*`, `s3:*`, `*`) with a Resource that
+  could match any key under `completions/` (e.g. `completions/TEAM-*.json`), refuses,
+  conditioned or not. A Deny written with `NotAction` or `NotResource` refuses outright.
 
 It fails closed on everything it cannot prove: an IAM or Lambda read that errors
 (AccessDenied, throttling), a conditioned grant, and **a grant that lives only in a
