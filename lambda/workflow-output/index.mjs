@@ -1272,6 +1272,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // TEAM-5830: whether or not the replay queue is configured — a hold an earlier drain
   // stamped outlives a queue URL taken off the env, and dropping it erased the hold.
   let briefHeld = false;
+  // TEAM-6130: the gate_settled release THIS call recorded (null otherwise), re-confirmed
+  // after the record write and before the Done below.
+  let releasedNow = null;
   if (!isSynthetic) {
     const held = earlyPrior.record;
     if (held?.briefPending === true) {
@@ -1282,6 +1285,18 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       if (briefKey) {
         const sib = needsSiblings && scan.ok ? scan : await loadSiblings(epicKey);
         brief = sib.ok ? await postQueuedBrief({ ticketId: ticket_id, epicKey, s3Key: briefKey, siblings: sib.siblings, scanComplete: sib.complete, workflowId: workflow_id }) : { ok: false, error: `list_tickets under ${epicKey}: ${sib.error}` };
+      }
+      // TEAM-6130: a gate_settled release is re-confirmed immediately before the record
+      // write that commits it (every audit-time gate read honoured first). A gate that
+      // reads open now is the off-gate hold: briefPending stays true, Done is withheld,
+      // and the agent's retry re-chooses the gate.
+      if (brief?.ok && brief.disposition?.release && brief.disposition.kind === "gate_settled") {
+        const confirm = await confirmDoneAtCommit({ ticketIds: brief.disposition.observed.map((o) => o.ticketId), earlier: brief.gateReads });
+        if (!confirm.ok) brief = { ok: false, error: `get_issue ${confirm.ticketId} (re-confirming the Merge Approval gate is Done before recording the release): ${confirm.error}` };
+        else if (!confirm.done) {
+          const why = `the Merge Approval gate ${confirm.why} when the release was about to be recorded`;
+          brief = { ok: true, outcome: "off_gate", targets: brief.targets, reason: why, disposition: { release: false, kind: "gate_reopened", why, observed: brief.disposition.observed } };
+        }
       }
       if (brief?.ok && brief.gate) {
         Object.assign(report, { briefPending: false, briefDelivered: "gate", briefTargets: [brief.gate] });
@@ -1296,6 +1311,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
         Object.assign(report, { briefDelivered: "off_gate", briefTargets: brief.targets });
         clearBriefHoldOnRelease(report, { ...brief.disposition, at: new Date().toISOString(), by: "report_completion" });
         deliveredNow = true;
+        if (brief.disposition.kind === "gate_settled") releasedNow = brief;
         console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} needs no gate (${brief.disposition.kind}: ${brief.disposition.why}) - briefPending cleared`);
       } else {
         briefHeld = true;
@@ -1307,6 +1323,17 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     }
   }
   report.followUpsPending = pendingFollowUps.length > 0;
+  // TEAM-6130: the admission designAmendmentGate made is committed by the write below (the
+  // twins trust the stamp), so the amendment is re-asked immediately before it. Reopened
+  // since: the same refusal as a never-done amendment, nothing written. Unreadable: retry.
+  if (review.residual && review.amendmentTicketId) {
+    const confirm = await confirmDoneAtCommit({ ticketIds: [review.amendmentTicketId] });
+    if (!confirm.ok) return amendmentScanRefusal({ ticketId: ticket_id, verdict: review.verdict, detail: `get_issue ${review.amendmentTicketId} (re-confirming the design amendment is done before the record write): ${confirm.error}` });
+    if (!confirm.done) {
+      console.warn(`[report_completion] REFUSED ${ticket_id}: design amendment ${confirm.why} before the record write - no record written, ticket not transitioned`);
+      return designAmendmentRefusal({ ticketId: ticket_id, verdict: review.verdict, open: { ticketId: review.amendmentTicketId }, note: `confirmed done, then ${amendmentReread(confirm)} before the record was written`, findings: countFindings(summary) });
+    }
+  }
   // TEAM-5830: the hold is whatever the WRITTEN record says, so a hold the drain stamped
   // after the read above withholds this Done, and a clear it made releases it.
   const firstWrite = await writeRecord(() => {
@@ -1324,6 +1351,23 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     return { ...completionRecordUnreadable(ticket_id, key, firstWrite.error), reason: firstWrite.reason || "completion_record_contended" };
   }
   console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
+  // TEAM-6130: a gate_settled release this call just recorded is re-asked once more before
+  // the Done it admits. A gate open now puts the hold back on the record (this call's own
+  // write, so adoptHold re-adopts nothing) and withholds the Done; the agent's retry
+  // re-chooses the gate.
+  if (releasedNow && !briefHeld && mayTransition) {
+    const confirm = await confirmDoneAtCommit({ ticketIds: releasedNow.disposition.observed.map((o) => o.ticketId) });
+    if (!confirm.ok || !confirm.done) {
+      const why = confirm.ok ? `the Merge Approval gate ${confirm.why} after the release was recorded` : `the Merge Approval gate ${confirm.ticketId} could not be re-read after the release was recorded (${confirm.error})`;
+      report.briefPending = true;
+      delete report.briefDisposition;
+      report.briefHoldReason = `off_gate: ${why}`;
+      briefHeld = true;
+      const back = await writeRecord(() => STATUS_PENDING_BRIEF);
+      if (!back.ok) console.error(`[report_completion] ${ticket_id}: ${why}, and the hold could not be put back on ${key} (${back.error}) - Done withheld; the retry restamps`);
+      else console.warn(`[report_completion] ${ticket_id}: ${why} - release taken back (briefPending:true), Done withheld`);
+    }
+  }
   // Done waits on both holds: every follow-up filed AND the merge brief on its gate.
   const mayDone = mayTransition && !briefHeld;
 
@@ -1349,6 +1393,23 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       ticketId: ticket_id, agentId: agent_id || null, summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null,
     });
   } else {
+    // TEAM-6130: the stamp just written is what the twins admit this Done on; re-ask the
+    // amendment once more before the residual posts and the Done. Reopened since (or
+    // unreadable): the stamp comes back off the record — both twins then refuse Done
+    // without it — no findings are posted, no Done is made, and the answer is the
+    // amendment refusal saying what WAS recorded.
+    if (review.residual && review.amendmentTicketId) {
+      const confirm = await confirmDoneAtCommit({ ticketIds: [review.amendmentTicketId] });
+      if (!confirm.ok || !confirm.done) {
+        delete report.securityReview;
+        const back = await writeRecord(() => STATUS_TRANSITION_FAILED);
+        const what = confirm.ok ? `design amendment ${confirm.why}` : `design amendment ${review.amendmentTicketId} could not be re-read (${confirm.error})`;
+        console.warn(`[report_completion] REFUSED ${ticket_id}: ${what} after the record was written - securityReview stamp ${back.ok ? "removed" : `NOT removed (${back.error})`}, no residual findings posted, ticket not transitioned`);
+        return confirm.ok
+          ? designAmendmentRefusal({ ticketId: ticket_id, verdict: review.verdict, open: { ticketId: review.amendmentTicketId }, note: `confirmed done, then ${amendmentReread(confirm)} after the record was written`, findings: countFindings(summary), recorded: true })
+          : amendmentScanRefusal({ ticketId: ticket_id, verdict: review.verdict, detail: `get_issue ${review.amendmentTicketId} (re-confirming the design amendment is done after the record write): ${confirm.error}`, recorded: true });
+      }
+    }
     // TEAM-5426: round 2 closes on a non-PASS verdict — the findings go onto the
     // dev lanes BEFORE the Done that releases them, so the cascade cannot dispatch
     // a dev turn ahead of its comment. Best-effort, never a refusal; a retry after
@@ -1646,22 +1707,29 @@ function decisionOf(body) {
  * One marker-deduped comment on one ticket: read it, skip when a comment already
  * carries `marker` (or `alsoMatches`), else run `beforePost` (if any) and post. The
  * replay's one way to say something on a ticket, so a redelivered message never says
- * it twice. `{ ok, outcome: "posted" | "already_posted", target }`, or
- * `{ ok: false, error, cause }` with `cause` the ticket tool's own error string.
+ * it twice. `{ ok, outcome: "posted" | "already_posted" | "withheld", target, issue }`,
+ * or `{ ok: false, error, cause }` with `cause` the ticket tool's own error string.
+ *
+ * TEAM-6130: `issue` is the ticket as the dedupe read saw it (normalizeIssue; null when
+ * the payload carried no key), so a caller whose decision rests on that ticket's STATUS
+ * can honour this read rather than only its comments. `beforePost(issue)` sees it too
+ * and may answer `{ ok: true, skip: <why> }` to withhold the post (`outcome: "withheld"`).
  */
 async function postMarkedComment(target, marker, comment, { alsoMatches = "", beforePost = null } = {}) {
   const read = await ticketTool("Tickets___get_issue", { ticket_id: target });
   if (!read.ok) return { ok: false, error: `get_issue ${target}: ${read.error}`, cause: read.error };
+  const issue = normalizeIssue(read.payload);
   if (commentBodiesOf(read.payload).some((c) => c.includes(marker) || (alsoMatches && c.includes(alsoMatches)))) {
-    return { ok: true, outcome: "already_posted", target };
+    return { ok: true, outcome: "already_posted", target, issue };
   }
   if (beforePost) {
-    const before = await beforePost();
+    const before = await beforePost(issue);
     if (!before.ok) return before;
+    if (before.skip) return { ok: true, outcome: "withheld", target, issue, reason: before.skip };
   }
   const posted = await ticketTool("Tickets___add_comment", { ticket_id: target, comment, body: comment });
   if (!posted.ok) return { ok: false, error: `add_comment ${target}: ${posted.error}`, cause: posted.error };
-  return { ok: true, outcome: "posted", target };
+  return { ok: true, outcome: "posted", target, issue };
 }
 
 /**
@@ -1861,7 +1929,22 @@ async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings, scanComplet
     why = `${gates.length} open Merge Approval gates (${gates.map((g) => g.ticketId).join(", ")}) and none is blocked by ${ticketId}`;
   }
 
-  if (disposition?.release) return postResolvedBrief({ ticketId, epicKey, s3Key, body, marker, decision, disposition });
+  if (disposition?.release) {
+    const resolved = await postResolvedBrief({ ticketId, epicKey, s3Key, body, marker, decision, disposition });
+    if (!resolved.ok || resolved.outcome !== "gate_reopened") return resolved;
+    // TEAM-6130: a gate whose own audit-time get_issue reads open is not settled. Once,
+    // the gate choice above re-runs on the fresh statuses (the brief goes on the reopened
+    // gate, or the off-gate hold applies); a second time the hold stands (gate_reopened).
+    const fresh = new Map(resolved.reopened.map((r) => [r.ticketId, r]));
+    const refreshed = siblings.map((s) => (fresh.has(s.ticketId) ? { ...s, status: fresh.get(s.ticketId).status, blockedBy: fresh.get(s.ticketId).blockedBy ?? s.blockedBy } : s));
+    const readOpen = resolved.reopened.map((r) => `${r.ticketId}:${r.status}`).join(", ");
+    if (!gatesConfirmed) {
+      console.warn(`[ticket-replay] ${ticketId}: every Merge Approval gate was confirmed Done but the release audit's own get_issue reads ${readOpen} - no release, re-choosing the gate`);
+      return postQueuedBrief({ ticketId, epicKey, s3Key, siblings: refreshed, scanComplete, workflowId, gatesConfirmed: true });
+    }
+    disposition = { release: false, kind: "gate_reopened", why: `the Merge Approval gate ${readOpen} was reopened while the release was being audited`, observed: disposition.observed };
+    why = disposition.why;
+  }
   console.error(`[ticket-replay] ${ticketId}: brief ${s3Key} cannot go on a gate (${why}) - posting it on the ticket and its epic instead`);
   const comment = `${marker}\n\nMERGE BRIEF NOT ON THE GATE - the Merge Approval gate could not be identified or refused the brief, so it is NOT in front of the approver.\n\nMerge brief for ${ticketId} (s3://${BUCKET}/${s3Key}). It could not be posted on the Merge Approval gate: ${why}. A human must put it in front of the approver.\n\n${body}`;
   const targets = [];
@@ -1898,18 +1981,37 @@ async function postResolvedBrief({ ticketId, epicKey, s3Key, body, marker, decis
   }
   const auditMarker = `[brief-resolved:${ticketId}]`;
   const observed = disposition.observed.map((o) => `${o.ticketId}:${o.status}`).join(", ") || "none";
+  // TEAM-6130: the gates FIRST. Each audit's own get_issue is the freshest read of the gate
+  // this release rests on, so a gate that reads open withholds its audit and ends the
+  // release before the ticket/epic audits say RELEASED; every gate's status is returned
+  // (`gateReads`) for the commit-time confirm, not just its comments.
+  const gateIds = disposition.observed.map((o) => o.ticketId);
+  const gateReads = new Map();
+  const reopened = [];
   const audit = `${auditMarker}\n\nThe merge-brief hold on ${ticketId} is RELEASED without gate delivery (${disposition.kind}): ${why}. Merge Approval gates observed: ${observed}.${disposition.gateOwed ? ` Gate owed: ${disposition.gateOwed.owed} (${disposition.gateOwed.detail}).` : ""} Recorded as briefDisposition on s3://${BUCKET}/completions/${ticketId}.json. The hub does NOT re-deliver a released brief (a re-run of WorkflowOutput___report_completion leaves it as is): if a Merge Approval gate is reopened or added for this run, a human must post the brief on it - it is at s3://${BUCKET}/${s3Key}${targets.length > 0 ? `, and a copy is in a comment on ${targets.join(" and ")}` : ""}.`;
   const seen = new Set();
-  for (const target of [ticketId, epicKey, ...disposition.observed.map((o) => o.ticketId)].filter(Boolean)) {
+  for (const target of [...gateIds, ticketId, epicKey].filter(Boolean)) {
     if (seen.has(target)) continue;
     seen.add(target);
-    const r = await postMarkedComment(target, auditMarker, audit);
+    const isGate = gateIds.includes(target);
+    const r = await postMarkedComment(target, auditMarker, audit, isGate ? {
+      beforePost: async (issue) => (isDoneStatus(issue?.status) ? { ok: true } : { ok: true, skip: `${target} reads ${asText(issue?.status) || "unknown"} on get_issue` }),
+    } : {});
+    if (r.ok && isGate) {
+      if (!r.issue) return { ok: false, error: `get_issue ${target} (confirming the Merge Approval gate is Done): the ticket payload carried no ticket key` };
+      gateReads.set(target, asText(r.issue.status));
+      if (!isDoneStatus(r.issue.status)) {
+        reopened.push({ ticketId: target, status: asText(r.issue.status), blockedBy: r.issue.blockedBy });
+        break;
+      }
+    }
     if (r.ok) continue;
     if (!isPermanentTicketRefusal(r.cause)) return { ok: false, error: `brief-resolved notice on ${target} not posted (${r.error})` };
     refused.push(`${target}: ${r.error}`);
   }
+  if (reopened.length > 0) return { ok: true, outcome: "gate_reopened", reopened, gateReads };
   const released = { ...disposition, ...(refused.length > 0 ? { notice: { refused } } : {}) };
-  return { ok: true, outcome: "off_gate", targets, reason: why, disposition: released };
+  return { ok: true, outcome: "off_gate", targets, reason: why, disposition: released, gateReads };
 }
 
 /** The missing-brief notice: a brief the report named is gone, so a human must post it. */
@@ -2282,6 +2384,18 @@ export async function drainCompletion(msg) {
     for (const f of out.failed) undelivered.push({ part: "residual_findings", ticketId: f.ticketId, reason: f.error });
     for (const id of [...out.posted, ...out.skipped]) delivered.push(undeliveredKey({ part: "residual_findings", ticketId: id }));
   }
+  // TEAM-6130: a gate_settled release rests on the gates' status, and the two commits below
+  // (drop()'s stamp on a follow-ups hold, step 6's write) make it durable. Re-ask immediately
+  // before either: a gate that read open at audit time or reads open now means no release
+  // this tick — the message comes back, and the next tick re-chooses the gate on the board
+  // as it is then (the brief and audit comments are marker-deduped, so nothing posts twice).
+  const settledGates = brief?.disposition?.release && brief.disposition.kind === "gate_settled"
+    ? brief.disposition.observed.map((o) => o.ticketId) : null;
+  if (settledGates) {
+    const confirm = await confirmDoneAtCommit({ ticketIds: settledGates, earlier: brief.gateReads });
+    if (!confirm.ok) return retry(`get_issue ${confirm.ticketId} (re-confirming the Merge Approval gate is Done before recording the release): ${confirm.error}`);
+    if (!confirm.done) return retry(`the Merge Approval gate ${confirm.why} after the release was confirmed - no release recorded; the next tick re-chooses the gate`);
+  }
   if (holds.length > 0) {
     // Round 5 P2: the hold stamps what the follow-ups really are now, so a brief-only
     // hold (every follow-up filed) does not leave the twins' Done guard refusing the
@@ -2333,6 +2447,22 @@ export async function drainCompletion(msg) {
     const restamped = await putRecordIfUnchanged(reportKey, record, recordEtag);
     if (!restamped.ok) return retry(restamped.moved ? restamped.error : `record ${reportKey} not restamped (${restamped.error})`);
     recordEtag = restamped.etag;
+    // TEAM-6130: and once more after the write, before the Done it admits — the Done is
+    // the irreversible, cascading act. A gate open now takes the release back off the
+    // record (the off-gate hold, on the ETag just received), and no Done is made: the
+    // message comes back and the next tick puts the brief on the reopened gate.
+    if (settledGates && !alreadyDone) {
+      const confirm = await confirmDoneAtCommit({ ticketIds: settledGates });
+      if (!confirm.ok || !confirm.done) {
+        const reason = confirm.ok ? `the Merge Approval gate ${confirm.why} after the release was recorded` : `the Merge Approval gate ${confirm.ticketId} could not be re-read after the release was recorded (${confirm.error})`;
+        const reheld = { ...record, briefPending: true, briefFallbackReason: `not on the gate: ${reason}` };
+        delete reheld.briefDisposition;
+        reheld.undelivered = mergeUndelivered(record.undelivered, [{ part: "brief", s3Key: msg.brief.s3Key, reason: `not on the gate: ${reason}`, postedOn: brief.targets }], []);
+        const back = await putRecordIfUnchanged(reportKey, reheld, recordEtag);
+        if (!back.ok) console.error(`[ticket-replay] ${ticketId}: ${reason}, and the release could not be taken back off ${reportKey} (${back.error}) - no Done is made; the next tick re-reads the record`);
+        return retry(`${reason}; the release is ${back.ok ? "taken back (hold re-stamped)" : "NOT taken back"} and no Done is made - the next tick re-chooses the gate`);
+      }
+    }
   }
 
   // 7. The Done itself — skipped when the ticket already reads Done, so a replay never
@@ -3242,6 +3372,43 @@ async function readTicketDone(ticketId) {
   const issue = r.ok ? normalizeIssue(r.payload) : null;
   if (!issue) return { ok: false, error: r.error || "the ticket payload carried no ticket key" };
   return { ok: true, done: isDoneStatus(issue.status), issue };
+}
+
+/**
+ * TEAM-6130: confirm-at-commit. Every "X is Done, so release / admit" decision in this
+ * Lambda (a gate_settled brief release; a security review's done design amendment) is
+ * re-asked here immediately before the write that makes it durable, and once more after
+ * that write before the Done transition — a strong read taken earlier and then acted on
+ * later is a race, and the completion record's ETag cannot fence a status change on
+ * ANOTHER ticket. Every status of X read in the same invocation after the first confirm
+ * (`earlier`: postResolvedBrief's audit-time get_issue reads) is honoured first.
+ *
+ *   { ok: true, done: true, issues: Map<ticketId, issue> }
+ *   { ok: true, done: false, open: [{ ticketId, status, error?, seenAt: "audit"|"commit" }], why }
+ *     — a permanent get_issue refusal is `done: false` too: "cannot read" is not Done
+ *   { ok: false, ticketId, error }   a transient get_issue failure (the tool's own error
+ *     string): the caller retries, nothing is written
+ */
+async function confirmDoneAtCommit({ ticketIds, earlier = null }) {
+  const open = [];
+  const describe = (o) => (o.status != null ? `${o.ticketId} reads ${o.status}` : `${o.ticketId} could not be read to confirm it is Done (${o.error})`);
+  const notDone = () => ({ ok: true, done: false, open, why: open.map(describe).join(", ") });
+  if (earlier) {
+    for (const [ticketId, status] of earlier) if (!isDoneStatus(status)) open.push({ ticketId, status: asText(status), seenAt: "audit" });
+    if (open.length > 0) return notDone();
+  }
+  const issues = new Map();
+  for (const ticketId of ticketIds) {
+    const r = await readTicketDone(ticketId);
+    if (!r.ok) {
+      if (!isPermanentTicketRefusal(r.error)) return { ok: false, ticketId, error: r.error };
+      open.push({ ticketId, status: null, error: r.error, seenAt: "commit" });
+      continue;
+    }
+    issues.set(ticketId, r.issue);
+    if (!r.done) open.push({ ticketId, status: asText(r.issue.status), seenAt: "commit" });
+  }
+  return open.length > 0 ? notDone() : { ok: true, done: true, issues, why: null };
 }
 
 async function transitionToDone(ticketId) {
@@ -4632,6 +4799,46 @@ export function designAmendmentsOf(siblings, reviewTicketId) {
  * ticket's Done without one (securityReviewRecordRefusal) — the twin reads its
  * own row, so identity is settled where it cannot be supplied by the caller.
  */
+/** The last sentence of an amendment refusal: what this call left behind. */
+const amendmentRefusalTail = (recorded) => (recorded
+  ? `The completion record was written WITHOUT the admission stamp (status ${STATUS_TRANSITION_FAILED}), so both ticket providers refuse Done until a re-run of WorkflowOutput___report_completion re-judges and restamps it; the ticket was NOT transitioned.`
+  : "Nothing was recorded and the ticket was NOT transitioned.");
+
+/** TEAM-6130: the retryable "could not read whether the amendment is done" refusal, one shape for every site. */
+export function amendmentScanRefusal({ ticketId, verdict, detail, recorded = false }) {
+  return {
+    ok: false,
+    reason: FOLLOW_UP_SCAN_FAILED,
+    detail,
+    ...(recorded ? { recorded: true } : {}),
+    message: `${ticketId} is a ${verdict} security review, and whether its design amendment exists could not be read (${detail}). ${recorded ? amendmentRefusalTail(true) : "Nothing was recorded and the ticket was NOT transitioned"} - retry WorkflowOutput___report_completion with the same arguments.`,
+  };
+}
+
+/**
+ * TEAM-6130: the design_amendment_required refusal, one shape for every site. `open` is
+ * the amendment still owed (null: none exists); `note` says why a listed/confirmed Done
+ * did not count; `recorded` says the record was written before the refusal (the stamp
+ * taken back off it).
+ */
+export function designAmendmentRefusal({ ticketId, verdict, open, note = null, findings, recorded = false }) {
+  return {
+    ok: false,
+    reason: DESIGN_AMENDMENT_REQUIRED,
+    detail: open ? `amendment ${open.ticketId} is still open${note ? ` (${note})` : ""}` : "no design amendment exists",
+    missing: ["design_amendment"],
+    findings_count: findings,
+    ...(open ? { amendmentTicketId: open.ticketId } : {}),
+    ...(recorded ? { recorded: true } : {}),
+    message: open
+      ? `${ticketId} is a ${verdict} security review and its design amendment ${open.ticketId} is not done yet. Stay blocked behind it; when it is done, re-review the amended design and call WorkflowOutput___report_completion again. ${amendmentRefusalTail(recorded)}`
+      : `${ticketId} is a ${verdict} security review: the dev lanes it blocks must not start on this design. File ONE "Amend design: ..." ticket (Tickets___create_ticket with parent_id=<your epic>, spawned_by_kind="review_fix", spawned_by_origin_id="${ticketId}", phase="design", the fix contract, assigned to the designer, every finding verbatim), park ${ticketId} blocked behind it, and call WorkflowOutput___report_completion after re-reviewing the amended design. ${amendmentRefusalTail(recorded)}`,
+  };
+}
+
+/** What a commit-time re-read of the amendment said, for a refusal's `note`. */
+const amendmentReread = (confirm) => (confirm.open[0].status != null ? `read ${confirm.open[0].status}` : `could not be read (${confirm.open[0].error})`);
+
 async function designAmendmentGate({ ticketId, isSynthetic, issue, issueError, agentId, summary }) {
   if (isSynthetic) return {};
   const isReviewer = issue ? issue.assignee === SECURITY_REVIEWER_AGENT : agentId === SECURITY_REVIEWER_AGENT;
@@ -4648,12 +4855,7 @@ async function designAmendmentGate({ ticketId, isSynthetic, issue, issueError, a
   if (verdict === "PASS") return { verdict };
 
   const findings = countFindings(summary);
-  const scanRefusal = (detail) => ({ refusal: {
-    ok: false,
-    reason: FOLLOW_UP_SCAN_FAILED,
-    detail,
-    message: `${ticketId} is a ${verdict} security review, and whether its design amendment exists could not be read (${detail}). Nothing was recorded and the ticket was NOT transitioned - retry WorkflowOutput___report_completion with the same arguments.`,
-  } });
+  const scanRefusal = (detail) => ({ refusal: amendmentScanRefusal({ ticketId, verdict, detail }) });
   if (!issue) return scanRefusal(`get_issue: ${issueError || "unreadable"}`);
   const scan = await loadSiblings(issue.parentKey);
   if (!scan.ok) return scanRefusal(`list_tickets under ${issue.parentKey}: ${scan.error}`);
@@ -4678,17 +4880,7 @@ async function designAmendmentGate({ ticketId, isSynthetic, issue, issueError, a
   }
   // An absent amendment on a truncated roster proves nothing; an OPEN one does.
   if (!amendments.length && !scan.complete) return scanRefusal(`list_tickets under ${issue.parentKey}: roster truncated (complete:false)`);
-  return { refusal: {
-    ok: false,
-    reason: DESIGN_AMENDMENT_REQUIRED,
-    detail: open ? `amendment ${open.ticketId} is still open${unconfirmed ? ` (listed done, but it ${unconfirmed})` : ""}` : "no design amendment exists",
-    missing: ["design_amendment"],
-    findings_count: findings,
-    ...(open ? { amendmentTicketId: open.ticketId } : {}),
-    message: open
-      ? `${ticketId} is a ${verdict} security review and its design amendment ${open.ticketId} is not done yet. Stay blocked behind it; when it is done, re-review the amended design and call WorkflowOutput___report_completion again. Nothing was recorded and the ticket was NOT transitioned.`
-      : `${ticketId} is a ${verdict} security review: the dev lanes it blocks must not start on this design. File ONE "Amend design: ..." ticket (Tickets___create_ticket with parent_id=<your epic>, spawned_by_kind="review_fix", spawned_by_origin_id="${ticketId}", phase="design", the fix contract, assigned to the designer, every finding verbatim), park ${ticketId} blocked behind it, and call WorkflowOutput___report_completion after re-reviewing the amended design. Nothing was recorded and the ticket was NOT transitioned.`,
-  } };
+  return { refusal: designAmendmentRefusal({ ticketId, verdict, open, note: unconfirmed ? `listed done, but it ${unconfirmed}` : null, findings }) };
 }
 
 /**
