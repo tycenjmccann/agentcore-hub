@@ -2259,4 +2259,141 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     expect(fake.tickets.get(BUILD).status).toBe("In Progress");
     await twinsRefuse();
   });
+
+  // ─── TEAM-6140 (DL-039): compensation must fail safe. TEAM-6130's post-write confirm took a
+  // reopened gate's release back by REWRITING the record; a rewrite that lost every CAS attempt
+  // (412) left briefPending:false + gate_settled on the record with the gate open, and the next
+  // reader trusted it (the retry skipped the held block; the twins admitted a Done). The release
+  // is now written PROVISIONALLY (briefPending:true, briefDisposition.provisional) and finalized
+  // by a second write only after the confirm, so a lost compensation changes nothing a reader trusts.
+  /** The first PUT of KEY lands (reopening the gate as it does, when asked); every later PUT of KEY is refused 412. */
+  const loseCasAfterFirst = ({ flipGate = false } = {}) => {
+    let n = 0;
+    fake.putError = (input) => {
+      if (input.Key !== KEY) return null;
+      if (++n === 1) { if (flipGate) fake.tickets.get(GATE).status = "To Do"; return null; }
+      return awsError("PreconditionFailed", 412, "At least one of the pre-conditions you specified did not hold");
+    };
+    return () => n;
+  };
+  const expectProvisional = () => {
+    expect(record().briefPending).toBe(true);
+    expect(record().briefDisposition).toMatchObject({ release: true, kind: "gate_settled", provisional: true });
+  };
+  const bodyOf = (p) => JSON.parse(typeof p.Body === "string" ? p.Body : Buffer.from(p.Body).toString("utf8"));
+  const keyPuts = () => fake.puts.filter((p) => p.Key === KEY);
+
+  it("TEAM-6140 R1 retry: the gate reopens at the release write and the hold cannot be put back (412 x3) ⇒ the record holds the release provisionally, both twins refuse; the identical retry re-reads the gate and puts the brief on it", async () => {
+    await holdUnnamed();
+    allGatesDone();
+    const puts = loseCasAfterFirst({ flipGate: true });
+    fake.calls.length = 0;
+    const res = await rerun();
+    expect(puts()).toBeGreaterThan(1);
+    expect(res).toMatchObject({ status: "complete_pending_brief", next_action: "retry_report_completion" });
+    expect(tools("Tickets___transition_ticket")).toHaveLength(0);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    expectProvisional();
+    await twinsRefuse();
+    fake.putError = null;
+    fake.calls.length = 0;
+    expect((await rerun()).status).toBe("complete");
+    expect(tools("Tickets___get_issue").some((c) => c.params.ticket_id === GATE), "the retry re-read the gate").toBe(true);
+    expect(briefComments(GATE)).toHaveLength(1);
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE] });
+    expect(record().briefDisposition).toBeUndefined();
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+  });
+
+  it("TEAM-6140 R2 retry: the finalize write loses every CAS attempt after the confirm ⇒ no Done, the record stays provisional and refused; the re-run finalizes", async () => {
+    await holdUnnamed();
+    allGatesDone();
+    loseCasAfterFirst();
+    fake.calls.length = 0;
+    const res = await rerun();
+    expect(res).toMatchObject({ status: "complete_pending_brief", next_action: "retry_report_completion" });
+    expect(tools("Tickets___transition_ticket")).toHaveLength(0);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    expectProvisional();
+    await twinsRefuse();
+    fake.putError = null;
+    expect((await rerun()).status).toBe("complete");
+    expectReleased("gate_settled");
+    expect(record().briefDisposition).toMatchObject({ by: "report_completion" });
+    expect(record().briefDisposition.provisional).toBeUndefined();
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    await twinsAdmit();
+  });
+
+  it("TEAM-6140 R3 retry: the release is written provisional, confirmed, finalized, then Doned - never a Done on a provisional record", async () => {
+    await holdUnnamed();
+    allGatesDone();
+    const before = keyPuts().length;
+    let seenAtDone = null;
+    fake.onTransition = () => { seenAtDone = record(); };
+    expect((await rerun()).status).toBe("complete");
+    const bodies = keyPuts().slice(before).map(bodyOf);
+    expect(bodies).toHaveLength(2);
+    expect(bodies[0]).toMatchObject({ briefPending: true, briefDisposition: { kind: "gate_settled", provisional: true }, status: "complete_pending_brief" });
+    expect(bodies[1]).toMatchObject({ briefPending: false, briefDisposition: { kind: "gate_settled", by: "report_completion" }, status: "complete" });
+    expect(bodies[1].briefDisposition.provisional).toBeUndefined();
+    expect(seenAtDone).toMatchObject({ briefPending: false });
+    expect(seenAtDone.briefDisposition.provisional).toBeUndefined();
+    expectReleased("gate_settled");
+    await twinsAdmit();
+  });
+
+  it("TEAM-6140 D1 drain: the gate reopens at step 6's release write and the hold cannot be re-stamped (412) ⇒ the record holds the release provisionally, both twins refuse, no Done; the next tick puts the brief on the gate", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    const puts = loseCasAfterFirst({ flipGate: true });
+    const t1 = await tick();
+    expect(puts()).toBeGreaterThan(1);
+    expect(t1.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expectProvisional();
+    expect(record().ticketWrites).toBe("queued");
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    await twinsRefuse();
+    fake.putError = null;
+    expireVisibility();
+    expect((await tick()).out.drained).toMatchObject({ applied: 1 });
+    expect(briefComments(GATE)).toHaveLength(1);
+    expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE], briefPending: false, ticketWrites: "applied" });
+    expect(record().briefDisposition).toBeUndefined();
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+  });
+
+  it("TEAM-6140 D2 drain: the finalize write loses its CAS after the confirm ⇒ retried, no Done, the record stays provisional and refused; the next tick finalizes", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    loseCasAfterFirst();
+    const t1 = await tick();
+    expect(t1.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expectProvisional();
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    await twinsRefuse();
+    fake.putError = null;
+    expireVisibility();
+    expect((await tick()).out.drained).toMatchObject({ applied: 1 });
+    expectReleased("gate_settled");
+    expect(record()).toMatchObject({ ticketWrites: "applied", briefDisposition: { by: "drain" } });
+    expect(record().briefDisposition.provisional).toBeUndefined();
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    await twinsAdmit();
+  });
+
+  it("TEAM-6140 D3 drain: step 6 writes the release provisional, confirms, finalizes, then Dones - never a Done on a provisional record", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    const before = keyPuts().length;
+    let seenAtDone = null;
+    fake.onTransition = () => { seenAtDone = record(); };
+    expect((await tick()).out.drained).toMatchObject({ applied: 1 });
+    const bodies = keyPuts().slice(before).map(bodyOf);
+    expect(bodies).toHaveLength(3); // provisional, final, applied
+    expect(bodies[0]).toMatchObject({ briefPending: true, briefDisposition: { kind: "gate_settled", provisional: true }, ticketWrites: "queued" });
+    expect(bodies[1]).toMatchObject({ briefPending: false, briefDisposition: { kind: "gate_settled", by: "drain" }, ticketWrites: "queued" });
+    expect(bodies[1].briefDisposition.provisional).toBeUndefined();
+    expect(bodies[2]).toMatchObject({ ticketWrites: "applied" });
+    expect(seenAtDone).toMatchObject({ briefPending: false });
+    expect(seenAtDone.briefDisposition.provisional).toBeUndefined();
+    await twinsAdmit();
+  });
 });
