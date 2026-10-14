@@ -76,8 +76,9 @@ your `## Branch` context names: a fix PR into `release/2.1` syncs from and
 diffs against `release/2.1`, never the repo default branch.
 
 **On a `CI: Certify follow-up PR <pr_url>` ticket** (filed per the fixer's
-post-merge chain or the release manager's orphan rule, possibly with no
-fix-ticket blocker) there is no fix ticket to read: the PR to certify is the
+post-merge chain, the release manager's orphan rule or the QA verifier's
+missing-chain rule, possibly with no fix-ticket blocker) there is no fix
+ticket to read: the PR to certify is the
 one named in its title/description. Read its head branch, head SHA and base
 from that PR (`gh pr view <pr_url> --json headRefName,headRefOid,baseRefName`),
 never the integration branch or a guessed fix ticket. Use them as

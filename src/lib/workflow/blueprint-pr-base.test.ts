@@ -216,6 +216,33 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     expect(t).toMatch(/blocked_by="<CD ticket id>"[^`]*\)`\s*\(DL-024\) and exit WITHOUT `report_completion`/);
   });
 
+  // TEAM-6076 (review round 2 of #933): TEAM-6063's park covers only a CD ticket that
+  // exists and is not Done. When none exists (fixer skipped the chain, RM orphan rule
+  // not run yet) QA must file the chain itself — bug-fixer's exact four titles — and
+  // park on the CD ticket it filed, never verify the undeployed fix. And "Done" alone
+  // is not delivery: the CD completion record must report a merge_commit.
+  it("qa-verifier files the follow-up chain itself when no CD: follow-up PR ticket exists (TEAM-6076)", () => {
+    const t = read("qa-verifier");
+    const para = t.slice(t.indexOf("find its `CD: follow-up PR <pr_url>` ticket"), t.indexOf("### Step 5: Deliver Verdict"));
+    expect(para.length).toBeGreaterThan(0);
+    expect(para).toContain("If NO `CD: follow-up PR <pr_url>` ticket exists");
+    expect(para).toContain("the fix is undeployed and you do not verify it");
+    expect(para).toContain("Orphan rule (TEAM-6032)");
+    expect(para).toContain("never re-file");
+    // Same four titles as bug-fixer, in chain order, and the park comes after the filing.
+    const TITLE_RE = /`((?:CI: Certify|Ship:|Merge Approval:|CD:) follow-up PR <pr_url>)`/g;
+    const titles = (s: string) => [...s.matchAll(TITLE_RE)].map((m) => m[1]);
+    const CHAIN = ["CI: Certify follow-up PR <pr_url>", "Ship: follow-up PR <pr_url>", "Merge Approval: follow-up PR <pr_url>", "CD: follow-up PR <pr_url>"];
+    expect([...new Set(titles(read("bug-fixer")))]).toEqual(CHAIN);
+    const IF_NO = "If NO `CD: follow-up PR <pr_url>` ticket exists";
+    const filed = para.slice(para.indexOf(IF_NO) + IF_NO.length);
+    expect(titles(filed).slice(0, 4)).toEqual(CHAIN);
+    expect(filed.indexOf("CD: follow-up PR <pr_url>` → `agentcore_hub_release_manager`")).toBeLessThan(filed.lastIndexOf("exit WITHOUT `report_completion`"));
+    // Delivery = CD ticket Done AND its completion record carries merge_commit; Done without one is not delivered.
+    expect(para).toContain("Done AND its completion record");
+    expect(para).toContain("Done without a `merge_commit` is NOT delivered");
+  });
+
   // TEAM-6063 finding 3: a hub-infra fix PR is an orphan class the existing chain and
   // completion-gate backstop don't cover (wrong repo, wrong ci_project/pipeline). Someone
   // must still ship or hand it off.

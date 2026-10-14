@@ -197,6 +197,32 @@ live; treating a code-read or a mocked run as that proof is exactly the
   `Tickets___transition_ticket(ticket_id=<your QA ticket>, transition_id="blocked", blocked_by="<CD ticket id>", reason="QA: post-merge fix not merged yet")`
   (DL-024) and exit WITHOUT `report_completion`. Verify only when you are
   re-invoked after it reports a `merge_commit`.
+  If NO `CD: follow-up PR <pr_url>` ticket exists (the fixer skipped filing its
+  chain and the release manager's orphan rule has not run yet), the fix is
+  undeployed and you do not verify it on this invocation. Read `pr_url` from
+  `s3://<bucket>/completions/<fix ticket>.json` and file the chain yourself,
+  exactly as `load_blueprint("bug-fixer")` → "Post-merge follow-up PR: file its
+  ship chain" and release-manager.md's "Orphan rule (TEAM-6032)" describe:
+  `CI: Certify follow-up PR <pr_url>` → `agentcore_hub_ci_agent`, `blocked_by`
+  nothing (the fix ticket is already Done); `Ship: follow-up PR <pr_url>` →
+  `agentcore_hub_release_manager`, `blocked_by` the CI ticket; `Merge Approval:
+  follow-up PR <pr_url>` → the SAME `human:<who>` assignee and labels as this
+  run's Merge Approval gate ticket (read it off `Tickets___list_tickets(<epic>)`,
+  never invent one), `blocked_by` the Ship ticket; `CD: follow-up PR <pr_url>` →
+  `agentcore_hub_release_manager`, `blocked_by` the Merge Approval ticket. Every
+  description carries the `pr_url`, the PR head SHA and a `base_branch:` line.
+  List the epic's tickets first and never re-file a ticket whose title already
+  names that `pr_url` — file only the missing links. Then PARK YOURSELF on the
+  `CD: follow-up PR <pr_url>` ticket you filed, with the same transition as
+  above, and exit WITHOUT `report_completion`.
+  Delivered means the CD ticket is Done AND its completion record
+  (`s3://<bucket>/completions/<CD ticket>.json`) reports a `merge_commit`. A CD
+  ticket Done without a `merge_commit` is NOT delivered — the merge did not land
+  (a blocked `outcome`, a refused merge) — so do not verify: park on whatever
+  open ticket that record names as the blocker (its gate or `ship_fix` ticket),
+  and if it names none, route it under BLOCKED below naming the CD ticket and
+  its `outcome` — never a PASS. A missing or unmerged chain is never a reason to
+  verify the pre-merge head or to verdict against your original QA ticket.
 
 ### Step 5: Deliver Verdict
 **Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists
