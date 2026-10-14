@@ -960,13 +960,19 @@ describe("transition_ticket — blocked → blocked adds blockers only (TEAM-614
     expect(h.state.statusUpdates).toHaveLength(1);
     const w = h.state.statusUpdates[0];
     expect(w.ExpressionAttributeValues[":s"]).toBe("blocked");
-    expect(w.ExpressionAttributeValues[":bb"]).toEqual(["TEAM-9", "TEAM-7"]);
+    // TEAM-6155: an atomic append of what is missing, not a whole-list SET of the union.
+    expect(w.UpdateExpression).toContain("#bb = list_append(if_not_exists(#bb, :empty), :bbAdd)");
+    expect(w.ExpressionAttributeValues[":bbAdd"]).toEqual(["TEAM-7"]);
     // Nothing but status/updatedAt/blockedBy: no skip, review-feedback or park-claim side effects.
     expect(w.UpdateExpression).not.toContain("skipReason");
     expect(w.UpdateExpression).not.toContain("#sr");
     expect(w.UpdateExpression).not.toContain("#rvc");
     expect(w.ExpressionAttributeValues[":pc"]).toBeUndefined();
-    expect(w.ConditionExpression).toBeUndefined();
+    // TEAM-6155: this used to assert `toBeUndefined()` — the absence of any fence on an
+    // un-expected_status repair, which is exactly the lost-update bug. The append is
+    // guarded on the edge it adds, with or without a status fence.
+    expect(w.ConditionExpression).toBe("NOT contains(#bb, :bb0)");
+    expect(w.ExpressionAttributeValues[":bb0"]).toBe("TEAM-7");
     expect(h.state.puts).toHaveLength(0); // no event row, no new ticket
   });
 
@@ -984,7 +990,8 @@ describe("transition_ticket — blocked → blocked adds blockers only (TEAM-614
 
     const ok = await transition({ ticket_id: LINK, transition_id: "blocked", blocked_by: "TEAM-7", expected_status: "blocked" });
     expect(ok).toMatchObject({ key: LINK, status: "transitioned", to: "blocked" });
-    expect(h.state.statusUpdates[0].ConditionExpression).toBe("#s = :expected");
+    // TEAM-6155: the blocker guard and the status fence ride in the same condition.
+    expect(h.state.statusUpdates[0].ConditionExpression).toBe("(NOT contains(#bb, :bb0)) AND #s = :expected");
     expect(h.state.statusUpdates[0].ExpressionAttributeValues[":expected"]).toBe("blocked");
 
     h.state.statusUpdates.length = 0;
@@ -1000,6 +1007,156 @@ describe("transition_ticket — blocked → blocked adds blockers only (TEAM-614
     expect(res.transitions.map((t) => t.id)).not.toContain("done");
     expect(res.transitions.filter((t) => t.to === "done").map((t) => t.id)).toEqual(["skip"]);
     expect(res.transitions.filter((t) => t.to === "blocked").map((t) => t.id)).toEqual(["block"]);
+  });
+});
+
+// TEAM-6155 (ship-review r3, regression of TEAM-6147) — two concurrent additive repairs
+// of the same link each read the row, unioned in memory and wrote the whole list back
+// fenced only on the status (or on nothing), so the later write erased the earlier
+// blocker while both callers were told `transitioned`. The write is now an atomic
+// append of what is missing, guarded per blocker; a lost guard re-reads and retries
+// with only what is still missing, bounded, and never reports an edge it did not write.
+describe("transition_ticket — concurrent additive blocked_by (TEAM-6155)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const LINK = "TEAM-6101";
+  const seed = () => {
+    h.state.items[LINK] = { ticketId: LINK, status: "blocked", assignee: "agentcore_hub_release_manager", blockedBy: ["TEAM-9"] };
+  };
+  const repair = (blocked_by, extra = {}) => transition({ ticket_id: LINK, transition_id: "blocked", blocked_by, ...extra });
+
+  // A stateful table on top of the shared mock: evaluates the condition subset this path
+  // emits (`#s = :expected`, `NOT contains(#bb, :bbN)`), applies the SET (#s, #u, and either
+  // the pre-fix `#bb = :bb` replace or list_append/if_not_exists), and REPLACES the row
+  // object so a caller's in-hand `current.Item` stays the snapshot it read. `barrier` holds
+  // the first writes until that many are in flight — every caller has read before any
+  // writes — and then opens for good, so a loser's retry write goes straight through.
+  const installTable = ({ barrier = 2, beforeWrite = null } = {}) => {
+    const waiting = [];
+    const applied = [];
+    let released = barrier <= 1;
+    h.state.onStatusWrite = async (input) => {
+      if (!released) {
+        await new Promise((resolve) => {
+          waiting.push(resolve);
+          if (waiting.length >= barrier) {
+            released = true;
+            waiting.splice(0).forEach((r) => r());
+          }
+        });
+      }
+      beforeWrite?.(input);
+      const key = input.Key.ticketId;
+      const row = h.state.items[key];
+      const v = input.ExpressionAttributeValues;
+      const cond = input.ConditionExpression || "";
+      const fail = () => {
+        const e = new Error("The conditional request failed");
+        e.name = "ConditionalCheckFailedException";
+        throw e;
+      };
+      if (cond.includes("#s = :expected") && row.status !== v[":expected"]) fail();
+      for (const [, ph] of cond.matchAll(/NOT contains\(#bb, (:\w+)\)/g)) {
+        if ((row.blockedBy || []).includes(v[ph])) fail();
+      }
+      let blockedBy = row.blockedBy;
+      if (/#bb = :bb\b/.test(input.UpdateExpression)) blockedBy = v[":bb"];
+      const m = input.UpdateExpression.match(/#bb = list_append\(if_not_exists\(#bb, :empty\), (:\w+)\)/);
+      if (m) blockedBy = [...(row.blockedBy || []), ...v[m[1]]];
+      h.state.items[key] = { ...row, status: v[":s"], updatedAt: v[":u"], ...(blockedBy ? { blockedBy } : {}) };
+      applied.push(input);
+    };
+    return applied;
+  };
+
+  it("two different edges added concurrently both land: the union, each caller reporting its own", async () => {
+    seed();
+    const applied = installTable();
+
+    const [a, b] = await Promise.all([
+      repair("TEAM-7", { expected_status: "blocked" }),
+      repair("TEAM-8", { expected_status: "blocked" }),
+    ]);
+
+    expect(a).toMatchObject({ status: "transitioned", from: "blocked", to: "blocked", blockedByAdded: ["TEAM-7"] });
+    expect(b).toMatchObject({ status: "transitioned", from: "blocked", to: "blocked", blockedByAdded: ["TEAM-8"] });
+    expect(h.state.items[LINK].blockedBy).toEqual(["TEAM-9", "TEAM-7", "TEAM-8"]);
+    expect(h.state.items[LINK].status).toBe("blocked");
+    expect(applied).toHaveLength(2);
+    for (const w of applied) expect(w.UpdateExpression).toContain("list_append(if_not_exists(#bb, :empty), :bbAdd)");
+  });
+
+  it("the same edge added concurrently is written once; the loser re-reads and becomes the no-op write", async () => {
+    seed();
+    const applied = installTable();
+
+    const [a, b] = await Promise.all([
+      repair("TEAM-7", { expected_status: "blocked" }),
+      repair("TEAM-7", { expected_status: "blocked" }),
+    ]);
+
+    expect(a.status).toBe("transitioned");
+    expect(b.status).toBe("transitioned");
+    expect(h.state.items[LINK].blockedBy).toEqual(["TEAM-9", "TEAM-7"]); // no duplicate
+    const withBb = applied.filter((w) => w.UpdateExpression.includes("#bb"));
+    expect(withBb).toHaveLength(1);
+    expect(applied).toHaveLength(2); // the loser's retry is status/updatedAt only
+    expect(applied.filter((w) => !w.UpdateExpression.includes("#bb"))).toHaveLength(1);
+    const reported = [a, b].map((r) => r.blockedByAdded);
+    expect(reported.filter((x) => x !== undefined)).toEqual([["TEAM-7"]]);
+    expect(h.state.puts).toHaveLength(0);
+  });
+
+  it("a status moved under the fenced repair is still the precondition refusal, not a blocker retry", async () => {
+    seed();
+    const applied = installTable({
+      barrier: 1,
+      beforeWrite: () => {
+        // Dispatched between the agent's read and its write.
+        h.state.items[LINK] = { ...h.state.items[LINK], status: "in_progress" };
+      },
+    });
+
+    const res = await repair("TEAM-7", { expected_status: "blocked" });
+
+    expect(res.content[0].text).toMatch(/^Status precondition failed: TEAM-6101 is in_progress, expected blocked/);
+    expect(h.state.items[LINK].blockedBy).toEqual(["TEAM-9"]);
+    expect(applied).toHaveLength(0);
+  });
+
+  it("without expected_status the append is still guarded, so the union survives the race", async () => {
+    seed();
+    const applied = installTable();
+
+    const [a, b] = await Promise.all([repair("TEAM-7"), repair("TEAM-8")]);
+
+    expect(a).toMatchObject({ status: "transitioned", blockedByAdded: ["TEAM-7"] });
+    expect(b).toMatchObject({ status: "transitioned", blockedByAdded: ["TEAM-8"] });
+    expect(h.state.items[LINK].blockedBy).toEqual(["TEAM-9", "TEAM-7", "TEAM-8"]);
+    for (const w of applied) expect(w.ConditionExpression).toContain("NOT contains(#bb");
+  });
+
+  it("an always-losing guard is bounded: three attempts, a clear refusal, never `transitioned`, no side effects", async () => {
+    seed();
+    let attempts = 0;
+    const applied = installTable({
+      barrier: 1,
+      beforeWrite: (input) => {
+        attempts += 1;
+        // A writer that, before every attempt's condition, lands the first edge this
+        // attempt is still trying to add — so each re-read drops one and retries the rest.
+        const [first] = input.ExpressionAttributeValues[":bbAdd"] || [];
+        if (first) h.state.items[LINK] = { ...h.state.items[LINK], blockedBy: [...h.state.items[LINK].blockedBy, first] };
+      },
+    });
+
+    const res = await repair("TEAM-7,TEAM-8,TEAM-6", { expected_status: "blocked" });
+
+    expect(res.status).toBeUndefined();
+    expect(res.content[0].text).toMatch(/^Write conflict: TEAM-6101 blocked_by changed under 3 attempts — not transitioned\./);
+    expect(attempts).toBe(3);
+    expect(applied).toHaveLength(0);
+    expect(h.state.puts).toHaveLength(0);
+    expect(h.state.events).toHaveLength(0);
   });
 });
 
@@ -1051,7 +1208,10 @@ describe("transition_ticket — blocked_by is additive (DL-024 agent self-park)"
     expect(res).toMatchObject({ key: SHIP, from: "in_progress", to: "blocked", blockedByAdded: ["TEAM-3", "TEAM-4"] });
     const u = h.state.statusUpdates[0];
     expect(u.ExpressionAttributeValues[":s"]).toBe("blocked");
-    expect(u.ExpressionAttributeValues[":bb"]).toEqual(["TEAM-2", "TEAM-3", "TEAM-4"]);
+    // TEAM-6155: only the missing blockers are appended (atomically), the existing TEAM-2 is not rewritten.
+    expect(u.UpdateExpression).toContain("#bb = list_append(if_not_exists(#bb, :empty), :bbAdd)");
+    expect(u.ExpressionAttributeValues[":bbAdd"]).toEqual(["TEAM-3", "TEAM-4"]);
+    expect(u.ConditionExpression).toBe("NOT contains(#bb, :bb0) AND NOT contains(#bb, :bb1)");
   });
 
   it("accepts an array too", async () => {
@@ -1060,7 +1220,7 @@ describe("transition_ticket — blocked_by is additive (DL-024 agent self-park)"
     const res = await transition({ ticket_id: SHIP, transition_id: "blocked", blocked_by: ["TEAM-3"] });
 
     expect(res.blockedByAdded).toEqual(["TEAM-3"]);
-    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":bb"]).toEqual(["TEAM-3"]);
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":bbAdd"]).toEqual(["TEAM-3"]);
   });
 
   it("re-parking on blockers already present writes no blockedBy at all", async () => {
@@ -3050,7 +3210,9 @@ describe("transition_ticket — expected_status precondition (TEAM-5707)", () =>
 
     expect(res).toMatchObject({ key: T, status: "transitioned", from: "in_progress", to: "blocked" });
     expect(h.state.statusUpdates).toHaveLength(1);
-    expect(h.state.statusUpdates[0].ConditionExpression).toBe("#s = :expected");
+    // TEAM-6155: this park carries blocked_by, so the blocker guard is ANDed onto the fence.
+    expect(h.state.statusUpdates[0].ConditionExpression).toContain("#s = :expected");
+    expect(h.state.statusUpdates[0].ConditionExpression).toContain("NOT contains(#bb, :bb0)");
     expect(h.state.statusUpdates[0].ExpressionAttributeValues[":expected"]).toBe("in_progress");
   });
 
