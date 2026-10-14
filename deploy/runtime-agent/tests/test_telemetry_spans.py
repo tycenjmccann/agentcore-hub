@@ -554,6 +554,12 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
             "_STREAM_RETRY_MAX_ATTEMPTS",
             "_STREAM_RETRY_BUDGET_S",
             "_STREAM_RETRY_BASE_S",
+            # TEAM-5963: the backoff cap, the heartbeat slice, the sleep seam and
+            # the best-effort exhaustion comment (its ticket tool is stubbed below).
+            "_STREAM_RETRY_CAP_S",
+            "_STREAM_RETRY_HEARTBEAT_S",
+            "_stream_retry_sleep",
+            "_comment_transient_exhaustion",
             "_STREAM_RETRY_MARKERS",
             "_STREAM_FAIL_MARKERS",
             "_classify_stream_error",

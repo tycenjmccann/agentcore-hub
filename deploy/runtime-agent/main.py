@@ -351,7 +351,11 @@ def _build_bedrock_model(model_id: str) -> BedrockModel:
     boto_config = BotocoreConfig(
         read_timeout=READ_TIMEOUT,
         connect_timeout=30,
-        retries={"max_attempts": 2},
+        # TEAM-5963: literal total (TEAM-5720 — `max_attempts` is a retry count and
+        # gets +1), same 3 HTTP tries as before; standard mode for its capped
+        # backoff on the documented transient set. Kept small on purpose: the long
+        # brownout window lives in _stream_with_retry, and the two layers multiply.
+        retries={"total_max_attempts": 3, "mode": "standard"},
     )
     return BedrockModel(
         model_id=model_id,
@@ -3951,6 +3955,9 @@ async def agent_invocation(payload, context):
                     pass  # events already flow to DDB inside the loop
             except Exception as exc:  # noqa: BLE001 — must never die silently
                 logger.error(f"[{agent_id}] detached run failed: {str(exc)[:500]}")
+                # TEAM-5963: _stream_with_retry already published this one.
+                if getattr(exc, "_agent_error_published", False):
+                    return
                 try:
                     # TEAM-4739: name the ticket. A detached crash with no
                     # ticketId is an error the board cannot place on a card, and
@@ -4057,7 +4064,8 @@ _AGENT_DIED_TEXT_LIMIT = 2048
 
 def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
                         session_id: str = "", last_stream_at: str = "",
-                        last_text: str = "", claim_started_at: str = "") -> None:
+                        last_text: str = "", claim_started_at: str = "",
+                        reason: str = "") -> None:
     """The turn ENDED without ending itself (TEAM-4739 FR-7): no
     report_completion, no deliberate park, and no exception either — the process
     simply stopped being given time (platform kill, microVM reap, a cancelled
@@ -4081,7 +4089,12 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
     the dead-session detector cannot tell the old invocation's death from the
     new one's — see lease.hasAgentErrorSince's `claimGeneration`. Omitted when
     empty, so a caller that never resolved a claim (or an older harness) is
-    byte-identical to before and still read as a generation-less legacy death."""
+    byte-identical to before and still read as a generation-less legacy death.
+
+    TEAM-5963: `reason` ("transient_exhaustion" when a turn's transient retries
+    ran out) is stamped into `detail.reason` only when given — same omit-when-empty
+    rule. The detector's agent.died arm does not filter on it; it is for humans
+    and cost-report."""
     import time as _t
     try:
         for attempt in range(1, _AGENT_ERROR_PUBLISH_ATTEMPTS + 1):
@@ -4102,6 +4115,8 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
                 }
                 if claim_started_at:
                     detail["claimStartedAt"] = {"S": claim_started_at}
+                if reason:
+                    detail["reason"] = {"S": reason}
                 _ddb_events_client.put_item(
                     TableName=_EVENTS_TABLE,
                     Item={
@@ -4427,7 +4442,7 @@ _FAIL_CLOSED_LAMBDA_CLIENT = boto3.client("lambda", region_name=REGION, config=_
 # ─── FR-6: in-turn ConverseStream retry ───────────────────────────────────────
 #
 # Why botocore cannot do this for us. `_build_bedrock_model` sets
-# retries={"max_attempts": 2}, and that governs the HTTP request that OPENS the
+# retries={"total_max_attempts": 3}, and that governs the HTTP request that OPENS the
 # stream. Once ConverseStream has responded 200 and the event stream is open,
 # every later failure arrives as an event INSIDE that stream (botocore's own
 # bedrock-runtime model lists internalServerException, modelStreamErrorException,
@@ -4442,13 +4457,23 @@ _FAIL_CLOSED_LAMBDA_CLIENT = boto3.client("lambda", region_name=REGION, config=_
 # conversation, the tool results already returned and the prompt cache all
 # survive; nothing is rebuilt and the prompt is never re-derived. It is also never
 # re-SENT: a retry passes `[]` so the vendored conversation manager appends no
-# second copy of the prompt (TEAM-4749 A2, see `_stream_with_retry`). The wall
-# budget below bounds retry time and is armed at the first failure, not at the top
-# of the turn — a 40-minute turn must not arrive at its first break with the
-# budget already spent.
-_STREAM_RETRY_MAX_ATTEMPTS = 3
-_STREAM_RETRY_BUDGET_S = 60.0
-_STREAM_RETRY_BASE_S = 1.0
+# second copy of the prompt (TEAM-4749 A2, see `_stream_with_retry`).
+#
+# TEAM-5961/5963: sized for a Bedrock brownout, not a hiccup. 3 attempts inside 60s
+# lost whole turns to a ServiceUnavailableException lasting a minute or two, and
+# because a single slow attempt counted against the wall budget, one 60s attempt
+# left no room for a second retry. The budget therefore bounds the cumulative
+# BACKOFF SLEEP, not wall time; each attempt is already bounded by botocore's
+# read_timeout and the attempt cap. Ceilings 2,4,…,60 s over 10 attempts sum to
+# ~300s. Env-tunable; unparsable/non-positive values fall back (`_wd_num`).
+_STREAM_RETRY_MAX_ATTEMPTS = _wd_num(os.getenv("STREAM_RETRY_MAX_ATTEMPTS")) or 10
+_STREAM_RETRY_BUDGET_S = float(_wd_num(os.getenv("STREAM_RETRY_BUDGET_S")) or 300)
+_STREAM_RETRY_BASE_S = float(_wd_num(os.getenv("STREAM_RETRY_BASE_S")) or 2)
+_STREAM_RETRY_CAP_S = float(_wd_num(os.getenv("STREAM_RETRY_CAP_S")) or 60)
+# A backoff sleeps in slices no longer than this, publishing a lease-renewing
+# agent.streaming event before each one, so a long wait never reads as silence to
+# the dead-session detector (lease.mjs lastAgentActivity).
+_STREAM_RETRY_HEARTBEAT_S = 30.0
 
 # Transient by nature: the stream broke, but asking again can work. Matched on
 # the lowercased exception TYPE NAME and message, not on imported classes,
@@ -4459,6 +4484,7 @@ _STREAM_RETRY_MARKERS = (
     "throttlingexception",
     "modelstreamerrorexception",
     "serviceunavailableexception",
+    "modelnotreadyexception",
     "eventstreamerror",
     "readtimeouterror",
     "timeouterror",  # botocore ReadTimeoutError's base, and asyncio.TimeoutError
@@ -4497,9 +4523,33 @@ def _stream_retry_delay(attempt: int, remaining_s: float) -> float:
     Full jitter (uniform in [0, 2^n * base]) rather than a fixed ramp: the
     failures worth retrying are overwhelmingly shared — one Bedrock hiccup hits
     every persona in the fleet at once — and a deterministic ramp would send all
-    of them back in the same instant."""
-    ceiling = _STREAM_RETRY_BASE_S * (2 ** max(0, attempt - 1))
+    of them back in the same instant. The ceiling is capped at
+    `_STREAM_RETRY_CAP_S` so late attempts keep probing instead of going quiet."""
+    ceiling = min(_STREAM_RETRY_CAP_S, _STREAM_RETRY_BASE_S * (2 ** max(0, attempt - 1)))
     return max(0.0, min(random.uniform(0.0, ceiling), remaining_s))
+
+
+async def _stream_retry_sleep(seconds: float) -> None:
+    """The backoff's one real wait — a seam so tests run the policy without sleeping."""
+    import asyncio as _sleep_asyncio
+    await _sleep_asyncio.sleep(seconds)
+
+
+def _comment_transient_exhaustion(ticket_id: str, comment: str) -> None:
+    """TEAM-5963: tell the ticket why its turn ended — the transient retries ran
+    out and the turn was released to dead-session recovery. Best-effort: the death
+    and the resume object are what recover the ticket, so a failed comment is only
+    logged. Bounded client for the same reason as the fail-closed park: this runs
+    on a dying turn and must not hang it. Never raises."""
+    if not ticket_id:
+        return
+    _override = _LAMBDA_CLIENT_OVERRIDE.set(_FAIL_CLOSED_LAMBDA_CLIENT)
+    try:
+        Tickets___add_comment(ticket_id=ticket_id, comment=comment)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"transient-exhaustion comment on {ticket_id} failed (non-fatal): {e}")
+    finally:
+        _LAMBDA_CLIENT_OVERRIDE.reset(_override)
 
 
 # ─── FR-7: the resume object ──────────────────────────────────────────────────
@@ -4660,6 +4710,9 @@ async def _run_agent_invocation(payload, context):
     # turn dies — a microVM reaped during agent construction unwinds through the
     # same finally as one reaped at token 40,000.
     _turn_crashed = False
+    # TEAM-5963: set by _stream_with_retry when a TRANSIENT failure ran out of
+    # retries — that raise is a death (agent.died + resume object), not a crash.
+    _transient_exhausted = False
     # TEAM-5707: _harness_fail_closed's outcome — "parked", "skipped" or "".
     # TEAM-5710: only "parked" accounts for the turn.
     _synthesised = ""
@@ -4902,10 +4955,15 @@ async def _run_agent_invocation(payload, context):
             rebuilding either would throw the turn away to save the stream. But a
             RETRY re-enters with `[]`, never with the prompt again: see the
             comment on `stream_input` below. On exhaustion the error is surfaced
-            as `agent.error` and re-raised, which is what keeps agent.error and
-            agent.died disjoint."""
+            as `agent.error` and re-raised. A DETERMINISTIC failure stays a crash
+            (agent.error only). TEAM-5963: a TRANSIENT one that ran out of retries
+            also sets `_transient_exhausted`, so the turn ends as a death too
+            (agent.died + resume object) and the dead-session detector re-dispatches
+            it — Bedrock being down for five minutes is not a reason to strand the
+            ticket in_progress."""
+            nonlocal _transient_exhausted
             attempt = 0
-            deadline = None  # A3: armed at the FIRST failure, not here
+            slept = 0.0  # A3 / TEAM-5963: the budget bounds backoff sleep only
             baseline = prompt_delivery.added
             while True:
                 attempt += 1
@@ -4933,14 +4991,11 @@ async def _run_agent_invocation(payload, context):
                     return
                 except Exception as exc:  # noqa: BLE001 — classified below
                     verdict = _classify_stream_error(exc)
-                    if deadline is None:
-                        # A3: the budget bounds RETRY time, not stream duration.
-                        # Armed before `while True` it was already spent by the
-                        # time a long turn broke, so every break past minute 1
-                        # gave up on attempt 1 and FR-6 never fired on the only
-                        # turns long enough to need it.
-                        deadline = time.monotonic() + _STREAM_RETRY_BUDGET_S
-                    remaining = deadline - time.monotonic()
+                    # A3: the budget bounds RETRY time, not stream duration — a
+                    # long turn must not reach its first break with it spent.
+                    # TEAM-5963: and only the time spent SLEEPING counts, so one
+                    # attempt that hangs for a minute cannot use up the window.
+                    remaining = _STREAM_RETRY_BUDGET_S - slept
                     exhausted = (verdict != "retry"
                                  or attempt >= _STREAM_RETRY_MAX_ATTEMPTS
                                  or remaining <= 0)
@@ -4949,11 +5004,26 @@ async def _run_agent_invocation(payload, context):
                             f"[{agent_id}] stream failed on attempt {attempt} "
                             f"({verdict}, {remaining:.1f}s budget left) — giving up: "
                             f"{type(exc).__name__}: {str(exc)[:300]}")
+                        if verdict == "retry":
+                            _transient_exhausted = True
+                            import asyncio as _tx_asyncio
+                            await _tx_asyncio.to_thread(
+                                _comment_transient_exhaustion, _CURRENT_TICKET_ID,
+                                f"[transient-exhaustion] {agent_id}'s turn hit "
+                                f"{type(exc).__name__} and stayed unavailable after "
+                                f"{attempt} attempt(s) / {slept:.0f}s of backoff. The turn "
+                                f"was released to dead-session recovery (agent.died + "
+                                f"resume object); it re-dispatches once the lease expires.")
                         _publish_agent_error(
                             workflow_id, agent_id,
                             f"stream failed after {attempt} attempt(s): "
                             f"{type(exc).__name__}: {str(exc)[:400]}",
                             ticket_id=_CURRENT_TICKET_ID)
+                        try:
+                            # The detached runner must not publish it a second time.
+                            exc._agent_error_published = True
+                        except Exception:  # noqa: BLE001 — a slotted exception type
+                            pass
                         raise
                     delay = _stream_retry_delay(attempt, remaining)
                     logger.warning(
@@ -4961,9 +5031,25 @@ async def _run_agent_invocation(payload, context):
                         f"{_STREAM_RETRY_MAX_ATTEMPTS} "
                         f"({type(exc).__name__}: {str(exc)[:200]}) — reopening in "
                         f"{delay:.1f}s with {len(final_text)} chars kept")
-                    if delay:
-                        import asyncio as _retry_asyncio
-                        await _retry_asyncio.sleep(delay)
+                    # TEAM-5963: sleep in slices, renewing the lease before each
+                    # one. agent.streaming is a heartbeatEventTypes member
+                    # (src/config/lease-constants.json), stamped with this agent
+                    # and ticket, so lastAgentActivity counts it.
+                    left = delay
+                    while left > 0:
+                        chunk = min(left, _STREAM_RETRY_HEARTBEAT_S)
+                        tracker._publish_event("agent.streaming", {
+                            "agentId": agent_id,
+                            "type": "text",
+                            "content": (f"\n\n> ⏳ Bedrock {type(exc).__name__} — retry "
+                                        f"{attempt + 1}/{_STREAM_RETRY_MAX_ATTEMPTS} in "
+                                        f"{left:.0f}s…\n\n"),
+                            "workflowId": workflow_id,
+                            "retryBackoff": "true",
+                        })
+                        await _stream_retry_sleep(chunk)
+                        left -= chunk
+                    slept += delay
 
         async def _turn_events():
             """TEAM-5696: the turn's stream, plus ONE re-prompt when the first pass
@@ -5118,7 +5204,10 @@ async def _run_agent_invocation(payload, context):
         # task or a closed generator IS a death (the platform took the turn away,
         # and nothing publishes agent.error for it), so those keep unwinding into
         # the finally with crashed still False.
-        _turn_crashed = True
+        # TEAM-5963: except a transient failure that exhausted its retries — that
+        # turn already published agent.error, and the death below is what gets the
+        # ticket re-dispatched instead of stranded in_progress.
+        _turn_crashed = not _transient_exhausted
         raise
     finally:
         # ─── FR-7: did this turn account for itself? ─────────────────────────
@@ -5144,12 +5233,14 @@ async def _run_agent_invocation(payload, context):
         _accounted = _completed or _parked or _turn_crashed or _synthesised == "parked"
         if not _accounted and _bound:
             logger.warning(f"[{agent_id}] turn ended without completion, park or error "
-                           f"— publishing agent.died for {_CURRENT_TICKET_ID}")
+                           f"— publishing agent.died for {_CURRENT_TICKET_ID}"
+                           + (" (transient retries exhausted)" if _transient_exhausted else ""))
             _publish_agent_died(
                 _CURRENT_WORKFLOW_ID, agent_id, _CURRENT_TICKET_ID,
                 session_id=getattr(context, "session_id", "") or "",
                 last_stream_at=last_stream_at, last_text=final_text,
-                claim_started_at=_CURRENT_CLAIM_STARTED_AT)
+                claim_started_at=_CURRENT_CLAIM_STARTED_AT,
+                **({"reason": "transient_exhaustion"} if _transient_exhausted else {}))
         # The resume object is written on a death OR a park — both leave work the
         # next turn on this ticket should continue from. Not on completion (the
         # gate's on_success deletes it) and not on a crash (the crash is reported
