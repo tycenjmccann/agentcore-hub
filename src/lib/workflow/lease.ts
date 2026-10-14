@@ -66,16 +66,35 @@ export function isLeaseLive(
 }
 
 /**
+ * TEAM-6021: eventId key ranges holding every events row at/after `sinceIso`
+ * (mirror of lambda/orchestrator/lease.mjs sinceKeyRanges — same output, see
+ * lease-parity.test.ts). Direct writers prefix eventId with 13-digit epoch ms;
+ * events-writer's EventBridge copy is 9-char base-36 ms (`0…`, sorts below
+ * every ms id) and is the only row when the direct put failed. 60s slack
+ * covers main.py's timestamp running up to ~2s past its eventId ms.
+ * Unparseable `sinceIso` reads the whole partition, as before.
+ */
+export function sinceKeyRanges(
+  sinceIso: string,
+  { bridged = true, slackMs = 60_000 }: { bridged?: boolean; slackMs?: number } = {}
+): Array<{ kc: string; vals: Record<string, string> }> {
+  const lo = Date.parse(sinceIso) - slackMs;
+  if (!Number.isFinite(lo)) return [{ kc: "workflowId = :w", vals: {} }];
+  const ms = { kc: "workflowId = :w AND eventId >= :lo", vals: { ":lo": String(lo) } };
+  if (!bridged) return [ms];
+  return [ms, { kc: "workflowId = :w AND eventId BETWEEN :lo AND :hi", vals: { ":lo": lo.toString(36).padStart(9, "0"), ":hi": "0~" } }];
+}
+
+/**
  * A recent work event this agent published for this workflow (its heartbeat).
  * Only agent.streaming/agent.started prove ongoing work — terminal events
  * (agent.error, agent.retry, workflow.*) must not renew a lease, or a crash
  * report would block recovery for a full TTL.
- * Paginates the partition with a server-side filter (heartbeat type + agentId
- * + inside the lease window) — a busy sibling agent flooding the event stream
- * can no longer push a live heartbeat past a fixed page size. The sort key is
- * eventId whose format differs per writer, so the window bound lives in the
- * filter, not the key condition; any in-window heartbeat proves liveness, so
- * the first match suffices.
+ * Paginates the lease window (sinceKeyRanges: key-bounded on eventId, ≤20 ×
+ * 500 per range) with a server-side filter (heartbeat type + agentId + inside
+ * the lease window) — a busy sibling agent flooding the event stream can no
+ * longer push a live heartbeat past a fixed page size; any in-window heartbeat
+ * proves liveness, so the first match suffices.
  *
  * `ticketId`: when given, events stamped with a DIFFERENT ticketId are
  * ignored; unstamped events still count (older runtimes don't stamp — err on
@@ -90,35 +109,38 @@ export async function lastAgentActivity(
   ttlMs: number = LEASE_TTL_MS
 ): Promise<string | null> {
   const windowStart = new Date(Date.now() - ttlMs).toISOString();
-  let lastKey: Record<string, unknown> | undefined;
-  // 20 pages × 500 scanned items bounds the read on pathological partitions
-  // while covering hours of the busiest observed event volume.
-  for (let page = 0; page < 20; page++) {
-    const res = await ddb.send(
-      new QueryCommand({
-        TableName: eventsTable,
-        KeyConditionExpression: "workflowId = :w",
-        FilterExpression: "#t IN (:hb1, :hb2) AND detail.agentId = :aid AND #ts >= :cutoff",
-        ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
-        ExpressionAttributeValues: {
-          ":w": workflowId,
-          ":hb1": HEARTBEAT_TYPE_1,
-          ":hb2": HEARTBEAT_TYPE_2,
-          ":aid": agentId,
-          ":cutoff": windowStart,
-        },
-        ScanIndexForward: false,
-        Limit: 500,
-        ExclusiveStartKey: lastKey,
-      })
-    );
-    for (const e of res.Items || []) {
-      const detail = (e.detail || {}) as Record<string, unknown>;
-      if (ticketId && detail.ticketId && detail.ticketId !== ticketId) continue;
-      if (typeof e.timestamp === "string") return e.timestamp;
+  for (const range of sinceKeyRanges(windowStart)) {
+    let lastKey: Record<string, unknown> | undefined;
+    // 20 pages × 500 scanned items per range bounds the read on pathological
+    // partitions while covering hours of the busiest observed event volume.
+    for (let page = 0; page < 20; page++) {
+      const res = await ddb.send(
+        new QueryCommand({
+          TableName: eventsTable,
+          KeyConditionExpression: range.kc,
+          FilterExpression: "#t IN (:hb1, :hb2) AND detail.agentId = :aid AND #ts >= :cutoff",
+          ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
+          ExpressionAttributeValues: {
+            ":w": workflowId,
+            ":hb1": HEARTBEAT_TYPE_1,
+            ":hb2": HEARTBEAT_TYPE_2,
+            ":aid": agentId,
+            ":cutoff": windowStart,
+            ...range.vals,
+          },
+          ScanIndexForward: false,
+          Limit: 500,
+          ExclusiveStartKey: lastKey,
+        })
+      );
+      for (const e of res.Items || []) {
+        const detail = (e.detail || {}) as Record<string, unknown>;
+        if (ticketId && detail.ticketId && detail.ticketId !== ticketId) continue;
+        if (typeof e.timestamp === "string") return e.timestamp;
+      }
+      lastKey = res.LastEvaluatedKey as Record<string, unknown> | undefined;
+      if (!lastKey) break;
     }
-    lastKey = res.LastEvaluatedKey as Record<string, unknown> | undefined;
-    if (!lastKey) break;
   }
   return null;
 }
