@@ -5160,10 +5160,13 @@ async def _run_agent_invocation(payload, context):
             # A3 / TEAM-5976 F3: armed at the FIRST failure of an outage, cleared
             # when an attempt completes a message (progress re-arms the window).
             outage_start = None
-            # TEAM-5999 F1: what the NEXT attempt may spend of the deadline (set
-            # after each failure as remaining - backoff); None = unbounded, which
-            # the first attempt and every attempt after a re-arm are.
-            attempt_budget = None
+            # TEAM-5999 F1 / TEAM-6045: the outage deadline on the LOOP clock, set
+            # ONCE with outage_start and shared by every attempt of that outage.
+            # Absolute, so the backoff's heartbeat publishes and the consumer's
+            # rollback between attempts are charged to it; a relative budget
+            # re-derived at each attempt's start let them push it forward. None =
+            # unbounded, which the first attempt and every attempt after a re-arm are.
+            outage_deadline = None
             baseline = prompt_delivery.added
             while True:
                 attempt += 1
@@ -5216,10 +5219,16 @@ async def _run_agent_invocation(payload, context):
                     # whole loop would end such a turn as a plain death instead).
                     # The deadline is absolute for the attempt — a trickling stream
                     # cannot extend it; only a completed message lifts it, with the
-                    # re-arm. An already-spent budget still lets a synchronous
-                    # raise through and cuts only an attempt that actually waits.
-                    attempt_deadline = (None if attempt_budget is None
-                                        else _sr_asyncio.get_running_loop().time() + attempt_budget)
+                    # re-arm. TEAM-6045: an attempt is never OPENED past the
+                    # deadline — raised here, inside the try, so a deadline spent
+                    # during backoff or rollback ends on the exhaustion path below.
+                    attempt_deadline = outage_deadline
+                    if (attempt_deadline is not None
+                            and _sr_asyncio.get_running_loop().time() >= attempt_deadline):
+                        raise StreamRetryDeadlineExceeded(
+                            f"attempt {attempt} not opened: the "
+                            f"{_STREAM_RETRY_DEADLINE_S:.0f}s outage deadline passed "
+                            f"during backoff/rollback")
                     agen = agent.stream_async(stream_input)
                     try:
                         while True:
@@ -5239,7 +5248,8 @@ async def _run_agent_invocation(payload, context):
                                 raise  # botocore's own read timeout: classified below
                             seen[0] += 1
                             if "message" in _ev:
-                                outage_start, attempt, attempt_deadline = None, 1, None
+                                outage_start, attempt = None, 1
+                                attempt_deadline = outage_deadline = None
                             yield _ev
                     finally:
                         # A no-op after the generator raised or finished; on a
@@ -5261,6 +5271,10 @@ async def _run_agent_invocation(payload, context):
                     now = time.monotonic()
                     if outage_start is None:
                         outage_start = now
+                        # TEAM-6045: the loop clock, not a second monotonic() read —
+                        # the same source in production, one reading per failure here.
+                        outage_deadline = (_sr_asyncio.get_running_loop().time()
+                                           + _STREAM_RETRY_DEADLINE_S)
                     remaining = _STREAM_RETRY_DEADLINE_S - (now - outage_start)
                     exhausted = (verdict != "retry"
                                  or attempt >= _STREAM_RETRY_MAX_ATTEMPTS
@@ -5298,9 +5312,6 @@ async def _run_agent_invocation(payload, context):
                             pass
                         raise
                     delay = _stream_retry_delay(attempt, remaining)
-                    # TEAM-5999 F1: the next attempt gets what the backoff leaves of
-                    # the deadline — from the same reading, no extra clock call.
-                    attempt_budget = max(0.0, remaining - delay)
                     logger.warning(
                         f"[{agent_id}] stream broke on attempt {attempt}/"
                         f"{_STREAM_RETRY_MAX_ATTEMPTS} "

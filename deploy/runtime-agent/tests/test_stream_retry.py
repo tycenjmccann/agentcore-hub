@@ -2101,3 +2101,88 @@ async def test_team6000_a_second_invocation_overwriting_the_globals_does_not_res
     assert comment["ticket_id"] == "TEAM-4739", comment
     (err_args, err_kwargs) = errors[0]
     assert err_args[0] == "wf_retry" and err_kwargs.get("ticket_id") == "TEAM-4739", (err_args, err_kwargs)
+
+
+# ─── 9. TEAM-6045: the outage deadline is absolute, not re-derived per attempt ──
+#
+# The defect: the except block saved what was left of the deadline as a RELATIVE
+# budget, and the next attempt turned it into a deadline only when it opened. The
+# backoff's heartbeat writes, the sentinel's consumer-side rollback (synchronous
+# delete_item) and the notice yield all ran in between and were never charged, so
+# a retry could open after the outage deadline had already passed.
+
+
+def _assert_exhausted_without_a_new_attempt(ns: dict, task: Any, agent_cls: Any,
+                                            errors: list, deaths: list) -> None:
+    exc = task.exception()
+    assert isinstance(exc, ns["StreamRetryDeadlineExceeded"]), repr(exc)
+    (agent,) = agent_cls.instances
+    assert agent.attempts == 1, (
+        f"a retry opened after the outage deadline had passed; got {agent.attempts} attempt(s)"
+    )
+    assert len(errors) == 1 and "StreamRetryDeadlineExceeded" in errors[0][0][2], errors
+    assert len(deaths) == 1 and deaths[0][1].get("reason") == "transient_exhaustion", deaths
+    assert ns["_test_log"] == ["comment", "error", "resume", "died"], ns["_test_log"]
+    assert _pending_tasks() == [], "the heartbeat task outlived the turn"
+
+
+@pytest.mark.asyncio
+async def test_team6045_a_slow_rollback_does_not_open_an_attempt_past_the_deadline() -> None:
+    """A flushed partial is rolled back with a synchronous delete_item that takes
+    longer than the whole outage deadline. The time is the outage's: the retry
+    must not open afterwards, and the turn ends on the exhaustion path."""
+    import time as _time
+
+    puts: list[dict] = []
+    deletes: list[dict] = []
+
+    def _slow_delete(**kw: Any) -> None:
+        _time.sleep(0.15)  # boto3 is synchronous: this blocks the loop, as in prod
+        deletes.append(kw)
+
+    ns, agent_cls, errors, deaths = _load(
+        [
+            [{"data": "A" * 250}, EventStreamError("stream closed")],
+            [{"data": "B"}, _engage_completion],
+        ],
+        _ddb_events_client=SimpleNamespace(put_item=lambda **kw: puts.append(kw),
+                                           delete_item=_slow_delete),
+    )
+    ns["_STREAM_RETRY_DEADLINE_S"] = 0.05
+
+    task = await _run_or_fail(ns["_run_agent_invocation"](PAYLOAD, CTX))
+
+    assert len(deletes) == 1, "the flushed partial must still be rolled back"
+    _assert_exhausted_without_a_new_attempt(ns, task, agent_cls, errors, deaths)
+
+
+@pytest.mark.asyncio
+async def test_team6045_slow_backoff_heartbeats_are_charged_to_the_deadline() -> None:
+    """The backoff's lease-renewing publish is a synchronous put_item. When it
+    takes longer than the deadline, the next attempt must not open on a budget
+    computed before the publish."""
+    import time as _time
+
+    puts: list[dict] = []
+
+    def _slow_put(**kw: Any) -> None:
+        if kw["Item"]["detail"]["M"].get("retryBackoff", {}).get("S") == "true":
+            _time.sleep(0.15)
+        puts.append(kw)
+
+    ns, agent_cls, errors, deaths = _load(
+        [
+            [EventStreamError("stream closed")],
+            [{"data": "B"}, _engage_completion],
+        ],
+        random=_CeilingRandom(),
+        _ddb_events_client=SimpleNamespace(put_item=_slow_put, delete_item=lambda **kw: None),
+    )
+    ns["_STREAM_RETRY_BASE_S"] = 0.01  # a real (if tiny) backoff, so one beat publishes
+    ns["_STREAM_RETRY_DEADLINE_S"] = 0.05
+
+    task = await _run_or_fail(ns["_run_agent_invocation"](PAYLOAD, CTX))
+
+    assert ns["_test_sleeps"] == [0.01], ns["_test_sleeps"]
+    assert any(p["Item"]["detail"]["M"].get("retryBackoff", {}).get("S") == "true" for p in puts)
+    _assert_exhausted_without_a_new_attempt(ns, task, agent_cls, errors, deaths)
