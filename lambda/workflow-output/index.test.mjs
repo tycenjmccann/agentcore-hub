@@ -1664,6 +1664,18 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "gate" }, { forceHold: true }).briefPending).toBe(false);
   });
 
+  it("TEAM-5995 T4: adoptHold — a hold released with no gate needed (briefDisposition) counts as delivered: a refusal does not re-force it, and it is carried", () => {
+    const fresh = () => ({ ticket_id: "T", status: "complete" });
+    const released = { briefPending: false, briefDelivered: "off_gate", briefDisposition: { release: true, kind: "gate_settled", at: "2026-10-14T00:00:00.000Z", by: "drain" } };
+    expect(adoptHold(fresh(), released, { forceHold: true }).briefPending).toBe(false);
+    expect(adoptHold(fresh(), released)).toMatchObject({ briefPending: false, briefDisposition: released.briefDisposition });
+    // anything short of a recorded release is still forced
+    expect(adoptHold(fresh(), { ...released, briefDisposition: { release: false } }, { forceHold: true }).briefPending).toBe(true);
+    expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "off_gate" }, { forceHold: true }).briefPending).toBe(true);
+    // a stale disposition on `report` goes when the current record's hold has none
+    expect(adoptHold({ ...fresh(), briefDisposition: released.briefDisposition }, { briefPending: true, briefDelivered: "off_gate" }).briefDisposition).toBeUndefined();
+  });
+
   it("TEAM-5941: adoptHold carries the twins' doneIntent verbatim — hold or no hold, delivered or not — and drops a copy the current record no longer has", () => {
     const fresh = () => ({ ticket_id: "T", status: "complete" });
     const intent = { at: "2026-10-14T12:00:00.000Z", provider: "jira", nonce: "0f8fad5b-d9cb-469f-a165-70867728950e" };

@@ -314,6 +314,8 @@ describe.each(Object.keys(TWINS))("TEAM-5941 e2e — the %s twin's Done-intent f
     const drained = await drainCompletion(MSG);
     expect(drained).toMatchObject({ outcome: "dropped", permanent: true });
     expect(record()).toMatchObject({ briefPending: true, ticketWrites: "dropped" });
+    // TEAM-5995: no gate and no readable run row ⇒ gate_owed_unknown, which fails closed.
+    expect(record().replayDropped.error).toMatch(/whether this run owes one could not be determined/);
     for (const id of [T, EPIC]) expect(dropNotices(id)).toHaveLength(1);
 
     fence.open();

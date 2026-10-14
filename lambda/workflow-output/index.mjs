@@ -279,14 +279,26 @@ export function normalizePlan(items, { featureBranch, rootTicketId, rootTitle } 
  */
 async function readFeatureBranch(workflowId) {
   if (!WORKFLOWS_TABLE || !workflowId) return null;
+  const r = await readWorkflowRow(workflowId, "featureBranch");
+  if (!r.ok) {
+    console.warn(`[submit_ticket_plan] ${workflowId}: could not read featureBranch from ${WORKFLOWS_TABLE} (${r.error}) - branch templating SKIPPED`);
+    return null;
+  }
+  return asText(r.item?.featureBranch).trim() || null;
+}
+
+/**
+ * The run's workflows row, GetItem only: `{ ok: true, item }` (`item` null when there
+ * is no row) or `{ ok: false, error }`. Callers decide what a failure means.
+ */
+async function readWorkflowRow(workflowId, projection) {
   try {
     const r = await ddb.send(new GetCommand({
-      TableName: WORKFLOWS_TABLE, Key: { workflowId }, ProjectionExpression: "featureBranch",
+      TableName: WORKFLOWS_TABLE, Key: { workflowId }, ProjectionExpression: projection,
     }));
-    return asText(r?.Item?.featureBranch).trim() || null;
+    return { ok: true, item: r?.Item || null };
   } catch (err) {
-    console.warn(`[submit_ticket_plan] ${workflowId}: could not read featureBranch from ${WORKFLOWS_TABLE} (${err.name}: ${err.message}) - branch templating SKIPPED`);
-    return null;
+    return { ok: false, error: `${err.name}: ${err.message}` };
   }
 }
 
@@ -590,7 +602,8 @@ async function shipContractRefusal(report, { pipelineName, workflowId }) {
 // something that accidentally reads as "complete".
 const STATUS_PENDING_FOLLOW_UPS = "complete_pending_follow_ups";
 /** TEAM-5592: what a replay's brief hold stamps, carried across a re-run report_completion. */
-const BRIEF_HOLD_FIELDS = ["briefPending", "briefDelivered", "briefTargets", "briefFallbackReason", "undelivered", "replayDropped"];
+/** TEAM-5995: + `briefDisposition`, the evidence a hold was released with no gate delivery. */
+const BRIEF_HOLD_FIELDS = ["briefPending", "briefDelivered", "briefTargets", "briefFallbackReason", "undelivered", "replayDropped", "briefDisposition"];
 const STATUS_TRANSITION_FAILED = "complete_transition_failed";
 /** TEAM-5805: the record is saved and the follow-ups filed, but the merge brief is not on its gate yet. */
 const STATUS_PENDING_BRIEF = "complete_pending_brief";
@@ -646,8 +659,11 @@ export function adoptHold(report, current, { deliveredNow = false, forceHold = f
       else delete report[f];
     }
   }
-  const deliveredSince = current?.briefPending === false && current?.briefDelivered === "gate";
-  if (forceHold && !deliveredSince) report.briefPending = true;
+  // TEAM-5995: a release (no gate needs the brief, briefDisposition) is proof too.
+  const deliveredSince = current?.briefPending === false
+    && (current?.briefDelivered === "gate" || current?.briefDisposition?.release === true);
+  // A forced hold is never a released one (TEAM-5995: disposition ⇒ briefPending false).
+  if (forceHold && !deliveredSince) { report.briefPending = true; delete report.briefDisposition; }
   // TEAM-5941: the twins' Done-intent fence (gate-contract.mjs) is CARRIED verbatim,
   // whatever else this write decides — it is not a hold field, and a write that dropped
   // it would re-open the window the fence closes (the drain would stamp a hold the
@@ -1177,12 +1193,19 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       let brief = null;
       if (briefKey) {
         const sib = needsSiblings && scan.ok ? scan : await loadSiblings(epicKey);
-        brief = sib.ok ? await postQueuedBrief({ ticketId: ticket_id, epicKey, s3Key: briefKey, siblings: sib.siblings }) : { ok: false, error: `list_tickets under ${epicKey}: ${sib.error}` };
+        brief = sib.ok ? await postQueuedBrief({ ticketId: ticket_id, epicKey, s3Key: briefKey, siblings: sib.siblings, scanComplete: sib.complete, workflowId: workflow_id }) : { ok: false, error: `list_tickets under ${epicKey}: ${sib.error}` };
       }
       if (brief?.ok && brief.gate) {
         Object.assign(report, { briefPending: false, briefDelivered: "gate", briefTargets: [brief.gate] });
         deliveredNow = true;
         console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} is on the gate ${brief.gate} (${brief.outcome}) - briefPending cleared`);
+      } else if (brief?.ok && brief.disposition?.release) {
+        // TEAM-5995: no gate needs the brief (every gate is Done, or the run never gets
+        // one), audited on the board by postQueuedBrief. The release is the evidence, so
+        // it goes through the same CAS write as a delivery (`deliveredNow`).
+        Object.assign(report, { briefPending: false, briefDelivered: "off_gate", briefTargets: brief.targets, briefDisposition: { ...brief.disposition, at: new Date().toISOString(), by: "report_completion" } });
+        deliveredNow = true;
+        console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} needs no gate (${brief.disposition.kind}: ${brief.disposition.why}) - briefPending cleared`);
       } else {
         briefHeld = true;
         report.briefHoldReason = !briefKey ? "the report names no merge brief (evidence_keys has no shared/merge-brief.md) and the record lists none"
@@ -1376,7 +1399,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     status: !mayTransition ? STATUS_PENDING_FOLLOW_UPS : briefHeld ? STATUS_PENDING_BRIEF : transitionFailed ? STATUS_TRANSITION_FAILED : "complete",
     ...(mayTransition && !briefHeld && !transitionFailed ? {} : { next_action: "retry_report_completion" }),
     message: mayTransition && briefHeld
-      ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${ticket_id} was NOT transitioned to Done: its merge brief is not on the Merge Approval gate${report.briefHoldReason ? ` (${report.briefHoldReason})` : ""}, and a Done would make the gate Ready without the brief in front of the approver. Put the brief on the gate (or make the gate identifiable: one open Merge Approval ticket blocked by ${ticket_id}), then call WorkflowOutput___report_completion again with the SAME arguments, including the shared/merge-brief.md key in evidence_keys - the retry re-posts the brief (deduped) and closes the ticket once it is on the gate. If no gate can be named, comment that on the ticket and report BLOCKED - do not walk away.`
+      ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${ticket_id} was NOT transitioned to Done: its merge brief is not on the Merge Approval gate${report.briefHoldReason ? ` (${report.briefHoldReason})` : ""}, and a Done would make the gate Ready without the brief in front of the approver. Put the brief on the gate (or make the gate identifiable: one open Merge Approval ticket blocked by ${ticket_id}), then call WorkflowOutput___report_completion again with the SAME arguments, including the shared/merge-brief.md key in evidence_keys - the retry re-posts the brief (deduped) and closes the ticket once it is on the gate. If no gate can be named, comment that on the ticket and report BLOCKED - do not walk away. If the gate is already Done, or this run has no Merge Approval gate by its workflow def, the retry records that (briefDisposition) and closes the ticket; if the run owes a gate that is missing, create it (B7 step 5) unless the run is hub-materialized, then retry.`
       : transitionFailed
       ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but the ticket could NOT be transitioned to Done: ${transition.error}. Nothing downstream has been unblocked, so the run is waiting on this. Call WorkflowOutput___report_completion again with the SAME arguments - the record write is idempotent and follow-ups that already exist are skipped as already_materialized, so the retry effectively just re-attempts the transition. If it keeps failing, comment this error on the ticket and report BLOCKED - do not walk away.`
       : mayTransition
@@ -1545,6 +1568,111 @@ async function postMarkedComment(target, marker, comment, { alsoMatches = "", be
 }
 
 /**
+ * TEAM-5995 (TEAM-5799 F9): what a brief hold owes when postQueuedBrief found NO open
+ * gate. `release: true` is the ONE way a hold goes without gate delivery, and only on
+ * evidence a reopen of the completing ticket cannot change: every human `Merge
+ * Approval:` gate under the epic is Done (a Done cannot make a Done gate Ready), or none
+ * exists on a complete roster and the run's effective def never gets one (gateOwed,
+ * runOwesMergeGate). Anything owed or UNKNOWN keeps the hold (fail closed, TEAM-5832).
+ */
+export function briefGateDisposition({ ticketId, epicKey, siblings, scanComplete, gateOwed }) {
+  if (!epicKey) return { release: false, kind: "no_epic", why: "the ticket's epic is unknown, so the gate roster cannot be read" };
+  if (scanComplete !== true) return { release: false, kind: "roster_incomplete", why: "the sibling roster is incomplete or unknown (list_tickets paged or failed), so a missing or settled gate cannot be told apart from an unseen one" };
+  const gates = (siblings || []).filter((s) => s.ticketId !== ticketId && /^Merge Approval:/i.test(asText(s.summary).trim()) && isHumanAssignee(s.assignee));
+  const observed = gates.map((g) => ({ ticketId: g.ticketId, status: asText(g.status) }));
+  if (gates.length > 0) {
+    if (gates.every((g) => isDoneStatus(g.status))) {
+      return { release: true, kind: "gate_settled", why: `every Merge Approval gate under ${epicKey} is Done (${observed.map((o) => `${o.ticketId}:${o.status}`).join(", ")}) - no gate can be made Ready by this Done`, observed };
+    }
+    return { release: false, kind: "gate_open", why: "an open Merge Approval gate exists but could not be identified or written", observed };
+  }
+  if (gateOwed?.owed === false) {
+    return { release: true, kind: "absent_never_gated", why: `no Merge Approval gate exists under ${epicKey} (roster complete) and this run never gets one (${gateOwed.detail})`, observed, gateOwed };
+  }
+  if (gateOwed?.owed === true) {
+    return { release: false, kind: "no_gate", why: `no Merge Approval gate exists under ${epicKey} (roster complete) but this run owes one (${gateOwed.detail}) - create ONE 'Merge Approval:' ticket (human assignee, blocked_by ${ticketId}; operator B7 step 5) unless the run is hub-materialized, then retry; otherwise report BLOCKED for a human to add it`, observed, gateOwed };
+  }
+  return { release: false, kind: "gate_owed_unknown", why: `no Merge Approval gate exists under ${epicKey} but whether this run owes one could not be determined (${gateOwed?.detail || "no workflow id"})`, observed, ...(gateOwed ? { gateOwed } : {}) };
+}
+
+/** A bucket JSON object: `{ ok, doc }`, `{ ok, missing: true }` on 404, else `{ ok: false, error }`. */
+async function readConfigObject(key) {
+  let text;
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+    text = await r.Body.transformToString();
+  } catch (err) {
+    if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) return { ok: true, missing: true };
+    return { ok: false, error: `${key} unreadable (${err?.name || "Error"}: ${err?.message || ""})` };
+  }
+  try {
+    return { ok: true, doc: JSON.parse(text) };
+  } catch (err) {
+    return { ok: false, error: `${key} is not JSON (${err.message})` };
+  }
+}
+
+// TEAM-5995: a byte copy of lambda/orchestrator/cd-registry.mjs normalizeRepoKey (this
+// zip cannot import it); src/lib/workflow/cd-registry-mirror-parity.test.ts pins both
+// functions below to the orchestrator and src/lib/cd-registry.ts.
+function normalizeRepoKey(value) {
+  let s = String(value ?? "").trim();
+  if (!s) return null;
+  s = s.replace(/^git@[^:]+:/, "").replace(/^[a-z]+:\/\/[^/]+\//i, "");
+  s = s.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "").replace(/\/+$/, "");
+  const parts = s.split("/");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  return `${parts[0]}/${parts[1]}`.toLowerCase();
+}
+
+/** findCdEntry(parseCdRegistry(doc), repoConfig) !== null, on the raw registry document. */
+function cdRegistryListsRepo(doc, repoConfig) {
+  const key = normalizeRepoKey(repoConfig?.repos?.[0]?.url);
+  if (!key) return false;
+  const list = Array.isArray(doc?.repos) ? doc.repos : [];
+  return list.some((e) => normalizeRepoKey(typeof e === "string" ? e : e?.repo) === key);
+}
+
+/**
+ * TEAM-5995: does this run's EFFECTIVE def declare a Merge Approval gate?
+ * `{ owed: true | false | "unknown", detail, workflowDefId?, cdRegistered? }`. Reads the
+ * workflows row (workflowDefId, repoConfig), the def's reviewGates (and its frameworks')
+ * in config/workflows.json, and for a ship-phase gate config/cd-registry.json: an
+ * unregistered repo is a handoff run, whose ship gate the orchestrator strips
+ * (lambda/orchestrator/cd-registry.mjs). Every read it cannot make is "unknown".
+ */
+export async function runOwesMergeGate(workflowId) {
+  const unknown = (detail, extra = {}) => ({ owed: "unknown", detail, ...extra });
+  if (!workflowId) return unknown("no workflow id");
+  if (!WORKFLOWS_TABLE) return unknown("WORKFLOWS_TABLE is not set");
+  const row = await readWorkflowRow(workflowId, "workflowDefId, repoConfig");
+  if (!row.ok) return unknown(`workflows row ${workflowId} unreadable (${row.error})`);
+  if (!row.item) return unknown(`no workflows row for ${workflowId}`);
+  const workflowDefId = asText(row.item.workflowDefId).trim();
+  if (!workflowDefId) return unknown(`workflows row ${workflowId} names no workflowDefId`);
+  const cfg = await readConfigObject("config/workflows.json");
+  if (!cfg.ok) return unknown(cfg.error, { workflowDefId });
+  if (cfg.missing) return unknown("config/workflows.json does not exist", { workflowDefId });
+  const def = Array.isArray(cfg.doc?.workflows) ? cfg.doc.workflows.find((w) => w?.id === workflowDefId) : null;
+  if (!def) return unknown(`def ${workflowDefId} is not in config/workflows.json`, { workflowDefId });
+  const frameworks = def.frameworks && typeof def.frameworks === "object" ? Object.values(def.frameworks) : [];
+  const gates = [def, ...frameworks].flatMap((d) => (Array.isArray(d?.reviewGates) ? d.reviewGates : []))
+    .filter((g) => /^merge approval$/i.test(asText(g?.name).trim()));
+  if (gates.length === 0) return { owed: false, detail: `def ${workflowDefId} declares no Merge Approval gate`, workflowDefId };
+  const early = gates.find((g) => asText(g.afterPhase).trim() !== "ship");
+  if (early) return { owed: true, detail: `def ${workflowDefId}: Merge Approval after ${asText(early.afterPhase) || "an unnamed phase"}`, workflowDefId };
+  const reg = await readConfigObject("config/cd-registry.json");
+  if (!reg.ok) return unknown(reg.error, { workflowDefId });
+  if (reg.missing) return { owed: false, detail: `def ${workflowDefId}: no config/cd-registry.json, so every repo is a handoff - the ship gate is stripped`, workflowDefId, cdRegistered: false };
+  if (!reg.doc || typeof reg.doc !== "object" || !Array.isArray(reg.doc.repos)) return unknown("config/cd-registry.json has no repos array", { workflowDefId });
+  const repo = asText(row.item.repoConfig?.repos?.[0]?.url) || "no repo";
+  if (cdRegistryListsRepo(reg.doc, row.item.repoConfig)) {
+    return { owed: true, detail: `def ${workflowDefId}: CD-registered repo ${repo}, Merge Approval after ship`, workflowDefId, cdRegistered: true };
+  }
+  return { owed: false, detail: `def ${workflowDefId}: repo ${repo} is not in the CD registry, a handoff - the ship gate is stripped`, workflowDefId, cdRegistered: false };
+}
+
+/**
  * Post the queued merge brief where a human will see it — at most once PER CALLER.
  *
  * TEAM-5830: the marker dedupe is read-then-write (postMarkedComment: get_issue, then
@@ -1570,7 +1698,7 @@ async function postMarkedComment(target, marker, comment, { alsoMatches = "", be
  * would take it; the missing object is then said on the ticket (missingBriefNotice).
  * `{ ok: false }` on anything a retry can change - the brief lands before the Done.
  */
-async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings }) {
+async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings, scanComplete, workflowId }) {
   let body;
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: s3Key }));
@@ -1590,6 +1718,7 @@ async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings }) {
   const gate = gates.find((g) => (g.blockedBy || []).includes(ticketId))
     || (gates.length === 1 && !(gates[0].blockedBy || []).length ? gates[0] : null);
   let why;
+  let disposition = null;
   if (gate) {
     const r = await postMarkedComment(gate.ticketId, marker, `${marker}\n\n${body}`, {
       alsoMatches: decision,
@@ -1601,10 +1730,18 @@ async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings }) {
     if (r.ok) return { ok: true, outcome: r.outcome, gate: gate.ticketId };
     if (!isPermanentTicketRefusal(r.cause)) return r;
     why = `the gate ${gate.ticketId} refused it (${r.error})`;
+  } else if (gates.length === 0) {
+    // TEAM-5995: no OPEN gate. Settled (every gate Done) or verified never-gated releases
+    // the hold; owed, unknown or an unreadable roster keeps it (briefGateDisposition).
+    const anyGate = siblings.some((s) => s.ticketId !== ticketId && /^Merge Approval:/i.test(asText(s.summary).trim()) && isHumanAssignee(s.assignee));
+    const gateOwed = epicKey && scanComplete === true && !anyGate ? await runOwesMergeGate(workflowId) : null;
+    disposition = briefGateDisposition({ ticketId, epicKey, siblings, scanComplete, gateOwed });
+    why = disposition.why;
   } else {
-    why = gates.length === 0 ? "no open Merge Approval gate" : `${gates.length} open Merge Approval gates (${gates.map((g) => g.ticketId).join(", ")}) and none is blocked by ${ticketId}`;
+    why = `${gates.length} open Merge Approval gates (${gates.map((g) => g.ticketId).join(", ")}) and none is blocked by ${ticketId}`;
   }
 
+  if (disposition?.release) return postResolvedBrief({ ticketId, epicKey, s3Key, body, marker, decision, disposition });
   console.error(`[ticket-replay] ${ticketId}: brief ${s3Key} cannot go on a gate (${why}) - posting it on the ticket and its epic instead`);
   const comment = `${marker}\n\nMERGE BRIEF NOT ON THE GATE - the Merge Approval gate could not be identified or refused the brief, so it is NOT in front of the approver.\n\nMerge brief for ${ticketId} (s3://${BUCKET}/${s3Key}). It could not be posted on the Merge Approval gate: ${why}. A human must put it in front of the approver.\n\n${body}`;
   const targets = [];
@@ -1617,6 +1754,42 @@ async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings }) {
   }
   if (targets.length === 0) return { ok: true, outcome: "undelivered", reason: `${why}; no fallback target took it (${refused.join("; ") || "no ticket or epic"})` };
   return { ok: true, outcome: "off_gate", targets, reason: why };
+}
+
+/**
+ * TEAM-5995: no gate needs the brief (`disposition.release`). The brief still goes on the
+ * ticket and its epic (same marker, so an earlier off-gate copy dedupes it), then the
+ * `[brief-resolved:<ticket>]` audit on the ticket, the epic and every gate observed, so
+ * the release is on the board before the record says it. A retryable failure is
+ * `{ ok: false }`: nothing is recorded and the hold stands this call. A permanent
+ * refusal is noted on the disposition and the release proceeds.
+ */
+async function postResolvedBrief({ ticketId, epicKey, s3Key, body, marker, decision, disposition }) {
+  const { why } = disposition;
+  console.log(`[ticket-replay] ${ticketId}: brief ${s3Key} needs no gate (${disposition.kind}: ${why}) - posting it on the ticket and its epic and releasing the hold`);
+  const comment = `${marker}\n\nMERGE BRIEF - no gate needs it: ${why}.\n\nMerge brief for ${ticketId} (s3://${BUCKET}/${s3Key}).\n\n${body}`;
+  const targets = [];
+  const refused = [];
+  for (const target of [ticketId, epicKey].filter(Boolean)) {
+    const r = await postMarkedComment(target, marker, comment, { alsoMatches: decision });
+    if (r.ok) targets.push(target);
+    else if (isPermanentTicketRefusal(r.cause)) refused.push(`${target}: ${r.error}`);
+    else return r;
+  }
+  const auditMarker = `[brief-resolved:${ticketId}]`;
+  const observed = disposition.observed.map((o) => `${o.ticketId}:${o.status}`).join(", ") || "none";
+  const audit = `${auditMarker}\n\nThe merge-brief hold on ${ticketId} is RELEASED without gate delivery (${disposition.kind}): ${why}. Merge Approval gates observed: ${observed}.${disposition.gateOwed ? ` Gate owed: ${disposition.gateOwed.owed} (${disposition.gateOwed.detail}).` : ""} Recorded as briefDisposition on s3://${BUCKET}/completions/${ticketId}.json. If a gate is reopened or added for this run, re-run WorkflowOutput___report_completion so the brief goes on it.`;
+  const seen = new Set();
+  for (const target of [ticketId, epicKey, ...disposition.observed.map((o) => o.ticketId)].filter(Boolean)) {
+    if (seen.has(target)) continue;
+    seen.add(target);
+    const r = await postMarkedComment(target, auditMarker, audit);
+    if (r.ok) continue;
+    if (!isPermanentTicketRefusal(r.cause)) return { ok: false, error: `brief-resolved notice on ${target} not posted (${r.error})` };
+    refused.push(`${target}: ${r.error}`);
+  }
+  const released = { ...disposition, ...(refused.length > 0 ? { notice: { refused } } : {}) };
+  return { ok: true, outcome: "off_gate", targets, reason: why, disposition: released };
 }
 
 /** The missing-brief notice: a brief the report named is gone, so a human must post it. */
@@ -1898,7 +2071,7 @@ export async function drainCompletion(msg) {
   //    Steps 3-5 dedupe on their markers, so they run even on a ticket already Done.
   let brief = null;
   if (msg.brief?.s3Key) {
-    brief = await postQueuedBrief({ ticketId, epicKey, s3Key: msg.brief.s3Key, siblings: scan.siblings });
+    brief = await postQueuedBrief({ ticketId, epicKey, s3Key: msg.brief.s3Key, siblings: scan.siblings, scanComplete: scan.complete, workflowId });
     if (!brief.ok) return retry(brief.error);
     if (brief.outcome === "undelivered") {
       undelivered.push({ part: "brief", s3Key: msg.brief.s3Key, reason: brief.reason });
@@ -1921,14 +2094,18 @@ export async function drainCompletion(msg) {
     // A Done would make the gate Ready without its brief in front of the approver, so
     // an undelivered brief holds the ticket open. (A ticket a human already closed
     // has released the gate anyway: the brief is only recorded undelivered.)
-    if ((brief.outcome === "off_gate" || brief.outcome === "undelivered") && !alreadyDone) {
+    // TEAM-5995: nor does one no gate needs (brief.disposition.release, audited).
+    if ((brief.outcome === "off_gate" || brief.outcome === "undelivered") && !alreadyDone && !brief.disposition?.release) {
       holds.push({ step: "brief", error: `merge brief ${msg.brief.s3Key} is not on the Merge Approval gate (${brief.outcome === "off_gate" ? `posted on ${brief.targets.join(", ")} instead: ${brief.reason}` : brief.reason})` });
     }
   }
   // Where the brief went, said on the record and the journey event: the gate, off the
   // gate (the ticket and its epic, still undelivered), or nowhere (undelivered[] says why).
   const briefDelivery = !brief ? null
-    : brief.outcome === "off_gate" ? { briefDelivered: "off_gate", briefTargets: brief.targets, briefFallbackReason: brief.reason }
+    : brief.outcome === "off_gate" ? {
+      briefDelivered: "off_gate", briefTargets: brief.targets, briefFallbackReason: brief.reason,
+      ...(brief.disposition?.release ? { briefDisposition: { ...brief.disposition, at: new Date().toISOString(), by: "drain" } } : {}),
+    }
       : brief.outcome === "undelivered" ? { briefDelivered: "undelivered" }
         : { briefDelivered: "gate", briefTargets: [brief.gate] };
 
@@ -1944,7 +2121,7 @@ export async function drainCompletion(msg) {
   // never reaches a twin at all). Kept, the hold costs a Done ticket nothing — no
   // reader acts on it until a NEW Done is attempted — and on a reopened ticket it is
   // exactly what makes the twins refuse Done until the brief is delivered.
-  const doneOverHold = alreadyDone && rec.record?.briefPending === true && !!brief && !brief.gate;
+  const doneOverHold = alreadyDone && rec.record?.briefPending === true && !!brief && !brief.gate && !brief.disposition?.release;
   if (doneOverHold) {
     const marker = `[brief-hold-released:${ticketId}]`;
     for (const target of [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])]) {
@@ -1970,7 +2147,8 @@ export async function drainCompletion(msg) {
       record: {
         followUpsPending: stillUnfiled, status: stillUnfiled ? STATUS_PENDING_FOLLOW_UPS : "complete",
         ...(entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
-        ...(briefDelivery ? { ...briefDelivery, ...(holds.some((h) => h.step === "brief") ? { briefPending: true } : {}) } : {}),
+        // TEAM-5995: a stamped hold drops a released disposition (it ⇒ briefPending false).
+        ...(briefDelivery ? { ...briefDelivery, ...(holds.some((h) => h.step === "brief") ? { briefPending: true, briefDisposition: undefined } : {}) } : {}),
         // TEAM-5958: `{...rec.record, ...extra}` keeps a brief hold a Done landed over
         // (doneOverHold) — the brief is still off the gate, so the hold stays true.
         ...(undelivered.length > 0 ? { undelivered } : {}),
@@ -1989,7 +2167,8 @@ export async function drainCompletion(msg) {
     // TEAM-5805: a brief an earlier hold stamped pending is on its gate now, so the
     // twins' Done guard below must read it as delivered. `false`, not deleted: the
     // record keeps the history that it was held.
-    if (record.briefPending === true && brief?.gate) record.briefPending = false;
+    // TEAM-5995: or no gate needs it (a released briefDisposition, audited above).
+    if (record.briefPending === true && (brief?.gate || brief?.disposition?.release)) record.briefPending = false;
     // TEAM-5958: a hold a concurrent Done landed over (doneOverHold) stays `true` — that
     // is the ONLY clear above: gate delivery. The ticket is Done; nothing reads the hold
     // until a new Done is attempted, and then it is the refusal a reopen needs.

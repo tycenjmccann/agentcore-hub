@@ -938,8 +938,10 @@ export function descriptionCarriesConsoleLink(description, { pipeline, region } 
 // ticket-replay drain (workflow-output drainCompletion) stamps it when the merge
 // brief could not be put on the Merge Approval gate: a Done would make the gate
 // Ready without the brief in front of the approver. A delivery to the gate (the
-// drain's step 6, or a re-run report_completion) restamps it `false`; a record
-// without the field never held a brief. TEAM-5832: the writer stamps the hold on
+// drain's step 6, or a re-run report_completion) restamps it `false`; so does a
+// finding that no gate needs the brief (every gate Done, or a run whose def never
+// gets one), recorded as `briefDisposition` (TEAM-5995); a record without the
+// field never held a brief. TEAM-5832: the writer stamps the hold on
 // ANY ticket whose report named the brief (no assignee check), so every Done that
 // is not ship-phase or a security review reads it through judgeBriefHold — and
 // that read is in THIS band too: the hold comes from a durable writer, so "could
