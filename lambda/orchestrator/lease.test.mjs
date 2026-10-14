@@ -633,3 +633,80 @@ describe("hasAgentErrorSince strictGeneration + reason (TEAM-5977)", () => {
     expect(filterOf(a.inputs).match(/:dreason/g)).toHaveLength(1);
   });
 });
+
+// TEAM-6021: the time bound is a key condition on the eventId sort key, not only a filter — a ticket with
+// no death must not page its whole pre-claim history. `keyedStub` honours the key condition (bare / >= / BETWEEN)
+// over a seeded row set so the tests prove WHICH rows each range can reach, not just the query text.
+describe("time-bounded reads key-bound on eventId (TEAM-6021)", () => {
+  const SINCE = "2026-08-30T11:40:00.000Z";
+  const LO = Date.parse(SINCE) - 60_000;
+  const b36 = (ms, n = 0) => `${ms.toString(36).padStart(9, "0")}-${String(n).padStart(4, "0")}`;
+  function keyedStub(rows) {
+    const inputs = [];
+    const inRange = (id, q) => {
+      const v = q.ExpressionAttributeValues;
+      if (q.KeyConditionExpression === "workflowId = :w") return true;
+      if (q.KeyConditionExpression === "workflowId = :w AND eventId >= :lo") return id >= v[":lo"];
+      if (q.KeyConditionExpression === "workflowId = :w AND eventId BETWEEN :lo AND :hi") return id >= v[":lo"] && id <= v[":hi"];
+      throw new Error(`unexpected key condition ${q.KeyConditionExpression}`);
+    };
+    const ddb = { async send(cmd) { inputs.push(cmd.input); return { Items: rows.filter((r) => inRange(r.eventId, cmd.input)) }; } };
+    return { ddb, inputs };
+  }
+
+  it("strict died read: one ms-range query, :lo = since − 60s as 13-digit ms, no base-36 range", async () => {
+    const { ddb, inputs } = keyedStub([]);
+    await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", SINCE, { types: ["agent.died"], claimGeneration: SINCE, strictGeneration: true, reason: "transient_exhaustion" });
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0].KeyConditionExpression).toBe("workflowId = :w AND eventId >= :lo");
+    expect(inputs[0].ExpressionAttributeValues[":lo"]).toBe(String(LO));
+    expect(inputs[0].ExpressionAttributeValues[":lo"]).toMatch(/^\d{13}$/);
+    expect(inputs[0].ScanIndexForward).toBe(false);
+  });
+
+  it("agent.error and lastAgentActivity add the base-36 range for events-writer copies", async () => {
+    for (const run of [
+      (ddb) => hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", SINCE),
+      (ddb) => lastAgentActivity(ddb, "events", "wf_1", "dev_agent", "TEAM-2", TTL),
+    ]) {
+      const { ddb, inputs } = keyedStub([]);
+      await run(ddb);
+      expect(inputs.map((q) => q.KeyConditionExpression)).toEqual(["workflowId = :w AND eventId >= :lo", "workflowId = :w AND eventId BETWEEN :lo AND :hi"]);
+      const v = inputs[1].ExpressionAttributeValues;
+      expect(v[":lo"]).toMatch(/^0[0-9a-z]{8}$/);
+      expect(v[":hi"]).toBe("0~");
+      expect(inputs.every((q) => q.ScanIndexForward === false)).toBe(true);
+    }
+  });
+
+  it("unparseable since: one bare-partition query with no :lo/:hi (DynamoDB rejects unused values)", async () => {
+    const { ddb, inputs } = keyedStub([]);
+    await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", "not-a-date");
+    expect(inputs).toHaveLength(1);
+    expect(inputs[0].KeyConditionExpression).toBe("workflowId = :w");
+    expect(inputs[0].ExpressionAttributeValues).not.toHaveProperty(":lo");
+    expect(inputs[0].ExpressionAttributeValues).not.toHaveProperty(":hi");
+  });
+
+  it("a died row whose timestamp runs 1.9s past its eventId ms (main.py random fraction) is still reached", async () => {
+    const idMs = Date.parse(SINCE) - 1_900;
+    const died = { eventId: `${idMs}-died-123456`, type: "agent.died", timestamp: "2026-08-30T11:40:00.000Z", detail: { ticketId: "TEAM-2" } };
+    const { ddb } = keyedStub([died]);
+    expect(await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", SINCE, { types: ["agent.died"] })).toBe(true);
+  });
+
+  it("a pre-window row is outside the ms range (the read no longer reaches old history)", async () => {
+    const old = { eventId: `${LO - 1}-err-000001`, type: "agent.error", timestamp: new Date(LO - 1).toISOString(), detail: { ticketId: "TEAM-2" } };
+    const { ddb } = keyedStub([old]);
+    expect(await hasAgentErrorSince(ddb, "events", "wf_1", "TEAM-2", SINCE)).toBe(false);
+  });
+
+  it("a base-36-only row (direct put failed, events-writer copy survived) is still reached", async () => {
+    const at = Date.now() - 60_000;
+    const started = { eventId: b36(at), type: "agent.started", timestamp: new Date(at).toISOString(), detail: { agentId: "dev_agent", ticketId: "TEAM-2" } };
+    const { ddb } = keyedStub([started]);
+    expect(await lastAgentActivity(ddb, "events", "wf_1", "dev_agent", "TEAM-2", TTL)).toBe(started.timestamp);
+    const err = { eventId: b36(Date.parse(SINCE) + 5_000, 7), type: "agent.error", timestamp: new Date(Date.parse(SINCE) + 5_000).toISOString(), detail: { ticketId: "TEAM-2" } };
+    expect(await hasAgentErrorSince(keyedStub([err]).ddb, "events", "wf_1", "TEAM-2", SINCE)).toBe(true);
+  });
+});
