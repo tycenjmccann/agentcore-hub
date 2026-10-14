@@ -497,8 +497,37 @@ const CD_LEDGER_ABSENT = "absent";
 const CD_LEDGER_INDETERMINATE = "indeterminate";
 
 /**
- * Probe workflows/<workflow_id>/shared/cd-ledger.json — the record the release
- * manager blueprint writes the moment Pipeline___start_deploy returns.
+ * TEAM-6149: a ticket id that is safe to interpolate into an S3 key segment.
+ * Anything else (a path separator, a dot, whitespace) skips the per-ticket key
+ * and falls through to the unified ledger, logged - never a key we did not mean.
+ */
+const CD_LEDGER_TICKET_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+
+/**
+ * TEAM-6149 — the ONE place that decides which cd-ledger keys a report may read,
+ * and in what order. TEAM-6134 gave each `CD: follow-up PR <url>` ticket its own
+ * ledger, `shared/cd-ledger-<CD ticket id>.json`, and left `shared/cd-ledger.json`
+ * to the unified PR's deploy; until this, both readers below looked only at the
+ * unified key, so a follow-up CD derived the unified deploy's stale follow-ups and
+ * never saw its own. Per-ticket first (owned by this report by construction),
+ * unified last. Both the follow-up read (selectCdLedger) and the DL-030 probe
+ * (probeCdLedger) iterate this list; what differs is what they do with a hit.
+ */
+function cdLedgerKeys({ workflowId, ticketId }) {
+  const keys = [];
+  if (typeof ticketId === "string" && CD_LEDGER_TICKET_ID_RE.test(ticketId)) {
+    keys.push({ key: `workflows/${workflowId}/shared/cd-ledger-${ticketId}.json`, source: "per_ticket" });
+  } else if (ticketId) {
+    console.warn(`[report_completion] ${ticketId}: ticket id is not a safe key segment - the per-ticket cd-ledger is not probed, only the unified one`);
+  }
+  keys.push({ key: `workflows/${workflowId}/shared/cd-ledger.json`, source: "unified" });
+  return keys;
+}
+
+/**
+ * Probe the run's cd-ledger keys (cdLedgerKeys above: the reporting ticket's own
+ * `cd-ledger-<ticket_id>.json`, then the unified `cd-ledger.json`) — the records
+ * the release manager blueprint writes the moment Pipeline___start_deploy returns.
  *
  * THREE outcomes, never two, for the DL-028 reason (docs/architecture.md, "the
  * licence to proceed must be positive evidence"): "no ledger" has to mean *we
@@ -511,24 +540,30 @@ const CD_LEDGER_INDETERMINATE = "indeterminate";
  * No IAM change: this Lambda's role already holds s3:GetObject on the whole
  * artifact bucket (deploy/setup-lambda-role.sh, Sid "ObjectRW").
  */
-async function probeCdLedger(workflowId) {
+async function probeCdLedger({ workflowId, ticketId }) {
   if (!BUCKET || !workflowId) {
     console.warn(`[report_completion] cd-ledger probe not attempted (${BUCKET ? "no workflow_id on the call" : "no ARTIFACT_BUCKET configured"}) - indeterminate`);
     return CD_LEDGER_INDETERMINATE;
   }
-  const key = `workflows/${workflowId}/shared/cd-ledger.json`;
-  try {
-    await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
-    return CD_LEDGER_PRESENT;
-  } catch (err) {
-    // A definite not-found is the ONLY positive evidence of "this run never
-    // started a pipeline deploy". Everything else is a failed look.
-    if (err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404) {
-      return CD_LEDGER_ABSENT;
+  // TEAM-6149: the same keys, in the same order, as selectCdLedger - but NO prUrl
+  // filter. The probe answers "did this run use the pipeline path at all", and any
+  // ledger under the run is positive evidence that it did; a mismatch treated as
+  // "absent" would let a ship claim through on a run that provably deployed.
+  for (const { key } of cdLedgerKeys({ workflowId, ticketId })) {
+    try {
+      await s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key: key }));
+      return CD_LEDGER_PRESENT;
+    } catch (err) {
+      // A definite not-found is the ONLY positive evidence of "this run never
+      // started a pipeline deploy". Everything else is a failed look.
+      if (err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404) {
+        continue;
+      }
+      console.warn(`[report_completion] cd-ledger probe for ${key} was indeterminate (${err?.name || "Error"}: ${err?.message || "no message"}) - the pipeline execution id stays required`);
+      return CD_LEDGER_INDETERMINATE;
     }
-    console.warn(`[report_completion] cd-ledger probe for ${key} was indeterminate (${err?.name || "Error"}: ${err?.message || "no message"}) - the pipeline execution id stays required`);
-    return CD_LEDGER_INDETERMINATE;
   }
+  return CD_LEDGER_ABSENT;
 }
 
 /**
@@ -561,7 +596,7 @@ async function shipContractRefusal(report, { pipelineName, workflowId }) {
   if (!report.merge_commit) missing.push("merge_commit");
   if (!report.pipeline_execution_id) {
     const named = typeof pipelineName === "string" && pipelineName.trim() !== "";
-    const ledger = named ? null : await probeCdLedger(workflowId);
+    const ledger = named ? null : await probeCdLedger({ workflowId, ticketId: report.ticket_id });
     if (!named && ledger === CD_LEDGER_ABSENT) {
       console.log(`[report_completion] ${report.ticket_id}: "shipped" with no pipeline_execution_id ACCEPTED as the legacy DEPLOY.md path - no pipeline_name argument and cd-ledger.json is definitively absent for ${workflowId || "(no workflow_id)"}`);
     } else {
@@ -814,7 +849,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // The ledger is read only for a report that is making a ship-shaped claim —
   // that is the only kind of run that has a cd-ledger — so an ordinary dev
   // completion costs no extra S3 call.
-  const ledger = report.outcome || report.merge_commit ? await readCdLedger(workflow_id) : null;
+  // TEAM-6149: and it is THIS report's ledger - the per-ticket key first, the unified
+  // key only when its prUrl is this report's pr_url (see selectCdLedger).
+  const ledger = report.outcome || report.merge_commit
+    ? await selectCdLedger({ workflowId: workflow_id, ticketId: ticket_id, prUrl: report.pr_url })
+    : null;
   // TEAM-4754 — and the read is three-outcome now, so an unreadable ledger REFUSES
   // rather than contributing `[]`. This belongs in the pre-write refusal band with
   // the DL-030 gate above and mainFixRefusal / verifyPrBase / emptySweepScanRefusal
@@ -828,7 +867,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   }
   const ledgerEntries = ledgerFollowUps(ledger?.ledger);
   if (ledgerEntries.length > 0) {
-    console.log(`[report_completion] ${ticket_id}: cd-ledger contributed ${ledgerEntries.length} follow-up(s) (${ledgerEntries.map((e) => e.kind).join(", ")})`);
+    console.log(`[report_completion] ${ticket_id}: cd-ledger ${ledger.key} (${ledger.source}) contributed ${ledgerEntries.length} follow-up(s) (${ledgerEntries.map((e) => e.kind).join(", ")})`);
   }
   // ONE validation over the agent's entries AND the ledger's, so the SEC-11 caps
   // and the (kind,title) dedupe apply to the union rather than twice over.
@@ -2681,7 +2720,7 @@ export function validateFollowUps(items, { ticketId, unreadable = null, recordKe
 }
 
 /**
- * The cd-ledger BODY, in THREE outcomes. A sibling of probeCdLedger above, still
+ * ONE cd-ledger BODY, in THREE outcomes. A sibling of probeCdLedger above, still
  * deliberately separate: that probe's HeadObject contract is what the DL-030 gate
  * is built on and must not grow a fourth answer.
  *
@@ -2697,15 +2736,9 @@ export function validateFollowUps(items, { ticketId, unreadable = null, recordKe
  *   { ok:true,  ledger: null,  error:null }  it provably does not exist
  *   { ok:false, ledger: null, error }        we could not tell
  *
- * `!BUCKET || !workflowId` is a definite negative here, and that is a deliberate
- * difference from probeCdLedger (which calls the same condition INDETERMINATE):
- * with no bucket the completion record's own PutObject cannot succeed either, and
- * with no workflow_id there is no run and so no ledger to lose. The probe is
- * stricter because it licenses a ship CLAIM; this read only DERIVES follow-ups.
+ * Reads ONE key; selectCdLedger below decides which keys, in which order.
  */
-async function readCdLedger(workflowId) {
-  if (!BUCKET || !workflowId) return { ok: true, ledger: null, error: null };
-  const key = `workflows/${workflowId}/shared/cd-ledger.json`;
+async function getLedgerBody(key) {
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
     return { ok: true, ledger: JSON.parse(await r.Body.transformToString()), error: null };
@@ -2719,6 +2752,52 @@ async function readCdLedger(workflowId) {
     console.error(`[report_completion] cd-ledger body for ${key} was UNREADABLE (${error}) - the ledger-derived follow-ups are unknown`);
     return { ok: false, ledger: null, error };
   }
+}
+
+/** Trivial PR-URL normalization for the ownership check: trim, drop trailing slashes. */
+const normalizePrUrl = (u) => (typeof u === "string" ? u.trim().replace(/\/+$/, "") : "");
+
+/**
+ * Does the unified ledger belong to ANOTHER PR than the one this report is about?
+ * Only when both sides name a PR and they differ. A ledger with no prUrl, or a
+ * report with no pr_url (the unified CD path today), is not a mismatch.
+ */
+function ledgerPrMismatch(ledger, prUrl) {
+  const a = normalizePrUrl(ledger?.prUrl);
+  const b = normalizePrUrl(prUrl);
+  return Boolean(a && b && a !== b);
+}
+
+/**
+ * TEAM-6149 — WHICH ledger this report derives its follow-ups from, in the same
+ * three outcomes as getLedgerBody plus `key` / `source` so a refusal and a log can
+ * say which object they mean. Walks cdLedgerKeys in order:
+ *   - the per-ticket key: readable → it is this report's ledger (source
+ *     "per_ticket"); unreadable → refuse (ok:false, naming THAT key); 404 → next.
+ *   - the unified key: 404 → no ledger; unreadable → refuse; readable → this
+ *     report's ledger ONLY if it is not provably another PR's (ledgerPrMismatch).
+ *     A mismatch is "no ledger" (source "mismatch"), logged - the unified deploy's
+ *     handoffs are the unified CD's to file, never a follow-up CD's.
+ *
+ * `!BUCKET || !workflowId` is a definite negative here, and that is a deliberate
+ * difference from probeCdLedger (which calls the same condition INDETERMINATE):
+ * with no bucket the completion record's own PutObject cannot succeed either, and
+ * with no workflow_id there is no run and so no ledger to lose. The probe is
+ * stricter because it licenses a ship CLAIM; this read only DERIVES follow-ups.
+ */
+async function selectCdLedger({ workflowId, ticketId, prUrl }) {
+  if (!BUCKET || !workflowId) return { ok: true, ledger: null, key: null, source: "none", error: null };
+  for (const { key, source } of cdLedgerKeys({ workflowId, ticketId })) {
+    const r = await getLedgerBody(key);
+    if (!r.ok) return { ok: false, ledger: null, key, source, error: r.error };
+    if (r.ledger === null) continue;
+    if (source === "unified" && ledgerPrMismatch(r.ledger, prUrl)) {
+      console.warn(`[report_completion] ${ticketId}: unified cd-ledger ${key} records prUrl ${normalizePrUrl(r.ledger.prUrl)}, not this report's pr_url ${normalizePrUrl(prUrl)} - treated as no ledger, nothing derived from it`);
+      return { ok: true, ledger: null, key, source: "mismatch", error: null };
+    }
+    return { ok: true, ledger: r.ledger, key, source, error: null };
+  }
+  return { ok: true, ledger: null, key: null, source: "none", error: null };
 }
 
 /**
@@ -2742,7 +2821,7 @@ export function cdLedgerRefusal({ workflowId, ledger }) {
     ok: false,
     reason: "cd_ledger_unreadable",
     missing: [],
-    message: `This ship report was refused: the run's cd-ledger (workflows/${workflowId || "<unknown>"}/shared/cd-ledger.json) could not be read (${ledger.error}), so the console/IAM handoffs and any unmerged-to-main work it records - each of which becomes a follow-up ticket - are UNKNOWN. Closing this ticket now would cascade the run to complete over work nobody owns. Nothing was recorded and the ticket was NOT transitioned. Retry the call.`,
+    message: `This ship report was refused: the run's cd-ledger (${ledger.key || `workflows/${workflowId || "<unknown>"}/shared/cd-ledger.json`}) could not be read (${ledger.error}), so the console/IAM handoffs and any unmerged-to-main work it records - each of which becomes a follow-up ticket - are UNKNOWN. Closing this ticket now would cascade the run to complete over work nobody owns. Nothing was recorded and the ticket was NOT transitioned. Retry the call.`,
   };
 }
 

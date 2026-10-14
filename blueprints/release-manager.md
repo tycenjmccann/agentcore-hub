@@ -802,8 +802,12 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
   resume it. Each follow-up CD merges THIS PR, calls `start_deploy` with
   `pipeline_name` and `approved_head_sha` = THIS PR's head, watches it to
   terminal and passes `pipeline_name` on `report_completion` with
-  `merge_commit` + outcome, exactly as below — so the legacy check, which
-  probes only `shared/cd-ledger.json`, never applies to it.
+  `merge_commit`, outcome and `pr_url=<the follow-up PR>`, exactly as below.
+  `report_completion` reads your `cd-ledger-<CD ticket id>.json` first and
+  falls back to `shared/cd-ledger.json` only when its `prUrl` is your `pr_url`
+  (or no `pr_url` was passed); a mismatch is no ledger, and a key it cannot
+  read refuses the report (`cd_ledger_unreadable`, naming that key). The
+  legacy check HEADs the same two keys in the same order.
 - Legacy mode writes NO ledger. Its absence, together with passing no
   `pipeline_name`, is exactly how `report_completion` recognises a legacy
   DEPLOY.md ship and accepts `outcome="shipped"` with a merge commit and no
@@ -1129,7 +1133,8 @@ path too ("The human's answer", above).
   nothing, page nobody — and never a second gate ticket for the same execution
 - Write `shared/cd-ledger.json` (on a follow-up CD, your `cd-ledger-<CD ticket id>.json`) the instant
   `start_deploy` returns an execution id, and read it FIRST on every re-dispatch: resume that execution (or
-  `waitingOn.supersededBy`), never trigger a second deploy
+  `waitingOn.supersededBy`), never trigger a second deploy; a follow-up CD also passes `pr_url=<the follow-up PR>`
+  on `report_completion`, which is how the tool picks the right ledger
 - `outcome="shipped"` needs `merge_commit` + `pipeline_execution_id` and
   `succeeded:true` for that execution (legacy DEPLOY.md ships: merge commit
   alone); `outcome="handoff"` needs `pr_url`; the tool refuses anything less and
