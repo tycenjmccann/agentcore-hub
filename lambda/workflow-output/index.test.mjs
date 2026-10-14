@@ -4901,3 +4901,13 @@ describe("report_completion — TEAM-5593 replays", () => {
     expect(res.status).toBe("complete");
   });
 });
+
+describe("TEAM-6057 — clearUndeliveredBriefTargets", () => {
+  it("drops briefTargets and briefFallbackReason, keeps every other field", async () => {
+    const { clearUndeliveredBriefTargets } = await import("./index.mjs");
+    const rec = { briefPending: true, briefDelivered: "undelivered", briefTargets: ["G"], briefFallbackReason: "no open gate", undelivered: [{ part: "brief", s3Key: "b.md" }] };
+    expect(clearUndeliveredBriefTargets(rec)).toBe(rec);
+    expect(rec).toEqual({ briefPending: true, briefDelivered: "undelivered", undelivered: [{ part: "brief", s3Key: "b.md" }] });
+    expect(clearUndeliveredBriefTargets({ briefDelivered: "undelivered" })).toEqual({ briefDelivered: "undelivered" });
+  });
+});
