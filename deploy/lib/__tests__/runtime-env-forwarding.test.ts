@@ -128,6 +128,7 @@ function run(script: string, extraEnv: Record<string, string> = {}) {
     encoding: "utf8",
     timeout: 120_000,
     env: {
+      NODE_ENV: "test",
       PATH: `${binDir}:/usr/local/bin:/usr/bin:/bin`,
       HOME: join(tmp, "home"),
       AC_LOG: acLog,
@@ -167,7 +168,14 @@ function robustCalls(): Record<string, string>[] {
   return readFileSync(robustLog, "utf8")
     .split("\n")
     .filter(Boolean)
-    .map((line) => Object.fromEntries(line.split("\x1f").map((kv) => kv.split(/=(.*)/s).slice(0, 2))));
+    .map((line) =>
+      Object.fromEntries(
+        line.split("\x1f").map((kv) => {
+          const eq = kv.indexOf("=");
+          return [kv.slice(0, eq), kv.slice(eq + 1)];
+        }),
+      ),
+    );
 }
 
 const RENAMED_SET = {
