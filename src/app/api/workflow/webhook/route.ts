@@ -152,7 +152,7 @@ async function transitionDoneViaLambda(ticketId: string, reason: string): Promis
     console.warn(`[webhook:lambda] ${ticketId}: tickets Lambda refused the transition to done: ${refusal}`);
     return NextResponse.json({ error: "Ticket transition rejected", details: refusal, ticketId }, { status: 409 });
   }
-  if (!provesTransitioned(parsed, "done")) {
+  if (!provesTransitioned(parsed, "done", ticketId)) {
     console.warn(`[webhook:lambda] ${ticketId}: tickets Lambda did not confirm the transition to done: ${text.slice(0, 500)}`);
     return NextResponse.json(
       { error: "tickets Lambda did not confirm the transition", details: text.slice(0, 500), ticketId },

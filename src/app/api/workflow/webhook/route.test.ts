@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { ticketsSuccess, JIRA_NAME_MATCH_CLOSED } from "@/lib/workflow/__fixtures__/ticket-transition-success";
 
 /**
  * TEAM-5781 — the webhook's `request_fix` branch minted a ticket id with its own
@@ -92,7 +93,7 @@ beforeEach(async () => {
   h.sends.length = 0;
   h.invokes.length = 0;
   h.lambdaThrows = null;
-  lambdaAnswers({ key: "TEAM-7", status: "transitioned", from: "in_review", to: "done" });
+  lambdaAnswers(ticketsSuccess("TEAM-7", "done", "in_review"));
   process.env.WEBHOOK_SECRET = SECRET;
   delete process.env.TICKET_TOOLS_LAMBDA;
   vi.resetModules();
@@ -384,5 +385,51 @@ describe("POST /api/workflow/webhook — an unproven Done is not a success (TEAM
     lambdaAnswers({ content: [{ text: "TEAM-7 has briefPending:true" }] });
     const res = await post(JIRA_DONE);
     expect(res.status).toBe(409);
+  });
+});
+
+/**
+ * TEAM-6131 (review fix round 2) — the proof must name THE ticket and THE status the
+ * route asked the Lambda for. F3: a bare `{status:"transitioned"}` (a shape the real
+ * tickets Lambda never returns) was proof → 200. F4: the jira Lambda matches a
+ * transition by NAME or destination and reports the destination's status, so a
+ * workflow whose "Done" lands in "Closed" answered `status:"closed"` → 502 although
+ * the ticket moved. The Lambda now also reports `requested` + `matchedTransition`.
+ */
+describe("POST /api/workflow/webhook — proof names the requested ticket and status (TEAM-6131)", () => {
+  it('F3: a bare {status:"transitioned"} (no key, no `to`) → 502, no direct write', async () => {
+    lambdaAnswers({ status: "transitioned" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ error: "tickets Lambda did not confirm the transition", ticketId: "TEAM-7" });
+    expect(h.sends.length).toBe(0);
+    expect(h.invokes).toHaveLength(1);
+  });
+
+  it("F3: the real tickets shape for a DIFFERENT ticket → 502, no direct write", async () => {
+    lambdaAnswers(ticketsSuccess("TEAM-8", "done", "in_review"));
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it("F4: the jira Lambda's name≠destination shape (Done → Closed) → 200", async () => {
+    lambdaAnswers(JIRA_NAME_MATCH_CLOSED);
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+  });
+
+  it("F4: …but for a DIFFERENT ticket → 502", async () => {
+    lambdaAnswers({ ...JIRA_NAME_MATCH_CLOSED, ticketId: "TEAM-8" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+  });
+
+  it("F4: an arbitrary landed status (in_progress for a requested done) → 502, even with requested/matchedTransition", async () => {
+    lambdaAnswers({ ...JIRA_NAME_MATCH_CLOSED, status: "in_progress" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
   });
 });
