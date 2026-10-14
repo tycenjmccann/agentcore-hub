@@ -3,25 +3,52 @@
  *
  * THIN handler — writes status to DynamoDB only.
  * The DynamoDB Stream triggers the Orchestration Lambda for all downstream logic.
+ *
+ * TEAM-6010: a `→ done` status NEVER lands with a raw UpdateCommand. It is sent
+ * through Tickets___transition_ticket on the tickets Lambda — the same call
+ * src/app/api/workflow/[id]/tickets/transition/route.ts makes — so the completion-
+ * record / brief-hold guard and the doneIntent fence (gate-contract.mjs) see it,
+ * exactly as they would a console-driven or agent-driven Done.
  */
 
 import { NextRequest, NextResponse } from "next/server";
+import { timingSafeEqual } from "node:crypto";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, UpdateCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
+import { rejectedDetails } from "@/lib/workflow/ticket-transition-refusal";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
 const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
-const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "dev-secret";
+const TICKET_TOOLS_LAMBDA = process.env.TICKET_TOOLS_LAMBDA || "agentcore-hub-tickets";
+// TEAM-6010: no default. Unset/blank, or the old "dev-secret" placeholder every
+// deploy used to ship unset as, disables the route — fail closed, not open.
+const WEBHOOK_SECRET = (process.env.WEBHOOK_SECRET || "").trim();
+const WEBHOOK_DISABLED = !WEBHOOK_SECRET || WEBHOOK_SECRET === "dev-secret";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
   marshallOptions: { removeUndefinedValues: true },
 });
+const lambda = new LambdaClient({ region: REGION });
+
+// Same idiom as src/app/api/workflow/start/route.ts's secretMatches: equal-length
+// buffers only, so a length mismatch never reaches timingSafeEqual (which throws
+// on unequal lengths rather than returning false).
+function secretMatches(provided: string, expected: string): boolean {
+  const a = Buffer.from(provided);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
 
 export async function POST(req: NextRequest) {
-  // Validate webhook secret
-  const secret = req.headers.get("x-webhook-secret");
-  if (WEBHOOK_SECRET !== "dev-secret" && secret !== WEBHOOK_SECRET) {
+  if (WEBHOOK_DISABLED) {
+    return NextResponse.json(
+      { error: "webhook disabled: WEBHOOK_SECRET not configured" },
+      { status: 503 }
+    );
+  }
+  if (!secretMatches(req.headers.get("x-webhook-secret") || "", WEBHOOK_SECRET)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
@@ -64,14 +91,10 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
           return NextResponse.json({ received: true, warning: "Ticket not found" });
         }
 
-        // Write "done" to DynamoDB — Stream handles the rest
-        await ddb.send(new UpdateCommand({
-          TableName: TICKETS_TABLE,
-          Key: { ticketId },
-          UpdateExpression: "SET #s = :s, #u = :u",
-          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-          ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
-        }));
+        // TEAM-6010: the Done goes through the tickets Lambda's guard, not a raw
+        // UpdateCommand — see the header comment.
+        const refused = await transitionDoneViaLambda(ticketId, `agent_completion from ${agentId}`);
+        if (refused) return refused;
 
         if (body.branch || body.commit_sha || body.pr_url) {
           await updateWorkflowTaskMetadata(workflowId, ticketId, {
@@ -82,8 +105,8 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
           });
         }
 
-        console.log(`[webhook:lambda] Wrote "done" for ${ticketId} (agent: ${agentId}). Stream handles cascade.`);
-        return NextResponse.json({ received: true, ticketId, mode: "lambda" });
+        console.log(`[webhook:lambda] Transitioned ${ticketId} to "done" via tickets Lambda (agent: ${agentId}). Stream handles cascade.`);
+        return NextResponse.json({ received: true, ticketId, mode: "lambda", via: "tickets-lambda" });
       }
 
       case "jira_transition":
@@ -94,6 +117,15 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
 
         if (issueKey && statusChange) {
           const mappedStatus = mapJiraStatus(statusChange.toString.toLowerCase());
+          // TEAM-6010: a Done goes through the tickets Lambda's guard — see the
+          // header comment. Every other mapped status is still a direct write;
+          // only `done` can skip the completion-record / brief-hold gate.
+          if (mappedStatus === "done") {
+            const refused = await transitionDoneViaLambda(issueKey, "Jira webhook transition to Done");
+            if (refused) return refused;
+            console.log(`[webhook:lambda] Jira: ${issueKey} → done via tickets Lambda. Stream handles cascade.`);
+            return NextResponse.json({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+          }
           await ddb.send(new UpdateCommand({
             TableName: TICKETS_TABLE,
             Key: { ticketId: issueKey },
@@ -117,6 +149,58 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
 }
 
 // ─── Shared Helpers ──────────────────────────────────────────────────────────────
+
+/**
+ * TEAM-6010: a `→ done` is sent through Tickets___transition_ticket on the tickets
+ * Lambda — the same invoke src/app/api/workflow/[id]/tickets/transition/route.ts
+ * makes — instead of a raw UpdateCommand, so the completion-record / brief-hold
+ * guard and the doneIntent fence (gate-contract.mjs) see every Done this route
+ * reports, not just ones that went through the console or an agent's own
+ * report_completion. Returns the error response to send back, or null on success
+ * (nothing left to do — the Lambda already wrote the status).
+ */
+async function transitionDoneViaLambda(ticketId: string, reason: string): Promise<NextResponse | null> {
+  let response;
+  try {
+    response = await lambda.send(new InvokeCommand({
+      FunctionName: TICKET_TOOLS_LAMBDA,
+      InvocationType: "RequestResponse",
+      Payload: Buffer.from(JSON.stringify({
+        tool_name: "Tickets___transition_ticket",
+        parameters: { ticket_id: ticketId, transition_id: "done", reason },
+      })),
+    }));
+  } catch (err) {
+    return NextResponse.json(
+      { error: "tickets Lambda invocation failed", details: (err as Error).message },
+      { status: 502 }
+    );
+  }
+
+  const text = response.Payload ? Buffer.from(response.Payload).toString() : "";
+  if (response.FunctionError) {
+    return NextResponse.json(
+      { error: "tickets Lambda invocation failed", details: text || response.FunctionError },
+      { status: 502 }
+    );
+  }
+
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    // Unreadable payload proves nothing — rejectedDetails fails open on it below.
+  }
+  const refusal = rejectedDetails(parsed, "done");
+  if (refusal) {
+    console.warn(`[webhook:lambda] ${ticketId}: tickets Lambda refused the transition to done: ${refusal}`);
+    return NextResponse.json(
+      { error: "Ticket transition rejected", details: refusal, ticketId },
+      { status: 409 }
+    );
+  }
+  return null;
+}
 
 /**
  * agentTasks is keyed by TICKET id (the orchestrator's claim key). Resolve the
