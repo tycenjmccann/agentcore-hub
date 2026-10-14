@@ -120,7 +120,7 @@ case "$MODULE" in
     # Jira webhook instead (lambda/orchestrator/index.mjs handles
     # source === "jira-webhook"), so requiring the stream here would fail a
     # valid Jira install.
-    if [[ "${TICKET_PROVIDER:-dynamodb}" == "dynamodb" ]]; then
+    if [[ "${TICKET_PROVIDER:-jira}" == "dynamodb" ]]; then
       stream_arn=$(aws dynamodb describe-table --table-name agentcore-hub-tickets \
         --region "$AWS_REGION" --query 'Table.LatestStreamArn' --output text 2>/dev/null || true)
       if [[ -z "$stream_arn" || "$stream_arn" == "None" ]]; then
@@ -160,7 +160,7 @@ case "$MODULE" in
       (cd deploy/runtime-agent && ./verify-fleet.sh) \
         || fail "verify-fleet.sh reported failures"
     fi
-    pass "tables + fleet ARNs + trigger wiring (TICKET_PROVIDER=${TICKET_PROVIDER:-dynamodb}) + EventBridge target + quick fleet invocation"
+    pass "tables + fleet ARNs + trigger wiring (TICKET_PROVIDER=${TICKET_PROVIDER:-jira}) + EventBridge target + quick fleet invocation"
     ;;
 
   evaluations)
