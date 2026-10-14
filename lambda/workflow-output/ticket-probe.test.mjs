@@ -2109,7 +2109,9 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
   const PRIOR_5599 = { part: "residual_findings", ticketId: DEV, reason: "Jira API 403: You do not have permission" };
   const withResidual = () => {
     seedTicket({ ticketId: DEV, title: "Dev: db9sx9 backend", status: "To Do", assignee: "agentcore_hub_backend_dev", parentKey: "TEAM-5600", blockedBy: [BUILD] });
-    fake.queue[0].Body = JSON.stringify({ ...JSON.parse(fake.queue[0].Body), residual: { verdict: "APPROVED_WITH_FINDINGS", summary: "R1: rotate the probe role key", artifacts: "" } });
+    // TEAM-6142: a residual message names its done design amendment (the drain re-confirms it).
+    seedTicket({ ticketId: "TEAM-5698", title: "Amend design: db9sx9", status: "Done", assignee: "agentcore_hub_backend_designer", parentKey: "TEAM-5600" });
+    fake.queue[0].Body = JSON.stringify({ ...JSON.parse(fake.queue[0].Body), residual: { verdict: "APPROVED_WITH_FINDINGS", summary: "R1: rotate the probe role key", artifacts: "", amendmentTicketId: "TEAM-5698" } });
     setRecord({ undelivered: [RESIDUAL_6097, PRIOR_5599] });
   };
 
@@ -2125,6 +2127,59 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     fake.failTool = { Tickets___add_comment: (p) => (p.ticket_id === DEV ? "Jira API 403: still forbidden" : null) };
     expect((await tick()).out.drained).toMatchObject({ applied: 1 });
     expect(record().undelivered).toEqual([RESIDUAL_6097, { part: "residual_findings", ticketId: DEV, reason: "Jira API 403: still forbidden" }]);
+  });
+
+  // TEAM-6142: the drain re-confirms the security review's design amendment before its Done
+  // (it had no amendment read at all). Reopened ⇒ no Done, and the record's finalized stamp is
+  // marked provisional again (the DL-039 shape both twins refuse) with the drop.
+  const AMEND = "TEAM-5698";
+  it("TEAM-6142 (drain) the amendment is reopened while the residual findings are posted ⇒ no Done, a surfaced drop, the stamp PROVISIONAL again and refused by both twins", async () => {
+    withResidual();
+    setRecord({ securityReview: { verdict: "FAIL", amendmentTicketId: AMEND } });
+    fake.beforeTool = (tool, params) => { if (tool === "Tickets___add_comment" && params.ticket_id === DEV) fake.tickets.get(AMEND).status = "To Do"; };
+    expect((await tick()).out.drained).toMatchObject({ applied: 0, dropped: 1 });
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    expect(fake.calls.some((c) => c.tool === "Tickets___transition_ticket" && c.params?.ticket_id === BUILD)).toBe(false);
+    expect(record()).toMatchObject({ ticketWrites: "dropped", replayDropped: { step: "amendment" } });
+    expect(record().replayDropped.error).toMatch(/design amendment TEAM-5698 reads To Do/);
+    expect(record().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND, provisional: true });
+    for (const twin of TWIN_GUARDS) {
+      expect((await twin()).securityReviewRecordRefusal(KEY, record())).toMatch(/PROVISIONAL securityReview admission on amendment TEAM-5698/);
+    }
+  });
+
+  it("TEAM-6142 (drain) the amendment is reopened and the provisional re-stamp loses its CAS ⇒ retried, no Done, no notice", async () => {
+    withResidual();
+    setRecord({ securityReview: { verdict: "FAIL", amendmentTicketId: AMEND } });
+    fake.beforeTool = (tool, params) => { if (tool === "Tickets___add_comment" && params.ticket_id === DEV) fake.tickets.get(AMEND).status = "To Do"; };
+    let n = 0;
+    fake.putError = (input) => (input.Key === KEY && ++n > 1 ? awsError("PreconditionFailed", 412, "At least one of the pre-conditions you specified did not hold") : null);
+    expect((await tick()).out.drained).toMatchObject({ applied: 0, dropped: 0 });
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    expect(fake.calls.some((c) => c.tool === "Tickets___transition_ticket" && c.params?.ticket_id === BUILD)).toBe(false);
+    expect(record().replayDropped).toBeUndefined();
+  });
+
+  it("TEAM-6142 (drain) a message queued before TEAM-6142 (no amendmentTicketId) re-confirms the record's stamped amendment", async () => {
+    withResidual();
+    const body = JSON.parse(fake.queue[0].Body);
+    delete body.residual.amendmentTicketId;
+    fake.queue[0].Body = JSON.stringify(body);
+    setRecord({ securityReview: { verdict: "FAIL", amendmentTicketId: AMEND } });
+    fake.tickets.get(AMEND).status = "In Progress";
+    expect((await tick()).out.drained).toMatchObject({ applied: 0, dropped: 1 });
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    expect(record().replayDropped.error).toMatch(/design amendment TEAM-5698 reads In Progress/);
+  });
+
+  it("TEAM-6142 (drain) no amendment id on the message or the record ⇒ fail closed: a surfaced drop, no Done", async () => {
+    withResidual();
+    const body = JSON.parse(fake.queue[0].Body);
+    delete body.residual.amendmentTicketId;
+    fake.queue[0].Body = JSON.stringify(body);
+    expect((await tick()).out.drained).toMatchObject({ applied: 0, dropped: 1 });
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    expect(record().replayDropped).toMatchObject({ step: "amendment", error: expect.stringMatching(/name no design amendment/) });
   });
 
   it("TEAM-6124 mergeUndelivered: same key replaces, other keys stay, delivered keys come off, empty ⇒ undefined", () => {

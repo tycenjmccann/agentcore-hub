@@ -1396,6 +1396,12 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // withheld - whether that tidy-up lands cannot change what any reader does, because the
   // record is already refused. A finalize that loses its CAS leaves the record provisional
   // and withholds the Done the same way; the agent's retry re-chooses the gate.
+  // TEAM-6142: the FINAL gate confirm. Between it and transitionToDone sit the FINALIZE write
+  // (the one S3 CAS write DL-039 needs AFTER the last read, since it is what makes the release
+  // trusted) and the amendment block below, which a security review never reaches with a
+  // merge-brief hold - so in practice nothing else. Residual window: Jira status and the S3
+  // CAS share no transaction, so a gate reopened after this read still goes Done (see
+  // confirmDoneAtCommit).
   if (releasedNow && mayTransition) {
     const confirm = await confirmDoneAtCommit({ ticketIds: releasedNow.observed.map((o) => o.ticketId) });
     if (confirm.ok && confirm.done) {
@@ -1459,30 +1465,27 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // without it — no findings are posted, no Done is made, and the answer is the
     // amendment refusal saying what WAS recorded.
     // TEAM-6140 (DL-039): the stamp above is PROVISIONAL (both twins refuse it), so this block
-    // is what admits the Done: the amendment confirmed ⇒ the FINALIZE write takes the marker
-    // off, then the findings and the Done. Reopened ⇒ the stamp is taken off best-effort and
-    // the answer says whether that landed (a provisional stamp left behind is refused anyway).
-    // A finalize that loses its CAS ⇒ no findings, no Done, a retryable answer.
-    if (review.residual && review.amendmentTicketId) {
-      const confirm = await confirmDoneAtCommit({ ticketIds: [review.amendmentTicketId] });
-      if (!confirm.ok || !confirm.done) {
-        delete report.securityReview;
-        const back = await writeRecord(() => STATUS_TRANSITION_FAILED);
-        const rollback = { ok: back.ok, ...(back.ok ? {} : { error: back.error }) };
-        const what = confirm.ok ? `design amendment ${confirm.why}` : `design amendment ${review.amendmentTicketId} could not be re-read (${confirm.error})`;
-        console.warn(`[report_completion] REFUSED ${ticket_id}: ${what} after the record was written - provisional securityReview stamp ${back.ok ? "removed" : `NOT removed (${back.error}); it stays PROVISIONAL, which both twins refuse`}, no residual findings posted, ticket not transitioned`);
-        return confirm.ok
-          ? designAmendmentRefusal({ ticketId: ticket_id, verdict: review.verdict, open: { ticketId: review.amendmentTicketId }, note: `confirmed done, then ${amendmentReread(confirm)} after the record was written`, findings: countFindings(summary), recorded: true, rollback })
-          : amendmentScanRefusal({ ticketId: ticket_id, verdict: review.verdict, detail: `get_issue ${review.amendmentTicketId} (re-confirming the design amendment is done after the record write): ${confirm.error}`, recorded: true, rollback });
-      }
-      finalizeSecurityReview(report);
-      const final = await writeRecord(() => report.status);
-      if (!final.ok) {
-        report.securityReview.provisional = true;
-        console.error(`[report_completion] REFUSED ${ticket_id}: the design amendment re-confirmed done but the admission could not be FINALIZED on ${key} (${final.error}) - the record keeps the PROVISIONAL stamp (both twins refuse it), no residual findings posted, ticket not transitioned; retry`);
-        return admissionNotFinalized(ticket_id, key, final.error);
-      }
-      console.log(`[report_completion] ${ticket_id}: design amendment ${review.amendmentTicketId} re-confirmed done after the write - securityReview admission FINALIZED`);
+    // is what admits the Done. Reopened ⇒ the stamp is taken off best-effort and the answer
+    // says whether that landed (a provisional stamp left behind is refused anyway).
+    // TEAM-6142: one take-back for both confirms (this one, and the final one after the
+    // residual posts). Tidy-up only, as DL-039 makes it: the stamp is still provisional at
+    // both sites, so a rewrite that loses its CAS leaves a record every reader already refuses;
+    // the refusal is returned (no Done) either way and carries `rollback`.
+    const amendment = review.residual && review.amendmentTicketId ? review.amendmentTicketId : null;
+    const takeBackAdmission = async (confirm, { note, detail, posted }) => {
+      delete report.securityReview;
+      const back = await writeRecord(() => STATUS_TRANSITION_FAILED);
+      const rollback = { ok: back.ok, ...(back.ok ? {} : { error: back.error }) };
+      const what = confirm.ok ? `design amendment ${confirm.why}` : `design amendment ${amendment} could not be re-read (${confirm.error})`;
+      console.warn(`[report_completion] REFUSED ${ticket_id}: ${what} ${note} - provisional securityReview stamp ${back.ok ? "removed" : `NOT removed (${back.error}); it stays PROVISIONAL, which both twins refuse`}, ${posted ? "residual findings already posted (marker-deduped)" : "no residual findings posted"}, ticket not transitioned`);
+      const refusal = confirm.ok
+        ? designAmendmentRefusal({ ticketId: ticket_id, verdict: review.verdict, open: { ticketId: amendment }, note: `confirmed done, then ${amendmentReread(confirm)} ${note}`, findings: countFindings(summary), recorded: true, rollback })
+        : amendmentScanRefusal({ ticketId: ticket_id, verdict: review.verdict, detail: `get_issue ${amendment} (re-confirming the design amendment is done ${detail}): ${confirm.error}`, recorded: true, rollback });
+      return posted ? { ...refusal, residualFindings } : refusal;
+    };
+    if (amendment) {
+      const confirm = await confirmDoneAtCommit({ ticketIds: [amendment] });
+      if (!confirm.ok || !confirm.done) return takeBackAdmission(confirm, { note: "after the record was written", detail: "after the record write", posted: false });
     }
     // TEAM-5426: round 2 closes on a non-PASS verdict — the findings go onto the
     // dev lanes BEFORE the Done that releases them, so the cascade cannot dispatch
@@ -1490,6 +1493,31 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // a failed transition re-posts nothing (the marker dedupe).
     if (review.residual) {
       residualFindings = await postResidualFindings({ ticketId: ticket_id, verdict: review.verdict, summary, artifacts, siblings: review.siblings });
+    }
+    // TEAM-6142: the FINAL confirm of the admission - after the residual posts (awaited ticket
+    // writes: a get_issue + add_comment per dev lane) and BEFORE the FINALIZE write. DL-039
+    // puts that finalize (one S3 CAS write, finalizeSecurityReview) between this read and the
+    // Done, and it has to sit there: it is the write that makes the stamp trusted, so it must
+    // follow the last status read of the amendment - a read after it would leave a trusted
+    // stamp behind whenever its take-back lost the CAS. It is the ONLY thing between this read
+    // and transitionToDone; nothing else may be awaited here (it only widens the window).
+    // Residual window: Jira status and the S3 CAS share no transaction, so an amendment
+    // reopened after this read still goes Done - see confirmDoneAtCommit. Refused here, the
+    // findings are already on the dev lanes (marker-deduped, so the next round's report does
+    // not re-post them) - `residualFindings` on the refusal says so. A finalize that loses its
+    // CAS ⇒ no Done, the record stays provisional (refused), a retryable answer; the retry
+    // re-confirms, re-posts nothing, and finalizes.
+    if (amendment) {
+      const confirm = await confirmDoneAtCommit({ ticketIds: [amendment] });
+      if (!confirm.ok || !confirm.done) return takeBackAdmission(confirm, { note: "after the residual findings were posted", detail: "after the residual findings were posted", posted: true });
+      finalizeSecurityReview(report);
+      const final = await writeRecord(() => report.status);
+      if (!final.ok) {
+        report.securityReview.provisional = true;
+        console.error(`[report_completion] REFUSED ${ticket_id}: the design amendment re-confirmed done but the admission could not be FINALIZED on ${key} (${final.error}) - the record keeps the PROVISIONAL stamp (both twins refuse it), residual findings already posted (marker-deduped), ticket not transitioned; retry`);
+        return { ...admissionNotFinalized(ticket_id, key, final.error, { posted: true }), residualFindings };
+      }
+      console.log(`[report_completion] ${ticket_id}: design amendment ${amendment} re-confirmed done after the residual posts - securityReview admission FINALIZED`);
     }
     transition = await transitionToDone(ticket_id);
     if (transition.ok) {
@@ -1593,7 +1621,8 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     try {
       queued = await enqueueTicketWrites({
         ticketId: ticket_id, workflowId: workflow_id, agentId: agent_id, epicKey, entries: toMaterialize,
-        residual: review.residual ? { verdict: review.verdict, summary: clampBlock(summary, 6000), artifacts: clampLine(artifacts, 500) } : null,
+        // TEAM-6142: amendmentTicketId, so the drain re-confirms the amendment before its Done.
+        residual: review.residual ? { verdict: review.verdict, summary: clampBlock(summary, 6000), artifacts: clampLine(artifacts, 500), amendmentTicketId: review.amendmentTicketId || null } : null,
         briefKey: mergeBriefKey(keys), reportKey: key,
         journey: { summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null },
       });
@@ -2465,6 +2494,10 @@ export async function drainCompletion(msg) {
   // as it is then (the brief and audit comments are marker-deduped, so nothing posts twice).
   const settledGates = brief?.disposition?.release && brief.disposition.kind === "gate_settled"
     ? brief.disposition.observed.map((o) => o.ticketId) : null;
+  // TEAM-6142: with no record this is the FINAL gate confirm (step 6 is skipped); nothing
+  // is awaited between it and step 7's transitionToDone. Residual window: Jira status and
+  // the record's S3 CAS share no transaction, so a gate reopened after this read still
+  // goes Done - see confirmDoneAtCommit.
   if (settledGates) {
     const confirm = await confirmDoneAtCommit({ ticketIds: settledGates, earlier: brief.gateReads });
     if (!confirm.ok) return retry(`get_issue ${confirm.ticketId} (re-confirming the Merge Approval gate is Done before recording the release): ${confirm.error}`);
@@ -2533,6 +2566,11 @@ export async function drainCompletion(msg) {
     // cannot change what any reader does, because the record is already refused. A finalize
     // that loses its CAS ⇒ no Done either; the message comes back and the next tick
     // re-chooses the gate on the record as it is then.
+    // TEAM-6142: the FINAL gate confirm. After it, before step 7's transitionToDone: the
+    // FINALIZE write (DL-039: the write that makes the release trusted must follow the last
+    // read) and step 7's amendment re-read (a security review never carries a merge brief, so
+    // in practice not both). Residual window: a gate reopened after this read still goes Done -
+    // Jira status and the S3 CAS share no transaction (see confirmDoneAtCommit).
     if (provisionalRelease) {
       const confirm = await confirmDoneAtCommit({ ticketIds: settledGates });
       if (confirm.ok && confirm.done) {
@@ -2558,6 +2596,31 @@ export async function drainCompletion(msg) {
   //    makes a second status change (and so never a second webhook).
   let transitioned = false;
   if (!alreadyDone) {
+    // TEAM-6142: a residual-findings message is a non-PASS security review admitted on a
+    // done design amendment, and that admission is re-asked here, the last await before
+    // the Done (the drain had no amendment read at all). The id is the message's; a
+    // message queued before TEAM-6142 has none, so it is the record's own stamp
+    // (securityReview.amendmentTicketId, the admission the twins' guard will honour).
+    // Neither (no record, or a record without the stamp): fail closed, a surfaced drop -
+    // never a Done on an admission nothing can re-read. Reopened (or permanently
+    // unreadable): the record's stamp (finalized by the report_completion that queued this
+    // message) is marked `provisional:true` again with the drop - the DL-039 shape both twins
+    // refuse - so a direct Done is refused too; a stamp drop() cannot write is drop()'s own
+    // retry (no Done, no notice; the next tick re-reads). Transiently unreadable: retry.
+    // Residual window, as on the report path: a reopen between this read and transitionToDone
+    // still goes Done; nothing is awaited in between.
+    if (msg.residual) {
+      const amendment = asText(msg.residual.amendmentTicketId) || asText(rec.record?.securityReview?.amendmentTicketId) || null;
+      if (!amendment) return drop("amendment", "the queued residual findings name no design amendment and the record carries no securityReview.amendmentTicketId - the admission cannot be re-confirmed", { epicKey });
+      const confirm = await confirmDoneAtCommit({ ticketIds: [amendment] });
+      if (!confirm.ok) return retry(`get_issue ${amendment} (re-confirming the design amendment is done before the Done): ${confirm.error}`);
+      if (!confirm.done) {
+        const stamp = rec.record?.securityReview && typeof rec.record.securityReview === "object" ? { securityReview: { ...rec.record.securityReview, provisional: true } } : {};
+        return drop("amendment", `design amendment ${confirm.why} - the security review's admission is PROVISIONAL again (securityReview.provisional:true, which both ticket providers refuse); re-review the amended design and re-run WorkflowOutput___report_completion`, {
+          epicKey, record: stamp,
+        });
+      }
+    }
     const transition = await transitionToDone(ticketId);
     // TEAM-5805: the twins' brief-hold refusal is permanent for this message too (it
     // carried no brief that could lift it), so it is a surfaced drop, not a DLQ loop.
@@ -3483,6 +3546,20 @@ async function readTicketDone(ticketId) {
  *     — a permanent get_issue refusal is `done: false` too: "cannot read" is not Done
  *   { ok: false, ticketId, error }   a transient get_issue failure (the tool's own error
  *     string): the caller retries, nothing is written
+ *
+ * TEAM-6142: the residual window. Every caller's FINAL confirm is the last await before
+ * its transitionToDone (report: the gate at the release re-ask, the amendment after the
+ * residual posts; drain: the gate after step 6, the amendment in step 7), because the
+ * ticket's status and the record's S3 CAS share no transaction: a gate or amendment
+ * reopened after that read and before the transition still lets the Done through. More
+ * reads only narrow it; never add an await between a final confirm and the Done.
+ * Provider-side fencing (evaluated, deferred to a follow-up): each twin's Done handler
+ * could, after its Done-intent fence, re-read the tickets the record names
+ * (securityReview.amendmentTicketId, briefDisposition.observed[]) and refuse. On Jira
+ * that only narrows the window again - the read and the transition are two REST calls,
+ * and a reopen in the Jira UI bypasses every fence. On the dynamodb twin it could close
+ * it: one TransactWriteItems with a ConditionCheck on the amendment/gate rows' status
+ * beside the build ticket's status Update, atomic against any reopen through the table.
  */
 async function confirmDoneAtCommit({ ticketIds, earlier = null }) {
   const open = [];
@@ -4925,13 +5002,13 @@ export function amendmentScanRefusal({ ticketId, verdict, detail, recorded = fal
  * provisional - both twins refuse Done on it - and nothing else was done; `ok:false` and a
  * status that is not "complete" keep the persona retrying.
  */
-export function admissionNotFinalized(ticketId, key, error) {
+export function admissionNotFinalized(ticketId, key, error, { posted = false } = {}) {
   return {
     ok: false,
     reason: "completion_record_contended",
     next_action: "retry_report_completion",
     recorded: true,
-    message: `report_completion for ${ticketId} was written to ${key} with a PROVISIONAL securityReview admission (both ticket providers refuse Done on it) but the admission could not be finalized (${error}): another writer owns the record right now. No residual findings were posted and the ticket was NOT transitioned. Retry the call with the SAME arguments.`,
+    message: `report_completion for ${ticketId} was written to ${key} with a PROVISIONAL securityReview admission (both ticket providers refuse Done on it) but the admission could not be finalized (${error}): another writer owns the record right now. ${posted ? "The residual findings were already posted on the dev lanes (marker-deduped: a retry re-posts nothing)" : "No residual findings were posted"} and the ticket was NOT transitioned. Retry the call with the SAME arguments.`,
   };
 }
 
