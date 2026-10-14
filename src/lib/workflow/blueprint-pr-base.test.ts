@@ -24,6 +24,48 @@ const section = (text: string, start: string, end: string) => {
   return text.slice(i, j < 0 ? undefined : j);
 };
 
+// TEAM-6147 (ship-review r2 R2-F1, regression of TEAM-6134): a blueprint that prescribes a
+// `Tickets___*` call with a kwarg the runtime's `@tool` wrapper does not declare is dead text —
+// Strands rejects the unknown keyword and the step silently never happens. The wrapper's def
+// line (deploy/runtime-agent/main.py) IS the tool spec, so it is read here as source text, the
+// same idiom as tool-signature-parity.test.ts (not imported: importing a test file would
+// register its suites twice).
+const MAIN_PY = readFileSync(join(__dirname, "../../../deploy/runtime-agent/main.py"), "utf8");
+/** Parameter names of one `@tool def Name(...)` in main.py (the def line may wrap). */
+const toolParams = (name: string): string[] => {
+  const start = MAIN_PY.indexOf(`def ${name}(`);
+  expect(start, `${name} is not a tool in main.py`).toBeGreaterThan(-1);
+  const open = start + `def ${name}`.length;
+  let depth = 0;
+  let close = -1;
+  for (let i = open; i < MAIN_PY.length; i++) {
+    if (MAIN_PY[i] === "(") depth++;
+    else if (MAIN_PY[i] === ")" && --depth === 0) {
+      close = i;
+      break;
+    }
+  }
+  expect(close, `unbalanced parens on ${name}'s def line`).toBeGreaterThan(open);
+  return MAIN_PY.slice(open + 1, close)
+    .split(",")
+    .map((p) => p.split(":")[0].split("=")[0].trim())
+    .filter(Boolean);
+};
+/** Every `Tickets___x(...)` call prescribed in `text` → { tool, kwargs }. Quoted values and
+ *  `<placeholders>` are stripped first so a `=` inside them is not read as a kwarg. */
+const prescribedCalls = (text: string) =>
+  [...text.matchAll(/Tickets___(\w+)\(([^)]*)\)/g)].map((m) => ({
+    tool: `Tickets___${m[1]}`,
+    kwargs: [...m[2].replace(/"[^"]*"|'[^']*'|<[^>]*>/g, "").matchAll(/\b(\w+)\s*=/g)].map((k) => k[1]),
+  }));
+/** Fails unless every kwarg of every prescribed `Tickets___*` call in `text` is a declared parameter. */
+const expectCallsSupported = (text: string, where: string) => {
+  for (const call of prescribedCalls(text)) {
+    const params = toolParams(call.tool);
+    for (const k of call.kwargs) expect(params, `${call.tool}(${k}=…) in ${where} — not a parameter of that tool`).toContain(k);
+  }
+};
+
 describe("blueprint PR-base rules (TEAM-5854)", () => {
   it("every `gh pr list … --state merged` check is scoped with --base", () => {
     const offenders = blueprints.flatMap(({ file, text }) =>
@@ -294,13 +336,40 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     expect(chain).toContain("**One chain per PR, reconciled on every pass.**");
     expect(chain).toContain("reconciles all four links for that `pr_url`");
     expect(chain).toContain("create only the missing links");
-    expect(chain).toContain('`Tickets___update_ticket(ticket_id=<link>, blocked_by="<its current blockers + predecessor>")`');
+    // TEAM-6147 (R2-F1): the edge repair must be a call the runtime accepts. `update_ticket`
+    // takes only ticket_id/description/title, so the TEAM-6134 text raised and no edge was
+    // ever repaired. The supported, additive path is transition_ticket(blocked, blocked_by=…).
+    expectCallsSupported(chain, "bug-fixer.md chain section");
+    expect(toolParams("Tickets___update_ticket")).not.toContain("blocked_by"); // the premise of the rule
+    expect(chain).toMatch(/Tickets___transition_ticket\([^)]*transition_id="blocked"[^)]*blocked_by=/);
+    expect(chain).toMatch(/Tickets___transition_ticket\([^)]*expected_status=/);
+    // Status guard: only a not-started link is re-blocked; a live or finished one gets a comment.
+    expect(chain).toContain("`todo`, `ready` or `blocked`");
+    expect(chain).toContain("never re-block it");
+    expect(chain).toContain("Tickets___add_comment(");
     expect(chain).toContain("A chain is complete only when all four exist with those edges");
     expect(chain).not.toContain("never re-file a chain whose titles already name your `pr_url`");
     const orphan = section(read("release-manager"), "**Orphan rule (TEAM-6032).**", "Both kinds share:");
     expect(orphan).not.toContain("that has no `Ship: follow-up PR <url>` ticket");
     expect(orphan).toContain("whose chain is incomplete");
     expect(orphan).toContain("create only the missing links and repair only the missing edges");
+    expectCallsSupported(orphan, "release-manager.md orphan rule");
+  });
+
+  // TEAM-6147: the whole blueprint set, not just the two sections above — nothing may prescribe
+  // `update_ticket` with a blocker field anywhere, and the orphan rule's repeat of the repair
+  // carries the same status guard.
+  it("no blueprint prescribes Tickets___update_ticket with blocked_by (TEAM-6147)", () => {
+    const offenders = blueprints.flatMap(({ file, text }) =>
+      [...text.matchAll(/Tickets___update_ticket\([^)]*\)/g)]
+        .filter((m) => /\bblocked_by\s*=/.test(m[0]))
+        .map((m) => `${file}: ${m[0]}`)
+    );
+    expect(offenders).toEqual([]);
+    const orphan = section(read("release-manager"), "**Orphan rule (TEAM-6032).**", "Both kinds share:");
+    expect(orphan).toMatch(/Tickets___transition_ticket\([^)]*transition_id="blocked"[^)]*blocked_by=/);
+    expect(orphan).toContain("`todo`/`ready`/`blocked`");
+    expect(orphan).toContain("Tickets___add_comment");
   });
 
   // TEAM-6134 F2: follow-up chains run concurrently, so "the newest CI record under the epic" can be

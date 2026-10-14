@@ -939,6 +939,70 @@ describe("transition_ticket — reaching done from in_progress vs from blocked (
   });
 });
 
+// TEAM-6147 (ship-review r2 R2-F1, regression of TEAM-6134) — a follow-up chain link that
+// lacks its predecessor edge is repaired with transition_ticket(blocked, blocked_by=…), the
+// only additive blocker path the runtime wrapper exposes (update_ticket has no blocked_by).
+// A link can already be `blocked` (autowired behind an open CD gate, or sent back by Request
+// Changes), and TRANSITIONS.blocked had no `block` row, so that repair was refused and nothing
+// persisted. The self-transition must be a pure blocker union: status stays blocked, no
+// skipReason/reviewComment/parkClaim, the expected_status fence still applies, and the
+// orchestrator's stream handler ignores a MODIFY whose status did not change (no cascade).
+describe("transition_ticket — blocked → blocked adds blockers only (TEAM-6147)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const LINK = "TEAM-6101";
+
+  it("unions blocked_by into the existing blockers and leaves the status blocked", async () => {
+    h.state.items[LINK] = { ticketId: LINK, status: "blocked", assignee: "agentcore_hub_release_manager", blockedBy: ["TEAM-9"] };
+
+    const res = await transition({ ticket_id: LINK, transition_id: "blocked", blocked_by: "TEAM-7" });
+
+    expect(res).toMatchObject({ key: LINK, status: "transitioned", from: "blocked", to: "blocked" });
+    expect(h.state.statusUpdates).toHaveLength(1);
+    const w = h.state.statusUpdates[0];
+    expect(w.ExpressionAttributeValues[":s"]).toBe("blocked");
+    expect(w.ExpressionAttributeValues[":bb"]).toEqual(["TEAM-9", "TEAM-7"]);
+    // Nothing but status/updatedAt/blockedBy: no skip, review-feedback or park-claim side effects.
+    expect(w.UpdateExpression).not.toContain("skipReason");
+    expect(w.UpdateExpression).not.toContain("#sr");
+    expect(w.UpdateExpression).not.toContain("#rvc");
+    expect(w.ExpressionAttributeValues[":pc"]).toBeUndefined();
+    expect(w.ConditionExpression).toBeUndefined();
+    expect(h.state.puts).toHaveLength(0); // no event row, no new ticket
+  });
+
+  it("is a no-op write on an edge that already exists (no #bb clause, still not an error)", async () => {
+    h.state.items[LINK] = { ticketId: LINK, status: "blocked", assignee: "agentcore_hub_release_manager", blockedBy: ["TEAM-7"] };
+
+    const res = await transition({ ticket_id: LINK, transition_id: "blocked", blocked_by: "TEAM-7" });
+
+    expect(res).toMatchObject({ key: LINK, status: "transitioned", from: "blocked", to: "blocked" });
+    expect(h.state.statusUpdates[0].UpdateExpression).not.toContain("#bb");
+  });
+
+  it("honours the expected_status fence: matching status is a conditional write, a moved link is refused", async () => {
+    h.state.items[LINK] = { ticketId: LINK, status: "blocked", assignee: "agentcore_hub_release_manager", blockedBy: [] };
+
+    const ok = await transition({ ticket_id: LINK, transition_id: "blocked", blocked_by: "TEAM-7", expected_status: "blocked" });
+    expect(ok).toMatchObject({ key: LINK, status: "transitioned", to: "blocked" });
+    expect(h.state.statusUpdates[0].ConditionExpression).toBe("#s = :expected");
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":expected"]).toBe("blocked");
+
+    h.state.statusUpdates.length = 0;
+    h.state.items[LINK].status = "in_progress"; // dispatched between the agent's list and its write
+    const refused = await transition({ ticket_id: LINK, transition_id: "blocked", blocked_by: "TEAM-7", expected_status: "blocked" });
+    expect(refused.content[0].text).toContain("Status precondition failed");
+    expect(h.state.statusUpdates).toHaveLength(0);
+  });
+
+  it("the self-transition does not change what `done`/`skip` resolve to from blocked (TEAM-4130 pin kept)", async () => {
+    h.state.items[LINK] = { ticketId: LINK, status: "blocked", assignee: "agentcore_hub_release_manager" };
+    const res = await handler({ name: "Tickets___get_transitions", arguments: { ticket_id: LINK } });
+    expect(res.transitions.map((t) => t.id)).not.toContain("done");
+    expect(res.transitions.filter((t) => t.to === "done").map((t) => t.id)).toEqual(["skip"]);
+    expect(res.transitions.filter((t) => t.to === "blocked").map((t) => t.id)).toEqual(["block"]);
+  });
+});
+
 // TEAM-5421 (TEAM-5396 F2) — cancelled is terminal and done is never cancelled.
 // The shared terminalMoveRefusal pin refuses before any write.
 describe("transition_ticket — terminal statuses (TEAM-5421)", () => {
