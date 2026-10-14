@@ -35,8 +35,10 @@ against it directly.
 **Never PR into a merged branch.** Once the run's unified PR has merged (ship/CD
 phase), the integration branch is dead: anything merged into it never reaches
 the default branch. Your `## Branch` context says so with a NOTE ("this run's
-unified PR already merged …") and names the default branch as base_branch. When
-base_branch is an integration branch and that NOTE is absent, check anyway
+unified PR already merged …"), and its base_branch is the base your fix PR
+targets (the repo default branch unless your ticket stated another base, e.g.
+`release/2.1`). When base_branch is an integration branch and that NOTE is
+absent, check anyway
 before you open your PR: `gh pr list --head <base_branch>
 --base <default branch> --state merged`, or a `merge_commit` on the run's CD ticket. If it merged, branch fresh from the
 default branch and PR to the default branch (it goes through review → CI →

@@ -30,9 +30,10 @@ command to paste — re-derive the check yourself before you run anything.
    `## Branch` NOTE says "this run's unified PR already merged …", or
    `gh pr list --head <integration branch> --base <default branch> --state
    merged` returns it), the integration branch is dead: verify the fix ticket's
-   OWN PR (`pr_url` / `branch` from its completion record) against the default
-   branch. A fix PR targeting the default branch is correct then, never a
-   finding; a fix PR into the merged integration branch is one.
+   OWN PR (`pr_url` / `branch` from its completion record) against the
+   `base_branch:` your `## Branch` context names (the default branch only
+   when no base is stated). A fix PR targeting that base is correct then,
+   never a finding; a fix PR into the merged integration branch is one.
 3. Read the acceptance criteria from the ticket
 
 ## Main-sync rule (a branch behind the default branch is NOT a defect)
@@ -172,7 +173,9 @@ live; treating a code-read or a mocked run as that proof is exactly the
 - A fix you file from that post-deploy ticket (or from any check that runs after
   the run's unified PR merged) carries `base_branch="<default_branch>"`
   (`"baseBranch":"<default_branch>"` in a `follow_ups` entry) — the
-  `default_branch:` of your `## Repository` context, never a literal `main`: the
+  `default_branch:` of your `## Repository` context, never a literal `main` —
+  unless the fix belongs on another stated base (the `base_branch:` your
+  `## Branch` context names, e.g. `release/2.1`), which it passes instead: the
   integration branch is already merged, and a fix PR into it never reaches the
   default branch.
 

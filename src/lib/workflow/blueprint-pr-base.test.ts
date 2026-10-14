@@ -52,4 +52,45 @@ describe("blueprint PR-base rules (TEAM-5854)", () => {
     expect(step1).toContain("Adopt the fix ticket's OWN PR");
     expect(step1).toContain("do NOT `create_pull_request` from it");
   });
+
+  // TEAM-5915 (S1-4): resolvePrBase (lambda/orchestrator/completion.mjs) keeps an
+  // explicit ticket base_branch even after the unified merge, and ## Branch names
+  // it. These pin that the review/verify/sync target is that resolved base — the
+  // repo default branch only when the ticket stated none — never "the default
+  // branch" unconditionally.
+  const between = (text: string, from: string, to: string) => {
+    const i = text.indexOf(from);
+    const j = text.indexOf(to, i + from.length);
+    expect(i).toBeGreaterThanOrEqual(0);
+    expect(j).toBeGreaterThan(i);
+    return text.slice(i, j);
+  };
+  const BRANCH_BASE = "the `base_branch:` your `## Branch` context names";
+  const DEAD = "**After the unified PR has merged, the integration branch is dead.**";
+
+  it.each([
+    ["code-reviewer", DEAD, "## Main-sync rule"],
+    ["ci-agent", DEAD, "### P0:"],
+    ["qa-verifier", "2. Find the implementation branch", "3. Read the acceptance criteria"],
+  ])("%s targets the ## Branch base_branch, not the default branch, for a post-merge fix PR", (name, from, to) => {
+    const para = between(read(name), from, to);
+    expect(para).toContain(BRANCH_BASE);
+    expect(para).not.toContain("against the default branch");
+  });
+
+  it("release-manager: 'leave base_branch out' is pre-merge only; post-merge keeps a stated base and the hub-infra exception", () => {
+    const rm = read("release-manager");
+    expect(rm).toContain("Before the merge, on every OTHER ticket you file, leave `base_branch` out entirely");
+    expect(rm).not.toContain("target repo. On every OTHER ticket you file");
+    const post = between(rm, "**After the unified PR has merged, the default flips.**", "Both kinds share:");
+    expect(post).toContain("Every ordinary fix ticket");
+    expect(post).toContain(`unless the work targets another stated base (${BRANCH_BASE}`);
+    expect(post).toContain("A hub-infra fix keeps its hub `main` base");
+  });
+
+  it.each(["api-dev", "backend-dev", "frontend-dev", "bug-fixer"])("%s no longer says ## Branch names the default branch unconditionally", (name) => {
+    const t = read(name);
+    expect(t).not.toContain("names the default branch as base_branch");
+    expect(t).toContain("its base_branch is the base your fix PR targets");
+  });
 });

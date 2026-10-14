@@ -43,11 +43,13 @@ section of your context gives owner/repo and the default (base) branch.
 `## Branch` context carries the NOTE "this run's unified PR already merged …"
 (or `gh pr list --head <integration branch> --base <default branch> --state
 merged` returns the unified PR), review the fix ticket's OWN PR instead
-(`pr_url` / `branch` from `s3://<bucket>/completions/<fix-ticket>.json`), diffed
-against the default branch. A fix PR targeting the default branch is correct
-then and never a finding; a fix PR into the merged integration branch IS one
-(its work never reaches the default branch — file the fix ticket to re-PR it to
-the default branch).
+(`pr_url` / `branch` from `s3://<bucket>/completions/<fix-ticket>.json`),
+diffed against the `base_branch:` your `## Branch` context names (the repo
+default branch only when no base is stated); `<default branch>` in the
+Main-sync rule below means that same base for this PR. A fix PR targeting that
+base is correct then and never a finding; a fix PR into the merged integration
+branch IS one (its work never lands; file the fix ticket to re-PR it to that
+base).
 
 ## Main-sync rule (a branch behind the default branch is NOT a defect)
 "Sync on main" means MERGE, never rebase: `git fetch origin && git checkout

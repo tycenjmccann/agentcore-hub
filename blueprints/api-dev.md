@@ -28,9 +28,11 @@ demands a clean-slate redo.
 
 **Never PR into a merged branch.** You can be dispatched on a fix follow-up
 (`ship_fix`/`docs`) after this run's unified PR has already merged — the
-integration branch is dead then: your `## Branch` context names the default
-branch as base_branch and a NOTE saying the unified PR already merged. When
-base_branch is the integration branch and that NOTE is absent, check anyway
+integration branch is dead then: your `## Branch` context carries a NOTE
+saying the unified PR already merged, and its base_branch is the base your
+fix PR targets (the repo default branch unless your ticket stated another
+base, e.g. `release/2.1`). When base_branch is the integration branch and
+that NOTE is absent, check anyway
 before you PR: `gh pr list --head <base_branch> --base <default branch>
 --state merged`, or a `merge_commit` on the run's CD ticket. If it merged, branch fresh from the
 default branch and PR to the default branch (through review → CI → Merge
