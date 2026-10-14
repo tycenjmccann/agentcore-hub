@@ -342,6 +342,48 @@ def _persona_cache_kwargs() -> dict:
     }
 
 
+# TEAM-6020: the invocation_state key carrying `_stream_with_retry`'s per-attempt
+# cancel event down to the model (strands passes invocation_state to model.stream).
+_ATTEMPT_CANCEL_KEY = "_hub_attempt_cancel"
+
+
+class _EitherSignal:
+    """TEAM-6020: set when strands' own cancel signal OR the attempt's is set.
+
+    Duck-types the only surface strands 1.54's Bedrock model path uses on a
+    cancel_signal: truthiness, `is not None` and `is_set()` (bedrock.py
+    `_poll_cancel_signal` and the per-chunk check in `_stream`)."""
+
+    def __init__(self, strands_signal, attempt_signal):
+        self._strands_signal = strands_signal
+        self._attempt_signal = attempt_signal
+
+    def is_set(self) -> bool:
+        return ((self._strands_signal is not None and self._strands_signal.is_set())
+                or self._attempt_signal.is_set())
+
+
+class _AttemptCancelledBedrockModel(BedrockModel):
+    """TEAM-6020: a BedrockModel whose worker thread a deadline cut can stop.
+
+    strands runs ConverseStream in `asyncio.to_thread`; an asyncio cancel only
+    DETACHES that worker, which keeps reading the socket on a default-executor
+    slot. The worker checks `cancel_signal` per chunk, but strands hands it
+    `agent._cancel_signal`, which `stream_async`'s finally CLEARS during the very
+    cancellation that cut the attempt — so a caller `cancel_signal=` never reaches
+    it. Here the worker also watches the attempt's own event, which nothing
+    clears and no later attempt reuses; once set, the worker closes the stream at
+    the next chunk. Caveat: a SILENT socket yields no next chunk, so that worker
+    is still bounded only by READ_TIMEOUT."""
+
+    async def stream(self, *args, cancel_signal=None, **kwargs):
+        attempt_signal = (kwargs.get("invocation_state") or {}).get(_ATTEMPT_CANCEL_KEY)
+        if attempt_signal is not None:
+            cancel_signal = _EitherSignal(cancel_signal, attempt_signal)
+        async for event in super().stream(*args, cancel_signal=cancel_signal, **kwargs):
+            yield event
+
+
 def _build_bedrock_model(model_id: str) -> BedrockModel:
     """Single construction site for every BedrockModel — default + overrides.
 
@@ -357,7 +399,7 @@ def _build_bedrock_model(model_id: str) -> BedrockModel:
         # brownout window lives in _stream_with_retry, and the two layers multiply.
         retries={"total_max_attempts": 3, "mode": "standard"},
     )
-    return BedrockModel(
+    return _AttemptCancelledBedrockModel(
         model_id=model_id,
         region_name=REGION,
         boto_client_config=boto_config,
@@ -5167,6 +5209,7 @@ async def _run_agent_invocation(payload, context):
             down for five minutes is not a reason to strand the ticket in_progress."""
             nonlocal _transient_exhausted
             import asyncio as _sr_asyncio
+            import threading as _sr_threading
             attempt = 0
             slept = 0.0  # log/comment only — the bound is the deadline below
             # A3 / TEAM-5976 F3: armed at the FIRST failure of an outage, cleared
@@ -5241,7 +5284,13 @@ async def _run_agent_invocation(payload, context):
                             f"attempt {attempt} not opened: the "
                             f"{_STREAM_RETRY_DEADLINE_S:.0f}s outage deadline passed "
                             f"during backoff/rollback")
-                    agen = agent.stream_async(stream_input)
+                    # TEAM-6020: one event per attempt, set in the finally below so
+                    # a cut attempt's detached Bedrock worker stops at its next chunk
+                    # (see _AttemptCancelledBedrockModel). Never reused or cleared,
+                    # so it cannot cancel the next attempt.
+                    attempt_cancel = _sr_threading.Event()
+                    agen = agent.stream_async(
+                        stream_input, invocation_state={_ATTEMPT_CANCEL_KEY: attempt_cancel})
                     try:
                         while True:
                             try:
@@ -5264,6 +5313,8 @@ async def _run_agent_invocation(payload, context):
                                 attempt_deadline = outage_deadline = None
                             yield _ev
                     finally:
+                        # TEAM-6020: before aclose — the worker must see the cut.
+                        attempt_cancel.set()
                         # A no-op after the generator raised or finished; on a
                         # cancel/aclose it runs strands' own finalisers now.
                         try:
