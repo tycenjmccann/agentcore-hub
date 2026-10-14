@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { provesTransitioned, jiraStatusToInternal, jiraDisplayNameOf, HUB_STATUSES } from "./ticket-transition-refusal";
+import { provesTransitioned, rejectedDetails, jiraStatusToInternal, jiraDisplayNameOf, HUB_STATUSES } from "./ticket-transition-refusal";
 import { JIRA_DONE_SUCCESS, JIRA_NAME_MATCH_CLOSED } from "./__fixtures__/ticket-transition-success";
 
 /**
@@ -190,7 +190,12 @@ describe("the TS status-map mirror × the REAL jira Lambda's mapStatusToInternal
     const posts = installFakeJira([{ id: "51", name: "Start Review", to: { name: "Waiting for review" } }]);
     const handler = await loadHandler();
 
-    await expect(transitionDone(handler)).rejects.toThrow(/No transition to "Done" found/);
+    // The handler answers a refusal as `{ error }` inside a 200 payload (index.mjs handler
+    // catch) — the shape rejectedDetails reads — and POSTs nothing.
+    const res = await transitionDone(handler);
+    expect(res).toEqual({ error: 'No transition to "Done" found. Available: Start Review (-> Waiting for review)' });
+    expect(rejectedDetails(res, "done")).toMatch(/No transition to "Done" found/);
+    expect(provesTransitioned(res, "done", TICKET)).toBe(false);
     expect(posts).toEqual([]);
     // …so the validator refusing that shape costs nothing real.
     expect(
