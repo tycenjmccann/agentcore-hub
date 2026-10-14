@@ -37,7 +37,7 @@ import {
   isLeaseLive,
   lastAgentActivity,
   lastStreamedText,
-  stealClaim, parkGeneration,
+  stealClaim, parkGeneration, hasAgentErrorSince,
 } from "./lease.mjs";
 import { resolveWatchdog, setWatchdogSource } from "./watchdog.mjs";
 import { createDetector } from "./dead-session-detector.mjs";
@@ -450,7 +450,7 @@ function getDetector() {
     workflowsTable: WORKFLOWS_TABLE,
     eventsTable: EVENTS_TABLE,
     store,
-    lease: { isLeaseLive, lastAgentActivity, stealClaim, LEASE_TTL_MS },
+    lease: { isLeaseLive, lastAgentActivity, stealClaim, hasAgentErrorSince, LEASE_TTL_MS },
     getTicket,
     getAgentDef,
     publishEvent,

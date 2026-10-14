@@ -552,10 +552,23 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
         tree,
         [
             "_STREAM_RETRY_MAX_ATTEMPTS",
-            "_STREAM_RETRY_BUDGET_S",
+            # TEAM-5976 F3: the wall-clock deadline that replaced the sleep budget.
+            "_STREAM_RETRY_DEADLINE_S",
             "_STREAM_RETRY_BASE_S",
+            # TEAM-5963: the backoff cap, the heartbeat slice, the sleep seam and
+            # the best-effort exhaustion comment (its ticket tool is stubbed below).
+            "_STREAM_RETRY_CAP_S",
+            "_STREAM_RETRY_HEARTBEAT_S",
+            "_stream_retry_sleep",
+            "_comment_transient_exhaustion",
+            # TEAM-5976: the in-flight heartbeat knob + its wait seam (F1), the
+            # restart notice (F5) and the exception-chain walk (F2).
+            "_STREAM_RETRY_INFLIGHT_HEARTBEAT_S",
+            "_stream_heartbeat_wait",
+            "_STREAM_RETRY_NOTICE",
             "_STREAM_RETRY_MARKERS",
             "_STREAM_FAIL_MARKERS",
+            "_exc_chain",
             "_classify_stream_error",
             "_stream_retry_delay",
             "_RESUME_TEXT_LIMIT",
@@ -568,6 +581,10 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
             # TEAM-5710: the section-scoped epic parse and the cancel-wait grace.
             "_workflow_context_epic",
             "_FAIL_CLOSED_CANCEL_GRACE_S",
+            # TEAM-5999: the shared "Error: …" reader (_annotate calls it) and the
+            # in-flight outage-deadline cut raised inside _stream_with_retry.
+            "_tool_error",
+            "StreamRetryDeadlineExceeded",
         ],
     )
 

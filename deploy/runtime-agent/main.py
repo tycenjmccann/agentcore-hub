@@ -351,7 +351,11 @@ def _build_bedrock_model(model_id: str) -> BedrockModel:
     boto_config = BotocoreConfig(
         read_timeout=READ_TIMEOUT,
         connect_timeout=30,
-        retries={"max_attempts": 2},
+        # TEAM-5963: literal total (TEAM-5720 — `max_attempts` is a retry count and
+        # gets +1), same 3 HTTP tries as before; standard mode for its capped
+        # backoff on the documented transient set. Kept small on purpose: the long
+        # brownout window lives in _stream_with_retry, and the two layers multiply.
+        retries={"total_max_attempts": 3, "mode": "standard"},
     )
     return BedrockModel(
         model_id=model_id,
@@ -439,7 +443,9 @@ def _wd_num(*candidates) -> "int | None":
             continue
         try:
             n = int(float(c))
-        except (TypeError, ValueError):
+        # TEAM-5976 F4: int(float("inf")) is an OverflowError (nan is a
+        # ValueError) — uncaught, `STREAM_RETRY_CAP_S=inf` crashed at import.
+        except (TypeError, ValueError, OverflowError):
             continue
         if n > 0:
             return n
@@ -3381,6 +3387,10 @@ logger.info(f"Loaded {len(LAMBDA_TOOLS)} Lambda-backed tools + GitHub MCP (built
 # --- DynamoDB client for real-time event publishing ---
 _ddb_events_client = boto3.client("dynamodb", region_name=REGION)
 _EVENTS_TABLE = os.getenv("EVENTS_TABLE", "agentcore-hub-events")
+# TEAM-5999: read (never written) by the resume-object claim fence — the row the
+# orchestrator keeps the invocation claims on. Same default as deploy/config.sh;
+# the runtime role already has GetItem on agentcore-hub-* (setup-runtime-role.sh).
+_WORKFLOWS_TABLE = os.getenv("WORKFLOWS_TABLE", "agentcore-hub-workflows")
 
 
 # --- Session anchor span (TEAM-3366 P0-A) -----------------------------------
@@ -3954,6 +3964,9 @@ async def agent_invocation(payload, context):
                     pass  # events already flow to DDB inside the loop
             except Exception as exc:  # noqa: BLE001 — must never die silently
                 logger.error(f"[{agent_id}] detached run failed: {str(exc)[:500]}")
+                # TEAM-5963: _stream_with_retry already published this one.
+                if getattr(exc, "_agent_error_published", False):
+                    return
                 try:
                     # TEAM-4739: name the ticket. A detached crash with no
                     # ticketId is an error the board cannot place on a card, and
@@ -3993,7 +4006,8 @@ _AGENT_ERROR_PUBLISH_BACKOFF_S = (0.5, 1.0)
 
 
 def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
-                         ticket_id: str = "") -> None:
+                         ticket_id: str = "", reason: str = "",
+                         claim_started_at: str = "") -> None:
     """Surface a failure to the events table so the workflow board and nudge
     system can see it — a detached-run crash (a detached task has no caller to
     error to) or a failed nested coding-runtime handoff (TEAM-3119: those used
@@ -4004,7 +4018,13 @@ def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
     errors instead of letting error surfacing break the turn it reports.
     Best-effort is not single-shot, though: a throttle or network blip here
     loses the only record of the failure, so the put is retried a couple of
-    times with short backoff before giving up (TEAM-3307)."""
+    times with short backoff before giving up (TEAM-3307).
+
+    TEAM-6044: `reason` and `claim_started_at` are stamped into `detail.reason` /
+    `detail.claimStartedAt` only when given (same omit-when-empty rule as
+    `_publish_agent_died`). A transient exhaustion passes both, so cost-report
+    pairs this error with its agent.died by claim identity — the timestamp
+    fraction is random, so the two rows' string order is not their real order."""
     import time as _t
     try:
         for attempt in range(1, _AGENT_ERROR_PUBLISH_ATTEMPTS + 1):
@@ -4014,18 +4034,23 @@ def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
                 # timestamp's fractional part must stay NUMERIC — workflow-analyzer
                 # Date.parse()s it, so hex there would poison lastSignificantEventAge().
                 digits = f"{uuid.uuid4().int % 10**6:06d}"
+                detail = {
+                    "agentId": {"S": agent_id},
+                    "workflowId": {"S": workflow_id or "unknown"},
+                    "ticketId": {"S": ticket_id or ""},
+                    "error": {"S": (error or "")[:1000]},
+                }
+                if reason:
+                    detail["reason"] = {"S": reason}
+                if claim_started_at:
+                    detail["claimStartedAt"] = {"S": claim_started_at}
                 _ddb_events_client.put_item(
                     TableName=_EVENTS_TABLE,
                     Item={
                         "workflowId": {"S": workflow_id or "unknown"},
                         "eventId": {"S": f"{int(_t.time() * 1000)}-err-{digits}"},
                         "type": {"S": "agent.error"},
-                        "detail": {"M": {
-                            "agentId": {"S": agent_id},
-                            "workflowId": {"S": workflow_id or "unknown"},
-                            "ticketId": {"S": ticket_id or ""},
-                            "error": {"S": (error or "")[:1000]},
-                        }},
+                        "detail": {"M": detail},
                         "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
                                       + f".{digits}Z"},
                     },
@@ -4060,7 +4085,8 @@ _AGENT_DIED_TEXT_LIMIT = 2048
 
 def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
                         session_id: str = "", last_stream_at: str = "",
-                        last_text: str = "", claim_started_at: str = "") -> None:
+                        last_text: str = "", claim_started_at: str = "",
+                        reason: str = "") -> None:
     """The turn ENDED without ending itself (TEAM-4739 FR-7): no
     report_completion, no deliberate park, and no exception either — the process
     simply stopped being given time (platform kill, microVM reap, a cancelled
@@ -4084,7 +4110,14 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
     the dead-session detector cannot tell the old invocation's death from the
     new one's — see lease.hasAgentErrorSince's `claimGeneration`. Omitted when
     empty, so a caller that never resolved a claim (or an older harness) is
-    byte-identical to before and still read as a generation-less legacy death."""
+    byte-identical to before and still read as a generation-less legacy death.
+
+    TEAM-5963: `reason` ("transient_exhaustion" when a turn's transient retries
+    ran out) is stamped into `detail.reason` only when given — same omit-when-empty
+    rule. The detector's general agent.died arm does not filter on it, but
+    TEAM-5977 does: a death stamped with the current claim's generation AND
+    reason "transient_exhaustion" is released even with the detector in shadow
+    mode. cost-report counts that death and its agent.error as one error."""
     import time as _t
     try:
         for attempt in range(1, _AGENT_ERROR_PUBLISH_ATTEMPTS + 1):
@@ -4105,6 +4138,8 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
                 }
                 if claim_started_at:
                     detail["claimStartedAt"] = {"S": claim_started_at}
+                if reason:
+                    detail["reason"] = {"S": reason}
                 _ddb_events_client.put_item(
                     TableName=_EVENTS_TABLE,
                     Item={
@@ -4239,10 +4274,14 @@ def _harness_fail_closed(workflow_id: str, agent_id: str, ticket_id: str,
                    f"{agent_id}; a later fail-closed attempt on {ticket_id} reuses this "
                    f"ticket. Close it if {ticket_id} completes.")
         try:
-            Tickets___add_comment(
+            res = Tickets___add_comment(
                 ticket_id=escalation_id,
                 comment=(f"{_HARNESS_LABEL}: the park of {ticket_id} behind this ticket "
                          f"did NOT take effect ({why}). {outcome}"))
+            # TEAM-5999: the tool reports a refused comment by RETURNING "Error: …".
+            if err := _tool_error(res):
+                logger.warning(f"[{agent_id}] fail-closed: annotate {escalation_id} failed "
+                               f"(non-fatal): {err[:300]}")
         except Exception as e:  # noqa: BLE001
             logger.warning(f"[{agent_id}] fail-closed: annotate {escalation_id} failed: {e}")
 
@@ -4430,7 +4469,7 @@ _FAIL_CLOSED_LAMBDA_CLIENT = boto3.client("lambda", region_name=REGION, config=_
 # ─── FR-6: in-turn ConverseStream retry ───────────────────────────────────────
 #
 # Why botocore cannot do this for us. `_build_bedrock_model` sets
-# retries={"max_attempts": 2}, and that governs the HTTP request that OPENS the
+# retries={"total_max_attempts": 3}, and that governs the HTTP request that OPENS the
 # stream. Once ConverseStream has responded 200 and the event stream is open,
 # every later failure arrives as an event INSIDE that stream (botocore's own
 # bedrock-runtime model lists internalServerException, modelStreamErrorException,
@@ -4445,13 +4484,46 @@ _FAIL_CLOSED_LAMBDA_CLIENT = boto3.client("lambda", region_name=REGION, config=_
 # conversation, the tool results already returned and the prompt cache all
 # survive; nothing is rebuilt and the prompt is never re-derived. It is also never
 # re-SENT: a retry passes `[]` so the vendored conversation manager appends no
-# second copy of the prompt (TEAM-4749 A2, see `_stream_with_retry`). The wall
-# budget below bounds retry time and is armed at the first failure, not at the top
-# of the turn — a 40-minute turn must not arrive at its first break with the
-# budget already spent.
-_STREAM_RETRY_MAX_ATTEMPTS = 3
-_STREAM_RETRY_BUDGET_S = 60.0
-_STREAM_RETRY_BASE_S = 1.0
+# second copy of the prompt (TEAM-4749 A2, see `_stream_with_retry`).
+#
+# TEAM-5961/5963: sized for a Bedrock brownout, not a hiccup. 3 attempts inside 60s
+# lost whole turns to a ServiceUnavailableException lasting a minute or two.
+# TEAM-5976 F3: the window is a WALL-CLOCK deadline from the first failure of an
+# outage — attempt time counts as well as backoff sleep, so ten attempts that each
+# hang on botocore's 1200s read_timeout cannot hold the claim for hours. 600s still
+# fits the whole ceiling schedule (2,4,…,60 s over 10 attempts ≈ 360s). An attempt
+# that completes a message is progress and re-arms the window (and the attempt
+# count): it bounds one contiguous outage, not the turn. Env-tunable;
+# unparsable/non-positive values fall back (`_wd_num`).
+_STREAM_RETRY_MAX_ATTEMPTS = _wd_num(os.getenv("STREAM_RETRY_MAX_ATTEMPTS")) or 10
+_STREAM_RETRY_DEADLINE_S = float(_wd_num(os.getenv("STREAM_RETRY_DEADLINE_S")) or 600)
+_STREAM_RETRY_BASE_S = float(_wd_num(os.getenv("STREAM_RETRY_BASE_S")) or 2)
+_STREAM_RETRY_CAP_S = float(_wd_num(os.getenv("STREAM_RETRY_CAP_S")) or 60)
+# A backoff sleeps in slices no longer than this, publishing a lease-renewing
+# agent.streaming event before each one, so a long wait never reads as silence to
+# the dead-session detector (lease.mjs lastAgentActivity).
+_STREAM_RETRY_HEARTBEAT_S = 30.0
+# TEAM-5976 F1: a model call in flight that has yielded nothing for this long
+# publishes an agent.streaming `detail.type="heartbeat"` row (no content — nothing
+# renders it; lease renewal filters on the event type only). Scoped to MODEL calls:
+# those are bounded by botocore, while a tool thread hung forever must still let
+# the lease lapse. Clamped to TTL/6 of the 30-minute lease.
+_STREAM_RETRY_INFLIGHT_HEARTBEAT_S = float(
+    min(_wd_num(os.getenv("STREAM_RETRY_INFLIGHT_HEARTBEAT_S")) or 60, 300))
+# TEAM-5976 F5: what the caller sees where a broken assistant message restarts.
+# strands commits a message to history only once its stream completes, so the
+# retry REGENERATES it; its partial is rolled back out of the turn's text, but
+# deltas already yielded cannot be — this line makes the restart legible.
+_STREAM_RETRY_NOTICE = "\n\n[stream interrupted - the reply restarts below]\n\n"
+
+
+class StreamRetryDeadlineExceeded(TimeoutError):
+    """TEAM-5999 F1: a retry attempt was still in flight when the outage deadline
+    passed. Before this, `remaining` was read only in the except block, so a
+    retry that HUNG was bounded by botocore's read_timeout alone (1200s, times
+    the attempt cap) while the in-flight heartbeat renewed the lease throughout.
+    A TimeoutError so every classifier reads it as transient; `_stream_with_retry`
+    treats it as exhaustion — the deadline is the bound, not a reason to retry."""
 
 # Transient by nature: the stream broke, but asking again can work. Matched on
 # the lowercased exception TYPE NAME and message, not on imported classes,
@@ -4462,9 +4534,17 @@ _STREAM_RETRY_MARKERS = (
     "throttlingexception",
     "modelstreamerrorexception",
     "serviceunavailableexception",
+    "modelnotreadyexception",
     "eventstreamerror",
     "readtimeouterror",
     "timeouterror",  # botocore ReadTimeoutError's base, and asyncio.TimeoutError
+    # TEAM-5976 F2: the socket never (re)connected, or dropped mid-read.
+    "endpointconnectionerror",
+    "connectionclosederror",
+    "connecttimeouterror",
+    "could not connect to the endpoint",
+    # strands' own throttle type (bedrock.py maps ThrottlingException to it).
+    "modelthrottledexception",
 )
 # Deterministic: the same call will fail the same way, so a retry only burns the
 # budget and the tokens. Checked FIRST — a wrapper whose message quotes both is
@@ -4476,6 +4556,30 @@ _STREAM_FAIL_MARKERS = (
 )
 
 
+def _exc_chain(exc, limit: int = 8) -> list:
+    """TEAM-5976 F2: `exc` and what it wraps, breadth-first, cycle-safe, capped.
+
+    strands re-raises model errors as `EventLoopException(e) from e`, whose type
+    name is its own — so the cause has to be read too. Follows strands'
+    `original_exception`, then `__cause__`, and `__context__` only when Python
+    itself would display it (no explicit cause, not suppressed by `from None`):
+    an incidental exception handled earlier must not decide the verdict."""
+    chain, seen, queue = [], set(), [exc]
+    while queue and len(chain) < limit:
+        e = queue.pop(0)
+        if e is None or id(e) in seen:
+            continue
+        seen.add(id(e))
+        chain.append(e)
+        queue.append(getattr(e, "original_exception", None))
+        cause = getattr(e, "__cause__", None)
+        if cause is not None:
+            queue.append(cause)
+        elif not getattr(e, "__suppress_context__", False):
+            queue.append(getattr(e, "__context__", None))
+    return chain
+
+
 def _classify_stream_error(exc) -> str:
     """"retry" | "fail" for an exception out of `agent.stream_async`.
 
@@ -4485,8 +4589,9 @@ def _classify_stream_error(exc) -> str:
     Anything unrecognised is "fail". The asymmetry is deliberate: a transient we
     fail to retry costs one turn, which the sweep already recovers, while a
     deterministic error we DO retry burns a full turn's tokens three times over
-    and still ends where it started."""
-    blob = f"{type(exc).__name__} {exc}".lower()
+    and still ends where it started. TEAM-5976 F2: the whole chain is read, and a
+    fail marker anywhere in it still wins."""
+    blob = " ".join(f"{type(e).__name__} {e}" for e in _exc_chain(exc)).lower()
     if any(m in blob for m in _STREAM_FAIL_MARKERS):
         return "fail"
     if any(m in blob for m in _STREAM_RETRY_MARKERS):
@@ -4500,9 +4605,52 @@ def _stream_retry_delay(attempt: int, remaining_s: float) -> float:
     Full jitter (uniform in [0, 2^n * base]) rather than a fixed ramp: the
     failures worth retrying are overwhelmingly shared — one Bedrock hiccup hits
     every persona in the fleet at once — and a deterministic ramp would send all
-    of them back in the same instant."""
-    ceiling = _STREAM_RETRY_BASE_S * (2 ** max(0, attempt - 1))
+    of them back in the same instant. The ceiling is capped at
+    `_STREAM_RETRY_CAP_S` so late attempts keep probing instead of going quiet."""
+    ceiling = min(_STREAM_RETRY_CAP_S, _STREAM_RETRY_BASE_S * (2 ** max(0, attempt - 1)))
     return max(0.0, min(random.uniform(0.0, ceiling), remaining_s))
+
+
+async def _stream_retry_sleep(seconds: float) -> None:
+    """The backoff's one real wait — a seam so tests run the policy without sleeping."""
+    import asyncio as _sleep_asyncio
+    await _sleep_asyncio.sleep(seconds)
+
+
+async def _stream_heartbeat_wait(seconds: float) -> None:
+    """TEAM-5976 F1: the in-flight heartbeat's interval — a seam, like the above."""
+    import asyncio as _hb_asyncio
+    await _hb_asyncio.sleep(seconds)
+
+
+def _tool_error(result) -> str:
+    """TEAM-5976 F7 / TEAM-5999: the Lambda-backed tools report a failed invoke by
+    RETURNING "Error: …" (`_invoke_lambda`), never by raising — so `except
+    Exception` alone sees every failed call as a success. The message when
+    `result` is one of those strings, else "". The one place harness code reads
+    that convention; a new site that ignores a tool's return has this to call."""
+    return result if isinstance(result, str) and result.startswith("Error") else ""
+
+
+def _comment_transient_exhaustion(ticket_id: str, comment: str) -> None:
+    """TEAM-5963: tell the ticket why its turn ended — the transient retries ran
+    out and the turn was released to dead-session recovery. Best-effort: the death
+    and the resume object are what recover the ticket, so a failed comment is only
+    logged. Bounded client for the same reason as the fail-closed park: this runs
+    on a dying turn and must not hang it. Never raises."""
+    if not ticket_id:
+        return
+    _override = _LAMBDA_CLIENT_OVERRIDE.set(_FAIL_CLOSED_LAMBDA_CLIENT)
+    try:
+        res = Tickets___add_comment(ticket_id=ticket_id, comment=comment)
+        # TEAM-5976 F7: the ticket tools report failure by RETURNING "Error: …".
+        if err := _tool_error(res):
+            logger.warning(f"transient-exhaustion comment on {ticket_id} failed "
+                           f"(non-fatal): {err[:300]}")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"transient-exhaustion comment on {ticket_id} failed (non-fatal): {e}")
+    finally:
+        _LAMBDA_CLIENT_OVERRIDE.reset(_override)
 
 
 # ─── FR-7: the resume object ──────────────────────────────────────────────────
@@ -4520,12 +4668,62 @@ def _resume_object_key(workflow_id: str, agent_id: str, ticket_id: str) -> str:
     return f"workflows/{workflow_id}/agents/{agent_id}/resume/{ticket_id}.json"
 
 
+def _claim_generation_now(workflow_id: str, ticket_id: str) -> str:
+    """TEAM-5999: the claim generation the orchestrator holds for this ticket right
+    now — `agentTasks[<ticket>].startedAt` on the workflow row, read strongly
+    consistently (the same field and read the ticket Lambda fences a park with,
+    TEAM-5716). "" when the row, the entry or the field is absent. Raises on a
+    read error: the caller tells "no claim" from "could not look"."""
+    res = _ddb_events_client.get_item(
+        TableName=_WORKFLOWS_TABLE,
+        Key={"workflowId": {"S": workflow_id}},
+        ConsistentRead=True,
+        ProjectionExpression="agentTasks.#tid",
+        ExpressionAttributeNames={"#tid": ticket_id},
+    )
+    task = (((res.get("Item") or {}).get("agentTasks") or {}).get("M") or {}).get(ticket_id) or {}
+    return str(((task.get("M") or {}).get("startedAt") or {}).get("S") or "")
+
+
 def _write_resume_object(workflow_id: str, agent_id: str, ticket_id: str,
-                         last_text: str = "", last_stream_at: str = "") -> None:
+                         last_text: str = "", last_stream_at: str = "",
+                         claim_started_at: str = "") -> None:
     """Best-effort (R1.4): a failed resume write is logged and changes nothing
-    about the death or the park it accompanies."""
+    about the death or the park it accompanies.
+
+    TEAM-5999: fenced on the claim generation. A late turn whose claim was stolen
+    used to recreate this ticket-scoped object after the NEWER claim had completed
+    and deleted it, so the next attempt resumed a dead one. `claim_started_at` is
+    the generation this turn was dispatched under (`_CURRENT_CLAIM_STARTED_AT`);
+    the write happens only while the orchestrator still records that exact
+    generation. Equality on `startedAt` alone, deliberately not on status: a claim
+    the detector has stolen (status ready, same startedAt) but not yet re-issued
+    has no newer owner, and this remnant is what its re-dispatch should read. No
+    entry / no startedAt is read as moved. Only a read ERROR fails open (the
+    object is advisory and the prompt block says to verify it), as does a dispatch
+    that carried no generation at all (a pre-TEAM-5719 orchestrator or a
+    hand-rolled invoke) — both with a warning. Residual window: the milliseconds
+    between the read and the put, the same one the ticket Lambda accepts."""
     if not (ARTIFACT_BUCKET and workflow_id and agent_id and ticket_id):
         return
+    if claim_started_at:
+        try:
+            current = _claim_generation_now(workflow_id, ticket_id)
+        except Exception as e:  # noqa: BLE001 — a read error proves nothing; fail open
+            logger.warning(f"[{agent_id}] resume object for {ticket_id}: claim generation "
+                           f"unverifiable ({e}) — writing unfenced")
+        else:
+            if not current:
+                logger.warning(f"[{agent_id}] resume object for {ticket_id} not written: no "
+                               f"claim on record for generation {claim_started_at}")
+                return
+            if current != claim_started_at:
+                logger.warning(f"[{agent_id}] resume object for {ticket_id} not written: claim "
+                               f"generation moved (ours {claim_started_at}, now {current})")
+                return
+    else:
+        logger.warning(f"[{agent_id}] resume object for {ticket_id}: no claim generation in "
+                       f"the dispatch payload — writing unfenced")
     try:
         prefix = f"workflows/{workflow_id}/agents/{agent_id}/"
         keys = []
@@ -4543,6 +4741,9 @@ def _write_resume_object(workflow_id: str, agent_id: str, ticket_id: str,
                 "lastText": (last_text or "")[:_RESUME_TEXT_LIMIT],
                 "lastStreamAt": last_stream_at or "",
                 "artifactKeys": keys,
+                # TEAM-5999: omit-when-empty, like agent.died's stamp — forensic
+                # only; no reader keys on it.
+                **({"claimStartedAt": claim_started_at} if claim_started_at else {}),
             }).encode("utf-8"),
             ContentType="application/json",
         )
@@ -4628,17 +4829,26 @@ async def _run_agent_invocation(payload, context):
     payload_connectors = payload.get("connectors")
     _CURRENT_WORKFLOW_ID = workflow_id
     _CURRENT_AGENT_ID = agent_id
-    _CURRENT_TICKET_ID = payload.get("ticket_id", "")
-    _cs = payload.get("claim_started_at")
-    _CURRENT_CLAIM_STARTED_AT = _cs if isinstance(_cs, str) else ""
+    # TEAM-6000: this turn's own ticket and claim generation, snapshotted into
+    # locals. The module globals stay for the tool layer (the park fence, the
+    # coding heartbeat), but a second invocation landing in this process while
+    # this turn is mid-outage rewrites them — a death stamped from the globals
+    # would then carry the NEW claim's ticket and generation, a strict match for a
+    # LIVE claim that the detector (DL-038) now acts on within one sweep. Every
+    # reader on this turn's own path — resume fence, exhaustion comment,
+    # agent.died, fail-closed park, heartbeat stamps — uses these locals.
+    _turn_ticket_id = payload.get("ticket_id", "")
+    _turn_claim_started_at = _cs if isinstance(_cs := payload.get("claim_started_at"), str) else ""
+    _CURRENT_TICKET_ID = _turn_ticket_id
+    _CURRENT_CLAIM_STARTED_AT = _turn_claim_started_at
     # TEAM-4739 FR-7: a previous turn on this ticket that died or parked left what
     # it had reached in S3. Prepend it so the retry continues instead of redoing
     # the work — the whole cost of a mid-turn death was the second attempt
     # starting from nothing. Missing is the normal case and stays silent.
-    _resume = _read_resume_object(workflow_id, agent_id, _CURRENT_TICKET_ID)
+    _resume = _read_resume_object(workflow_id, agent_id, _turn_ticket_id)
     if _resume_block := _resume_prompt_block(_resume):
         prompt = _resume_block + prompt
-        logger.info(f"[{agent_id}] resuming {_CURRENT_TICKET_ID} from a previous attempt "
+        logger.info(f"[{agent_id}] resuming {_turn_ticket_id} from a previous attempt "
                     f"({len(_resume_block)} chars of context prepended)")
     # Fleet-wide watchdog knobs (D1.1) — payload-first → env → legacy constants.
     _WATCHDOG = _resolve_watchdog(payload)
@@ -4657,12 +4867,15 @@ async def _run_agent_invocation(payload, context):
     # even if the microVM is interrupted mid-loop and the SDK's own
     # loop-spanning invoke_agent span never gets exported.
     await _emit_session_anchor_span(agent_id, getattr(context, "session_id", None),
-                                    workflow_id, _CURRENT_TICKET_ID)
+                                    workflow_id, _turn_ticket_id)
 
     # FR-7: bound BEFORE the try so the finally can read them however early the
     # turn dies — a microVM reaped during agent construction unwinds through the
     # same finally as one reaped at token 40,000.
     _turn_crashed = False
+    # TEAM-5963: set by _stream_with_retry when a TRANSIENT failure ran out of
+    # retries — that raise is a death (agent.died + resume object), not a crash.
+    _transient_exhausted = False
     # TEAM-5707: _harness_fail_closed's outcome — "parked", "skipped" or "".
     # TEAM-5710: only "parked" accounts for the turn.
     _synthesised = ""
@@ -4674,9 +4887,9 @@ async def _run_agent_invocation(payload, context):
     # module's own default), so it must count as UNBOUND here exactly as it
     # does in _publish_event's guard — otherwise a chat turn that happened to
     # name a ticket would publish a death against a run id nothing can read.
-    _bound = bool(_CURRENT_WORKFLOW_ID
-                  and _CURRENT_WORKFLOW_ID != "unknown"
-                  and _CURRENT_TICKET_ID)
+    _bound = bool(workflow_id
+                  and workflow_id != "unknown"
+                  and _turn_ticket_id)
 
     try:
         # Fresh coding session per agent-task: a warm microVM reuses this module, so
@@ -4746,7 +4959,7 @@ async def _run_agent_invocation(payload, context):
                 Skips writing if no workflow context (chat/ad-hoc invocations).
                 IMPORTANT: Table sort key is `timestamp` — must be unique per item."""
                 if not workflow_id or workflow_id == "unknown":
-                    return
+                    return None
                 try:
                     import time
                     self._seq += 1
@@ -4755,8 +4968,8 @@ async def _run_agent_invocation(payload, context):
                     unique_ts = f"{time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())}.{self._seq:04d}Z"
                     # Stamp the ticket so lease liveness (R3) can scope activity
                     # to the claimed ticket when one agent runs siblings.
-                    if _CURRENT_TICKET_ID and "ticketId" not in detail:
-                        detail = {**detail, "ticketId": _CURRENT_TICKET_ID}
+                    if _turn_ticket_id and "ticketId" not in detail:
+                        detail = {**detail, "ticketId": _turn_ticket_id}
                     detail_map = {}
                     for k, v in detail.items():
                         if v is not None:
@@ -4771,8 +4984,11 @@ async def _run_agent_invocation(payload, context):
                             "timestamp": {"S": unique_ts},
                         },
                     )
+                    # TEAM-5999 F4: the row's key, so a text flush can be rolled back.
+                    return {"workflowId": workflow_id, "eventId": event_id}
                 except Exception as e:
                     logger.warning(f"[{agent_id}] Failed to publish {event_type} event: {e}")
+                    return None
 
             def __call__(self, **kwargs):
                 current_tool_use = kwargs.get("current_tool_use", {})
@@ -4830,15 +5046,15 @@ async def _run_agent_invocation(payload, context):
             "workflow.id": workflow_id,
             "agent.id": agent_id,
             "gen_ai.agent.id": agent_id,
-            "ticket.id": _CURRENT_TICKET_ID,
+            "ticket.id": _turn_ticket_id,
             "hub.prompt_cache": "on" if _cache_on else "off",
             "hub.cache_ttl": PERSONA_CACHE_TTL if _cache_on else "",
         }.items() if v}
         completion_gate = _CompletionGate(
             on_success=lambda: _delete_resume_object(
-                workflow_id, agent_id, _CURRENT_TICKET_ID),
-            ticket_id=_CURRENT_TICKET_ID)
-        park_gate = _ParkGate(_CURRENT_TICKET_ID)
+                workflow_id, agent_id, _turn_ticket_id),
+            ticket_id=_turn_ticket_id)
+        park_gate = _ParkGate(_turn_ticket_id)
 
         class _PromptDelivery:
             """TEAM-5706: counts messages strands ADDS to history. Monotonic, so
@@ -4855,28 +5071,60 @@ async def _run_agent_invocation(payload, context):
             def _on_added(self, event):
                 self.added += 1
 
+        class _ModelInFlight:
+            """TEAM-5976 F1: True between strands' Before/AfterModelCallEvent, so
+            the in-flight heartbeat beats only while a MODEL call is open. After
+            fires on `except Exception` but not on a BaseException (a cancel), so
+            `_stream_with_retry` also clears it when each attempt ends."""
+            def __init__(self):
+                self.inflight = False
+
+            def register_hooks(self, registry, **kwargs):
+                from strands.hooks import AfterModelCallEvent, BeforeModelCallEvent
+                registry.add_callback(BeforeModelCallEvent, self._on_before)
+                registry.add_callback(AfterModelCallEvent, self._on_after)
+
+            def _on_before(self, event):
+                self.inflight = True
+
+            def _on_after(self, event):
+                self.inflight = False
+
         prompt_delivery = _PromptDelivery()
+        model_inflight = _ModelInFlight()
         agent = Agent(
             model=active_model,
             system_prompt=persona_prompt,
             tools=all_tools,
             callback_handler=None,
             hooks=[_OperatorMailbox(workflow_id, agent_id), completion_gate, park_gate,
-                   prompt_delivery],
+                   prompt_delivery, model_inflight],
             name=agent_id,
             trace_attributes=_trace_attrs,
+            # TEAM-5976 F3: one retry layer. strands' default ModelRetryStrategy
+            # retries ModelThrottledException on its own — ~124s of silent sleep
+            # outside the deadline, no heartbeat, the partial replayed. None means
+            # one attempt; _stream_with_retry classifies the throttle instead.
+            retry_strategy=None,
         )
 
         # Iterate stream_async — write events to DDB in real-time as they arrive.
         # Each event gets a unique timestamp (ISO second + sequence suffix) to avoid
         # sort key collisions. Text is buffered briefly to reduce DDB writes.
         final_text = ""
+        # TEAM-5976 F5: len(final_text) at the last COMPLETED assistant message —
+        # what a retry rolls back to (see _STREAM_RETRY_NOTICE).
+        _rollback_mark = 0
         result = None
         # TEAM-4695: deltas are yielded AS they arrive, so this records whether
         # the loop emitted any — the post-loop fallback stays exactly-once.
         streamed_any = False
         _text_buffer = ""
         _FLUSH_THRESHOLD = 200  # chars before flushing text to DDB
+        # TEAM-5999 F4: keys of the text rows flushed since the last COMPLETED
+        # message — the rows a retry's rollback deletes (they hold only text the
+        # retry regenerates; see the "message" branch below for why none straddles).
+        _flushed_since_mark: list = []
         # FR-7: when the turn dies, this is the last moment it was demonstrably
         # alive — the detector's silence clock and the resume object both read it.
         last_stream_at = ""
@@ -4884,31 +5132,53 @@ async def _run_agent_invocation(payload, context):
         def _flush_text_buffer():
             nonlocal _text_buffer
             if _text_buffer:
-                tracker._publish_event("agent.streaming", {
+                key = tracker._publish_event("agent.streaming", {
                     "agentId": agent_id,
                     "type": "text",
                     "content": _text_buffer,
                     "workflowId": workflow_id,
                 })
+                if key:
+                    _flushed_since_mark.append(key)
                 _text_buffer = ""
 
         async def _stream_with_retry(turn_prompt):
             """FR-6: `agent.stream_async(prompt)`, re-opened on a transient break.
 
-            Yields exactly what stream_async yields, so the loop body below is
-            unchanged and every partial the turn already accumulated
-            (`final_text`, `_text_buffer`, `streamed_any`, the DDB deltas already
-            published) survives untouched — a retry appends, it never replays.
+            Yields what stream_async yields, plus one `{"_stream_retry": n}`
+            sentinel before each re-entry. TEAM-5976 F5: strands commits an
+            assistant message to history only once its stream completes, so a
+            retry REGENERATES the message that broke — the sentinel is how the
+            loop below rolls that partial back out of `final_text` (everything
+            before the last completed message survives untouched).
 
             Re-entry is on the SAME Agent object, so the conversation, the tool
             results already returned and the prompt cache are all preserved —
             rebuilding either would throw the turn away to save the stream. But a
             RETRY re-enters with `[]`, never with the prompt again: see the
             comment on `stream_input` below. On exhaustion the error is surfaced
-            as `agent.error` and re-raised, which is what keeps agent.error and
-            agent.died disjoint."""
+            as `agent.error` and re-raised. A DETERMINISTIC failure stays a crash
+            (agent.error only). TEAM-5963: a TRANSIENT one that ran out of retries
+            also sets `_transient_exhausted`, so the turn ends as a death too
+            (agent.died + resume object) and the dead-session detector re-dispatches
+            it, even in shadow mode (TEAM-5977), on its next sweep: the holder's
+            generation-stamped exhaustion death is read as a dead lease (DL-038 /
+            TEAM-6000), so the 30-min lease TTL no longer gates it. Bedrock being
+            down for five minutes is not a reason to strand the ticket in_progress."""
+            nonlocal _transient_exhausted
+            import asyncio as _sr_asyncio
             attempt = 0
-            deadline = None  # A3: armed at the FIRST failure, not here
+            slept = 0.0  # log/comment only — the bound is the deadline below
+            # A3 / TEAM-5976 F3: armed at the FIRST failure of an outage, cleared
+            # when an attempt completes a message (progress re-arms the window).
+            outage_start = None
+            # TEAM-5999 F1 / TEAM-6045: the outage deadline on the LOOP clock, set
+            # ONCE with outage_start and shared by every attempt of that outage.
+            # Absolute, so the backoff's heartbeat publishes and the consumer's
+            # rollback between attempts are charged to it; a relative budget
+            # re-derived at each attempt's start let them push it forward. None =
+            # unbounded, which the first attempt and every attempt after a re-arm are.
+            outage_deadline = None
             baseline = prompt_delivery.added
             while True:
                 attempt += 1
@@ -4930,43 +5200,173 @@ async def _run_agent_invocation(payload, context):
                 # baseline after a failed pass.
                 delivered = prompt_delivery.added > baseline
                 stream_input = [] if delivered else turn_prompt
+                # TEAM-5976 F1: while a model call is open and has yielded nothing
+                # for a whole interval, renew the lease. Synchronous publish on the
+                # loop, like the backoff beat below: tracker._seq is not
+                # thread-safe, and a sort-key collision would overwrite a chunk.
+                seen = [0]
+
+                async def _inflight_heartbeat():
+                    last = 0  # the attempt's start, not this task's first run
+                    while True:
+                        await _stream_heartbeat_wait(_STREAM_RETRY_INFLIGHT_HEARTBEAT_S)
+                        if model_inflight.inflight and seen[0] == last:
+                            tracker._publish_event("agent.streaming", {
+                                "agentId": agent_id,
+                                "type": "heartbeat",
+                                "heartbeat": "true",
+                                "workflowId": workflow_id,
+                            })
+                        last = seen[0]
+
+                heartbeat = _sr_asyncio.create_task(_inflight_heartbeat())
                 try:
-                    async for _ev in agent.stream_async(stream_input):
-                        yield _ev
+                    # TEAM-5999 F1: once the outage clock is armed, this attempt is
+                    # bounded by what is left of the deadline — on the LOOP clock
+                    # (asyncio.timeout_at), never time.monotonic(), so the deadline
+                    # arithmetic in the except block stays one reading per failure.
+                    # Bounded per event and closed before the yield, so the cancel
+                    # can only land inside a hung model call, never in the consumer
+                    # or the SDK's response writer (a single timeout around the
+                    # whole loop would end such a turn as a plain death instead).
+                    # The deadline is absolute for the attempt — a trickling stream
+                    # cannot extend it; only a completed message lifts it, with the
+                    # re-arm. TEAM-6045: an attempt is never OPENED past the
+                    # deadline — raised here, inside the try, so a deadline spent
+                    # during backoff or rollback ends on the exhaustion path below.
+                    attempt_deadline = outage_deadline
+                    if (attempt_deadline is not None
+                            and _sr_asyncio.get_running_loop().time() >= attempt_deadline):
+                        raise StreamRetryDeadlineExceeded(
+                            f"attempt {attempt} not opened: the "
+                            f"{_STREAM_RETRY_DEADLINE_S:.0f}s outage deadline passed "
+                            f"during backoff/rollback")
+                    agen = agent.stream_async(stream_input)
+                    try:
+                        while True:
+                            try:
+                                if attempt_deadline is None:
+                                    _ev = await anext(agen)
+                                else:
+                                    async with _sr_asyncio.timeout_at(attempt_deadline) as _cut:
+                                        _ev = await anext(agen)
+                            except StopAsyncIteration:
+                                break
+                            except TimeoutError as e:
+                                if attempt_deadline is not None and _cut.expired():
+                                    raise StreamRetryDeadlineExceeded(
+                                        f"attempt {attempt} still in flight at the "
+                                        f"{_STREAM_RETRY_DEADLINE_S:.0f}s outage deadline") from e
+                                raise  # botocore's own read timeout: classified below
+                            seen[0] += 1
+                            if "message" in _ev:
+                                outage_start, attempt = None, 1
+                                attempt_deadline = outage_deadline = None
+                            yield _ev
+                    finally:
+                        # A no-op after the generator raised or finished; on a
+                        # cancel/aclose it runs strands' own finalisers now.
+                        try:
+                            await agen.aclose()
+                        except Exception:  # noqa: BLE001 — teardown must not mask the cause
+                            pass
                     return
                 except Exception as exc:  # noqa: BLE001 — classified below
-                    verdict = _classify_stream_error(exc)
-                    if deadline is None:
-                        # A3: the budget bounds RETRY time, not stream duration.
-                        # Armed before `while True` it was already spent by the
-                        # time a long turn broke, so every break past minute 1
-                        # gave up on attempt 1 and FR-6 never fired on the only
-                        # turns long enough to need it.
-                        deadline = time.monotonic() + _STREAM_RETRY_BUDGET_S
-                    remaining = deadline - time.monotonic()
+                    # The call is over; the backoff below renews the lease itself.
+                    model_inflight.inflight = False
+                    # TEAM-5999 F1: a cut at the deadline IS transient exhaustion.
+                    deadline_hit = isinstance(exc, StreamRetryDeadlineExceeded)
+                    verdict = "retry" if deadline_hit else _classify_stream_error(exc)
+                    # A3: the deadline bounds RETRY time, not stream duration — a
+                    # long turn must not reach its first break with it spent.
+                    # TEAM-5976 F3: and it is wall-clock, attempt time included.
+                    now = time.monotonic()
+                    if outage_start is None:
+                        outage_start = now
+                        # TEAM-6045: the loop clock, not a second monotonic() read —
+                        # the same source in production, one reading per failure here.
+                        outage_deadline = (_sr_asyncio.get_running_loop().time()
+                                           + _STREAM_RETRY_DEADLINE_S)
+                    remaining = _STREAM_RETRY_DEADLINE_S - (now - outage_start)
                     exhausted = (verdict != "retry"
                                  or attempt >= _STREAM_RETRY_MAX_ATTEMPTS
-                                 or remaining <= 0)
+                                 or remaining <= 0
+                                 or deadline_hit)
                     if exhausted:
                         logger.error(
                             f"[{agent_id}] stream failed on attempt {attempt} "
-                            f"({verdict}, {remaining:.1f}s budget left) — giving up: "
+                            f"({verdict}, {remaining:.1f}s of deadline left) — giving up: "
                             f"{type(exc).__name__}: {str(exc)[:300]}")
+                        if verdict == "retry":
+                            _transient_exhausted = True
+                            import asyncio as _tx_asyncio
+                            await _tx_asyncio.to_thread(
+                                _comment_transient_exhaustion, _turn_ticket_id,
+                                f"[transient-exhaustion] {agent_id}'s turn hit "
+                                f"{type(exc).__name__} and stayed unavailable after "
+                                f"{attempt} attempt(s) over {now - outage_start:.0f}s "
+                                f"({slept:.0f}s of backoff; retry deadline "
+                                f"{_STREAM_RETRY_DEADLINE_S:.0f}s). The turn "
+                                f"was released to dead-session recovery (agent.died + "
+                                f"resume object); the dead-session sweep re-dispatches it "
+                                f"on its next pass (within one 5 min sweep — the lease TTL "
+                                f"does not gate a claim-stamped exhaustion death, DL-038), "
+                                f"even with the detector in shadow mode.")
                         _publish_agent_error(
                             workflow_id, agent_id,
                             f"stream failed after {attempt} attempt(s): "
                             f"{type(exc).__name__}: {str(exc)[:400]}",
-                            ticket_id=_CURRENT_TICKET_ID)
+                            ticket_id=_turn_ticket_id,
+                            # TEAM-6044: the claim identity cost-report pairs
+                            # this error with its agent.died by. A crash
+                            # (verdict "fail") has no death, so no stamp.
+                            **({"reason": "transient_exhaustion",
+                                "claim_started_at": _turn_claim_started_at}
+                               if verdict == "retry" else {}))
+                        try:
+                            # The detached runner must not publish it a second time.
+                            exc._agent_error_published = True
+                        except Exception:  # noqa: BLE001 — a slotted exception type
+                            pass
                         raise
                     delay = _stream_retry_delay(attempt, remaining)
                     logger.warning(
                         f"[{agent_id}] stream broke on attempt {attempt}/"
                         f"{_STREAM_RETRY_MAX_ATTEMPTS} "
                         f"({type(exc).__name__}: {str(exc)[:200]}) — reopening in "
-                        f"{delay:.1f}s with {len(final_text)} chars kept")
-                    if delay:
-                        import asyncio as _retry_asyncio
-                        await _retry_asyncio.sleep(delay)
+                        f"{delay:.1f}s ({len(final_text) - _rollback_mark} partial chars to regenerate)")
+                    # TEAM-5963: sleep in slices, renewing the lease before each
+                    # one. agent.streaming is a heartbeatEventTypes member
+                    # (src/config/lease-constants.json), stamped with this agent
+                    # and ticket, so lastAgentActivity counts it.
+                    left = delay
+                    while left > 0:
+                        chunk = min(left, _STREAM_RETRY_HEARTBEAT_S)
+                        tracker._publish_event("agent.streaming", {
+                            "agentId": agent_id,
+                            "type": "text",
+                            "content": (f"\n\n> ⏳ Bedrock {type(exc).__name__} — retry "
+                                        f"{attempt + 1}/{_STREAM_RETRY_MAX_ATTEMPTS} in "
+                                        f"{left:.0f}s…\n\n"),
+                            "workflowId": workflow_id,
+                            "retryBackoff": "true",
+                        })
+                        await _stream_retry_sleep(chunk)
+                        left -= chunk
+                    slept += delay
+                finally:
+                    # TEAM-5976 F1: on every exit — return, raise, cancel, aclose.
+                    # The flag first: a BaseException skips AfterModelCallEvent.
+                    model_inflight.inflight = False
+                    heartbeat.cancel()
+                    try:
+                        await heartbeat
+                    except _sr_asyncio.CancelledError:
+                        # Ours, unless THIS task is being cancelled too.
+                        if _sr_asyncio.current_task().cancelling():
+                            raise
+                # Reached only on a retry: the loop below rolls back the partial.
+                yield {"_stream_retry": attempt}
 
         async def _turn_events():
             """TEAM-5696: the turn's stream, plus ONE re-prompt when the first pass
@@ -4977,11 +5377,47 @@ async def _run_agent_invocation(payload, context):
                 yield _ev
             if _bound and not completion_gate.engaged and not park_gate.parked:
                 logger.warning(f"[{agent_id}] turn ended without completion or park "
-                               f"— re-prompting once for {_CURRENT_TICKET_ID}")
+                               f"— re-prompting once for {_turn_ticket_id}")
                 async for _ev in _stream_with_retry(_FINAL_TURN_NUDGE):
                     yield _ev
 
         async for event in _turn_events():
+            if "_stream_retry" in event:
+                # TEAM-5976 F5: the retry regenerates the message that broke, so
+                # its partial leaves the turn's text — Memory, agent.died, the
+                # resume object and the unflushed DDB buffer (always a suffix of
+                # final_text). Text the caller already saw stays; the notice says
+                # the reply restarts. Post-completion text is in neither.
+                _rolled = len(final_text) - _rollback_mark
+                if _rolled > 0 and not completion_gate.engaged:
+                    final_text = final_text[:_rollback_mark]
+                    _text_buffer = _text_buffer[:len(_text_buffer) - min(_rolled, len(_text_buffer))]
+                    # TEAM-5999 F4: the partial past the flush threshold is already
+                    # DDB rows, and every stored-stream reader (agent-output route,
+                    # lastStreamedText, the dossier) concatenates text rows — so
+                    # the rollback deletes them, best-effort. Live SSE clients keep
+                    # what they saw, like the HTTP caller. lastAgentActivity may
+                    # briefly read older until the retry's first flush or beat.
+                    for _key in _flushed_since_mark:
+                        try:
+                            _ddb_events_client.delete_item(
+                                TableName=_EVENTS_TABLE,
+                                Key={"workflowId": {"S": _key["workflowId"]},
+                                     "eventId": {"S": _key["eventId"]}},
+                            )
+                        except Exception as e:  # noqa: BLE001 — best-effort, like the flush
+                            logger.warning(f"[{agent_id}] rollback: flushed partial row "
+                                           f"{_key['eventId']} not deleted (non-fatal): {e}")
+                    _flushed_since_mark.clear()
+                    yield {"event": {"contentBlockDelta": {"delta": {"text": _STREAM_RETRY_NOTICE}}}}
+                continue
+            if "message" in event:
+                # TEAM-5999 F4: flush at the boundary, so no DDB row holds the tail
+                # of this committed message AND the head of the next — the rows
+                # recorded from here on are exactly what a retry would regenerate.
+                _flush_text_buffer()
+                _rollback_mark = len(final_text)
+                _flushed_since_mark.clear()
             if "data" in event and event["data"]:
                 # R3.2: post-completion text duplicates the report_completion summary
                 if not completion_gate.engaged:
@@ -5055,7 +5491,7 @@ async def _run_agent_invocation(payload, context):
             # can forge a section that matches too, so any disagreement among
             # validating sections fails closed to "" instead of trusting the
             # first match in text order.
-            _epic_id = _workflow_context_epic(prompt, workflow_id, _CURRENT_TICKET_ID)
+            _epic_id = _workflow_context_epic(prompt, workflow_id, _turn_ticket_id)
             # TEAM-5706: a cancel cannot stop the thread, so it must not decide
             # the outcome either. Shielded: on cancel, flag the thread (it starts
             # no park; it may still annotate its escalation), wait for the call
@@ -5068,7 +5504,7 @@ async def _run_agent_invocation(payload, context):
             # already released the claim the death would otherwise recover.
             _fc_cancel = _fc_threading.Event()
             _fc_future = _fc_asyncio.ensure_future(_fc_asyncio.to_thread(
-                _harness_fail_closed, workflow_id, agent_id, _CURRENT_TICKET_ID,
+                _harness_fail_closed, workflow_id, agent_id, _turn_ticket_id,
                 final_text, epic_id=_epic_id, cancel=_fc_cancel,
                 session_id=getattr(context, "session_id", None) or ""))
             try:
@@ -5083,8 +5519,8 @@ async def _run_agent_invocation(payload, context):
                         logger.warning(
                             f"[{agent_id}] fail-closed thread still running "
                             f"{_FAIL_CLOSED_CANCEL_GRACE_S:.0f}s after cancel — treating "
-                            f"{_CURRENT_TICKET_ID} as not parked; agent.died follows")
-                        def _fc_late(f, _a=agent_id, _t=_CURRENT_TICKET_ID):
+                            f"{_turn_ticket_id} as not parked; agent.died follows")
+                        def _fc_late(f, _a=agent_id, _t=_turn_ticket_id):
                             try:
                                 outcome = f.result()
                             except BaseException as e:  # noqa: BLE001 — log only
@@ -5121,7 +5557,10 @@ async def _run_agent_invocation(payload, context):
         # task or a closed generator IS a death (the platform took the turn away,
         # and nothing publishes agent.error for it), so those keep unwinding into
         # the finally with crashed still False.
-        _turn_crashed = True
+        # TEAM-5963: except a transient failure that exhausted its retries — that
+        # turn already published agent.error, and the death below is what gets the
+        # ticket re-dispatched instead of stranded in_progress.
+        _turn_crashed = not _transient_exhausted
         raise
     finally:
         # ─── FR-7: did this turn account for itself? ─────────────────────────
@@ -5145,14 +5584,6 @@ async def _run_agent_invocation(payload, context):
         # recovery signal the runtime can send. The detector ignores a death on a
         # ticket that is done, cancelled or parked, so nothing double-acts.
         _accounted = _completed or _parked or _turn_crashed or _synthesised == "parked"
-        if not _accounted and _bound:
-            logger.warning(f"[{agent_id}] turn ended without completion, park or error "
-                           f"— publishing agent.died for {_CURRENT_TICKET_ID}")
-            _publish_agent_died(
-                _CURRENT_WORKFLOW_ID, agent_id, _CURRENT_TICKET_ID,
-                session_id=getattr(context, "session_id", "") or "",
-                last_stream_at=last_stream_at, last_text=final_text,
-                claim_started_at=_CURRENT_CLAIM_STARTED_AT)
         # The resume object is written on a death OR a park — both leave work the
         # next turn on this ticket should continue from. Not on completion (the
         # gate's on_success deletes it) and not on a crash (the crash is reported
@@ -5160,9 +5591,23 @@ async def _run_agent_invocation(payload, context):
         # at a turn that failed for a reason, not a continuation of one that was
         # cut off mid-thought).
         # TEAM-5710: a skip is unaccounted, so it writes one like any death.
+        # TEAM-5976 F6: BEFORE the death — agent.died is what triggers the
+        # re-dispatch, and a turn that reads before this write lands starts from
+        # nothing.
         if _bound and (_parked or _synthesised == "parked" or not _accounted):
-            _write_resume_object(_CURRENT_WORKFLOW_ID, agent_id, _CURRENT_TICKET_ID,
-                                 last_text=final_text, last_stream_at=last_stream_at)
+            _write_resume_object(workflow_id, agent_id, _turn_ticket_id,
+                                 last_text=final_text, last_stream_at=last_stream_at,
+                                 claim_started_at=_turn_claim_started_at)
+        if not _accounted and _bound:
+            logger.warning(f"[{agent_id}] turn ended without completion, park or error "
+                           f"— publishing agent.died for {_turn_ticket_id}"
+                           + (" (transient retries exhausted)" if _transient_exhausted else ""))
+            _publish_agent_died(
+                workflow_id, agent_id, _turn_ticket_id,
+                session_id=getattr(context, "session_id", "") or "",
+                last_stream_at=last_stream_at, last_text=final_text,
+                claim_started_at=_turn_claim_started_at,
+                **({"reason": "transient_exhaustion"} if _transient_exhausted else {}))
 
         # Deliver queued spans before the microVM becomes freeze-eligible.
         # BatchSpanProcessor exports on a daemon thread on a 5s batch delay;

@@ -13,7 +13,11 @@
  *        lease.mjs. isLeaseLive is the MANDATORY FIRST guard on every candidate:
  *        a session whose heartbeat is within the lease TTL is untouchable, and
  *        the silence threshold is floored at LEASE_TTL_MS so the math can never
- *        fire inside a live lease even if the guard were bypassed.
+ *        fire inside a live lease even if the guard were bypassed. ONE exception
+ *        (DL-038, TEAM-6000): the claim holder's own agent.died stamped with THIS
+ *        generation and reason transient_exhaustion is read as a dead lease —
+ *        positive proof from the holder, never inference; the steal CAS on
+ *        startedAt still arbitrates.
  *   Steal is never forced — stealClaim only wins against the exact generation
  *        the sweep inspected (its startedAt), so a re-issued claim is safe.
  *
@@ -22,7 +26,10 @@
  * agent.error — shadow is the default, and every agent.error consumer reads that
  * type as a real failure: UI error cards, anomaly agent_error_retry_rate), but
  * ZERO writes (no steal, no retry, no status change); enforce = full behavior,
- * and only enforce ever publishes a real agent.error. The gate
+ * and only enforce ever publishes a real agent.error. One exception (TEAM-5977):
+ * a claim holder's own `agent.died{reason:"transient_exhaustion"}` stamped with
+ * this exact claim generation promotes THAT candidate to enforce in shadow mode
+ * (see transientExhaustionRelease). The gate
  * fails SAFE: the value is trimmed + lowercased, and anything that is not
  * exactly off|shadow|enforce is coerced to shadow with a loud warning — only
  * the literal normalized "enforce" may write.
@@ -288,6 +295,23 @@ export function createDetector(deps) {
   }
 
   /**
+   * TEAM-5977 — does THIS claim generation carry the claim holder's own
+   * transient-exhaustion death? Strict: the row must be stamped with exactly
+   * `task.startedAt` (no legacy unstamped allowance) and carry
+   * reason=transient_exhaustion. The runtime gave up on a Bedrock outage and
+   * released the turn; leaving it to shadow mode strands the ticket in_progress
+   * forever. Never widened beyond that reason. Throws on a failed read — the
+   * caller skips the candidate (fail toward silence).
+   */
+  async function transientExhaustionRelease(workflowId, ticketId, task) {
+    if (!lease.hasAgentErrorSince || !task.startedAt) return false;
+    return lease.hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, task.startedAt, {
+      types: ["agent.died"], claimGeneration: task.startedAt,
+      strictGeneration: true, reason: "transient_exhaustion",
+    });
+  }
+
+  /**
    * Run one sweep. `mode` is off | shadow | enforce (anything else is coerced
    * to shadow — fail safe). Returns a metrics summary (also emitted as an EMF
    * record) for observability + tests.
@@ -372,7 +396,14 @@ export function createDetector(deps) {
           // The lease-liveness guard doesn't apply here — "ready" is not a live
           // claim status; the steal already happened for this generation.
           if (stalledSteal) {
-            if (mode === "shadow") {
+            let backstopMode = mode;
+            if (mode === "shadow") try {
+              if (await transientExhaustionRelease(workflow.id, ticketId, task)) backstopMode = "enforce";
+            } catch (e) {
+              log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
+              continue;
+            }
+            if (backstopMode === "shadow") {
               log(`detector.would_recover (shadow) — ${ticketId} agent=${agentId} stolen-but-stalled since ${task.deadSessionDetectedAt} (sweep ${sweepId})`);
               continue;
             }
@@ -385,7 +416,7 @@ export function createDetector(deps) {
               log(`detector.recover_skipped — ${ticketId} claim moved since scan (sweep ${sweepId})`);
               continue;
             }
-            log(`detector.recover_stalled — ${ticketId} agent=${agentId} re-driving retry/escalate (sweep ${sweepId})`);
+            log(`detector.recover_stalled — ${ticketId} agent=${agentId} re-driving retry/escalate${backstopMode !== mode ? " (shadow → enforce: transient exhaustion)" : ""} (sweep ${sweepId})`);
             // Idempotent re-drive: the fresh counter read decides retry vs
             // escalate, and a re-dispatch that already landed loses the claim
             // CAS inside redispatch harmlessly.
@@ -396,6 +427,7 @@ export function createDetector(deps) {
                 claimStartedAt: task.startedAt || null,
                 deadSessionDetectedAt: task.deadSessionDetectedAt,
                 recoveredStalledSteal: true,
+                effectiveMode: backstopMode,
                 sweepId,
               },
               m, startedAtMs, sweepId,
@@ -407,7 +439,23 @@ export function createDetector(deps) {
           const lastActivity = await lease.lastAgentActivity(
             ddb, eventsTable, workflow.id, agentId, ticketId
           );
-          if (lease.isLeaseLive(task, lastActivity, startedAtMs)) {
+          // TEAM-6000 (DL-038): the ONE exception to "a live lease is untouchable" —
+          // the holder's own agent.died{reason:transient_exhaustion} stamped with
+          // THIS generation. The runtime publishes it after its last backoff
+          // heartbeat and raises, so a live reading here is the beats that PRECEDED
+          // the death, and no later heartbeat can carry this generation. A newer
+          // claim has a different startedAt: the strict read misses and the skip
+          // below is as before. Read only on a live lease (one bounded partition
+          // read per live candidate per sweep); a failed read skips the candidate.
+          const liveLease = lease.isLeaseLive(task, lastActivity, startedAtMs);
+          let exhaustionDeath = false;
+          if (liveLease) try {
+            exhaustionDeath = await transientExhaustionRelease(workflow.id, ticketId, task);
+          } catch (e) {
+            log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
+            continue;
+          }
+          if (liveLease && !exhaustionDeath) {
             m.skippedLiveLease++;
             // A stamp on a LIVE lease is residue of a clear that failed or
             // raced (TEAM-3702) — retry the generation-CAS'd clear so the
@@ -427,6 +475,9 @@ export function createDetector(deps) {
               }
             }
             continue;
+          }
+          if (exhaustionDeath) {
+            log(`detector.transient_exhaustion_live_lease — ${ticketId} agent=${agentId} gen=${task.startedAt} holder's own exhaustion death on record; lease treated as dead (sweep ${sweepId})`);
           }
 
           // Session already completed for this generation (event beat the status
@@ -448,11 +499,25 @@ export function createDetector(deps) {
           // park refused by TEAM-5716's claim fence after this ticket was
           // re-claimed) belongs to the invocation that generation ran, not
           // this one, and must not override GUARD 2 for it.
-          let positiveDeath = false;
-          if (lease.hasAgentErrorSince) try {
+          let positiveDeath = exhaustionDeath; // TEAM-6000: strict ⊂ loose — no second read
+          if (!positiveDeath && lease.hasAgentErrorSince) try {
             positiveDeath = await lease.hasAgentErrorSince(
               ddb, eventsTable, workflow.id, ticketId, task.startedAt,
               { types: ["agent.died"], claimGeneration: task.startedAt });
+          } catch (e) {
+            log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
+            continue;
+          }
+          // TEAM-5977: in shadow, the claim holder's own transient-exhaustion
+          // death promotes THIS candidate to enforce. Read only when the loose
+          // death read matched (strict ⊂ loose). GUARD 1 already found the lease
+          // dead; the CAS steps, re-check and retry cap below are unchanged.
+          let effectiveMode = mode;
+          if (mode === "shadow" && positiveDeath) try {
+            if (exhaustionDeath || await transientExhaustionRelease(workflow.id, ticketId, task)) {
+              effectiveMode = "enforce";
+              log(`detector.transient_exhaustion_release (shadow → enforce) — ${ticketId} agent=${agentId} gen=${task.startedAt} (sweep ${sweepId})`);
+            }
           } catch (e) {
             log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
             continue;
@@ -484,6 +549,8 @@ export function createDetector(deps) {
             threshold,
             deathClass,
             positiveDeath,
+            liveLeaseBypass: exhaustionDeath, // TEAM-6000
+            effectiveMode,
             claimStartedAt: task.startedAt || null,
             sweepId,
           };
@@ -495,7 +562,7 @@ export function createDetector(deps) {
           // stream maps it to an error card and the anomaly watcher counts it in
           // agent_error_retry_rate. A distinct type keeps the full observation
           // payload without polluting either. Detail is unchanged.
-          if (mode === "shadow") {
+          if (effectiveMode === "shadow") {
             m.fired++;
             if (deathClass === "streamed_then_silent") m.hungToolCalls++;
             await publishEvent(ticketId, "dead_session.shadow", {
@@ -531,10 +598,15 @@ export function createDetector(deps) {
           // error) or loses its CAS, later sweeps re-evaluate the stamped
           // generation instead of skipping it (TEAM-3702) — the clear retried
           // while the lease is live, recovery re-driven once it is dead.
-          const recheckActivity = await lease.lastAgentActivity(
+          // TEAM-6000: skipped when GUARD 1 accepted the holder's own exhaustion
+          // death — that row is immutable and fenced to task.startedAt, and no
+          // later heartbeat can carry this generation, so re-reading activity
+          // proves nothing; a claim re-issued since the stamp has a NEW startedAt
+          // and loses the steal CAS below, which is the final fence either way.
+          const recheckActivity = exhaustionDeath ? null : await lease.lastAgentActivity(
             ddb, eventsTable, workflow.id, agentId, ticketId
           );
-          if (lease.isLeaseLive(task, recheckActivity, now())) {
+          if (!exhaustionDeath && lease.isLeaseLive(task, recheckActivity, now())) {
             m.skippedLiveLease++;
             const cleared = await store.clearDeadSessionDetected(workflow.id, ticketId, task.startedAt);
             if (cleared) {

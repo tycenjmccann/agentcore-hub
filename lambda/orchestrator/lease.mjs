@@ -200,8 +200,13 @@ export async function lastStreamedText(ddb, eventsTable, workflowId, agentId, ti
  * stamped with a DIFFERENT generation is filtered out server-side. Omitted
  * (the default), every existing call — `agent.error`, or `agent.died`
  * without this option — is byte-identical to before.
+ *
+ * TEAM-5977: two more opt-ins, also on the `agent.died` arm only and in the
+ * same FilterExpression. `strictGeneration` drops the legacy allowance (the
+ * row MUST be stamped with `claimGeneration`; without one the arm matches
+ * nothing), and `reason` requires `detail.reason` to equal it.
  */
-export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, sinceIso, { types = ["agent.error"], claimGeneration } = {}) {
+export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, sinceIso, { types = ["agent.error"], claimGeneration, strictGeneration = false, reason } = {}) {
   if (!sinceIso) return false;
   const vals = { ":w": workflowId, ":tid": ticketId, ":since": sinceIso };
   const ors = [];
@@ -210,14 +215,17 @@ export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId,
     vals[":dead"] = "dead_session";
     ors.push("(#t = :err AND (attribute_not_exists(detail.reason) OR detail.reason <> :dead))");
   }
-  if (types.includes("agent.died")) {
+  if (types.includes("agent.died") && (claimGeneration || !strictGeneration)) {
     vals[":died"] = "agent.died";
+    let arm = "#t = :died";
     if (claimGeneration) {
       vals[":gen"] = claimGeneration;
-      ors.push("(#t = :died AND (attribute_not_exists(detail.claimStartedAt) OR detail.claimStartedAt = :gen))");
-    } else {
-      ors.push("#t = :died");
+      arm += strictGeneration
+        ? " AND detail.claimStartedAt = :gen"
+        : " AND (attribute_not_exists(detail.claimStartedAt) OR detail.claimStartedAt = :gen)";
     }
+    if (reason) { vals[":dreason"] = reason; arm += " AND detail.reason = :dreason"; }
+    ors.push(arm === "#t = :died" ? arm : `(${arm})`);
   }
   if (!ors.length) return false;
   let lastKey;
