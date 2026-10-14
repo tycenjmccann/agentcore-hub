@@ -23,7 +23,10 @@
  *     grant inline, and this check reads inline policies only (the Deploy role holds
  *     iam:ListRolePolicies / iam:GetRolePolicy on the two twin roles and nothing more);
  *   - a conditioned Allow (TEAM-5883: an s3:prefix condition never binds to GetObject's
- *     implicit list check, so S3 still answers 403), or any matching Deny.
+ *     implicit list check, so S3 still answers 403), or any Deny that may apply;
+ *   - GetObject is proven over the WHOLE completions/ namespace, never one probe key
+ *     (TEAM-5924): an Allow counts only when its Resource covers every key under
+ *     completions/, and any GetObject Deny whose Resource could match one of them refuses.
  * The twins' own fail-closed semantics are untouched; this only decides whether their
  * code may ship.
  *
@@ -62,6 +65,32 @@ const statementsOf = (docs) => docs.flatMap((d) => list(d?.document?.Statement))
 const actionMatches = (st, action) => list(st.Action).some((a) => globRe(a, "i").test(action));
 const resourceMatches = (st, arn) => list(st.Resource).some((r) => globRe(r).test(arn));
 
+/**
+ * TEAM-5924: does the IAM glob `pattern` match EVERY string that starts with `prefix`?
+ * Only when it is a literal prefix of `prefix` followed by nothing but `*` (`?` before
+ * the star is refused: it is not shown to match the prefix's character).
+ */
+export function coversPrefix(pattern, prefix) {
+  const p = String(pattern);
+  const k = p.indexOf("*");
+  return k >= 0 && k <= prefix.length && p.slice(0, k) === prefix.slice(0, k) && /^\**$/.test(p.slice(k));
+}
+
+/**
+ * TEAM-5924: could the IAM glob `pattern` match SOME string that starts with `prefix`?
+ * Exact, because the other side is always `prefix` + `*`: once the pattern reaches a `*`
+ * (or the end of `prefix`) it can produce the rest.
+ */
+export function mayIntersectPrefix(pattern, prefix) {
+  const p = String(pattern);
+  for (let i = 0; i < prefix.length; i++) {
+    if (i >= p.length) return false;
+    if (p[i] === "*") return true;
+    if (p[i] !== "?" && p[i] !== prefix[i]) return false;
+  }
+  return true;
+}
+
 /** Some UNCONDITIONED Allow grants `action` on `arn` in one statement. NotAction/NotResource never count. */
 export function policyGrants(docs, action, arn) {
   return statementsOf(docs).some(
@@ -81,6 +110,33 @@ export function policyDenies(docs, action, arn) {
     (st) =>
       st?.Effect === "Deny" &&
       ("NotAction" in st || "NotResource" in st || (actionMatches(st, action) && resourceMatches(st, arn)))
+  );
+}
+
+/** Some UNCONDITIONED Allow grants `action` on every key under `prefix`, in one statement. */
+export function policyGrantsUnder(docs, action, prefix) {
+  return statementsOf(docs).some(
+    (st) =>
+      st?.Effect === "Allow" &&
+      !("NotAction" in st) &&
+      !("NotResource" in st) &&
+      actionMatches(st, action) &&
+      list(st.Resource).some((r) => coversPrefix(r, prefix)) &&
+      Object.keys(st.Condition || {}).length === 0
+  );
+}
+
+/**
+ * Some Deny MAY deny `action` on a key under `prefix` — conditioned or not. A NotAction /
+ * NotResource Deny, or one with no Resource at all, is assumed to (fail closed).
+ */
+export function policyMayDenyUnder(docs, action, prefix) {
+  return statementsOf(docs).some(
+    (st) =>
+      st?.Effect === "Deny" &&
+      ("NotAction" in st ||
+        "NotResource" in st ||
+        (actionMatches(st, action) && (!("Resource" in st) || list(st.Resource).some((r) => mayIntersectPrefix(r, prefix)))))
   );
 }
 
@@ -114,16 +170,22 @@ export function decideTwin({ fn, optional, expectedBucket, config, policies }) {
     );
   }
   const bucketArn = `arn:aws:s3:::${config.bucket}`;
+  const completions = `${bucketArn}/completions/`;
   const reasons = [];
+  // ListBucket is one concrete ARN; GetObject is the whole completions/ namespace
+  // (TEAM-5924: a single probe key let a Deny on completions/TEAM-* or an Allow on
+  // completions/twin-* through).
   const need = [
-    ["s3:ListBucket", bucketArn, "a missing completions/<ticket>.json must read as 404, not 403"],
-    ["s3:GetObject", `${bucketArn}/completions/twin-preflight-probe.json`, "the Done guard reads completion records"],
+    ["s3:ListBucket", bucketArn, "a missing completions/<ticket>.json must read as 404, not 403",
+      () => policyDenies(policies.docs, "s3:ListBucket", bucketArn), () => policyGrants(policies.docs, "s3:ListBucket", bucketArn)],
+    ["s3:GetObject", `${completions}*`, "the Done guard reads completion records",
+      () => policyMayDenyUnder(policies.docs, "s3:GetObject", completions), () => policyGrantsUnder(policies.docs, "s3:GetObject", completions)],
   ];
-  for (const [action, arn, why] of need) {
-    if (policyDenies(policies.docs, action, arn)) {
+  for (const [action, arn, why, denied, granted] of need) {
+    if (denied()) {
       reasons.push(`role ${config.role} has a Deny that may cover ${action} on ${arn} (${why})`);
-    } else if (!policyGrants(policies.docs, action, arn)) {
-      reasons.push(`role ${config.role} has no unconditioned inline ${action} on ${arn} (${why})`);
+    } else if (!granted()) {
+      reasons.push(`role ${config.role} has no unconditioned inline ${action} covering ${arn} (${why})`);
     }
   }
   if (reasons.length) {
@@ -132,7 +194,7 @@ export function decideTwin({ fn, optional, expectedBucket, config, policies }) {
     );
     return { action: "block", reasons };
   }
-  return { action: "proceed", reasons: [`role ${config.role} grants unconditioned s3:ListBucket on ${bucketArn}; ARTIFACT_BUCKET is set`] };
+  return { action: "proceed", reasons: [`role ${config.role} grants unconditioned s3:ListBucket on ${bucketArn} and s3:GetObject over ${completions}*, with no Deny that may apply; ARTIFACT_BUCKET is set`] };
 }
 
 // ── the thin wrapper over the aws CLI ───────────────────────────────────────────
