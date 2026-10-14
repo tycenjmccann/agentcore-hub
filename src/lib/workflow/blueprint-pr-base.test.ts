@@ -409,6 +409,21 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     expect(ARCH).not.toContain("**Persisted state: the cd-ledger archive");
   });
 
+  // TEAM-6149 (ship review r2 F2 of #954): the TEAM-6134 text claimed workflow-output
+  // "derives nothing" from the unified ledger on a follow-up CD. It derived the unified
+  // deploy's stale handoff[]/unmerged, because it read only cd-ledger.json. The reader
+  // now selects the per-ticket key first and the unified key only when its prUrl is
+  // the report's pr_url; the blueprint tells a follow-up CD to pass that pr_url.
+  it("report_completion reads the follow-up CD's own ledger first, unified only on a prUrl match (TEAM-6149)", () => {
+    const rm = read("release-manager");
+    const ledger = section(rm, "#### The CD ledger", "1. **Preflight:**");
+    expect(ledger).toContain("reads your `cd-ledger-<CD ticket id>.json` first and falls back to `shared/cd-ledger.json` only when its `prUrl` is your `pr_url`");
+    expect(ledger).toContain("`pr_url=<the follow-up PR>`");
+    expect(rm).not.toContain("which probes only `shared/cd-ledger.json`");
+    expect(ARCH).toContain("`cd-ledger-<ticket_id>.json` first, then `cd-ledger.json` only when its `prUrl` matches the report's `pr_url`");
+    expect(ARCH).not.toContain("carries no `handoff[]` / `unmerged`");
+  });
+
   it("qa-verifier treats a post-merge fix delivered only on its follow-up CD merge_commit", () => {
     const t = read("qa-verifier");
     expect(t).toContain(SECTION);
