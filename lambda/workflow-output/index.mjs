@@ -696,16 +696,35 @@ export function pruneDeliveredBrief(record) {
 }
 
 /**
- * TEAM-6029: the drain's one clear for a brief it just put on its gate — a held
- * `briefPending:true` goes `false` (not deleted: the record keeps the history that it
- * was held) and its stale `part:"brief"` entry comes off. Step 6 and drop() both call
+ * TEAM-6124: a record's `undelivered[]` merged with this drain's (`fresh`), keyed by
+ * `part` + `ticketId`: a fresh entry replaces the prior one of its key, every other
+ * prior entry stays, and a prior entry whose key the drain DELIVERED this time
+ * (`delivered`, e.g. a residual-findings comment that landed on redelivery) comes off —
+ * nothing is permanent. Step 6 and drop() both write through it; a bare assignment
+ * of the drain's own list erased the record's other parts. Empty ⇒ undefined.
+ */
+const undeliveredKey = (u) => `${u?.part}|${u?.ticketId ?? ""}`;
+export function mergeUndelivered(prior, fresh = [], delivered = []) {
+  const out = new Map();
+  for (const u of Array.isArray(prior) ? prior : []) out.set(undeliveredKey(u), u);
+  for (const k of delivered) out.delete(k);
+  for (const u of fresh) out.set(undeliveredKey(u), u);
+  return out.size > 0 ? [...out.values()] : undefined;
+}
+
+/**
+ * TEAM-6029: the drain's one clear for a brief it just put on its gate — the hold
+ * goes `false` and its stale `part:"brief"` entry comes off. TEAM-6124: `false` even
+ * when no hold was ever stamped (a first delivery): adoptHold carries the hold fields
+ * only off a record that states `briefPending`, so an unstated one lost its
+ * `briefDelivered`/`briefTargets` to the next report. Step 6 and drop() both call
  * it, so neither carries the hold over a delivery. TEAM-6052: through pruneDeliveredBrief
  * the off-gate hold's `briefFallbackReason` comes off too, so a follow-ups-only drop()
  * stamps a gate delivery exactly as step 6 and report_completion do. Mutates and
  * returns `record`.
  */
 export function clearBriefHoldOnGate(record) {
-  if (record.briefPending === true) record.briefPending = false;
+  record.briefPending = false;
   // TEAM-6097: a gate delivery supersedes an earlier no-gate-needed release.
   delete record.briefDisposition;
   return pruneDeliveredBrief(record);
@@ -718,10 +737,12 @@ export function clearBriefHoldOnGate(record) {
  * recorded, and through pruneDeliveredBrief the stale `part:"brief"` entry and the
  * off-gate `briefFallbackReason` come off — the reason a release was made lives in
  * `briefDisposition.why`. Drain step 6, drop() and report_completion's retry all call
- * it, so the three cannot diverge. Mutates and returns `record`.
+ * it, so the three cannot diverge. TEAM-6124: `false` on a first release too (no hold
+ * stamped), or adoptHold dropped the disposition on the next report and a forced hold
+ * re-held over it. Mutates and returns `record`.
  */
 export function clearBriefHoldOnRelease(record, disposition) {
-  if (record.briefPending === true) record.briefPending = false;
+  record.briefPending = false;
   record.briefDisposition = disposition;
   return pruneDeliveredBrief(record);
 }
@@ -1774,7 +1795,7 @@ export async function runOwesMergeGate(workflowId) {
  * would take it; the missing object is then said on the ticket (missingBriefNotice).
  * `{ ok: false }` on anything a retry can change - the brief lands before the Done.
  */
-async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings, scanComplete, workflowId }) {
+async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings, scanComplete, workflowId, gatesConfirmed = false }) {
   let body;
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: s3Key }));
@@ -1812,6 +1833,29 @@ async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings, scanComplet
     const anyGate = siblings.some((s) => s.ticketId !== ticketId && /^Merge Approval:/i.test(asText(s.summary).trim()) && isHumanAssignee(s.assignee));
     const gateOwed = epicKey && scanComplete === true && !anyGate ? await runOwesMergeGate(workflowId) : null;
     disposition = briefGateDisposition({ ticketId, epicKey, siblings, scanComplete, gateOwed });
+    // TEAM-6124: "every gate is Done" was read off list_tickets — an eventually consistent
+    // search (Jira) / GSI (DynamoDB) that can still show a reopened gate Done. Before a
+    // release on it, each gate's status is confirmed by its own get_issue: one that is not
+    // Done (or names this ticket now) goes back through the gate choice above, once; one
+    // that cannot be read keeps the hold (permanent) or retries (anything else).
+    if (disposition.release && disposition.kind === "gate_settled" && !gatesConfirmed) {
+      const fresh = new Map();
+      for (const o of disposition.observed) {
+        const r = await readTicketDone(o.ticketId);
+        if (r.ok) { fresh.set(o.ticketId, r.issue); continue; }
+        if (!isPermanentTicketRefusal(r.error)) return { ok: false, error: `get_issue ${o.ticketId} (confirming the Merge Approval gate is Done): ${r.error}` };
+        disposition = { release: false, kind: "gate_unconfirmed", why: `the Merge Approval gate ${o.ticketId} could not be read to confirm it is Done (${r.error})`, observed: disposition.observed };
+        break;
+      }
+      if (disposition.release) {
+        const refreshed = siblings.map((s) => (fresh.has(s.ticketId) ? { ...s, status: fresh.get(s.ticketId).status, blockedBy: fresh.get(s.ticketId).blockedBy } : s));
+        if ([...fresh.values()].some((i) => !isDoneStatus(i.status))) {
+          console.warn(`[ticket-replay] ${ticketId}: list_tickets showed every Merge Approval gate Done but get_issue reads ${[...fresh.values()].filter((i) => !isDoneStatus(i.status)).map((i) => `${i.ticketId}:${i.status}`).join(", ")} - no release, re-choosing the gate`);
+          return postQueuedBrief({ ticketId, epicKey, s3Key, siblings: refreshed, scanComplete, workflowId, gatesConfirmed: true });
+        }
+        disposition = briefGateDisposition({ ticketId, epicKey, siblings: refreshed, scanComplete, gateOwed });
+      }
+    }
     why = disposition.why;
   } else {
     why = `${gates.length} open Merge Approval gates (${gates.map((g) => g.ticketId).join(", ")}) and none is blocked by ${ticketId}`;
@@ -1854,7 +1898,7 @@ async function postResolvedBrief({ ticketId, epicKey, s3Key, body, marker, decis
   }
   const auditMarker = `[brief-resolved:${ticketId}]`;
   const observed = disposition.observed.map((o) => `${o.ticketId}:${o.status}`).join(", ") || "none";
-  const audit = `${auditMarker}\n\nThe merge-brief hold on ${ticketId} is RELEASED without gate delivery (${disposition.kind}): ${why}. Merge Approval gates observed: ${observed}.${disposition.gateOwed ? ` Gate owed: ${disposition.gateOwed.owed} (${disposition.gateOwed.detail}).` : ""} Recorded as briefDisposition on s3://${BUCKET}/completions/${ticketId}.json. If a gate is reopened or added for this run, re-run WorkflowOutput___report_completion so the brief goes on it.`;
+  const audit = `${auditMarker}\n\nThe merge-brief hold on ${ticketId} is RELEASED without gate delivery (${disposition.kind}): ${why}. Merge Approval gates observed: ${observed}.${disposition.gateOwed ? ` Gate owed: ${disposition.gateOwed.owed} (${disposition.gateOwed.detail}).` : ""} Recorded as briefDisposition on s3://${BUCKET}/completions/${ticketId}.json. The hub does NOT re-deliver a released brief (a re-run of WorkflowOutput___report_completion leaves it as is): if a Merge Approval gate is reopened or added for this run, a human must post the brief on it - it is at s3://${BUCKET}/${s3Key}${targets.length > 0 ? `, and a copy is in a comment on ${targets.join(" and ")}` : ""}.`;
   const seen = new Set();
   for (const target of [ticketId, epicKey, ...disposition.observed.map((o) => o.ticketId)].filter(Boolean)) {
     if (seen.has(target)) continue;
@@ -2074,6 +2118,10 @@ export async function drainCompletion(msg) {
       // TEAM-5941: a fresh Done-intent rides along (the spread keeps it); a stale one — the
       // twin that wrote it is gone — comes off with this stamp.
       const stamp = { ...rec.record, ...(extra || {}) };
+      // TEAM-6124: the spread let this drain's undelivered[] replace the record's.
+      const merged = mergeUndelivered(rec.record.undelivered, extra?.undelivered, delivered);
+      if (merged) stamp.undelivered = merged;
+      else delete stamp.undelivered;
       // TEAM-6029: a follow-ups-only hold whose brief this drain put on the gate clears
       // the brief hold as step 6 does; the spread alone carried the old `true` and its
       // stale `part:"brief"` entry over the delivery.
@@ -2112,6 +2160,9 @@ export async function drainCompletion(msg) {
     return { outcome: "dropped", reason: `${step}: ${error}`, permanent: true, notice };
   };
   const undelivered = [];
+  // TEAM-6124: the undelivered[] keys this drain DID deliver (a redelivered message
+  // re-posts its parts), so mergeUndelivered takes their earlier entries off.
+  const delivered = [];
 
   // 0. The record says whether these writes already landed (a second tick, a duplicate
   //    message). A record that is missing still gets its writes; one S3 cannot read is a retry.
@@ -2229,6 +2280,7 @@ export async function drainCompletion(msg) {
     const out = await postResidualFindings({ ticketId, ...msg.residual, siblings: scan.siblings });
     if (out.failed.some((f) => !isPermanentTicketRefusal(f.error))) return retry(`residual findings not posted on ${out.failed.map((f) => f.ticketId).join(", ")}`);
     for (const f of out.failed) undelivered.push({ part: "residual_findings", ticketId: f.ticketId, reason: f.error });
+    for (const id of [...out.posted, ...out.skipped]) delivered.push(undeliveredKey({ part: "residual_findings", ticketId: id }));
   }
   if (holds.length > 0) {
     // Round 5 P2: the hold stamps what the follow-ups really are now, so a brief-only
@@ -2255,7 +2307,10 @@ export async function drainCompletion(msg) {
   if (record) {
     Object.assign(record, { status: "complete", followUpsPending: false, ticketWrites: "queued" });
     if (entries.length > 0) record.followUpsMaterialized = materialized;
-    if (undelivered.length > 0) record.undelivered = undelivered;
+    // TEAM-6124: merged onto the record's own list, as drop() does.
+    const merged = mergeUndelivered(record.undelivered, undelivered, delivered);
+    if (merged) record.undelivered = merged;
+    else delete record.undelivered;
     if (briefDelivery) Object.assign(record, briefDelivery);
     // TEAM-6057: and an undelivered brief keeps no earlier outcome's targets or reason.
     if (briefDelivery?.briefDelivered === "undelivered") clearUndeliveredBriefTargets(record);
@@ -4603,15 +4658,30 @@ async function designAmendmentGate({ ticketId, isSynthetic, issue, issueError, a
   const scan = await loadSiblings(issue.parentKey);
   if (!scan.ok) return scanRefusal(`list_tickets under ${issue.parentKey}: ${scan.error}`);
   const amendments = designAmendmentsOf(scan.siblings, ticketId);
-  const done = amendments.find((a) => isDoneStatus(a.status));
-  if (done) return { verdict, residual: true, amendmentTicketId: done.ticketId, siblings: scan.siblings };
+  const listedDone = amendments.find((a) => isDoneStatus(a.status));
+  // TEAM-6124 (sibling of F1): list_tickets is eventually consistent, and this
+  // admission is final (the review's Done releases the dev lanes; the twins trust
+  // the stamp's amendmentTicketId without re-reading it). So a listed Done is only
+  // a candidate: get_issue must read it Done too. A transient failure refuses
+  // retryably; a permanent one, or a strong read that is not Done, is "still open".
+  let open = amendments[0];
+  let unconfirmed = null;
+  if (listedDone) {
+    const read = await readTicketDone(listedDone.ticketId);
+    if (!read.ok && !isPermanentTicketRefusal(read.error)) {
+      return scanRefusal(`get_issue ${listedDone.ticketId} (confirming the design amendment is done): ${read.error}`);
+    }
+    if (read.ok && read.done) return { verdict, residual: true, amendmentTicketId: listedDone.ticketId, siblings: scan.siblings };
+    open = listedDone;
+    unconfirmed = read.ok ? `reads ${read.issue.status} on get_issue` : `could not be read to confirm it is done (${read.error})`;
+    console.warn(`[report_completion] ${ticketId}: list_tickets shows amendment ${listedDone.ticketId} done but it ${unconfirmed} - treated as still open`);
+  }
   // An absent amendment on a truncated roster proves nothing; an OPEN one does.
   if (!amendments.length && !scan.complete) return scanRefusal(`list_tickets under ${issue.parentKey}: roster truncated (complete:false)`);
-  const open = amendments[0];
   return { refusal: {
     ok: false,
     reason: DESIGN_AMENDMENT_REQUIRED,
-    detail: open ? `amendment ${open.ticketId} is still open` : "no design amendment exists",
+    detail: open ? `amendment ${open.ticketId} is still open${unconfirmed ? ` (listed done, but it ${unconfirmed})` : ""}` : "no design amendment exists",
     missing: ["design_amendment"],
     findings_count: findings,
     ...(open ? { amendmentTicketId: open.ticketId } : {}),

@@ -607,7 +607,7 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     const t = await tick();
     expect(t.out.drained).toMatchObject({ applied: 1, dropped: 0 });
     expect(record()).toMatchObject({ ticketWrites: "applied", briefDelivered: "off_gate" });
-    expect(record().briefPending).toBeUndefined();
+    expect(record().briefPending).toBe(false); // TEAM-6124: a release states the hold false
     expect(droppedMetrics()).toHaveLength(0);
   });
 
@@ -1206,7 +1206,7 @@ describe("TEAM-5926 — a Done that lands over the brief hold", () => {
     expect(t2.out.drained).toMatchObject({ applied: 0, dropped: 1, retried: 0 });
     expect(fake.queue).toHaveLength(0);
     expect(record()).toMatchObject({ followUpsPending: true, ticketWrites: "dropped", replayDropped: { step: "follow_ups" } });
-    expect(record().briefPending).toBeUndefined();
+    expect(record().briefPending).toBe(false); // TEAM-6124: a gate delivery states the hold false
     expect(droppedMetrics()).toHaveLength(1);
     expect(eventsOf("workflow.ticket_replay_dropped", BUILD)).toHaveLength(1);
     for (const id of [BUILD, EPIC]) {
@@ -1502,7 +1502,7 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     const t = await tick();
     expect(t.out.drained).toMatchObject({ applied: 1, dropped: 0, retried: 0 });
     expect(fake.tickets.get(BUILD).status).toBe("Done");
-    expect(record().briefPending).toBeUndefined();
+    expect(record().briefPending).toBe(false); // TEAM-6124: stated, so the next report carries it
     expect(record()).toMatchObject({
       ticketWrites: "applied", briefDelivered: "off_gate",
       briefDisposition: { release: true, kind: "gate_settled", by: "drain", observed: [{ ticketId: GATE, status: "Done" }] },
@@ -1714,7 +1714,7 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     const t = await tick();
     expect(t.out.drained).toMatchObject({ applied: 1, dropped: 0 });
     expect(fake.tickets.get(BUILD).status).toBe("Done");
-    expect(record().briefPending).toBeUndefined();
+    expect(record().briefPending).toBe(false); // TEAM-6124
     expect(record()).toMatchObject({ briefDelivered: "off_gate", briefDisposition: { release: true, kind: "absent_never_gated", observed: [], gateOwed: { owed: false } } });
     expect(record().briefDisposition.gateOwed.detail).toMatch(detail);
     for (const id of [BUILD, "TEAM-5600"]) expect(resolvedNotices(id)).toHaveLength(1);
@@ -1939,5 +1939,202 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     await redeliver(body);
     expect(record()).toMatchObject({ briefDelivered: "undelivered" });
     expect(record().briefDisposition).toBeUndefined();
+  });
+
+  // ─── TEAM-6124: review-fix of the release path ───
+  const setRecord = (patch) => {
+    fake.objects.set(KEY, JSON.stringify({ ...record(), ...patch }));
+    fake.etags.set(KEY, `"e${++fake.etagSeq}"`);
+  };
+  /** list_tickets (eventually consistent: Jira search / DynamoDB GSI) still shows `ids` Done; get_issue reads the board. */
+  const staleListDone = async (ids) => {
+    const { LambdaClient } = await import("@aws-sdk/client-lambda");
+    const real = LambdaClient.prototype.send;
+    return vi.spyOn(LambdaClient.prototype, "send").mockImplementation(async function (c) {
+      const out = await real.call(this, c);
+      const raw = c?.input?.Payload;
+      const call = JSON.parse(typeof raw === "string" ? raw : new TextDecoder().decode(raw));
+      if (call.tool_name !== "Tickets___list_tickets" || !out?.Payload) return out;
+      const payload = JSON.parse(new TextDecoder().decode(out.Payload));
+      const tickets = payload.tickets.map((t) => (ids.includes(t.ticketId) ? { ...t, status: "Done" } : t));
+      return { ...out, Payload: new TextEncoder().encode(JSON.stringify({ ...payload, tickets })) };
+    });
+  };
+  const withStaleList = async (ids, fn) => {
+    const spy = await staleListDone(ids);
+    try { return await fn(); } finally { spy.mockRestore(); }
+  };
+  const noRelease = () => {
+    expect(record().briefDisposition).toBeUndefined();
+    for (const id of [BUILD, "TEAM-5600", GATE]) expect(resolvedNotices(id)).toHaveLength(0);
+  };
+
+  it("TEAM-6124 F1 drain: list_tickets shows the gate Done but get_issue reads it open ⇒ the brief goes on the gate, no release", async () => {
+    // Fixture: GATE is To Do and blocked by BUILD on the board.
+    const t = await withStaleList([GATE], () => tick());
+    expect(t.out.drained).toMatchObject({ applied: 1, dropped: 0 });
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE] });
+    noRelease();
+    expect(briefComments(GATE)).toHaveLength(1);
+  });
+
+  it("TEAM-6124 F1 retry: a stale all-Done roster ⇒ report_completion delivers to the gate get_issue reads open, no release", async () => {
+    await holdUnnamed();
+    fake.tickets.get(GATE).status = "Done"; // TEAM-5604 stays To Do (unlinked, the one open gate)
+    const res = await withStaleList([GATE, "TEAM-5604"], () => rerun());
+    expect(res.status).toBe("complete");
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: ["TEAM-5604"] });
+    noRelease();
+  });
+
+  it("TEAM-6124 F1 drain: a stale all-Done roster over two open unnamed gates ⇒ the hold stays (gate choice re-run on the fresh reads)", async () => {
+    gateUnidentifiable();
+    const t = await withStaleList([GATE, "TEAM-5604"], () => tick());
+    expect(t.out.drained).toMatchObject({ dropped: 1 });
+    expectHeld();
+    expect(record().replayDropped.error).toMatch(/2 open Merge Approval gates/);
+    noRelease();
+    await twinsRefuse();
+  });
+
+  it("TEAM-6124 F1 a gate get_issue refuses permanently ⇒ not confirmed Done, the hold stays (gate_unconfirmed)", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    fake.failTool = { Tickets___get_issue: (p) => (p.ticket_id === GATE ? "Jira API 404: Issue TEAM-5602 does not exist" : null) };
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ dropped: 1 });
+    expectHeld();
+    expect(record().replayDropped.error).toMatch(/TEAM-5602 could not be read to confirm it is Done/);
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+  });
+
+  it("TEAM-6124 F1 a gate get_issue 503 while confirming ⇒ the drain retries, record untouched", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    fake.failTool = { Tickets___get_issue: (p) => (p.ticket_id === GATE ? PROVIDER_503 : null) };
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expect(record().ticketWrites).toBe("queued");
+    expect(record().briefDisposition).toBeUndefined();
+  });
+
+  /** Every place the release audit says the brief is, holds the brief. */
+  const auditLocationsHoldTheBrief = () => {
+    const audit = resolvedNotices(BUILD)[0];
+    expect(audit).toBeDefined();
+    expect(audit).not.toMatch(/re-run WorkflowOutput___report_completion so the brief goes on it/);
+    expect(audit).toMatch(/does NOT re-deliver a released brief/);
+    const m = /a human must post the brief on it - it is at s3:\/\/[^/\s]+\/(\S+?)(?:, and a copy is in a comment on (.+?))?\.$/.exec(audit);
+    expect(m).not.toBeNull();
+    const [, s3Key, on] = m;
+    expect(s3Key).toBe(fixture.mergeBrief.s3Key);
+    expect(fake.objects.get(s3Key)).toBe(fixture.mergeBrief.body);
+    const named = on.split(" and ");
+    expect(named).toEqual([BUILD, "TEAM-5600"]);
+    const body = fixture.mergeBrief.body.trim();
+    for (const id of named) {
+      expect(briefComments(id)).toHaveLength(1);
+      expect(briefComments(id)[0]).toContain(body);
+    }
+  };
+
+  it("TEAM-6124 F2 retry (report_completion): the release audit names only places that hold the brief, and promises no re-delivery", async () => {
+    await holdUnnamed();
+    allGatesDone();
+    expect((await rerun()).status).toBe("complete");
+    expect(record().briefDisposition).toMatchObject({ release: true, by: "report_completion" });
+    auditLocationsHoldTheBrief();
+  });
+
+  it("TEAM-6124 F2 drain: the same audit text on a drain release", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    expect((await tick()).out.drained).toMatchObject({ applied: 1 });
+    auditLocationsHoldTheBrief();
+  });
+
+  it("TEAM-6124 F2b a re-report after a release does not re-deliver to a reopened gate (as the audit says)", async () => {
+    await holdUnnamed();
+    allGatesDone();
+    await rerun();
+    const disposition = record().briefDisposition;
+    fake.tickets.get(GATE).status = "To Do";
+    fake.tickets.get(GATE).blockedBy = [BUILD];
+    const descBefore = fake.tickets.get(GATE).description;
+    expect((await rerun()).status).toBe("complete");
+    expect(briefComments(GATE)).toHaveLength(0);
+    expect(fake.tickets.get(GATE).description).toBe(descBefore);
+    expect(record().briefDisposition).toEqual(disposition);
+  });
+
+  it("TEAM-6124 F3 a FIRST release (no hold ever stamped) is carried by the next report", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    expect((await tick()).out.drained).toMatchObject({ applied: 1 });
+    const disposition = record().briefDisposition;
+    expect(disposition).toMatchObject({ release: true, kind: "gate_settled", by: "drain" });
+    await rerun({ summary: `${call0.arguments.summary} (re-run)` });
+    // The carry first: on the base the disposition is lost here (adoptHold skipped an unstated hold).
+    expect(record().briefDisposition).toEqual(disposition);
+    expect(record()).toMatchObject({ briefDelivered: "off_gate", briefPending: false });
+  });
+
+  it("TEAM-6124 B a FIRST gate delivery (no hold ever stamped) is carried by the next report", async () => {
+    expect((await tick()).out.drained).toMatchObject({ applied: 1 });
+    expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE] });
+    await rerun({ summary: `${call0.arguments.summary} (re-run)` });
+    // The carry first: on the base briefDelivered/briefTargets are lost here.
+    expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE] });
+    expect(record().briefPending).toBe(false);
+  });
+
+  const briefGone = () => fake.objects.delete(fixture.mergeBrief.s3Key);
+  const briefEntry = expect.objectContaining({ part: "brief", s3Key: fixture.mergeBrief.s3Key, reason: expect.stringMatching(/does not exist/) });
+
+  it("TEAM-6124 F4 step 6: a fresh undelivered entry is merged onto the record's, not over it", async () => {
+    setRecord({ undelivered: [RESIDUAL_6097] });
+    fake.tickets.get(BUILD).status = "Done"; // no hold: step 6 writes
+    briefGone();
+    expect((await tick()).out.drained).toMatchObject({ applied: 1 });
+    expect(record().undelivered).toEqual([RESIDUAL_6097, briefEntry]);
+  });
+
+  it("TEAM-6124 F4 drop(): a fresh undelivered entry is merged onto the record's, not over it", async () => {
+    setRecord({ undelivered: [RESIDUAL_6097] });
+    briefGone(); // BUILD open: the undelivered brief is a hold, so drop() stamps
+    expect((await tick()).out.drained).toMatchObject({ dropped: 1 });
+    expectHeld();
+    expect(record().undelivered).toEqual([RESIDUAL_6097, briefEntry]);
+  });
+
+  // Residual findings are re-posted by a redelivered message (msg.residual, marker-deduped):
+  // the entry for a part this drain DID deliver comes off; one that failed again is replaced.
+  const DEV = "TEAM-5599";
+  const PRIOR_5599 = { part: "residual_findings", ticketId: DEV, reason: "Jira API 403: You do not have permission" };
+  const withResidual = () => {
+    seedTicket({ ticketId: DEV, title: "Dev: db9sx9 backend", status: "To Do", assignee: "agentcore_hub_backend_dev", parentKey: "TEAM-5600", blockedBy: [BUILD] });
+    fake.queue[0].Body = JSON.stringify({ ...JSON.parse(fake.queue[0].Body), residual: { verdict: "APPROVED_WITH_FINDINGS", summary: "R1: rotate the probe role key", artifacts: "" } });
+    setRecord({ undelivered: [RESIDUAL_6097, PRIOR_5599] });
+  };
+
+  it("TEAM-6124 F4 a residual entry the drain now delivers comes off the record", async () => {
+    withResidual();
+    expect((await tick()).out.drained).toMatchObject({ applied: 1 });
+    expect(fake.tickets.get(DEV).comments.some((c) => c.includes("R1: rotate the probe role key"))).toBe(true);
+    expect(record().undelivered).toEqual([RESIDUAL_6097]);
+  });
+
+  it("TEAM-6124 F4 a residual entry that 403s again is replaced, not duplicated", async () => {
+    withResidual();
+    fake.failTool = { Tickets___add_comment: (p) => (p.ticket_id === DEV ? "Jira API 403: still forbidden" : null) };
+    expect((await tick()).out.drained).toMatchObject({ applied: 1 });
+    expect(record().undelivered).toEqual([RESIDUAL_6097, { part: "residual_findings", ticketId: DEV, reason: "Jira API 403: still forbidden" }]);
+  });
+
+  it("TEAM-6124 mergeUndelivered: same key replaces, other keys stay, delivered keys come off, empty ⇒ undefined", () => {
+    const a = { part: "residual_findings", ticketId: "T-1", reason: "old" };
+    const b = { part: "brief", s3Key: "k", reason: "gone" };
+    const a2 = { ...a, reason: "new" };
+    expect(output.mergeUndelivered([a, b], [a2])).toEqual([a2, b]);
+    expect(output.mergeUndelivered([a], [b])).toEqual([a, b]);
+    expect(output.mergeUndelivered([a, b], [], ["residual_findings|T-1"])).toEqual([b]);
+    expect(output.mergeUndelivered([a], [], ["residual_findings|T-1"])).toBeUndefined();
+    expect(output.mergeUndelivered(undefined, undefined)).toBeUndefined();
   });
 });
