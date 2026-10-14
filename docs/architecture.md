@@ -1400,7 +1400,7 @@ aws dynamodb update-table \
 # 2. Configure Jira webhook to POST to /api/workflow/webhook
 #    Event: issue_updated (status field changes)
 #    URL: https://your-app.com/api/workflow/webhook
-#    Secret: set WEBHOOK_SECRET env var to match
+#    Secret: set WEBHOOK_SECRET env var to match (unset, blank or "dev-secret" = route refuses every request with 503)
 
 # 3. Switch ticket provider
 TICKET_PROVIDER=jira
