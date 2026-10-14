@@ -91,6 +91,8 @@ import {
   publishJourneyEvent,
   verifyGateCondition,
   terminalMoveRefusal,
+  deriveCreateDedupeToken,
+  isSettledGateStatus,
 } from "./gate-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -129,6 +131,11 @@ const COUNTER_KEY = { ticketId: "__COUNTER__" };
  * isTicketRow, exactly as they always filtered __COUNTER__. It expires via the
  * table's TTL on `ttl` (enabled by deploy/setup-tickets-lambda.mjs and
  * scripts/create-dynamodb-tables.sh).
+ *
+ * TEAM-6091: a create WITHOUT a token takes the same lock under a DERIVED token
+ * (`auto-<hash>` of run-or-parent + assignee + normalized summary, gate-contract.mjs
+ * deriveCreateDedupeToken), so concurrent check-then-create of one ticket lands one
+ * row; a derived lock whose ticket is settled is taken over (claimCreateLock).
  */
 const IDEMP_PREFIX = "IDEMP#";
 const IDEMP_TTL_S = 7 * 24 * 60 * 60;
@@ -1675,34 +1682,23 @@ async function createTicket(args) {
     });
   }
 
+  // TEAM-6091: no client_token ⇒ a token derived from the run (or parent) + assignee +
+  // normalized summary, through the SAME atomic lock — so two personas that each
+  // check-then-create one ticket converge on it instead of filing two. Scope and
+  // normalization are the Jira twin's guard's (gate-contract.mjs), so the twins dedupe
+  // the same calls; with neither a workflow nor a parent there is no token, as before.
+  const derivedToken = clientToken ? null : deriveCreateDedupeToken({ workflowId: workflow_id, parentId: parent_key, assignee, summary });
+  const lockToken = clientToken || derivedToken;
+
   let ticketId = await nextTicketId(project_key);
-  if (clientToken) {
+  if (lockToken) {
     // TEAM-5712: the lock records the id BEFORE the ticket exists, so a retry
     // after a partial failure (lock written, ticket Put lost) re-puts the ticket
     // under that same id rather than pointing at a missing one forever. A losing
     // writer's freshly minted id is simply burned — a numbering gap, nothing more.
-    const lockKey = `${IDEMP_PREFIX}${clientToken}`;
-    try {
-      await ddb.send(new PutCommand({
-        TableName: TABLE_NAME,
-        Item: {
-          ticketId: lockKey,
-          reservedTicketId: ticketId,
-          lockedAt: new Date().toISOString(),
-          ttl: Math.floor(Date.now() / 1000) + IDEMP_TTL_S,
-        },
-        ConditionExpression: "attribute_not_exists(ticketId)",
-      }));
-    } catch (err) {
-      if (err?.name !== "ConditionalCheckFailedException") throw err;
-      const lock = await ddb.send(
-        new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: lockKey }, ConsistentRead: true })
-      );
-      if (!lock.Item?.reservedTicketId) throw new Error(`client_token lock ${lockKey} holds no reserved ticket id`);
-      ticketId = lock.Item.reservedTicketId;
-      const existing = await getTicketRow(ticketId);
-      if (existing) return createdResponse(existing, { idempotent: true });
-    }
+    const claimed = await claimCreateLock(`${IDEMP_PREFIX}${lockToken}`, ticketId, { reclaimSettled: derivedToken !== null });
+    if (claimed.existing) return createdResponse(claimed.existing, { idempotent: true });
+    ticketId = claimed.ticketId;
   }
   const now = new Date().toISOString();
   const type = (issue_type || "Task").toLowerCase();
@@ -1751,7 +1747,7 @@ async function createTicket(args) {
     ...(baseBranch ? { baseBranch } : {}),
   };
 
-  if (clientToken) {
+  if (lockToken) {
     // Conditional, so two replays of one token racing to finish a create land
     // ONE row; the loser answers with the winner's.
     try {
@@ -1789,6 +1785,64 @@ async function createTicket(args) {
     // entirely when nothing was autowired, so an ordinary create is unchanged.
     ...(autowire.autowired ? { autowired: autowire.autowired } : {}),
   }, issue_type || "Task");
+}
+
+/**
+ * TEAM-5712 / TEAM-6091: claim the `IDEMP#<token>` lock for `ticketId`. Resolves to
+ * `{ ticketId }` — the id to Put under (ours, or a reserved one whose ticket Put was
+ * lost) — or `{ existing }`, the ticket another create already filed under this lock.
+ *
+ * `reclaimSettled` (derived tokens only): a lock whose ticket is settled (done /
+ * closed / skipped / cancelled) is TAKEN OVER with a conditional update on the id it
+ * holds, so a ticket legitimately re-filed after the first one closed is created, not
+ * answered with the closed one — the Jira twin's guard never matched a Done ticket
+ * either. Of two re-filers racing the takeover exactly one wins; the loser re-reads
+ * and converges on the winner's. An explicit client_token is a RETRY of one call, so
+ * it keeps answering with whatever that call filed.
+ */
+const CREATE_LOCK_ATTEMPTS = 3;
+async function claimCreateLock(lockKey, ticketId, { reclaimSettled }) {
+  const ttl = () => Math.floor(Date.now() / 1000) + IDEMP_TTL_S;
+  try {
+    await ddb.send(new PutCommand({
+      TableName: TABLE_NAME,
+      Item: {
+        ticketId: lockKey,
+        reservedTicketId: ticketId,
+        lockedAt: new Date().toISOString(),
+        ttl: ttl(),
+      },
+      ConditionExpression: "attribute_not_exists(ticketId)",
+    }));
+    return { ticketId };
+  } catch (err) {
+    if (err?.name !== "ConditionalCheckFailedException") throw err;
+  }
+  for (let attempt = 1; attempt <= CREATE_LOCK_ATTEMPTS; attempt++) {
+    const lock = await ddb.send(
+      new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: lockKey }, ConsistentRead: true })
+    );
+    const reserved = lock.Item?.reservedTicketId;
+    if (!reserved) throw new Error(`client_token lock ${lockKey} holds no reserved ticket id`);
+    const existing = await getTicketRow(reserved);
+    if (!existing) return { ticketId: reserved };
+    if (!reclaimSettled || !isSettledGateStatus(existing.status)) return { existing };
+    try {
+      await ddb.send(new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { ticketId: lockKey },
+        UpdateExpression: "SET reservedTicketId = :new, lockedAt = :now, #ttl = :ttl",
+        ConditionExpression: "reservedTicketId = :old",
+        ExpressionAttributeNames: { "#ttl": "ttl" },
+        ExpressionAttributeValues: { ":new": ticketId, ":old": reserved, ":now": new Date().toISOString(), ":ttl": ttl() },
+      }));
+      return { ticketId };
+    } catch (err) {
+      if (err?.name !== "ConditionalCheckFailedException") throw err;
+      // Another re-filer took it over first — re-read and answer with theirs.
+    }
+  }
+  throw new Error(`create lock ${lockKey} kept moving under ${CREATE_LOCK_ATTEMPTS} takeover attempts`);
 }
 
 /** TEAM-5712: a stored ticket row by id (strongly consistent), or null. */
