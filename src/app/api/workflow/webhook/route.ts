@@ -146,17 +146,23 @@ async function getWorkflowFromDynamo(workflowId: string) {
  * rewrote the ENTIRE agentTasks map from a read snapshot (keyed by agentId,
  * doubly wrong) — resurrecting pre-claim state over concurrent sibling
  * invocation claims (study P1).
+ *
+ * TEAM-5917 — status/completedAt are split into their own conditional write,
+ * mirroring completeTaskEntry's condition (lambda/orchestrator/workflow-store.mjs)
+ * exactly: the stamp applies only on a running/failed/unset -> complete
+ * transition, once per generation. DynamoDB can't condition individual
+ * attributes within one UpdateItem, so the metadata merge (unconditional
+ * beyond the entry existing) and the stamp (generation-aware) are two writes
+ * sharing one `now`.
  */
 async function updateWorkflowTaskMetadata(workflowId: string, ticketId: string, metadata: Record<string, unknown>) {
+  const now = new Date().toISOString();
+
   const names: Record<string, string> = { "#tid": ticketId, "#u": "updatedAt" };
-  const values: Record<string, unknown> = { ":u": new Date().toISOString() };
+  const values: Record<string, unknown> = { ":u": now };
   const sets = ["#u = :u"];
   let i = 0;
-  for (const [k, v] of Object.entries({
-    ...metadata,
-    status: "complete",
-    completedAt: new Date().toISOString(),
-  })) {
+  for (const [k, v] of Object.entries(metadata)) {
     if (v === undefined || v === null) continue;
     i++;
     names[`#f${i}`] = k;
@@ -176,8 +182,28 @@ async function updateWorkflowTaskMetadata(workflowId: string, ticketId: string, 
     // Entry not tracked yet — drop the metadata rather than materializing a
     // partial entry the orchestrator's claim path doesn't own. Anything else
     // (throttle, auth, service error) must propagate so the delivery retries.
+    // The stamp write below would fail the same way, so stop here.
     if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
     console.warn(`[webhook:lambda] task metadata skipped for ${ticketId}: no tracked entry`);
+    return;
+  }
+
+  try {
+    await ddb.send(new UpdateCommand({
+      TableName: WORKFLOWS_TABLE,
+      Key: { workflowId },
+      UpdateExpression: "SET agentTasks.#tid.#st = :s, agentTasks.#tid.completedAt = :ts",
+      ConditionExpression: "attribute_exists(agentTasks.#tid) AND (attribute_not_exists(agentTasks.#tid.#st) OR agentTasks.#tid.#st <> :s)",
+      ExpressionAttributeNames: { "#tid": ticketId, "#st": "status" },
+      ExpressionAttributeValues: { ":s": "complete", ":ts": now },
+    }));
+  } catch (err) {
+    // TEAM-5890: completedAt is stamped exactly once per generation (running ->
+    // complete). A replayed agent_completion or a stale-read duplicate hits this
+    // and must NOT move the stamp. Anything else (throttle, auth, service error)
+    // propagates so the delivery retries.
+    if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
+    console.warn(`[webhook:lambda] completion stamp skipped for ${ticketId}: already complete this generation`);
   }
 }
 
