@@ -204,13 +204,13 @@ describe("completion-evidence harvest on the done cascade", () => {
     expect(h.state.workflow.agentTasks[DONE].output).toBe("webhook merge landed first");
   });
 
-  it("evidence AND a ship signal already present — no S3 read, no merge", async () => {
+  it("evidence AND a ship signal already present — one record read (TEAM-5951: a claimed generation checks for a fresh record), no merge", async () => {
     // Both halves satisfied is the only short-circuit left; it must still hold or
     // every done ticket re-reads S3 on every cascade.
     h.state.workflow = makeWorkflow({ output: "webhook merge landed first", mergeCommit: "9f1c2ab" });
     h.state.s3Objects[COMPLETION_KEY] = RECORD;
     await handleTicketDoneUnified(DONE);
-    expect(h.state.s3Gets).not.toContain(COMPLETION_KEY);
+    expect(h.state.s3Gets.filter((k) => k === COMPLETION_KEY)).toHaveLength(1); // memoized; RECORD is not this generation's
     expect(h.state.merges).toHaveLength(0);
   });
 
@@ -400,24 +400,24 @@ describe("late re-harvest on an evidence-less complete entry (TEAM-3976)", () =>
     warn.mockRestore();
   });
 
-  it("entry already complete WITH output and a merge commit → no S3 read, no merge (existing fields never overwritten)", async () => {
+  it("entry already complete WITH output and a merge commit → one record read (TEAM-5951), no merge (existing fields never overwritten)", async () => {
     h.state.workflow = makeWorkflow({ status: "complete", output: "already there", mergeCommit: "9f1c2ab" });
     h.state.s3Objects[COMPLETION_KEY] = RECORD;
     await handleTicketDoneUnified(DONE);
-    expect(completionReads()).toEqual([]);
+    expect(completionReads()).toEqual([COMPLETION_KEY]); // TEAM-5951: one memoized read, RECORD not this generation's
     expect(h.state.merges).toHaveLength(0);
     expect(h.state.workflow.agentTasks[DONE].output).toBe("already there");
     expect(h.state.workflow.agentTasks[DONE].mergeCommit).toBe("9f1c2ab");
   });
 
-  it("entry already complete WITH output (evidence present) → the guard does not re-harvest", async () => {
+  it("entry already complete WITH output (evidence present) → one record read (TEAM-5951), nothing re-harvested", async () => {
     // The guard's predicate is the harvest's own hasEvidence: output alone is
     // enough to skip. (Ship-signal top-up on a complete entry is the D2 harvest's
     // job on the ORIGINAL done cascade, not this late path.)
     h.state.workflow = makeWorkflow({ status: "complete", output: "already there" });
     h.state.s3Objects[COMPLETION_KEY] = RECORD;
     await handleTicketDoneUnified(DONE);
-    expect(completionReads()).toEqual([]);
+    expect(completionReads()).toEqual([COMPLETION_KEY]); // TEAM-5951: one memoized read, RECORD not this generation's
     expect(h.state.merges).toHaveLength(0);
   });
 });
@@ -663,5 +663,67 @@ describe("TEAM-5900 — an accepted re-completion harvests the NEW head over the
   it("a record older than this generation's startedAt (done before report_completion) is not taken over the entry", async () => {
     const row = await complete(rework(), record({ completed_at: T1 }));
     expect(row.agentTasks[DONE]).toMatchObject({ completedAt: T3, commitSha: HEAD_H, output: "gen-1 done", prUrl: OLD_PR });
+  });
+});
+
+/**
+ * TEAM-5951 — the agent moved its rework ticket to done BEFORE report_completion, so
+ * the accepted re-completion saw only the previous generation's record (older than
+ * startedAt, correctly not taken — TEAM-5900) and kept the old head. The fresh record
+ * lands afterwards; whatever harvests next (a replayed done on either path) must take
+ * it, because it is THIS generation's (>= startedAt) and newer than the done stamp.
+ */
+describe("TEAM-5951 — done before report_completion on a rework still records the new head", () => {
+  const HEAD_H = "old111abcdef0123456789abcdef0123456789ab"; // gen-1 head, merged in PR #846
+  const HEAD_F = "fff0000bbbb";                               // gen-2 head
+  const OLD_PR = "https://github.com/o/r/pull/846";
+  const T4 = "2026-10-01T00:04:00.000Z", T5 = "2026-10-01T00:05:00.000Z";
+  const mergedPr = { number: 846, merged_at: "2026-10-01T00:00:00Z", state: "closed", head: { sha: HEAD_H }, base: { ref: "main" }, merge_commit_sha: "m846", html_url: OLD_PR };
+  const api = async (path) => {
+    if (path.includes("/pulls?")) return [mergedPr];
+    if (path.includes("/branches/")) throw Object.assign(new Error("GitHub GET branches 404: Branch not found"), { status: 404 });
+    if (path.includes(`/compare/${HEAD_F}...`)) return { status: "diverged", ahead_by: 1, behind_by: 1 };
+    throw new Error(`unexpected ${path}`);
+  };
+  const genOne = (extra) => ({ id: "task_t1", agentId: DEV, ticketId: DONE, completedAt: T1, output: "gen-1 done", commitSha: HEAD_H, prUrl: OLD_PR, branch: "feature/x", ...extra });
+  const record = (completed_at, fields) => JSON.stringify({ ticket_id: DONE, summary: completed_at === T1 ? "gen-1 done" : "gen-2 rework", branch: "feature/x", commit_sha: completed_at === T1 ? HEAD_H : HEAD_F, completed_at, ...fields });
+
+  // Fresh module per invocation, as in Lambda: readCompletionRecord is memoized per invocation.
+  async function invoke(row, rec, at, fn) {
+    await load();
+    await wireRealStore(row);
+    const mocked = await import("./workflow-store.mjs");
+    mocked.mergeTaskMetadata.mockImplementation((await vi.importActual("./workflow-store.mjs")).mergeTaskMetadata);
+    h.state.s3Objects[COMPLETION_KEY] = rec;
+    vi.setSystemTime(new Date(at));
+    h.state.workflow = { ...makeWorkflow(), agentTasks: clone(row.agentTasks) };
+    await fn();
+  }
+
+  beforeEach(() => { vi.useFakeTimers({ toFake: ["Date"] }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("done lands before the record; a replayed stream done after the record harvests the new head and the 404 proof stays merged:null", async () => {
+    const row = { agentTasks: { [DONE]: genOne({ status: "running", startedAt: T2 }) } };
+    await invoke(row, record(T1), T3, () => handleTicketDone(DONE, streamImage())); // the done: only gen-1's record exists
+    expect(row.agentTasks[DONE]).toMatchObject({ status: "complete", completedAt: T3, commitSha: HEAD_H });
+    await invoke(row, record(T4), T5, () => handleTicketDone(DONE, streamImage())); // gen-2's record landed; the done replays
+    expect(row.agentTasks[DONE]).toMatchObject({ completedAt: T3, commitSha: HEAD_F, output: "gen-2 rework", prUrl: OLD_PR });
+    expect(recordedHeads(row.agentTasks)).toEqual([HEAD_F]);
+    const r = await featureBranchLanding({ owner: "o", repo: "r", base: "main", head: "feature/x", api, recordedHeads: recordedHeads(row.agentTasks) });
+    expect(r.merged).toBe(null); // base: merged:true via the old PR #846
+  });
+
+  it("Jira duplicate done (already complete, carrying gen-1's output) harvests the fresh record", async () => {
+    const row = { agentTasks: { [DONE]: genOne({ status: "complete", startedAt: T2, completedAt: T3 }) } };
+    await invoke(row, record(T4), T5, () => handleTicketDoneUnified(DONE));
+    expect(row.agentTasks[DONE]).toMatchObject({ completedAt: T3, commitSha: HEAD_F, output: "gen-2 rework" });
+    expect(h.state.workflow.agentTasks[DONE].commitSha).toBe(HEAD_F);
+  });
+
+  it("a replayed done whose record predates the done stamp (record-then-done) never overwrites", async () => {
+    const row = { agentTasks: { [DONE]: genOne({ status: "complete", startedAt: T2, completedAt: T4 }) } };
+    await invoke(row, record(T3), T5, () => handleTicketDone(DONE, streamImage()));
+    expect(row.agentTasks[DONE]).toMatchObject({ completedAt: T4, commitSha: HEAD_H, output: "gen-1 done" });
   });
 });

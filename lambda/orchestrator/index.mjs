@@ -931,13 +931,10 @@ export async function handleTicketDoneUnified(ticketId) {
   if (workflow.agentTasks?.[ticketId]?.status === "complete") {
     console.log(`[orchestrator] ${ticketId} already marked complete — skipping duplicate cascade.`);
     // TEAM-3976 — heal an evidence-less complete entry (mark_done landed before
-    // report_completion) even when the run is not yet complete; fill-only-if-
-    // missing, and completeWorkflow's own re-harvest then short-circuits.
+    // report_completion); with evidence, TEAM-5951: take only a fresh record (a rework's new head).
     const prior = workflow.agentTasks[ticketId];
-    const priorHasEvidence =
-      (typeof prior?.output === "string" && prior.output.trim().length > 0) ||
-      (typeof prior?.artifactKey === "string" && prior.artifactKey.length > 0);
-    if (!priorHasEvidence) await harvestCompletionEvidence(workflow, ticketId);
+    await harvestCompletionEvidence(workflow, ticketId, false, // only-fresh when the entry already has evidence
+      (typeof prior?.output === "string" && prior.output.trim().length > 0) || (typeof prior?.artifactKey === "string" && prior.artifactKey.length > 0));
     // TEAM-3974 — the cascade is a one-shot, but a human RE-deciding a gate is
     // not: re-Done'ing an escalation gate (a corrected DECISION comment, a
     // second approval) has to reach the parked release manager, or the human's
@@ -1265,10 +1262,10 @@ async function markTaskComplete(workflow, ticketId, assignee) {
  * the gate sees it in the same pass.
  *
  * Fills only what the entry lacks (a webhook merge that DID land wins) — except on
- * a `transitioned` rework re-completion (accepted stamp over a prior one) with a record no
- * older than startedAt (TEAM-5900: the new head), whose non-empty fields overwrite. Never throws.
+ * THIS generation's record (>= startedAt) on a `transitioned` re-completion (TEAM-5900) or written after the done
+ * stamp (TEAM-5951: done before report_completion; replay / merge-verify re-harvest), whose fields overwrite. Never throws.
  */
-async function harvestCompletionEvidence(workflow, ticketId, transitioned = false) {
+async function harvestCompletionEvidence(workflow, ticketId, transitioned = false, onlyFresh = false) {
   if (!ARTIFACT_BUCKET) return;
   const entry = workflow.agentTasks?.[ticketId];
   const hasEvidence =
@@ -1283,7 +1280,8 @@ async function harvestCompletionEvidence(workflow, ticketId, transitioned = fals
     (typeof entry?.mergeCommit === "string" && entry.mergeCommit.trim().length > 0) ||
     (typeof entry?.commitSha === "string" && entry.commitSha.trim().length > 0) ||
     (typeof entry?.outcome === "string" && entry.outcome.trim().length > 0);
-  if (hasEvidence && hasShipSignal && !transitioned) return;
+  const skip = onlyFresh || (hasEvidence && hasShipSignal && !transitioned); // TEAM-5951: past this, only a fresh record
+  if (skip && !entry?.startedAt) return;
   try {
     // Shared per-invocation read (TEAM-4121 FR-9): the live-reverify hook needs
     // the same record moments later, and one GET serves both.
@@ -1292,7 +1290,8 @@ async function harvestCompletionEvidence(workflow, ticketId, transitioned = fals
       console.warn(`[orchestrator] evidence harvest skipped for ${ticketId}: no readable completions/${ticketId}.json`);
       return;
     }
-    const fields = {}, fresh = transitioned && record.completed_at >= entry?.startedAt, take = (k) => fresh || !entry?.[k];
+    const fields = {}, fresh = record.completed_at >= entry?.startedAt && (transitioned || record.completed_at > entry?.completedAt), take = (k) => fresh || !entry?.[k];
+    if (skip && !fresh) return;
     // Deliverable evidence — fill when absent, overwrite when `fresh` (TEAM-5900).
     if (!hasEvidence || fresh) {
       const summary = typeof record.summary === "string" ? record.summary.trim() : "";
@@ -3507,7 +3506,9 @@ export async function completeWorkflow(workflow) {
   // leave the run open, never fall through to completion.
   let mergeProof = null;
   if (mergeVerifyConfigured && !verdict?.handoff) {
-    const probe = await featureBranchMergeProbe(workflow, freshWf?.agentTasks || workflow.agentTasks);
+    const wf = freshWf || workflow; // TEAM-5951: a record that landed after its done (no event) reaches recordedHeads
+    await Promise.all(Object.keys(wf.agentTasks || {}).map((t) => harvestCompletionEvidence(wf, t, false, true)));
+    const probe = await featureBranchMergeProbe(workflow, wf.agentTasks);
     if (probe.merged === null && probe.reason) console.warn(`[orchestrator] merge-verify inconclusive for ${workflow.id}: ${probe.reason}`);
     if (probe.merged === false) {
       console.error(
