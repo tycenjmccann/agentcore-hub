@@ -69,6 +69,7 @@ else:
     os.environ["PATH"] = f"/tmp/node-v20.18.0-linux-arm64/bin:/tmp/.npm-global/bin:{os.environ.get('PATH', '')}"
 
 import base64
+import concurrent.futures
 import contextvars
 import hashlib
 import importlib.metadata
@@ -346,6 +347,29 @@ def _persona_cache_kwargs() -> dict:
 # cancel event down to the model (strands passes invocation_state to model.stream).
 _ATTEMPT_CANCEL_KEY = "_hub_attempt_cancel"
 
+# TEAM-6074: the executor every ConverseStream worker runs on. strands 1.54 uses
+# asyncio.to_thread, i.e. the loop's DEFAULT executor, shared with sync @tools
+# (claude_code, codex, kiro) and with our own to_thread helpers; a cut attempt
+# whose socket went silent blocks its worker until READ_TIMEOUT, and on the
+# default pool that starves them all. Here it only ties up a slot no one else
+# uses. Threads start on demand, so the cap (CPython's own default-pool ceiling)
+# costs nothing idle; a small one would let leaked workers queue model calls.
+_MODEL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=32, thread_name_prefix="bedrock-model")
+
+
+async def _model_to_thread(func, /, *args, **kwargs):
+    """TEAM-6074: `asyncio.to_thread` (CPython 3.13 asyncio/threads.py) on
+    `_MODEL_EXECUTOR` instead of the default executor. The same context copy, so
+    the OTel/botocore span context reaches the worker exactly as before."""
+    import asyncio
+    import contextvars
+    import functools
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    func_call = functools.partial(ctx.run, func, *args, **kwargs)
+    return await loop.run_in_executor(_MODEL_EXECUTOR, func_call)
+
 
 class _EitherSignal:
     """TEAM-6020: set when strands' own cancel signal OR the attempt's is set.
@@ -373,15 +397,72 @@ class _AttemptCancelledBedrockModel(BedrockModel):
     cancellation that cut the attempt — so a caller `cancel_signal=` never reaches
     it. Here the worker also watches the attempt's own event, which nothing
     clears and no later attempt reuses; once set, the worker closes the stream at
-    the next chunk. Caveat: a SILENT socket yields no next chunk, so that worker
-    is still bounded only by READ_TIMEOUT."""
+    the next chunk.
 
-    async def stream(self, *args, cancel_signal=None, **kwargs):
+    TEAM-6074: a SILENT socket yields no next chunk, so that worker stays blocked
+    until READ_TIMEOUT. It therefore runs on `_MODEL_EXECUTOR`, never the default
+    executor, so a cut never leaves it holding a shared slot. `stream` is strands
+    1.54.0's `BedrockModel.stream` line for line, with only the `_EitherSignal`
+    wrap and `_model_to_thread` in place of `asyncio.to_thread` (strands offers no
+    executor hook); test_stream_retry §10 pins the mirrored source."""
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, *,
+                     tool_choice=None, system_prompt_content=None, cancel_signal=None,
+                     **kwargs):
+        import asyncio
+        from strands.models.bedrock import (
+            _next_stream_event, _poll_cancel_signal, _suppress_task_exception)
+
         attempt_signal = (kwargs.get("invocation_state") or {}).get(_ATTEMPT_CANCEL_KEY)
         if attempt_signal is not None:
             cancel_signal = _EitherSignal(cancel_signal, attempt_signal)
-        async for event in super().stream(*args, cancel_signal=cancel_signal, **kwargs):
-            yield event
+
+        def callback(event=None):
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+            if event is None:
+                return
+
+        loop = asyncio.get_event_loop()
+        queue = asyncio.Queue()
+
+        # Handle backward compatibility: if system_prompt is provided but system_prompt_content is None
+        if system_prompt and system_prompt_content is None:
+            system_prompt_content = [{"text": system_prompt}]
+
+        thread = _model_to_thread(  # TEAM-6074: was asyncio.to_thread
+            self._stream,
+            callback,
+            messages,
+            tool_specs,
+            system_prompt_content,
+            tool_choice,
+            kwargs.get("dynamic_trailing_blocks", 0),
+            cancel_signal,
+        )
+        task = asyncio.create_task(thread)
+        cancel_poll = asyncio.ensure_future(_poll_cancel_signal(cancel_signal)) if cancel_signal else None
+
+        try:
+            while True:
+                event = await _next_stream_event(queue, cancel_poll)
+                if event is None:
+                    break
+
+                yield event
+
+            if cancel_poll is not None and cancel_poll.done():
+                # The worker thread owns the event stream and closes it at its next chunk boundary.
+                # Detaching it rather than awaiting keeps a stalled read from delaying the caller.
+                task.add_done_callback(_suppress_task_exception)
+                return
+
+            await task
+        except BaseException:
+            task.add_done_callback(_suppress_task_exception)
+            raise
+        finally:
+            if cancel_poll is not None:
+                cancel_poll.cancel()
 
 
 def _build_bedrock_model(model_id: str) -> BedrockModel:

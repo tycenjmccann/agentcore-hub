@@ -2206,17 +2206,25 @@ async def test_team6045_slow_backoff_heartbeats_are_charged_to_the_deadline() ->
 
 def _shipped_attempt_cancel_model_cls() -> type:
     """`_AttemptCancelledBedrockModel` exec'd from main.py against the REAL
-    BedrockModel (the shared loader stubs `BedrockModel = None`)."""
+    BedrockModel (the shared loader stubs `BedrockModel = None`). TEAM-6074: the
+    model executor and its to_thread mirror come along when defined; their
+    presence is asserted strictly by the §10 parity test, not here, so the §10
+    behaviour test still runs (and fails on the bug) against a main.py without them."""
     import ast
+    import concurrent.futures
 
     from strands.models.bedrock import BedrockModel
 
     from test_telemetry_spans import MAIN_PY, _module_scope_nodes
 
     tree = ast.parse(MAIN_PY.read_text())
+    defined = {t.id for n in tree.body if isinstance(n, ast.Assign)
+               for t in n.targets if isinstance(t, ast.Name)}
+    defined |= {n.name for n in tree.body if isinstance(n, ast.AsyncFunctionDef)}
+    executor = [n for n in ("_MODEL_EXECUTOR", "_model_to_thread") if n in defined]
     nodes = _module_scope_nodes(
-        tree, ["_ATTEMPT_CANCEL_KEY", "_EitherSignal", "_AttemptCancelledBedrockModel"])
-    ns: dict[str, Any] = {"BedrockModel": BedrockModel}
+        tree, [*executor, "_ATTEMPT_CANCEL_KEY", "_EitherSignal", "_AttemptCancelledBedrockModel"])
+    ns: dict[str, Any] = {"BedrockModel": BedrockModel, "concurrent": concurrent}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(MAIN_PY), "exec"), ns)  # noqa: S102
     return ns["_AttemptCancelledBedrockModel"]
 
@@ -2402,3 +2410,130 @@ def test_team6020_either_signal_and_the_model_factory() -> None:
     (factory,) = _module_scope_nodes(ast.parse(MAIN_PY.read_text()), ["_build_bedrock_model"])
     returns = [n for n in ast.walk(factory) if isinstance(n, ast.Return)]
     assert [r.value.func.id for r in returns] == ["_AttemptCancelledBedrockModel"]
+
+
+# ─── 10. TEAM-6074: a cut worker on a SILENT socket holds no shared pool slot ─
+#
+# §9's cancel event stops the worker at its NEXT chunk; a socket that goes fully
+# silent yields none, so the worker blocks until READ_TIMEOUT (1200s, x3 botocore
+# attempts on open). strands 1.54 runs it via asyncio.to_thread — the loop's
+# DEFAULT executor, shared with sync @tools (claude_code) and our own to_thread
+# helpers. The model worker now runs on main.py's dedicated `_MODEL_EXECUTOR`.
+
+# sha256 of `inspect.getsource(BedrockModel.stream)` in strands-agents 1.54.0 —
+# the body `_AttemptCancelledBedrockModel.stream` mirrors.
+_STRANDS_1_54_STREAM_SHA256 = "6bb5e9561b418a015f1d4c354ee997406149195c19710c9e378416bef69fcee9"
+
+
+class _SilentStream:
+    """A ConverseStream body that never yields: the worker blocks on `gate`
+    (released only at teardown; the 10s cap just bounds a broken run)."""
+
+    def __init__(self, gate: Any) -> None:
+        import threading
+
+        self.gate = gate
+        self.started = threading.Event()
+        self.thread_name: str | None = None
+        self.returned = False
+        self.closed = False
+
+    def __iter__(self):
+        import threading
+
+        self.thread_name = threading.current_thread().name
+        self.started.set()
+        try:
+            self.gate.wait(10)
+        finally:
+            self.returned = True
+        return
+        yield  # noqa: unreachable — makes this a generator
+
+    def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_team6074_a_silent_cut_worker_holds_no_shared_pool_slot() -> None:
+    """Attempt 1 times out (arms the outage clock); attempt 2's socket goes fully
+    silent past the 0.3s deadline. With the default executor shrunk to ONE slot,
+    the cut must leave that slot free: the silent worker sits on a bedrock-model
+    thread, and both the run's own exhaustion comment and a fresh to_thread
+    complete while it is still blocked."""
+    import asyncio
+    import concurrent.futures
+    import threading
+
+    from botocore.exceptions import ReadTimeoutError as BotoReadTimeoutError
+
+    loop = asyncio.get_running_loop()
+    shared = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop.set_default_executor(shared)
+    gate = threading.Event()
+    silent = _SilentStream(gate)
+    model = _stub_client_model(_shipped_attempt_cancel_model_cls(),
+                               [BotoReadTimeoutError(endpoint_url="https://bedrock-runtime"), silent])
+    ns, _unused, errors, deaths = _load_real(model)
+    ns["_STREAM_RETRY_DEADLINE_S"] = 0.3
+    ns["_STREAM_RETRY_INFLIGHT_HEARTBEAT_S"] = 0.05
+    ns["_stream_heartbeat_wait"] = asyncio.sleep
+    try:
+        task = await _run_or_fail(ns["_run_agent_invocation"](UNBOUND, CTX))
+        assert isinstance(task.exception(), ns["StreamRetryDeadlineExceeded"]), repr(task.exception())
+        assert len(model.test_calls) == 2
+        assert silent.started.is_set() and not silent.returned, "the silent worker must still be blocked"
+
+        assert (silent.thread_name or "").startswith("bedrock-model"), (
+            f"the silent worker runs on {silent.thread_name!r}, a shared pool thread")
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(lambda: 1), 1.0) == 1
+        except TimeoutError:
+            pytest.fail("asyncio.to_thread stalled: the cut worker holds the default executor's slot")
+        assert not silent.returned, "the probe must have run while the worker was still blocked"
+    finally:
+        gate.set()  # never strand a thread past the test
+        shared.shutdown(wait=False)
+
+
+def test_team6074_mirrored_strands_stream_is_unchanged() -> None:
+    """`_AttemptCancelledBedrockModel.stream` is a line-for-line mirror of strands
+    1.54.0's `BedrockModel.stream` with only the executor swapped. A strands bump
+    that touches that body (or the helpers / `_stream` signature it relies on) must
+    fail here, loudly, instead of silently diverging."""
+    import ast
+    import hashlib
+    import re
+
+    import strands.models.bedrock as sb
+
+    from test_telemetry_spans import MAIN_PY, _module_scope_nodes
+
+    digest = hashlib.sha256(inspect.getsource(sb.BedrockModel.stream).encode()).hexdigest()
+    assert digest == _STRANDS_1_54_STREAM_SHA256, (
+        "strands' BedrockModel.stream changed: re-mirror _AttemptCancelledBedrockModel.stream "
+        "in main.py from the new source, then re-pin _STRANDS_1_54_STREAM_SHA256")
+    for helper in ("_next_stream_event", "_poll_cancel_signal", "_suppress_task_exception"):
+        assert callable(getattr(sb, helper, None)), f"strands.models.bedrock.{helper} is gone"
+    params = list(inspect.signature(sb.BedrockModel._stream).parameters)[1:]
+    assert params == ["callback", "messages", "tool_specs", "system_prompt_content",
+                      "tool_choice", "dynamic_trailing_blocks", "cancel_signal"], params
+
+    for req in (MAIN_PY.parent / "requirements.txt",
+                MAIN_PY.parent / "tests" / "requirements-test.txt"):
+        (line,) = [ln for ln in req.read_text().splitlines()
+                   if re.match(r"strands-agents\s*[<>=]", ln)]
+        assert "<1.55" in line, f"{req.name}: {line!r} — the mirror is pinned to 1.54"
+
+    tree = ast.parse(MAIN_PY.read_text())
+    (cls,) = _module_scope_nodes(tree, ["_AttemptCancelledBedrockModel"])
+    _module_scope_nodes(tree, ["_MODEL_EXECUTOR", "_model_to_thread"])  # asserts both exist
+    for node in ast.walk(cls):
+        assert not (isinstance(node, ast.Attribute) and node.attr == "to_thread"), (
+            "the model worker must not go through asyncio.to_thread (the default executor)")
+        assert not (isinstance(node, ast.Attribute) and node.attr == "stream"
+                    and isinstance(node.value, ast.Call)
+                    and getattr(node.value.func, "id", None) == "super"), (
+            "super().stream() runs strands' to_thread — the override must mirror the body")
+    executor = _shipped_attempt_cancel_model_cls().stream.__globals__["_MODEL_EXECUTOR"]
+    assert executor._thread_name_prefix == "bedrock-model"
