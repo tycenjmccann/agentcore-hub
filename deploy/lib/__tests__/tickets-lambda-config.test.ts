@@ -60,7 +60,7 @@ const s3Statements = (list: Statement[]) =>
 
 describe("buildTicketsPolicyStatements — the S3 grants (TEAM-5867 P0)", () => {
   it.each(["dynamodb", "jira"] as const)(
-    "%s: grants s3:ListBucket on the bucket ARN itself - no /*, no Condition",
+    "%s: grants s3:ListBucket on the bucket ARN itself - no /*, scoped to completions/* and config/*",
     (provider) => {
       const list = statements(provider).filter((s) => actionsOf(s).includes("s3:ListBucket"));
       expect(list).toEqual([
@@ -69,14 +69,15 @@ describe("buildTicketsPolicyStatements — the S3 grants (TEAM-5867 P0)", () => 
           Effect: "Allow",
           Action: ["s3:ListBucket"],
           Resource: BUCKET_ARN,
+          Condition: { StringLike: { "s3:prefix": ["completions/*", "config/*"] } },
         },
       ]);
       // The bucket ARN, not an object ARN: ListBucket on `<bucket>/*` grants nothing.
       expect(list[0].Resource).not.toContain("/");
-      // Unconditioned on purpose: the twins probe with GetObject, whose implicit ListBucket
-      // check carries no s3:prefix, so a StringLike s3:prefix condition would never match
-      // and S3 would keep answering 403 for a missing record.
-      expect(list[0]).not.toHaveProperty("Condition");
+      // TEAM-5881: the s3:prefix condition DOES bind to the implicit list check behind a
+      // GetObject/HeadObject (s3:prefix = the requested key) — live proof CodeBuild
+      // agentcore-hub-runtime-image-deploy:3c398e4f — so the scoped grant still turns a
+      // missing completions/<ticket>.json into 404, without enumerating the whole bucket.
     }
   );
 
@@ -97,10 +98,16 @@ describe("buildTicketsPolicyStatements — the S3 grants (TEAM-5867 P0)", () => 
     }
   );
 
-  it("no S3 statement carries an s3:prefix Condition", () => {
+  it("only ArtifactBucketList carries a Condition, and it is exactly the completions/* + config/* s3:prefix (TEAM-5881)", () => {
     for (const provider of ["dynamodb", "jira"] as const) {
       for (const s of s3Statements(statements(provider))) {
-        expect(s.Condition, `${provider}/${s.Sid}`).toBeUndefined();
+        if (s.Sid === "ArtifactBucketList") {
+          expect(s.Condition, `${provider}/${s.Sid}`).toEqual({
+            StringLike: { "s3:prefix": ["completions/*", "config/*"] },
+          });
+        } else {
+          expect(s.Condition, `${provider}/${s.Sid}`).toBeUndefined();
+        }
       }
     }
   });

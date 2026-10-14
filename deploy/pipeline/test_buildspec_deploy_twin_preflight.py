@@ -47,14 +47,17 @@ print(json.dumps(reply["out"]))
 '''
 
 
-def _policy(with_list=True):
+def _policy(with_list=True, list_condition=None):
     st = [
         {"Effect": "Allow", "Action": ["logs:CreateLogGroup"], "Resource": f"arn:aws:logs:us-east-1:{ACCOUNT}:*"},
         {"Sid": "ArtifactRead", "Effect": "Allow", "Action": ["s3:GetObject"], "Resource": f"arn:aws:s3:::{BUCKET}/*"},
         {"Sid": "CompletionRecordFence", "Effect": "Allow", "Action": ["s3:PutObject"], "Resource": f"arn:aws:s3:::{BUCKET}/completions/*"},
     ]
     if with_list:
-        st.append({"Sid": "ArtifactBucketList", "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": f"arn:aws:s3:::{BUCKET}"})
+        lst = {"Sid": "ArtifactBucketList", "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": f"arn:aws:s3:::{BUCKET}"}
+        if list_condition is not None:
+            lst["Condition"] = list_condition
+        st.append(lst)
     return {"Version": "2012-10-17", "Statement": st}
 
 
@@ -146,6 +149,21 @@ def test_grant_present_lets_the_deploy_proceed(tmp_path):
     r, calls = _run(tmp_path, _fixture())
     assert r.returncode == 0, r.stdout + r.stderr
     assert any(c.startswith("iam get-role-policy") for c in calls), calls
+
+
+# TEAM-5881: the scoped grant setup-tickets-lambda.mjs now writes. A ListBucket scoped by
+# s3:prefix covers the implicit list check behind GetObject/HeadObject (live proof CodeBuild
+# agentcore-hub-runtime-image-deploy:3c398e4f), so it must not refuse the deploy.
+def test_prefix_scoped_grant_lets_the_deploy_proceed(tmp_path):
+    scoped = {"StringLike": {"s3:prefix": ["completions/*", "config/*"]}}
+    r, calls = _run(tmp_path, _fixture(policy=_policy(list_condition=scoped)))
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_grant_scoped_to_an_unrelated_prefix_fails_pre_build(tmp_path):
+    r, calls = _run(tmp_path, _fixture(policy=_policy(list_condition={"StringLike": {"s3:prefix": ["workflows/*"]}})))
+    assert r.returncode != 0, r.stdout + r.stderr
+    assert not [c for c in calls if "update-function-code" in c], calls
 
 
 def test_no_twin_in_the_plan_makes_no_aws_call(tmp_path):

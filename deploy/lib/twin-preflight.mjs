@@ -5,7 +5,7 @@
  * Since TEAM-5832/TEAM-5805 both twins GetObject completions/<ticket>.json on every
  * non-ship Done and admit a missing record ONLY on 404; anything else refuses with
  * completion_record_required. S3 answers a missing key with 404 only when the caller
- * also holds s3:ListBucket on the bucket — the ArtifactBucketList statement
+ * also holds s3:ListBucket covering that key — the ArtifactBucketList statement
  * (tickets-lambda-config.mjs) that ONLY deploy/setup-tickets-lambda.mjs applies, a
  * handoff. The pipeline ships twin code with update-function-code alone, so without
  * this check a green deploy could ship code that refuses every non-ship Done fleet-wide.
@@ -22,8 +22,11 @@
  *   - a grant that exists only in a MANAGED policy. setup-tickets-lambda.mjs writes the
  *     grant inline, and this check reads inline policies only (the Deploy role holds
  *     iam:ListRolePolicies / iam:GetRolePolicy on the two twin roles and nothing more);
- *   - a conditioned Allow (TEAM-5883: an s3:prefix condition never binds to GetObject's
- *     implicit list check, so S3 still answers 403), or any Deny that may apply;
+ *   - a conditioned Allow, or any Deny that may apply. The one exception is s3:ListBucket
+ *     scoped ONLY by StringLike s3:prefix with an entry covering completions/ (TEAM-5881):
+ *     the implicit list check behind a GetObject/HeadObject of a missing key carries
+ *     s3:prefix = that key, so the scoped grant yields 404 as an unconditioned one does
+ *     (live proof CodeBuild agentcore-hub-runtime-image-deploy:3c398e4f);
  *   - GetObject is proven over the WHOLE completions/ namespace, never one probe key
  *     (TEAM-5924): an Allow counts only when its Resource covers every key under
  *     completions/, and any GetObject Deny whose Resource could match one of them refuses.
@@ -108,6 +111,29 @@ export function policyGrants(docs, action, arn) {
   );
 }
 
+/**
+ * TEAM-5881: some Allow grants s3:ListBucket on `bucketArn` in a way that covers every key
+ * under `keyPrefix` — unconditioned, or under a Condition that is exactly StringLike
+ * s3:prefix with an entry covering `keyPrefix` (coversPrefix). S3 evaluates the implicit
+ * list check behind a GetObject/HeadObject with s3:prefix = the requested key, so either
+ * makes a missing key answer 404. Any other operator or condition key does not count.
+ */
+export function policyGrantsListUnder(docs, bucketArn, keyPrefix) {
+  return statementsOf(docs).some((st) => {
+    if (st?.Effect !== "Allow" || "NotAction" in st || "NotResource" in st) return false;
+    if (!actionMatches(st, "s3:ListBucket") || !resourceMatches(st, bucketArn)) return false;
+    const cond = st.Condition || {};
+    if (Object.keys(cond).length === 0) return true;
+    const like = cond.StringLike;
+    return (
+      Object.keys(cond).length === 1 &&
+      like && typeof like === "object" &&
+      Object.keys(like).length === 1 && "s3:prefix" in like &&
+      list(like["s3:prefix"]).some((p) => coversPrefix(p, keyPrefix))
+    );
+  });
+}
+
 /** Some Deny MAY deny `action` on `arn` — conditioned or not; a NotAction/NotResource Deny is assumed to. */
 export function policyDenies(docs, action, arn) {
   return statementsOf(docs).some(
@@ -181,7 +207,7 @@ export function decideTwin({ fn, optional, expectedBucket, config, policies }) {
   // completions/twin-* through).
   const need = [
     ["s3:ListBucket", bucketArn, "a missing completions/<ticket>.json must read as 404, not 403",
-      () => policyDenies(policies.docs, "s3:ListBucket", bucketArn), () => policyGrants(policies.docs, "s3:ListBucket", bucketArn)],
+      () => policyDenies(policies.docs, "s3:ListBucket", bucketArn), () => policyGrantsListUnder(policies.docs, bucketArn, "completions/")],
     ["s3:GetObject", `${completions}*`, "the Done guard reads completion records",
       () => policyMayDenyUnder(policies.docs, "s3:GetObject", completions), () => policyGrantsUnder(policies.docs, "s3:GetObject", completions)],
     // TEAM-5941: the Done-intent fence is a conditional PutObject of the record right
@@ -194,7 +220,8 @@ export function decideTwin({ fn, optional, expectedBucket, config, policies }) {
     if (denied()) {
       reasons.push(`role ${config.role} has a Deny that may cover ${action} on ${arn} (${why})`);
     } else if (!granted()) {
-      reasons.push(`role ${config.role} has no unconditioned inline ${action} covering ${arn} (${why})`);
+      const kind = action === "s3:ListBucket" ? "inline s3:ListBucket covering completions/ (unconditioned or s3:prefix-scoped) on" : `unconditioned inline ${action} covering`;
+      reasons.push(`role ${config.role} has no ${kind} ${arn} (${why})`);
     }
   }
   if (reasons.length) {
@@ -203,7 +230,7 @@ export function decideTwin({ fn, optional, expectedBucket, config, policies }) {
     );
     return { action: "block", reasons };
   }
-  return { action: "proceed", reasons: [`role ${config.role} grants unconditioned s3:ListBucket on ${bucketArn}, and s3:GetObject and s3:PutObject over ${completions}*, with no Deny that may apply; ARTIFACT_BUCKET is set`] };
+  return { action: "proceed", reasons: [`role ${config.role} grants s3:ListBucket on ${bucketArn} covering completions/ (unconditioned or s3:prefix-scoped), and s3:GetObject and s3:PutObject over ${completions}*, with no Deny that may apply; ARTIFACT_BUCKET is set`] };
 }
 
 // ── the thin wrapper over the aws CLI ───────────────────────────────────────────

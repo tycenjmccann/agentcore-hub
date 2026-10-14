@@ -434,6 +434,8 @@ export function buildInlinePolicy(env) {
         : []),
       // Read ONE prefix of the artifact bucket: the Deploy stage's handoff
       // markers. Never the roster, blueprints, rollback snapshots or baselines.
+      // TEAM-5881: the same prefix is also listable (ShipRejectionMarkerList below),
+      // so a missing marker - the normal case - reads as NoSuchKey, not 403.
       ...(artifactBucket
         ? [
             {
@@ -492,6 +494,14 @@ export function buildInlinePolicy(env) {
       // condition binds every list to a marker-shaped prefix: the role can learn
       // whether a veto key exists and nothing else - no record bodies, no listing
       // of the approval records it writes, and still no read of any object.
+      //
+      // TEAM-5881: and pipeline-artifacts/handoff/*, so executionSnapshot's GetObject
+      // of a MISSING handoff/<sha12>.txt answers NoSuchKey instead of 403 (which
+      // logged "handoff marker read failed" on every deploy with nothing to hand
+      // off). The implicit list check behind a GetObject/HeadObject carries s3:prefix
+      // = the requested key, so a prefix-scoped grant covers it - live proof CodeBuild
+      // agentcore-hub-runtime-image-deploy:3c398e4f. Listing handoff/ names keys
+      // HandoffMarkerRead can already read; it adds nothing else.
       ...(artifactBucket
         ? [
             {
@@ -501,7 +511,10 @@ export function buildInlinePolicy(env) {
               Resource: [`arn:aws:s3:::${artifactBucket}`],
               Condition: {
                 StringLike: {
-                  "s3:prefix": ["pipeline-artifacts/ship-approvals/*.rejected.json"],
+                  "s3:prefix": [
+                    "pipeline-artifacts/ship-approvals/*.rejected.json",
+                    "pipeline-artifacts/handoff/*",
+                  ],
                 },
               },
             },

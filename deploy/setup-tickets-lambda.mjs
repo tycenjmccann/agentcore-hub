@@ -273,10 +273,11 @@ try {
 // what each grants and why. In short: CloudWatch Logs; DynamoDB (dynamodb provider only);
 // s3:GetObject on the artifact bucket's objects (roster + completions/<ticket>.json, the
 // body the Done guard reads since TEAM-4706/TEAM-4757); and - TEAM-5867 - s3:ListBucket on
-// the bucket itself, unconditioned, so S3 reports a MISSING completion record as 404
-// rather than 403. The twins' guard (TEAM-5832) admits a recordless Done only on 404 and
-// refuses on anything else, so without ListBucket no human gate could ever close. The
-// pipeline probe / events / workflows statements stay conditional on their env vars.
+// the bucket itself, scoped by s3:prefix to completions/* and config/* (TEAM-5881), so S3
+// reports a MISSING completion record as 404 rather than 403. The twins' guard
+// (TEAM-5832) admits a recordless Done only on 404 and refuses on anything else, so
+// without ListBucket no human gate could ever close. The pipeline probe / events /
+// workflows statements stay conditional on their env vars.
 // scripts/verify-infra.sh asserts both S3 grants are still present on the live role.
 const policyStatements = buildTicketsPolicyStatements({
   provider: TICKET_PROVIDER,

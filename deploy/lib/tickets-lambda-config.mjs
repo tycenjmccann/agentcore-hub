@@ -56,18 +56,17 @@ export function resolveArtifactBucket({ env = process.env, accountId = "", regio
  *   ArtifactRead       — s3:GetObject on <bucket>/*: the agent roster, the phase sets, and
  *                        (TEAM-4706 DL-030, TEAM-4757) the body of completions/<ticket>.json
  *                        behind the Done guard.
- *   ArtifactBucketList — s3:ListBucket on the BUCKET ARN (no `/*`), UNCONDITIONED
- *                        (TEAM-5867 P0). This is what makes S3 report a missing record as
- *                        404 instead of 403, which the twins' guard needs to tell "no
- *                        record" (admit a human gate) from "could not read" (refuse). It
- *                        carries no s3:prefix Condition on purpose: the twins probe with
- *                        GetObject, whose implicit ListBucket check has no prefix in its
- *                        request context, so a StringLike s3:prefix condition would never
- *                        match and S3 would keep answering 403. (TEAM-5600 hit the same wall
- *                        on the pipeline-tools role and had to move ITS probe to
- *                        ListObjectsV2 before a prefix condition could bind.) The role
- *                        already reads every object in the bucket, so this adds key-name
- *                        enumeration and nothing else.
+ *   ArtifactBucketList — s3:ListBucket on the BUCKET ARN (no `/*`), scoped by
+ *                        StringLike s3:prefix to completions/* and config/* (TEAM-5867 P0,
+ *                        TEAM-5881). This is what makes S3 report a missing record as 404
+ *                        instead of 403, which the twins' guard needs to tell "no record"
+ *                        (admit a human gate) from "could not read" (refuse). The prefix
+ *                        condition binds to the implicit list check behind a GetObject /
+ *                        HeadObject of a missing key (s3:prefix = the requested key) — live
+ *                        proof CodeBuild agentcore-hub-runtime-image-deploy:3c398e4f, whose
+ *                        only hub-bucket ListBucket is the prefix-scoped
+ *                        ListShipApprovalPrefix — so the twins can enumerate key names
+ *                        under the two prefixes they read and nowhere else.
  *   CompletionRecordFence — s3:PutObject on <bucket>/completions/* ONLY (TEAM-5941): the
  *                        twins' Done-intent fence is a conditional PutObject of the
  *                        completion record right before the provider commit. The one S3
@@ -133,6 +132,7 @@ export function buildTicketsPolicyStatements({
       Effect: "Allow",
       Action: ["s3:ListBucket"],
       Resource: `arn:aws:s3:::${artifactBucket}`,
+      Condition: { StringLike: { "s3:prefix": ["completions/*", "config/*"] } },
     },
     {
       // TEAM-5941 (TEAM-5799 ship-review r2 F1): the Done-intent fence. Before the
