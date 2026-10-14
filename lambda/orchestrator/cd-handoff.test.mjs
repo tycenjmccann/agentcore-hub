@@ -131,6 +131,9 @@ vi.mock("./workflow-store.mjs", () => ({
   setRepoCheck: vi.fn(async () => {}),
   appendReviewNotificationOnce: vi.fn(async (wfId, tid, n) => { h.state.notifications.push(n); return true; }),
   appendNotification: vi.fn(async () => {}),
+  // TEAM-5914: the unmerged refusal escalates through the CAS once-append. Before, a
+  // missing stub was swallowed by notifyCompletionBlockedOnce's catch (no escalation).
+  appendEscalationOnce: vi.fn(async (wfId, id, n) => { h.state.notifications.push({ ...n, id }); return true; }),
   ackNotifications: vi.fn(async () => {}),
   completeWorkflow: vi.fn(async (id, ts) => { h.state.completions.push({ id, ts }); return true; }),
   claimTerminalOutcome: vi.fn(async (id, outcome) => { h.state.terminalClaims.push({ id, outcome }); return true; }),
@@ -569,6 +572,8 @@ describe("5. completion — CD run handed off (TEAM-4768)", () => {
     expect(h.state.deliveries).toEqual([]);
     expect(eventsOf("workflow.complete")).toHaveLength(0);
     expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedUnmergedBranch"))).toBe(true);
+    expect(eventsOf("workflow.completion_blocked").map((e) => e.detail.reason)).toEqual(["unmerged_branch"]);
+    expect(h.state.notifications.filter((n) => n.id === "notif_completion_unmerged_wf_1")).toHaveLength(1);
     error.mockRestore();
   });
 

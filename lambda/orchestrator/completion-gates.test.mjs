@@ -37,6 +37,7 @@ const h = vi.hoisted(() => ({
     queries: 0,
     freshWorkflow: /** @type {any} */ (null),
     getWorkflowThrows: false,
+    escalationOverride: null, // TEAM-5914: () => result | throws, replaces the once-append for one test
     storeCompletions: /** @type {any[]} */ ([]),
     finalized: /** @type {any[]} */ ([]),
     // TEAM-3747 D2: the honest-terminal-close seam. Every claimTerminalOutcome
@@ -194,9 +195,13 @@ vi.mock("./workflow-store.mjs", () => ({
     if (tasks) tasks[tid] = { ...(tasks[tid] || { ticketId: tid }), ...fields };
   }),
   appendNotification: vi.fn(async (id, n) => { h.state.notifications.push({ id, n }); }),
+  // TEAM-5914: the stream Done path (handleTicketDone) before it reaches completeWorkflow.
+  completeTaskEntry: vi.fn(async () => true),
+  ackNotifications: vi.fn(async () => 0),
   // TEAM-5853: the CAS-backed once-append. The open-id check and the push run with
   // no await between them, so concurrent callers see each other — as the real CAS does.
   appendEscalationOnce: vi.fn(async (wfId, id, n, { maxCount = 6 } = {}) => {
+    if (h.state.escalationOverride) return h.state.escalationOverride();
     if (maxCount <= 1 && h.state.notifications.some((x) => x.n.id === id && !x.n.acknowledged)) return false;
     h.state.notifications.push({ id: wfId, n: { ...n, id, count: 1 } });
     return true;
@@ -258,6 +263,7 @@ beforeEach(() => {
   h.state.queries = 0;
   h.state.freshWorkflow = null;
   h.state.getWorkflowThrows = false;
+  h.state.escalationOverride = null;
   h.state.storeCompletions.length = 0;
   h.state.finalized.length = 0;
   h.state.terminalClaims.length = 0;
@@ -1192,6 +1198,68 @@ describe("completeWorkflow — late evidence is re-harvested; a real gap escalat
     expect(n.details).toContain("D-1@development");
     expect(n.acknowledged).toBe(false);
     error.mockRestore();
+  });
+
+  // TEAM-5914 (S1-3): only a VERIFIED open row may suppress workflow.completion_blocked.
+  // A write that throws or cannot be confirmed (CAS exhausted / row unreadable → null)
+  // must still publish, or the stranded run leaves neither a notification nor an event.
+  const quiet = () => [vi.spyOn(console, "error").mockImplementation(() => {}), vi.spyOn(console, "warn").mockImplementation(() => {})];
+  const evidenceBlocked = () => ebEventsOfType("workflow.completion_blocked").filter((d) => d.reason === "missing_evidence");
+
+  it("TEAM-5914: the escalation write throws → workflow.completion_blocked is still published, once", async () => {
+    const spies = quiet();
+    h.state.snapshots = [CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: TASKS_MISSING_D1(), humanNotifications: [] };
+    h.state.escalationOverride = () => { throw new Error("ProvisionedThroughputExceededException"); };
+    await expect(completeWorkflow({ ...WF })).resolves.toBeUndefined();
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.notifications).toHaveLength(0);
+    expect(evidenceBlocked()).toHaveLength(1);
+    expect(evidenceBlocked()[0].offenders).toContain("D-1@development");
+    spies.forEach((s) => s.mockRestore());
+  });
+
+  it("TEAM-5914: CAS retries exhausted (null) → workflow.completion_blocked is still published, once", async () => {
+    const spies = quiet();
+    h.state.snapshots = [CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: TASKS_MISSING_D1(), humanNotifications: [] };
+    h.state.escalationOverride = () => null;
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(evidenceBlocked()).toHaveLength(1);
+    spies.forEach((s) => s.mockRestore());
+  });
+
+  // TEAM-5914: "at most once per invocation". Two Done records of one run in ONE stream
+  // batch, with the escalation write failing both times → one event; the next handler
+  // invocation (the guard is cleared at entry) is a fresh re-observation and publishes again.
+  const doneRecord = (ticketId) => ({ eventName: "MODIFY", dynamodb: {
+    OldImage: { ticketId: { S: ticketId }, status: { S: "in_progress" } },
+    NewImage: { ticketId: { S: ticketId }, status: { S: "done" }, parentId: { S: "EPIC-1" }, workflowId: { S: "wf_1" }, assignee: { S: "agentcore_hub_qa_verifier" } },
+  } });
+  it("TEAM-5914: one handler invocation, two Done records, failing write → ONE event; a new invocation publishes again", async () => {
+    const spies = quiet();
+    h.state.snapshots = [CHILDREN];
+    h.state.freshWorkflow = { ...WF, agentTasks: TASKS_MISSING_D1(), humanNotifications: [] };
+    h.state.escalationOverride = () => { throw new Error("ProvisionedThroughputExceededException"); };
+    await handler({ Records: [doneRecord("D-2"), doneRecord("D-3")] });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(evidenceBlocked()).toHaveLength(1);
+    await handler({ Records: [doneRecord("D-2")] });
+    expect(evidenceBlocked()).toHaveLength(2);
+    spies.forEach((s) => s.mockRestore());
+  });
+
+  it("TEAM-5914: a verified open row (stale snapshot missed it) → no event, no second append", async () => {
+    const spies = quiet();
+    h.state.snapshots = [CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: TASKS_MISSING_D1(), humanNotifications: [] };
+    h.state.notifications.push({ id: "wf_1", n: { id: "notif_completion_evidence_wf_1", acknowledged: false, count: 1 } });
+    await completeWorkflow({ ...WF });
+    expect(h.state.storeCompletions).toHaveLength(0);
+    expect(h.state.notifications).toHaveLength(1);
+    expect(evidenceBlocked()).toHaveLength(0);
+    spies.forEach((s) => s.mockRestore());
   });
 });
 

@@ -896,12 +896,13 @@ export async function appendReviewNotificationOnce(workflowId, ticketId, notific
  * Same optimistic notifVersion CAS as appendReviewNotificationOnce, for the same
  * reason (DynamoDB cannot predicate-match inside a list), and the same
  * acknowledged-based lifecycle: an acked watch that recurs re-notifies.
- * Returns true only when THIS caller wrote (appended or bumped).
+ * Returns true only when THIS caller wrote (appended or bumped); false only when a
+ * verified open row stood it down; null when nothing could be persisted (no row, CAS exhausted).
  */
 export async function appendEscalationOnce(workflowId, id, notification, { maxCount = 6 } = {}, maxAttempts = 3) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const wf = await getWorkflow(workflowId);
-    if (!wf) return false;
+    if (!wf) return null;
     const list = Array.isArray(wf.humanNotifications) ? wf.humanNotifications : [];
     const at = list.findIndex((n) => n.id === id && !n.acknowledged);
     const open = at >= 0 ? list[at] : null;
@@ -929,7 +930,7 @@ export async function appendEscalationOnce(workflowId, id, notification, { maxCo
     }
   }
   console.warn(`[workflow-store] appendEscalationOnce(${workflowId}, ${id}): CAS retries exhausted`);
-  return false;
+  return null;
 }
 
 /**

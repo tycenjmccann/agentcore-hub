@@ -1196,10 +1196,24 @@ describe("appendEscalationOnce (TEAM-4739 W1'/W2/W3)", () => {
     expect(gets).toBe(2);
   });
 
-  it("a missing workflow row is a no-op, not a throw", async () => {
+  // TEAM-5914: false means ONLY "a verified open row stood this down". A missing row
+  // or exhausted CAS could not persist anything, so it is null (unknown), still falsy.
+  it("a missing workflow row is a no-op, not a throw — null (could not persist), never false", async () => {
     const restore = rowReturning(undefined);
     try {
-      expect(await appendEscalationOnce("wf_missing", ID, notif())).toBe(false);
+      expect(await appendEscalationOnce("wf_missing", ID, notif())).toBeNull();
     } finally { restore(); }
+  });
+
+  it("TEAM-5914: CAS retries exhausted → null (could not persist), never false", async () => {
+    const restore = rowReturning({ workflowId: "wf_1", notifVersion: 1, humanNotifications: [] });
+    const realSend = stubDdb.send;
+    stubDdb.send = async (cmd) => {
+      if (cmd.constructor.name !== "UpdateCommand") return realSend(cmd);
+      const err = new Error("moved"); err.name = "ConditionalCheckFailedException"; throw err;
+    };
+    try {
+      expect(await appendEscalationOnce("wf_1", ID, notif(), { maxCount: 1 })).toBeNull();
+    } finally { stubDdb.send = realSend; restore(); }
   });
 });
