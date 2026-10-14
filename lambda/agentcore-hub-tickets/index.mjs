@@ -2333,9 +2333,13 @@ async function transitionIssue(args) {
   }
 
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
-  // ADDITIVE — union with the row's existing blockers (the row is already in
-  // hand), matching the Jira Lambda where each blocked_by entry becomes one more
-  // "Blocks" link. edit_issue keeps the explicit whole-array "set" semantics.
+  // ADDITIVE — union with the row's existing blockers, matching the Jira Lambda where
+  // each blocked_by entry becomes one more "Blocks" link. edit_issue keeps the explicit
+  // whole-array "set" semantics.
+  // TEAM-6155: the union is NOT written as a whole-list SET — two concurrent additive
+  // writers (TEAM-6147 chain repairs) both passed the status fence and the later
+  // replace erased the earlier blocker. sendTransition appends only what is missing,
+  // guarded per blocker; a guard loss re-reads and retries with what is still missing.
   const blockers = args.blocked_by;
   let blockedByAdded = [];
   if (blockers) {
@@ -2343,12 +2347,7 @@ async function transitionIssue(args) {
       .map((b) => String(b).trim())
       .filter(Boolean);
     const existing = Array.isArray(current.Item.blockedBy) ? current.Item.blockedBy : [];
-    blockedByAdded = requested.filter((b) => !existing.includes(b));
-    if (blockedByAdded.length > 0) {
-      updateExpr += ", #bb = :bb";
-      exprNames["#bb"] = "blockedBy";
-      exprValues[":bb"] = [...existing, ...new Set(blockedByAdded)];
-    }
+    blockedByAdded = [...new Set(requested.filter((b) => !existing.includes(b)))];
   }
 
   // TEAM-5719: attribute a park to the claim generation that made it, in the SAME
@@ -2434,6 +2433,22 @@ async function transitionIssue(args) {
       if (labelPlan.removes) removes.push(...labelPlan.removes);
       condition = labelPlan.condition || null;
     }
+    // TEAM-6155: append only the blockers this attempt still has to add, and refuse the
+    // write if any of them landed meanwhile (a concurrent additive writer) — never a
+    // whole-list SET. `contains` on a missing attribute is false, so the guard also
+    // holds for a row that has no blockedBy yet. Same attribute, same List type.
+    if (blockedByAdded.length > 0) {
+      names["#bb"] = "blockedBy";
+      values[":empty"] = [];
+      values[":bbAdd"] = blockedByAdded;
+      expr += ", #bb = list_append(if_not_exists(#bb, :empty), :bbAdd)";
+      const guards = blockedByAdded.map((b, i) => {
+        values[`:bb${i}`] = b;
+        return `NOT contains(#bb, :bb${i})`;
+      });
+      const guard = guards.join(" AND ");
+      condition = condition ? `(${condition}) AND ${guard}` : guard;
+    }
     if (dropParkClaim) removes.push("#pc"); // TEAM-5719
     // TEAM-5707: on BOTH attempts, so the label-race retry keeps the status fence.
     if (expectedStatus) {
@@ -2463,7 +2478,10 @@ async function transitionIssue(args) {
       new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey }, ConsistentRead: true })
     );
     const actual = fresh.Item ? fresh.Item.status || "todo" : "missing";
-    return { actual, moved: actual !== expectedStatus };
+    // TEAM-6155: the fresh blocker list too, so a lost blocker guard can be told apart
+    // from the status fence and retried with only what is still missing.
+    const blockedBy = Array.isArray(fresh.Item?.blockedBy) ? fresh.Item.blockedBy : [];
+    return { actual, moved: expectedStatus ? actual !== expectedStatus : false, blockedBy };
   };
   // The condition is built from exactly two sources — the gate label slot checks
   // and `#s = :expected` (no attribute_exists here) — so when the label clause
@@ -2481,32 +2499,47 @@ async function transitionIssue(args) {
     if (fence?.refusal) return fence.refusal;
   }
 
+  // TEAM-6155: a lost blocker guard is retried with what is still missing — bounded, so
+  // a pathological writer cannot spin us, and never reported as transitioned when an
+  // edge was not written. Everything before this loop (gate guard, Done-intent fence)
+  // and after it (hold check, response) runs once, around the single successful write.
+  const MAX_WRITE_ATTEMPTS = 3;
   let committed = false;
   try {
-    try {
-      await sendTransition(true);
-    } catch (err) {
-      if (err?.claimRefusal) return err.claimRefusal;
-      if (!isCondFail(err)) throw err;
-      const reread = expectedStatus ? await fenceReread() : null;
-      if (reread?.moved) return preconditionRefusal(reread.actual);
-      if (!labelPlan?.condition) {
-        if (reread) return fenceRefusal(reread);
-        throw err;
-      }
-      // A concurrent writer moved the label list under us. The label bookkeeping is
-      // cosmetic; the status and the verification are not — retry without the label
-      // clause rather than wedge a verified transition on a label race.
-      console.warn(
-        `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
-      );
+    let withLabelPlan = true;
+    for (let attempt = 1; ; attempt++) {
       try {
-        await sendTransition(false);
-      } catch (retryErr) {
-        if (retryErr?.claimRefusal) return retryErr.claimRefusal;
-        // The retry carries no label clause: with a fence it is the fence that failed.
-        if (isCondFail(retryErr) && expectedStatus) return fenceRefusal(await fenceReread());
-        throw retryErr;
+        await sendTransition(withLabelPlan);
+        break;
+      } catch (err) {
+        if (err?.claimRefusal) return err.claimRefusal;
+        if (!isCondFail(err)) throw err;
+        // The reread decides which clause failed: a moved status is the fence; a blocker
+        // that landed meanwhile is the guard; neither (with a label clause) is the race.
+        const reread = expectedStatus || blockedByAdded.length ? await fenceReread() : null;
+        if (reread?.moved) return preconditionRefusal(reread.actual);
+        if (blockedByAdded.length) {
+          const remaining = blockedByAdded.filter((b) => !reread.blockedBy.includes(b));
+          if (remaining.length !== blockedByAdded.length) {
+            blockedByAdded = remaining; // drop what landed; the status part still has to be written
+            if (attempt < MAX_WRITE_ATTEMPTS) continue;
+            return textResult(
+              `Write conflict: ${issueKey} blocked_by changed under ${MAX_WRITE_ATTEMPTS} attempts — not transitioned.`
+            );
+          }
+        }
+        if (!labelPlan?.condition || !withLabelPlan) {
+          // No label clause on this attempt: with a fence it is the fence that failed.
+          if (reread) return fenceRefusal(reread);
+          throw err;
+        }
+        // A concurrent writer moved the label list under us. The label bookkeeping is
+        // cosmetic; the status and the verification are not — retry without the label
+        // clause rather than wedge a verified transition on a label race.
+        console.warn(
+          `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
+        );
+        withLabelPlan = false;
       }
     }
     committed = true;
