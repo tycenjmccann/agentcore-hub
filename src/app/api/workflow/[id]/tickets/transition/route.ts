@@ -670,7 +670,7 @@ export async function POST(
     // UNREVERTED, same reasoning as the FunctionError/throw branches above — this is
     // ambiguous, not a proven refusal, so reverting on a guess risks undoing a
     // ticket that really did move.
-    if (!provesTransitioned(responsePayload, targetStatus)) {
+    if (!provesTransitioned(responsePayload, targetStatus, ticketId)) {
       console.warn(`[transition] ${ticketId}: tickets Lambda did not confirm the transition to ${targetStatus}: ${responseText.slice(0, 500)}`);
       return NextResponse.json(
         {

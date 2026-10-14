@@ -2496,6 +2496,14 @@ async function transitionTicket(params) {
     ticketId: ticket_id,
     status: finalStatus,
     message: `Transitioned to ${finalStatus}`,
+    // TEAM-6131: what was asked for, and which Jira transition answered it. `status` stays
+    // the destination Jira actually landed in (the match above is by NAME or destination,
+    // so a workflow whose "Done" lands in e.g. "Closed" reports `status:"closed"`); the hub's
+    // provesTransitioned (src/lib/workflow/ticket-transition-refusal.ts) reads this pair to
+    // tell that move apart from a move into one of the hub's own other columns. Additive:
+    // the `message` literal above is pinned by deploy/runtime-agent/tests/test_park_gate.py.
+    requested: targetInternal,
+    matchedTransition: { id: match.id, name: match.name, to: match.to.name },
     ...(blockers.length ? { blockedByAdded: blockers } : {}),
     ...(gateVerification ? { gateVerification } : {}),
     ...(conflict ? { conflict: "done_over_cancelled" } : hold.conflict ? { conflict: hold.conflict } : {}),
