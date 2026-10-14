@@ -176,4 +176,15 @@ describe("POST /api/workflow/start — repo URL pre-flight", () => {
     expect(res.status).toBe(200);
     expect(h.check.fn).not.toHaveBeenCalled();
   });
+
+  // TEAM-6092: a padded repo url (trailing space / newline from a paste or a shell) is
+  // trimmed BEFORE the pre-flight and before the row is written, so the orchestrator's
+  // parseGitHubUrl callers (repoTargets, parseRepoUrl) and the checker all see one url.
+  it("TEAM-6092: repo url is trimmed before the pre-flight and on the persisted row", async () => {
+    h.check.fn.mockResolvedValue({ checkedAt: "t", results: [clean] });
+    const res = await post({ title: "t", repoConfig: repoConfig(`  ${GOOD} \n`) });
+    expect(res.status).toBe(200);
+    expect(h.check.fn).toHaveBeenCalledWith(repoConfig(GOOD), { token: "ghp_test", fallbackOwner: "tycenjmccann" });
+    expect((h.puts[0].Item.repoConfig as { repos: { url: string }[] }).repos[0].url).toBe(GOOD);
+  });
 });

@@ -101,4 +101,12 @@ describe("TEAM-6075 parseGitHubUrl — the one shared owner/repo parser", () => 
   it("TEAM-6075: non-GitHub, missing repo and empty input → null", () => {
     for (const u of ["https://gitlab.com/x/y", "https://github.com/o", "", null, undefined]) expect(parseGitHubUrl(u)).toBeNull();
   });
+  // TEAM-6092 — review round 3 of #928: the end anchor made a padded url (trailing space,
+  // newline, CRLF — what a copy-paste or a shell `$(...)` hands over) parse to null, which
+  // made repoTargets() [] and silently switched the follow-up PR gate off.
+  it("TEAM-6092: surrounding whitespace (leading/trailing space, \\n, \\r\\n) is ignored", () => {
+    for (const u of [" https://github.com/o/r", "https://github.com/o/r ", "https://github.com/o/r\n", "https://github.com/o/r\r\n", " https://github.com/o/r.git \n"]) expect(parseGitHubUrl(u)).toEqual({ owner: "o", repo: "r" });
+    expect(parseGitHubUrl(" https://github.com/o/my.repo/pull/12 \n")).toEqual({ owner: "o", repo: "my.repo" });
+    expect(parseGitHubUrl("   ")).toBeNull();
+  });
 });

@@ -2075,6 +2075,7 @@ describe("TEAM-6075 follow-up PR gate hardening", () => {
 
   it("TEAM-6075 repoTargets: repo entry with no defaultBranch is treated as main", async () => {
     expect(completionMod.repoTargets({ repos: [{ url: "https://github.com/o/r" }] })).toEqual(R);
+    expect(completionMod.repoTargets({ repos: [{ url: "https://github.com/o/r \n" }] })).toEqual(R); // TEAM-6092: padded url
     const tasks = { ...MERGED, F: { prUrl: P12 } };
     const open = await completionMod.followUpPrGate({
       workflow: wf([{ url: "https://github.com/o/r" }]), agentTasks: tasks, mergeProof: null, getAgentPhase, warn: () => {},
