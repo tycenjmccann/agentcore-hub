@@ -81,6 +81,13 @@ const lambdaAnswers = (body: unknown, FunctionError?: string) => {
   h.lambdaResp = { Payload: new TextEncoder().encode(JSON.stringify(body)), ...(FunctionError ? { FunctionError } : {}) };
 };
 
+// TEAM-6123 — unlike lambdaAnswers, does not JSON.stringify: lets a test hand the
+// route the EXACT raw bytes a Lambda payload could be, including text that is not
+// valid JSON at all (lambdaAnswers can only ever produce valid JSON text).
+const lambdaAnswersRaw = (text: string) => {
+  h.lambdaResp = { Payload: new TextEncoder().encode(text) };
+};
+
 beforeEach(async () => {
   h.sends.length = 0;
   h.invokes.length = 0;
@@ -312,5 +319,70 @@ describe("POST /api/workflow/webhook — done routes through the tickets Lambda 
     expect(res.status).toBe(502);
     expect((await res.json()).details).toMatch(/AccessDenied/);
     expect(h.sends.length).toBe(0);
+  });
+});
+
+/**
+ * TEAM-6123 (P2) — rejectedDetails is a DENY-list: it answers null for any
+ * payload it doesn't recognize as a refusal, and a 200 with no FunctionError and
+ * no recognized refusal was treated as "the ticket moved". None of these five
+ * shapes prove a transition happened, so each must now 502 instead of the old
+ * 200 processed:true — and, since the invoke genuinely returned with no
+ * FunctionError, there is still no direct DynamoDB write either way.
+ */
+describe("POST /api/workflow/webhook — an unproven Done is not a success (TEAM-6123)", () => {
+  it("unparseable payload text → 502, no direct write", async () => {
+    lambdaAnswersRaw("not json");
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it("empty payload → 502, no direct write", async () => {
+    lambdaAnswersRaw("");
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it('literal JSON "null" payload → 502, no direct write', async () => {
+    lambdaAnswersRaw("null");
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it('"{}" payload → 502, no direct write', async () => {
+    lambdaAnswersRaw("{}");
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it('a refusal-shaped-but-unrecognized object ({ok:true,status:"blocked"}) → 502, no direct write', async () => {
+    lambdaAnswers({ ok: true, status: "blocked" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it("the real tickets-Lambda success shape still 200s (regression guard)", async () => {
+    lambdaAnswers({ key: "TEAM-7", status: "transitioned", from: "in_review", to: "done" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+  });
+
+  it("the real jira-Lambda success shape still 200s (regression guard)", async () => {
+    lambdaAnswers({ ticketId: "TEAM-7", status: "done", message: "Transitioned to done" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+  });
+
+  it("a real refusal is still 409, not 502 (the two codes stay distinct)", async () => {
+    lambdaAnswers({ content: [{ text: "TEAM-7 has briefPending:true" }] });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(409);
   });
 });

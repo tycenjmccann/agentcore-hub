@@ -19,6 +19,10 @@
  * makes — so the completion-record / brief-hold guard and the doneIntent fence
  * (gate-contract.mjs) see it like any other Done. Every other status is still a
  * direct write; only `done` has a guard to skip.
+ *
+ * TEAM-6123: a 200 for that `done` invoke requires positive proof the ticket
+ * moved (provesTransitioned), not just the absence of a recognized refusal —
+ * see transitionDoneViaLambda below.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -26,7 +30,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { secretMatches } from "@/lib/auth/secret-match";
-import { rejectedDetails } from "@/lib/workflow/ticket-transition-refusal";
+import { rejectedDetails, provesTransitioned } from "@/lib/workflow/ticket-transition-refusal";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -110,9 +114,12 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
 /**
  * TEAM-6094: `→ done` through Tickets___transition_ticket, the same invoke as
  * src/app/api/workflow/[id]/tickets/transition/route.ts. Returns the error response
- * to send back, or null when the Lambda moved the ticket (it wrote the status; the
- * Stream does the rest). An invoke failure or FunctionError is 502; a refusal the
- * Lambda reported inside a 200 (rejectedDetails — e.g. a brief hold) is 409.
+ * to send back, or null when the Lambda PROVED it moved the ticket (it wrote the
+ * status; the Stream does the rest). An invoke failure or FunctionError is 502; a
+ * refusal the Lambda reported inside a 200 (rejectedDetails — e.g. a brief hold) is
+ * 409; TEAM-6123: anything else — unparseable, "null", "{}", or any shape that does
+ * not positively prove the move (provesTransitioned) — is also 502, since nothing
+ * here proves the ticket actually transitioned.
  */
 async function transitionDoneViaLambda(ticketId: string, reason: string): Promise<NextResponse | null> {
   let response;
@@ -138,12 +145,19 @@ async function transitionDoneViaLambda(ticketId: string, reason: string): Promis
   try {
     parsed = JSON.parse(text);
   } catch {
-    // An unreadable payload proves nothing — rejectedDetails fails open on it, as in the transition route.
+    // An unreadable payload proves nothing — falls through to the unproven 502 below.
   }
   const refusal = rejectedDetails(parsed, "done");
   if (refusal) {
     console.warn(`[webhook:lambda] ${ticketId}: tickets Lambda refused the transition to done: ${refusal}`);
     return NextResponse.json({ error: "Ticket transition rejected", details: refusal, ticketId }, { status: 409 });
+  }
+  if (!provesTransitioned(parsed, "done")) {
+    console.warn(`[webhook:lambda] ${ticketId}: tickets Lambda did not confirm the transition to done: ${text.slice(0, 500)}`);
+    return NextResponse.json(
+      { error: "tickets Lambda did not confirm the transition", details: text.slice(0, 500), ticketId },
+      { status: 502 }
+    );
   }
   return null;
 }
