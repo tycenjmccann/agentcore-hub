@@ -390,7 +390,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord, doneIntentFresh, DONE_INTENT_TTL_MS } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord, doneIntentFresh, DONE_INTENT_TTL_MS, holdDeferredOnDoneIntent } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -1691,6 +1691,89 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(doneIntentFresh({ doneIntent: "soon" }, NOW)).toBe(false);
     expect(doneIntentFresh({}, NOW)).toBe(false);
     expect(doneIntentFresh(null, NOW)).toBe(false);
+  });
+
+  it("TEAM-5958: holdDeferredOnDoneIntent - defers ONLY a hold written onto a record with a FRESH intent while the ticket is not Done; shared by drop() and report_completion", () => {
+    const NOW = Date.parse("2026-10-14T12:00:00.000Z");
+    const now = vi.spyOn(Date, "now").mockReturnValue(NOW);
+    try {
+      const fresh = { status: "complete", doneIntent: { at: new Date(NOW - 1000).toISOString(), provider: "jira", nonce: "n" } };
+      const stale = { status: "complete", doneIntent: { at: new Date(NOW - DONE_INTENT_TTL_MS).toISOString(), provider: "jira", nonce: "n" } };
+      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: true, ticketDone: false })).toBe(fresh.doneIntent.at);
+      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: false, ticketDone: false })).toBeNull(); // no hold written: nothing to defer
+      expect(holdDeferredOnDoneIntent({ current: fresh, holdWritten: true, ticketDone: true })).toBeNull(); // a committed Done keeps its intent as audit
+      expect(holdDeferredOnDoneIntent({ current: stale, holdWritten: true, ticketDone: false })).toBeNull(); // the twin is gone
+      expect(holdDeferredOnDoneIntent({ current: { status: "complete" }, holdWritten: true, ticketDone: false })).toBeNull();
+      expect(holdDeferredOnDoneIntent({ current: null, holdWritten: true, ticketDone: false })).toBeNull();
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  // TEAM-5958 (TEAM-5799 F6): report_completion's record write DEFERS on the twins' fence.
+  const seedFenced = (extra = {}) => {
+    h.objects.set(HELD_KEY, JSON.stringify({ ticket_id: "TEAM-4200", status: "complete", followUpsPending: false, doneIntent: { at: new Date().toISOString(), provider: "jira", nonce: "0f8fad5b-d9cb-469f-a165-70867728950e" }, ...extra }));
+    h.etags.set(HELD_KEY, '"fenced"');
+  };
+  const ONE_FOLLOW_UP = JSON.stringify([{ kind: "docs", owner: "agent", assignee: "agentcore_hub_api_dev", title: "Document it" }]);
+  const refuseCreate = () => { h.createGate = () => ({ error: "Jira API 400: Field 'labels' is invalid" }); };
+
+  it("TEAM-5958 (F6): a write that would put followUpsPending:true on a record carrying a FRESH doneIntent, on a ticket not yet Done, is DEFERRED - no PUT, no Done, completion_record_done_in_flight", async () => {
+    seedFenced();
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", status: "in_progress" });
+    refuseCreate();
+    const res = result(await report({ follow_ups: ONE_FOLLOW_UP }));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_done_in_flight", next_action: "retry_report_completion" });
+    expect(res.status).toBeUndefined();
+    expect(res.message).toMatch(/Done on TEAM-4200 is being committed/);
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(JSON.parse(h.objects.get(HELD_KEY))).toMatchObject({ followUpsPending: false });
+    expect(calls("Tickets___get_issue").length).toBeGreaterThanOrEqual(2); // the fresh re-read before deferring
+  });
+
+  it("TEAM-5958 (F6): an UNREADABLE ticket defers too - 'could not tell' is not 'Done'", async () => {
+    seedFenced();
+    h.ticketFail.add("Tickets___get_issue");
+    refuseCreate();
+    const res = result(await report({ follow_ups: ONE_FOLLOW_UP }));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_done_in_flight", next_action: "retry_report_completion" });
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(JSON.parse(h.objects.get(HELD_KEY))).toMatchObject({ followUpsPending: false });
+  });
+
+  it("TEAM-5958 (F6): the ticket already reads Done ⇒ the fresh intent is a committed Done's audit - the hold is written over the Done ticket (drop()'s already-Done rule), pending_follow_ups", async () => {
+    seedFenced();
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", status: "done" });
+    refuseCreate();
+    const res = result(await report({ follow_ups: ONE_FOLLOW_UP }));
+    expect(res).toMatchObject({ status: "complete_pending_follow_ups", next_action: "retry_report_completion" });
+    expect(written()).toHaveLength(1);
+    expect(record()).toMatchObject({ followUpsPending: true, status: "complete_pending_follow_ups", doneIntent: { provider: "jira" } });
+    expect(transitioned()).toBe(false);
+  });
+
+  it("TEAM-5958 (F6): a hold ALREADY on the record is not an introduction - written as before, fresh intent or not", async () => {
+    seedFenced({ followUpsPending: true, status: "complete_pending_follow_ups" });
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", status: "in_progress" });
+    refuseCreate();
+    const res = result(await report({ follow_ups: ONE_FOLLOW_UP }));
+    expect(res).toMatchObject({ status: "complete_pending_follow_ups" });
+    expect(written()).toHaveLength(1);
+    expect(record()).toMatchObject({ followUpsPending: true, doneIntent: { provider: "jira" } });
+    // no fence re-read of the ticket: nothing to defer (the other get_issue is the epic, for the notice dedupe)
+    expect(calls("Tickets___get_issue").filter((p) => p.ticket_id === "TEAM-4200")).toHaveLength(1);
+  });
+
+  it("TEAM-5958 (F6): a STALE intent (the twin died, or its commit failed and the clear failed) is not a Done in flight - written, bounded by the TTL", async () => {
+    seedFenced({ doneIntent: { at: new Date(Date.now() - DONE_INTENT_TTL_MS - 1000).toISOString(), provider: "jira", nonce: "n" } });
+    h.issue = ticketRow({ key: "TEAM-4200", summary: "The ticket under report", status: "in_progress" });
+    refuseCreate();
+    const res = result(await report({ follow_ups: ONE_FOLLOW_UP }));
+    expect(res).toMatchObject({ status: "complete_pending_follow_ups" });
+    expect(written()).toHaveLength(1);
+    expect(record().followUpsPending).toBe(true);
   });
 
   it("TEAM-5866 (1): a body stream that fails after S3 answered is an UNREADABLE record - refused, no IfMatch write over the hold, no Done", async () => {
