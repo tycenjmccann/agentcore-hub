@@ -36,6 +36,11 @@ the PR — you open a PR for human review and never merge into `base_branch`, so
 the sync belongs on the branch the human reviews. A non-trivial conflict that
 survives the `model="opus"` retry → report BLOCKED naming the conflicting files;
 never a silent handoff, and never a fix ticket for staleness alone.
+`<default branch>` in the Main-sync rule above (and the sync step below) means
+this PR's resolved base: the `base_branch:` your `## Branch` context names when
+your ticket stated one (a sweep PR into `release/2.1` syncs from `release/2.1`),
+the repo default branch only when no base is stated — never merge the default
+branch into a stated non-default base.
 
 ## The core risk: false positives
 Static dead-code detection is wrong often. Code that LOOKS unused but is live:
@@ -169,15 +174,20 @@ still pass with the code gone.
 A session that dies after the deliverable but before the report leaves the run un-closable.
 
 1. Commit referencing the routine + date.
-2. **Sync `feature_branch` on main FIRST — before the PR exists.** Merge
-   `origin/<default branch>` INTO your `feature_branch` (see the Main-sync rule),
-   so the branch a human reviews is never merely behind main. The sync is part of
-   the deliverable and lands before the PR and the report, so the ship-then-report
-   ordering above is unchanged: sync, PR, then report.
+2. **Sync `feature_branch` on main FIRST — before the PR exists.** Merge the
+   PR's resolved base (see Your scope) INTO your `feature_branch` per the
+   Main-sync rule: `origin/<base_branch>` when your ticket stated a base,
+   `origin/<default branch>` only when none is stated — never merge the default
+   branch into a stated non-default base — so the branch a human reviews is
+   never merely behind its base. The sync is part of the deliverable and lands
+   before the PR and the report, so the ship-then-report ordering above is
+   unchanged: sync, PR, then report.
    Before opening the PR, confirm the sync actually landed:
-   `git merge-base --is-ancestor origin/<default branch> HEAD` (exit code 0 means
-   `<default branch>` is an ancestor of your head — the branch is NOT behind). A
-   non-zero exit means the sync did not take; redo it before continuing.
+   `git merge-base --is-ancestor origin/<base_branch> HEAD` (or
+   `origin/<default branch>` when no base is stated — the same ref you just
+   merged; exit code 0 means the resolved base is an ancestor of your head —
+   the branch is NOT behind). A non-zero exit means the sync did not take;
+   redo it before continuing.
 3. Push `feature_branch`, open a PR into `base_branch`.
 4. PR body MUST contain a **Removal Ledger**:
 
@@ -205,7 +215,7 @@ A session that dies after the deliverable but before the report leaves the run u
 - Every removal needs an evidence row (grep 0 refs + not a dynamic/entry-point/public API) in the Removal Ledger.
 - iOS removals MUST be built + tested on the macOS gateway before the PR; gateway tools missing/failing = BLOCKED.
 - NEVER auto-merge. Always a PR for human review. When unsure about a candidate, keep it and list it.
-- Never hand off to review with your `feature_branch` behind the repo default
-  branch — a branch that only needs a main-merge is your job to sync (Main-sync
-  rule), not a fix ticket.
+- Never hand off to review with your `feature_branch` behind its resolved base
+  — the repo default branch unless a base is stated — a branch that only needs
+  a base-merge is your job to sync (Main-sync rule), not a fix ticket.
 - If detection tools cannot be installed/run, or the build/test cannot run, report BLOCKED — do not open a PR of unverified deletions.

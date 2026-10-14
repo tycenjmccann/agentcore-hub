@@ -69,6 +69,7 @@ else:
     os.environ["PATH"] = f"/tmp/node-v20.18.0-linux-arm64/bin:/tmp/.npm-global/bin:{os.environ.get('PATH', '')}"
 
 import base64
+import concurrent.futures
 import contextvars
 import hashlib
 import importlib.metadata
@@ -342,6 +343,128 @@ def _persona_cache_kwargs() -> dict:
     }
 
 
+# TEAM-6020: the invocation_state key carrying `_stream_with_retry`'s per-attempt
+# cancel event down to the model (strands passes invocation_state to model.stream).
+_ATTEMPT_CANCEL_KEY = "_hub_attempt_cancel"
+
+# TEAM-6074: the executor every ConverseStream worker runs on. strands 1.54 uses
+# asyncio.to_thread, i.e. the loop's DEFAULT executor, shared with sync @tools
+# (claude_code, codex, kiro) and with our own to_thread helpers; a cut attempt
+# whose socket went silent blocks its worker until READ_TIMEOUT, and on the
+# default pool that starves them all. Here it only ties up a slot no one else
+# uses. Threads start on demand, so the cap (CPython's own default-pool ceiling)
+# costs nothing idle; a small one would let leaked workers queue model calls.
+_MODEL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=32, thread_name_prefix="bedrock-model")
+
+
+async def _model_to_thread(func, /, *args, **kwargs):
+    """TEAM-6074: `asyncio.to_thread` (CPython 3.13 asyncio/threads.py) on
+    `_MODEL_EXECUTOR` instead of the default executor. The same context copy, so
+    the OTel/botocore span context reaches the worker exactly as before."""
+    import asyncio
+    import contextvars
+    import functools
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    func_call = functools.partial(ctx.run, func, *args, **kwargs)
+    return await loop.run_in_executor(_MODEL_EXECUTOR, func_call)
+
+
+class _EitherSignal:
+    """TEAM-6020: set when strands' own cancel signal OR the attempt's is set.
+
+    Duck-types the only surface strands 1.54's Bedrock model path uses on a
+    cancel_signal: truthiness, `is not None` and `is_set()` (bedrock.py
+    `_poll_cancel_signal` and the per-chunk check in `_stream`)."""
+
+    def __init__(self, strands_signal, attempt_signal):
+        self._strands_signal = strands_signal
+        self._attempt_signal = attempt_signal
+
+    def is_set(self) -> bool:
+        return ((self._strands_signal is not None and self._strands_signal.is_set())
+                or self._attempt_signal.is_set())
+
+
+class _AttemptCancelledBedrockModel(BedrockModel):
+    """TEAM-6020: a BedrockModel whose worker thread a deadline cut can stop.
+
+    strands runs ConverseStream in `asyncio.to_thread`; an asyncio cancel only
+    DETACHES that worker, which keeps reading the socket on a default-executor
+    slot. The worker checks `cancel_signal` per chunk, but strands hands it
+    `agent._cancel_signal`, which `stream_async`'s finally CLEARS during the very
+    cancellation that cut the attempt — so a caller `cancel_signal=` never reaches
+    it. Here the worker also watches the attempt's own event, which nothing
+    clears and no later attempt reuses; once set, the worker closes the stream at
+    the next chunk.
+
+    TEAM-6074: a SILENT socket yields no next chunk, so that worker stays blocked
+    until READ_TIMEOUT. It therefore runs on `_MODEL_EXECUTOR`, never the default
+    executor, so a cut never leaves it holding a shared slot. `stream` is strands
+    1.54.0's `BedrockModel.stream` line for line, with only the `_EitherSignal`
+    wrap and `_model_to_thread` in place of `asyncio.to_thread` (strands offers no
+    executor hook); test_stream_retry §10 pins the mirrored source."""
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, *,
+                     tool_choice=None, system_prompt_content=None, cancel_signal=None,
+                     **kwargs):
+        import asyncio
+        from strands.models.bedrock import (
+            _next_stream_event, _poll_cancel_signal, _suppress_task_exception)
+
+        attempt_signal = (kwargs.get("invocation_state") or {}).get(_ATTEMPT_CANCEL_KEY)
+        if attempt_signal is not None:
+            cancel_signal = _EitherSignal(cancel_signal, attempt_signal)
+
+        def callback(event=None):
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+            if event is None:
+                return
+
+        loop = asyncio.get_event_loop()
+        queue = asyncio.Queue()
+
+        # Handle backward compatibility: if system_prompt is provided but system_prompt_content is None
+        if system_prompt and system_prompt_content is None:
+            system_prompt_content = [{"text": system_prompt}]
+
+        thread = _model_to_thread(  # TEAM-6074: was asyncio.to_thread
+            self._stream,
+            callback,
+            messages,
+            tool_specs,
+            system_prompt_content,
+            tool_choice,
+            kwargs.get("dynamic_trailing_blocks", 0),
+            cancel_signal,
+        )
+        task = asyncio.create_task(thread)
+        cancel_poll = asyncio.ensure_future(_poll_cancel_signal(cancel_signal)) if cancel_signal else None
+
+        try:
+            while True:
+                event = await _next_stream_event(queue, cancel_poll)
+                if event is None:
+                    break
+
+                yield event
+
+            if cancel_poll is not None and cancel_poll.done():
+                # The worker thread owns the event stream and closes it at its next chunk boundary.
+                # Detaching it rather than awaiting keeps a stalled read from delaying the caller.
+                task.add_done_callback(_suppress_task_exception)
+                return
+
+            await task
+        except BaseException:
+            task.add_done_callback(_suppress_task_exception)
+            raise
+        finally:
+            if cancel_poll is not None:
+                cancel_poll.cancel()
+
+
 def _build_bedrock_model(model_id: str) -> BedrockModel:
     """Single construction site for every BedrockModel — default + overrides.
 
@@ -357,7 +480,7 @@ def _build_bedrock_model(model_id: str) -> BedrockModel:
         # brownout window lives in _stream_with_retry, and the two layers multiply.
         retries={"total_max_attempts": 3, "mode": "standard"},
     )
-    return BedrockModel(
+    return _AttemptCancelledBedrockModel(
         model_id=model_id,
         region_name=REGION,
         boto_client_config=boto_config,
@@ -390,7 +513,12 @@ lambda_client = boto3.client("lambda", region_name=REGION)
 _LAMBDA_CLIENT_OVERRIDE = contextvars.ContextVar("lambda_client_override", default=None)
 
 # Tool Lambda function names (the gateway targets are backed by these)
-TICKET_TOOLS_LAMBDA = os.getenv("TICKET_TOOLS_LAMBDA", "agentcore-hub-tickets")
+# TEAM-6069: the fallback follows TICKET_PROVIDER (default jira) — the function
+# setup-tickets-lambda.mjs actually deploys, and the rule the orchestrator and
+# workflow-output Lambdas use. The deploy always sets this explicitly.
+TICKET_TOOLS_LAMBDA = os.getenv("TICKET_TOOLS_LAMBDA") or (
+    "agentcore-hub-jira" if os.getenv("TICKET_PROVIDER", "jira") == "jira" else "agentcore-hub-tickets"
+)
 BUILDER_TOOLS_LAMBDA = os.getenv("BUILDER_TOOLS_LAMBDA", "agentcore-hub-builder-tools")
 WORKFLOW_OUTPUT_LAMBDA = os.getenv("WORKFLOW_OUTPUT_LAMBDA", "agentcore-hub-workflow-output")
 PIPELINE_TOOLS_LAMBDA = os.getenv("PIPELINE_TOOLS_LAMBDA", "agentcore-hub-pipeline-tools")
@@ -4503,13 +4631,19 @@ _STREAM_RETRY_CAP_S = float(_wd_num(os.getenv("STREAM_RETRY_CAP_S")) or 60)
 # agent.streaming event before each one, so a long wait never reads as silence to
 # the dead-session detector (lease.mjs lastAgentActivity).
 _STREAM_RETRY_HEARTBEAT_S = 30.0
+# TEAM-6022: the invocation lease TTL, mirrored from lease.mjs `resolveTtlMs`
+# (same WORKFLOW_LEASE_TTL_MINUTES override; default = defaultTtlMinutes in
+# src/config/lease-constants.json, which is not shipped in this image).
+# Unparsable/non-positive values fall back (`_wd_num`).
+_LEASE_TTL_S = float(_wd_num(os.getenv("WORKFLOW_LEASE_TTL_MINUTES")) or 30) * 60
 # TEAM-5976 F1: a model call in flight that has yielded nothing for this long
 # publishes an agent.streaming `detail.type="heartbeat"` row (no content — nothing
 # renders it; lease renewal filters on the event type only). Scoped to MODEL calls:
 # those are bounded by botocore, while a tool thread hung forever must still let
-# the lease lapse. Clamped to TTL/6 of the 30-minute lease.
+# the lease lapse. Clamped to TTL/6 of the lease. TEAM-6022: and capped at one
+# TTL of silence — see `_inflight_heartbeat`.
 _STREAM_RETRY_INFLIGHT_HEARTBEAT_S = float(
-    min(_wd_num(os.getenv("STREAM_RETRY_INFLIGHT_HEARTBEAT_S")) or 60, 300))
+    min(_wd_num(os.getenv("STREAM_RETRY_INFLIGHT_HEARTBEAT_S")) or 60, _LEASE_TTL_S / 6))
 # TEAM-5976 F5: what the caller sees where a broken assistant message restarts.
 # strands commits a message to history only once its stream completes, so the
 # retry REGENERATES it; its partial is rolled back out of the turn's text, but
@@ -4522,7 +4656,9 @@ class StreamRetryDeadlineExceeded(TimeoutError):
     passed. Before this, `remaining` was read only in the except block, so a
     retry that HUNG was bounded by botocore's read_timeout alone (1200s, times
     the attempt cap) while the in-flight heartbeat renewed the lease throughout.
-    A TimeoutError so every classifier reads it as transient; `_stream_with_retry`
+    An attempt with no deadline (the first, or one after a re-arm) is bounded on
+    the lease side instead: TEAM-6022 stops the in-flight heartbeat after one
+    lease TTL of silence. A TimeoutError so every classifier reads it as transient; `_stream_with_retry`
     treats it as exhaustion — the deadline is the bound, not a reason to retry."""
 
 # Transient by nature: the stream broke, but asking again can work. Matched on
@@ -5167,6 +5303,7 @@ async def _run_agent_invocation(payload, context):
             down for five minutes is not a reason to strand the ticket in_progress."""
             nonlocal _transient_exhausted
             import asyncio as _sr_asyncio
+            import threading as _sr_threading
             attempt = 0
             slept = 0.0  # log/comment only — the bound is the deadline below
             # A3 / TEAM-5976 F3: armed at the FIRST failure of an outage, cleared
@@ -5177,7 +5314,8 @@ async def _run_agent_invocation(payload, context):
             # Absolute, so the backoff's heartbeat publishes and the consumer's
             # rollback between attempts are charged to it; a relative budget
             # re-derived at each attempt's start let them push it forward. None =
-            # unbounded, which the first attempt and every attempt after a re-arm are.
+            # unbounded, which the first attempt and every attempt after a re-arm are
+            # (their lease is bounded by the in-flight heartbeat's cap, TEAM-6022).
             outage_deadline = None
             baseline = prompt_delivery.added
             while True:
@@ -5208,9 +5346,20 @@ async def _run_agent_invocation(payload, context):
 
                 async def _inflight_heartbeat():
                     last = 0  # the attempt's start, not this task's first run
+                    # Consecutive intervals in flight with nothing yielded; any
+                    # event, or no model call open, resets it.
+                    quiet = 0
                     while True:
                         await _stream_heartbeat_wait(_STREAM_RETRY_INFLIGHT_HEARTBEAT_S)
-                        if model_inflight.inflight and seen[0] == last:
+                        quiet = quiet + 1 if (model_inflight.inflight
+                                              and seen[0] == last) else 0
+                        # TEAM-6022: a hung model call cannot keep its lease alive
+                        # longer than one lease TTL. One silent read is bounded by
+                        # botocore's 1200s read_timeout, under the TTL, so a call
+                        # quiet for a whole TTL is hung (only botocore's own retries
+                        # get it there). After the last beat the lease lapses within
+                        # one TTL and the dead-session sweep can reap it.
+                        if quiet and quiet * _STREAM_RETRY_INFLIGHT_HEARTBEAT_S < _LEASE_TTL_S:
                             tracker._publish_event("agent.streaming", {
                                 "agentId": agent_id,
                                 "type": "heartbeat",
@@ -5241,7 +5390,13 @@ async def _run_agent_invocation(payload, context):
                             f"attempt {attempt} not opened: the "
                             f"{_STREAM_RETRY_DEADLINE_S:.0f}s outage deadline passed "
                             f"during backoff/rollback")
-                    agen = agent.stream_async(stream_input)
+                    # TEAM-6020: one event per attempt, set in the finally below so
+                    # a cut attempt's detached Bedrock worker stops at its next chunk
+                    # (see _AttemptCancelledBedrockModel). Never reused or cleared,
+                    # so it cannot cancel the next attempt.
+                    attempt_cancel = _sr_threading.Event()
+                    agen = agent.stream_async(
+                        stream_input, invocation_state={_ATTEMPT_CANCEL_KEY: attempt_cancel})
                     try:
                         while True:
                             try:
@@ -5264,6 +5419,8 @@ async def _run_agent_invocation(payload, context):
                                 attempt_deadline = outage_deadline = None
                             yield _ev
                     finally:
+                        # TEAM-6020: before aclose — the worker must see the cut.
+                        attempt_cancel.set()
                         # A no-op after the generator raised or finished; on a
                         # cancel/aclose it runs strands' own finalisers now.
                         try:

@@ -1265,8 +1265,8 @@ export function withoutDoneIntent(record) {
 // The body a twin creates on a 404 admission. Mirrored (the marker field/value and the
 // intent-only rule) in src/lib/workflow/completion-evidence.ts and lambda/cost-report/
 // index.mjs, neither of which can import this file; src/lib/workflow/gate-contract-
-// parity.test.ts pins the literals to each other. The orchestrator needs no mirror: its
-// completionRecordHasEvidence field rule already reads a reservation as "no evidence".
+// parity.test.ts pins the literals to each other. lambda/orchestrator/completion.mjs mirrors
+// the predicate too (TEAM-5996): its readCompletionRecord reads a reservation as a 404.
 export const RESERVATION_FIELD = "reservation";
 export const DONE_INTENT_RESERVATION = "done-intent";
 const RESERVATION_KEYS = new Set([RESERVATION_FIELD, "ticketId", "doneIntent"]);

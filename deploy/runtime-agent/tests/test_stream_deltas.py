@@ -62,7 +62,7 @@ def _fake_agent_class(script: list[Any]) -> type:
             """The _CompletionGate main.py registered — hooks[1] by construction."""
             return next((h for h in self.hooks if hasattr(h, "_on_tool_result")), None)
 
-        async def stream_async(self, prompt: str):
+        async def stream_async(self, prompt: str, **kwargs: Any):
             for step in script:
                 if callable(step):
                     step(self)

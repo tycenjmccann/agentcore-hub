@@ -3,10 +3,10 @@
  * setup-tickets-lambda.mjs
  *
  * Deploys the ticket-tools Lambda. Branches on TICKET_PROVIDER:
- *   - "dynamodb" (default) — deploys lambda/agentcore-hub-tickets/ +
- *     creates the agentcore-hub-tickets DynamoDB table.
- *   - "jira" — deploys lambda/agentcore-hub-jira/ with JIRA_* env vars.
- *     No tickets table is created (Jira Cloud is the store).
+ *   - "jira" (default) — deploys lambda/agentcore-hub-jira/ with JIRA_*
+ *     env vars. No tickets table is created (Jira Cloud is the store).
+ *   - "dynamodb" — deploys lambda/agentcore-hub-tickets/ + creates the
+ *     agentcore-hub-tickets DynamoDB table.
  *
  * Both Lambdas expose the identical tool interface (Tickets___create_ticket,
  * etc.) so agents don't know or care which backend is in use.
@@ -19,7 +19,7 @@
  *     [--project-key TEAM]
  *
  * Reads from environment:
- *   TICKET_PROVIDER         — "dynamodb" or "jira"
+ *   TICKET_PROVIDER         — "jira" (default) or "dynamodb"
  *   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY
  *                           — required when TICKET_PROVIDER=jira
  *   ARTIFACT_BUCKET         — the artifact bucket the Lambda reads (agent roster,
@@ -28,7 +28,10 @@
  *
  * The role policy, the bucket derivation and the function env are built by the pure
  * module deploy/lib/tickets-lambda-config.mjs, which is unit-tested; this script only
- * sequences the AWS calls.
+ * sequences the AWS calls. The TICKET_PROVIDER default is deploy/lib/ticket-provider.mjs
+ * (TEAM-6087), shared with deploy/workflow-manager/setup-workflow-manager.mjs so the two
+ * Node setup scripts can't drift from each other or from the shell deploy scripts' own
+ * "jira" default.
  */
 
 import { readFileSync } from "fs";
@@ -40,6 +43,7 @@ import {
   buildTicketsPolicyStatements,
   buildTicketsLambdaEnv,
 } from "./lib/tickets-lambda-config.mjs";
+import { resolveTicketProvider, ticketToolsLambdaName } from "./lib/ticket-provider.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -52,7 +56,7 @@ function getArg(name) {
 
 const REGION = getArg("region") || process.env.AWS_REGION || "us-east-1";
 const GATEWAY_ID = getArg("gateway-id");
-const TICKET_PROVIDER = (process.env.TICKET_PROVIDER || "dynamodb").toLowerCase();
+const TICKET_PROVIDER = resolveTicketProvider(process.env);
 if (!["dynamodb", "jira"].includes(TICKET_PROVIDER)) {
   console.error(`✗ TICKET_PROVIDER must be "dynamodb" or "jira" (got "${TICKET_PROVIDER}")`);
   process.exit(1);
@@ -63,8 +67,7 @@ const PROJECT_KEY =
   getArg("project-key") || process.env.JIRA_PROJECT_KEY || "TEAM";
 
 // Per-provider Lambda config
-const LAMBDA_NAME =
-  TICKET_PROVIDER === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets";
+const LAMBDA_NAME = ticketToolsLambdaName(TICKET_PROVIDER);
 const LAMBDA_SOURCE_DIR = LAMBDA_NAME; // matches lambda/<dir>
 const ROLE_NAME =
   TICKET_PROVIDER === "jira"

@@ -6,7 +6,9 @@
 # <1.55: strands 1.55 stopped emitting the system_prompt span attribute the UI
 # evaluator + test_telemetry_spans expect. Lift to 1.55+ only as a deliberate,
 # test-verified upgrade (span-attribute contract), not a silent rebuild bump.
-strands-agents>=1.53.0,<1.55
+# >=1.54: TEAM-6020 — 1.53's BedrockModel.stream has no cancel_signal, so a cut
+# attempt's worker thread could never be stopped.
+strands-agents>=1.54.0,<1.55
 bedrock-agentcore>=1.0.0,<2
 strands-agents-tools>=0.2.0,<1
 boto3>=1.43.0,<2

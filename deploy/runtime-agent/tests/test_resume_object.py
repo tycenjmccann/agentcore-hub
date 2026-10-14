@@ -476,7 +476,7 @@ async def test_a_turn_runs_normally_when_there_is_nothing_to_resume() -> None:
         def __init__(self, **kwargs: Any) -> None:
             self.prompts: list[str] = []
 
-        async def stream_async(self, prompt: str):
+        async def stream_async(self, prompt: str, **kwargs: Any):
             self.prompts.append(prompt)
             yield {"data": "hello"}
 

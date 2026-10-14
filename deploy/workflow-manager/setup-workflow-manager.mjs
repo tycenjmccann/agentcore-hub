@@ -31,6 +31,7 @@ import {
 import { snapshotHarness } from "../pipeline/harness-snapshot.mjs";
 import { loadRegistryDoc, resolveHarnessModel } from "../pipeline/harness-model.mjs";
 import { wmModel, wmUpdateInput, wmMaxTokensPerResponse, WM_MAX_TOKENS_PER_INVOCATION } from "./harness-config.mjs";
+import { resolveTicketProvider } from "../lib/ticket-provider.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -90,7 +91,9 @@ if (existsSync(ENV_LOCAL)) {
 }
 
 const WORKFLOW_API_URL = getArg("workflow-api-url") || process.env.DEPLOYMENT_URL || "";
-const TICKET_PROVIDER = process.env.TICKET_PROVIDER || "dynamodb";
+// Shared deploy-layer default (TEAM-6087): "jira" when unset, matching every
+// other deploy script's TICKET_PROVIDER default — see deploy/lib/ticket-provider.mjs.
+const TICKET_PROVIDER = resolveTicketProvider(process.env);
 // PIPELINE_MODE=1: the CI/CD Deploy stage runs this under its narrow role — no
 // IAM writes, no memory provisioning, no verify invoke. Only the code-like
 // surfaces of an EXISTING harness (model, system prompt, skills) are updated,

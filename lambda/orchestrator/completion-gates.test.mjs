@@ -1251,6 +1251,26 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     expect(h.state.merges.some(({ tid, fields }) => tid === "B-4" && fields.mergeVerifiedBy === "github")).toBe(true);
   });
 
+  // TEAM-5951: the rework dev moved B-1 to done BEFORE report_completion, so the done
+  // harvest saw only the old record and B-1 still carries the merged head000. Its fresh
+  // record (fff0000) lands later with NO event (done -> done is dropped), so completion's
+  // merge-verify is the first reader: it must re-harvest before recordedHeads.
+  it("TEAM-5951: rework done before its record, record lands with no further event → merge-verify re-harvests the new head, branch 404 is NOT proof (merged:null), nothing stamped", async () => {
+    h.state.snapshots = [SHIP_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: {
+      ...SHIP_TASKS,
+      "B-1": { ticketId: "B-1", status: "complete", output: "gen-1 fixed", commitSha: "head000", startedAt: "2026-09-03T00:00:00Z", completedAt: "2026-09-04T00:00:00Z" },
+      "B-4": { ticketId: "B-4", output: "shipped" },
+    } };
+    h.state.s3Objects["completions/B-1.json"] = JSON.stringify({ ticket_id: "B-1", summary: "gen-2 fixed", commit_sha: "fff0000", completed_at: "2026-09-05T00:00:00Z" });
+    mockGitHub({ prs: [{ ...MERGED_PR, html_url: "https://github.com/o/r/pull/846" }], branch404: true, compares: F_NOT_IN_H });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.merges.some(({ tid, fields }) => tid === "B-1" && fields.commitSha === "fff0000")).toBe(true);
+    expect(h.state.merges.some(({ fields }) => fields.mergeVerifiedBy === "github")).toBe(false); // base: head000 is PR #846's head → proof
+    expect(h.state.storeCompletions.length).toBe(0);
+  });
+
   it("TEAM-5868 N1 revert repro: empty main...head diff from a merge-base BEFORE the squash → BLOCKS as stranded", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     h.state.snapshots = [SHIP_CHILDREN];

@@ -1,9 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { isLeaseLive as isLeaseLiveTs } from "./lease";
+import { isLeaseLive as isLeaseLiveTs, sinceKeyRanges as sinceKeyRangesTs } from "./lease";
 // The orchestrator (Lambda) port. Both copies MUST agree bit-for-bit — a drift
 // means retry/dispatch and the board's re-Ready path disagree on whether an
 // agent is alive, which is exactly the duplicate-agent bug R3 closes.
-import { isLeaseLive as isLeaseLiveMjs } from "../../../lambda/orchestrator/lease.mjs";
+import { isLeaseLive as isLeaseLiveMjs, sinceKeyRanges as sinceKeyRangesMjs } from "../../../lambda/orchestrator/lease.mjs";
 
 /**
  * TEAM-3618 parity contract: feed the SAME (claim entry × activity timestamp ×
@@ -60,5 +60,17 @@ describe("isLeaseLive parity: lease.ts ≡ lease.mjs", () => {
   it("agrees with the default (env-derived) TTL argument omitted", () => {
     const task = { status: "running", startedAt: iso(5 * 60_000) };
     expect(isLeaseLiveMjs(task, null, NOW)).toBe(isLeaseLiveTs(task, null, NOW));
+  });
+});
+
+// TEAM-6021: both lastAgentActivity copies key-bound their read with the same
+// eventId ranges; a drift would let one copy miss a heartbeat the other sees.
+describe("sinceKeyRanges parity: lease.ts ≡ lease.mjs", () => {
+  it("agrees on valid, epoch-boundary and unparseable since, bridged or not", () => {
+    for (const since of [iso(0), iso(TTL), "1970-01-01T00:01:00.000Z", "2026-08-30T12:00:00.123456Z", "", "not-a-date"]) {
+      for (const bridged of [true, false]) {
+        expect(sinceKeyRangesMjs(since, { bridged }), `since=${since} bridged=${bridged}`).toEqual(sinceKeyRangesTs(since, { bridged }));
+      }
+    }
   });
 });

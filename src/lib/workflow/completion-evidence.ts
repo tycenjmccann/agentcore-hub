@@ -64,9 +64,9 @@ const nonEmptyString = (v: unknown): v is string => typeof v === "string" && v.t
  * admitted on a 404, so a record created + hold-stamped inside its commit window cannot
  * lose the fence. It is NOT a completion record: every reader treats it exactly as a
  * 404. Mirror of gate-contract.mjs (RESERVATION_FIELD / DONE_INTENT_RESERVATION /
- * isIntentOnlyReservation) — gate-contract-parity.test.ts pins the literals. Deliberately
- * NOT ported to lambda/orchestrator/completion.mjs (DL-009 line budget): its
- * completionRecordHasEvidence field rule already reads a reservation as no evidence.
+ * isIntentOnlyReservation) — gate-contract-parity.test.ts pins the literals. Also mirrored
+ * in lambda/orchestrator/completion.mjs (TEAM-5996), whose readCompletionRecord reads a
+ * reservation as a 404 (a presence test, e.g. cancelledRunTicket, is not an evidence test).
  * "Intent-only" = the marker AND no key outside {reservation, ticketId, doneIntent}: the
  * moment any writer adds a field (a hold, a summary) it is a record and is judged as one.
  */

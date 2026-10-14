@@ -109,10 +109,27 @@ describe("blueprint PR-base rules (TEAM-5854)", () => {
     ["backend-dev", SCOPE_DEV, "## Sibling-sweep rule"],
     ["frontend-dev", SCOPE_DEV, "## Sibling-sweep rule"],
     ["bug-fixer", SCOPE_DEV, "## Sibling-sweep rule"],
+    ["code-sweeper", "**Your scope:** you PUSH the sync on your own `feature_branch`", "## The core risk"],
   ])("%s maps `<default branch>` in the Main-sync rule to the stated base_branch", (name, from, to) => {
     const para = between(read(name), from, to);
     expect(para).toMatch(PLACEHOLDER_MAP);
     expect(para).toContain(BRANCH_BASE);
+  });
+
+  // TEAM-5945: code-sweeper opens its PR into `base_branch` (never merges into it, unlike
+  // the four dev personas above), so its own sync step merges the resolved base INTO
+  // `feature_branch` and checks ancestry against that same resolved base — never the
+  // default branch into a stated non-default base_branch.
+  it("code-sweeper Step 5 syncs and checks ancestry against the resolved base, never the default branch into a stated base", () => {
+    const t = read("code-sweeper");
+    const step = between(t, "Sync `feature_branch` on main FIRST", "Push `feature_branch`, open a PR into `base_branch`");
+    expect(step).toContain("resolved base");
+    expect(step).toContain("`origin/<base_branch>` when your ticket stated a base");
+    expect(step).toContain("never merge the default branch into a stated non-default base");
+    expect(step).toContain("`git merge-base --is-ancestor origin/<base_branch> HEAD`");
+    expect(step).not.toContain("Merge `origin/<default branch>` INTO your `feature_branch`");
+    expect(step).not.toContain("means `<default branch>` is an ancestor of your head");
+    expect(t).not.toContain("with your `feature_branch` behind the repo default branch");
   });
 
   it.each(["api-dev", "backend-dev", "frontend-dev", "bug-fixer"])("%s delivery step syncs from the resolved base, never the default branch into a stated base", (name) => {

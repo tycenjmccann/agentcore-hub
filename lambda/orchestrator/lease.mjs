@@ -65,16 +65,46 @@ export function isLeaseLive(task, lastActivityIso, nowMs, ttlMs = LEASE_TTL_MS) 
 }
 
 /**
+ * TEAM-6021: eventId key ranges holding every events row at/after `sinceIso`, so a time-bounded read pays only for
+ * rows in its window (the `#ts` filter stays exact; this only stops the read reaching older rows). Every writer of a
+ * type these reads match starts eventId with 13-digit epoch ms (runtime main.py; orchestrator + agent-invoker via
+ * eventIdFor). events-writer's EventBridge copy of an orchestrator/agent-invoker event is 9-char base-36 ms (`0…`,
+ * below every ms id) and is the only row when the publisher's direct put failed: `bridged` adds that range. 60s
+ * slack: main.py's timestamp runs up to ~2s past its eventId ms (random fraction, two clock reads). Unparseable
+ * `sinceIso` reads the whole partition, as before.
+ */
+export function sinceKeyRanges(sinceIso, { bridged = true, slackMs = 60_000 } = {}) {
+  const lo = Date.parse(sinceIso) - slackMs;
+  if (!Number.isFinite(lo)) return [{ kc: "workflowId = :w", vals: {} }];
+  const ms = { kc: "workflowId = :w AND eventId >= :lo", vals: { ":lo": String(lo) } };
+  return bridged ? [ms, { kc: "workflowId = :w AND eventId BETWEEN :lo AND :hi", vals: { ":lo": lo.toString(36).padStart(9, "0"), ":hi": "0~" } }] : [ms];
+}
+
+/** TEAM-6021: page each sinceKeyRanges range (≤ `pages` × 500 items apiece) in `input`'s direction; first truthy `pick(items)` wins. */
+export async function findEventSince(ddb, input, sinceIso, pick, { bridged, pages = 20 } = {}) {
+  for (const r of sinceKeyRanges(sinceIso, { bridged })) {
+    let lastKey;
+    for (let page = 0; page < pages; page++) {
+      const res = await ddb.send(new QueryCommand({ ...input, KeyConditionExpression: r.kc,
+        ExpressionAttributeValues: { ...input.ExpressionAttributeValues, ...r.vals }, Limit: 500, ExclusiveStartKey: lastKey }));
+      const hit = pick(res.Items || []);
+      if (hit) return hit;
+      lastKey = res.LastEvaluatedKey;
+      if (!lastKey) break;
+    }
+  }
+  return null;
+}
+
+/**
  * A recent work event this agent published for this workflow (its heartbeat).
  * Only agent.streaming/agent.started prove ongoing work — terminal events
  * (agent.error, agent.retry, workflow.*) must not renew a lease, or a crash
  * report would block recovery for a full TTL.
- * Paginates the partition with a server-side filter (heartbeat type + agentId
- * + inside the lease window) — a busy sibling agent flooding the event stream
- * can no longer push a live heartbeat past a fixed page size. The sort key is
- * eventId whose format differs per writer, so the window bound lives in the
- * filter, not the key condition; any in-window heartbeat proves liveness, so
- * the first match suffices.
+ * Pages the lease window (findEventSince: key-bounded on eventId, ≤20 × 500
+ * per range) with a server-side filter (heartbeat type + agentId + in-window),
+ * so a busy sibling flooding the stream cannot push a live heartbeat past a
+ * fixed page size; any in-window heartbeat proves liveness, first match wins.
  *
  * `ticketId`: when given, events stamped with a DIFFERENT ticketId are
  * ignored; unstamped events still count (older runtimes don't stamp — err on
@@ -82,37 +112,20 @@ export function isLeaseLive(task, lastActivityIso, nowMs, ttlMs = LEASE_TTL_MS) 
  */
 export async function lastAgentActivity(ddb, eventsTable, workflowId, agentId, ticketId, ttlMs = LEASE_TTL_MS) {
   const windowStart = new Date(Date.now() - ttlMs).toISOString();
-  let lastKey;
-  // 20 pages × 500 scanned items bounds the read on pathological partitions
-  // while covering hours of the busiest observed event volume.
-  for (let page = 0; page < 20; page++) {
-    const res = await ddb.send(
-      new QueryCommand({
-        TableName: eventsTable,
-        KeyConditionExpression: "workflowId = :w",
-        FilterExpression: "#t IN (:hb1, :hb2) AND detail.agentId = :aid AND #ts >= :cutoff",
-        ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
-        ExpressionAttributeValues: {
-          ":w": workflowId,
-          ":hb1": HEARTBEAT_TYPE_1,
-          ":hb2": HEARTBEAT_TYPE_2,
-          ":aid": agentId,
-          ":cutoff": windowStart,
-        },
-        ScanIndexForward: false,
-        Limit: 500,
-        ExclusiveStartKey: lastKey,
-      })
-    );
-    for (const e of res.Items || []) {
+  return findEventSince(ddb, {
+    TableName: eventsTable,
+    FilterExpression: "#t IN (:hb1, :hb2) AND detail.agentId = :aid AND #ts >= :cutoff",
+    ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
+    ExpressionAttributeValues: { ":w": workflowId, ":hb1": HEARTBEAT_TYPE_1, ":hb2": HEARTBEAT_TYPE_2, ":aid": agentId, ":cutoff": windowStart },
+    ScanIndexForward: false,
+  }, windowStart, (items) => {
+    for (const e of items) {
       const detail = e.detail || {};
       if (ticketId && detail.ticketId && detail.ticketId !== ticketId) continue;
       if (typeof e.timestamp === "string") return e.timestamp;
     }
-    lastKey = res.LastEvaluatedKey;
-    if (!lastKey) break;
-  }
-  return null;
+    return null;
+  });
 }
 
 /**
@@ -228,25 +241,14 @@ export async function hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId,
     ors.push(arm === "#t = :died" ? arm : `(${arm})`);
   }
   if (!ors.length) return false;
-  let lastKey;
-  for (let page = 0; page < 20; page++) {
-    const res = await ddb.send(
-      new QueryCommand({
-        TableName: eventsTable,
-        KeyConditionExpression: "workflowId = :w",
-        FilterExpression: `(${ors.join(" OR ")}) AND detail.ticketId = :tid AND #ts >= :since`,
-        ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
-        ExpressionAttributeValues: vals,
-        ScanIndexForward: false,
-        Limit: 500,
-        ExclusiveStartKey: lastKey,
-      })
-    );
-    if ((res.Items || []).length > 0) return true;
-    lastKey = res.LastEvaluatedKey;
-    if (!lastKey) break;
-  }
-  return false;
+  // TEAM-6021: agent.died is written only by the runtime (no EventBridge copy), so its read skips the base-36 range.
+  return !!(await findEventSince(ddb, {
+    TableName: eventsTable,
+    FilterExpression: `(${ors.join(" OR ")}) AND detail.ticketId = :tid AND #ts >= :since`,
+    ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
+    ExpressionAttributeValues: vals,
+    ScanIndexForward: false,
+  }, sinceIso, (items) => items.length > 0, { bridged: types.includes("agent.error") }));
 }
 
 /** TEAM-5719 (R1-3): the CURRENT claim's startedAt iff this park is attributed to it, else null (third-party
