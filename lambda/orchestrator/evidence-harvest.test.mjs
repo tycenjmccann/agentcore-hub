@@ -5,10 +5,11 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
  *
  * The evidence gate (TEAM-3690) requires agentTasks output/artifactKey, but the
  * only other writer of those fields — the agent_completion webhook's metadata
- * merge — has no live caller, so every gated run stranded non-terminal
+ * merge — had no live caller, so every gated run stranded non-terminal
  * (first observed: wf coc7es/TEAM-3611). markTaskComplete now harvests the
  * agent's own report_completion record (S3 completions/{ticketId}.json) into
- * the task entry via store.mergeTaskMetadata, on BOTH done paths.
+ * the task entry via store.mergeTaskMetadata, on BOTH done paths. The dead
+ * webhook branch was removed (TEAM-5953).
  *
  * Same harness as done-handlers-cascade.test.mjs: real handlers, real cascade,
  * mocked I/O seams — except S3 here can serve completion records.

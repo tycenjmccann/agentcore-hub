@@ -1258,15 +1258,15 @@ async function markTaskComplete(workflow, ticketId, assignee) {
  *
  * The completion evidence gate (TEAM-3690, completion.mjs missingEvidenceTickets)
  * requires agentTasks output/artifactKey, but the only other writer of those
- * fields — the agent_completion webhook's metadata merge — has no live caller,
+ * fields — the agent_completion webhook's metadata merge — had no live caller (dead, removed TEAM-5953; this harvest is now the sole writer),
  * so every gated run stranded non-terminal with CompletionRejectedMissingEvidence
  * (first observed: wf coc7es/TEAM-3611). This closes the loop on the done
  * cascade itself: runs before completeWorkflow's fresh agentTasks re-read, so
  * the gate sees it in the same pass.
  *
- * Fills only when the entry has no evidence yet (a webhook merge that DID land
- * wins), and never throws — a missing record (human gates, legacy tickets)
- * just means the gate won't see harvested evidence for this ticket.
+ * Fills only when the entry has no evidence yet, and never throws — a missing
+ * record (human gates, legacy tickets) just means the gate won't see
+ * harvested evidence for this ticket.
  */
 async function harvestCompletionEvidence(workflow, ticketId) {
   if (!ARTIFACT_BUCKET) return;
