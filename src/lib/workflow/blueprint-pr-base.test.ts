@@ -192,7 +192,29 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     for (const name of ["api-dev", "backend-dev", "frontend-dev"]) {
       expect(read(name)).toContain('load_blueprint("bug-fixer")');
       expect(read(name)).toContain(SECTION);
+      expect(read(name)).toContain(
+        "branch fresh from the default branch and PR to the default branch; never PR into the merged integration branch."
+      );
     }
+  });
+
+  // TEAM-6107: e6aaf94 regressed this exact sentence in api/backend/frontend-dev into
+  // "...and PR to the default branch and PR to the default branch;" when it added the
+  // bug-fixer pointer. Pin both the specific phrase and a general doubled-phrase guard
+  // over every blueprint so the same edit mistake can't silently recur anywhere else.
+  it("no blueprint repeats \"and PR to the default branch\" back-to-back", () => {
+    const offenders = blueprints
+      .filter(({ text }) => text.includes("and PR to the default branch and PR to the default branch"))
+      .map(({ file }) => file);
+    expect(offenders).toEqual([]);
+  });
+
+  it("no blueprint repeats any five-plus-word phrase back-to-back", () => {
+    const REPEATED_PHRASE = /\b((?:\S+ ){4,}\S+) \1\b/g;
+    const offenders = blueprints.flatMap(({ file, text }) =>
+      [...text.matchAll(REPEATED_PHRASE)].map((m) => `${file}: ${m[1]}`)
+    );
+    expect(offenders).toEqual([]);
   });
 
   it("release-manager ships follow-up pairs, files orphans, and archives the earlier cd-ledger", () => {
