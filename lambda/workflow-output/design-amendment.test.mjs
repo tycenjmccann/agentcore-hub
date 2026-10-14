@@ -357,7 +357,7 @@ for (const twin of ["dynamodb", "jira"]) {
       expect(transitioned()).toBe(false);
       // The record as it STANDS: the last completion PUT that landed (the 412s did not).
       const standing = JSON.parse(h.landed.filter((p) => p.Key?.startsWith("completions/")).at(-1).Body);
-      expect(standing.securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399", provisional: true });
+      expect(standing.securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399", provisional: true, provisionalNonce: expect.any(String) });
       for (const twin of TWIN_GUARDS) {
         const m = await twin();
         expect(m.securityReviewRecordRefusal("completions/TEAM-5357.json", standing)).toMatch(/PROVISIONAL securityReview admission on amendment TEAM-5399/);
@@ -406,7 +406,7 @@ for (const twin of ["dynamodb", "jira"]) {
       expect(h.comments.size, "no residual findings reach the dev lanes").toBe(0);
       expect(transitioned()).toBe(false);
       expect(landedCompletions()).toHaveLength(1);
-      expect(lastLanded().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399", provisional: true });
+      expect(lastLanded().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399", provisional: true, provisionalNonce: expect.any(String) });
       for (const twin of TWIN_GUARDS) {
         const m = await twin();
         expect(m.securityReviewRecordRefusal(SEC_KEY, lastLanded())).toMatch(/PROVISIONAL securityReview admission on amendment TEAM-5399/);
@@ -420,7 +420,7 @@ for (const twin of ["dynamodb", "jira"]) {
       expect(res.status).toBe("complete");
       const landed = landedCompletions();
       expect(landed).toHaveLength(2);
-      expect(landed[0].securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399", provisional: true });
+      expect(landed[0].securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399", provisional: true, provisionalNonce: expect.any(String) });
       expect(landed[1].securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399" });
       const putIdx = h.seq.map((e, i) => (e === `put:${SEC_KEY}` ? i : -1)).filter((i) => i >= 0);
       expect(putIdx).toHaveLength(2);
@@ -442,7 +442,7 @@ for (const twin of ["dynamodb", "jira"]) {
       expect(res.residualFindings).toEqual({ posted: ["TEAM-5358", "TEAM-5359"], skipped: [], failed: [] });
       expect(h.comments.size).toBe(2);
       expect(transitioned()).toBe(false);
-      expect(lastLanded().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399", provisional: true });
+      expect(lastLanded().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399", provisional: true, provisionalNonce: expect.any(String) });
       for (const twin of TWIN_GUARDS) expect((await twin()).securityReviewRecordRefusal(SEC_KEY, lastLanded())).toMatch(/PROVISIONAL/);
       h.putError = null;
       const again = await report();

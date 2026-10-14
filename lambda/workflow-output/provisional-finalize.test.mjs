@@ -19,6 +19,14 @@ import { fake, resetFake, seedTicket, PROVIDER_503, awsError } from "./__fixture
  *       was refused by the twins and retried until the queue gave up.
  *   F3  the replay's revocation of a FINALIZED admission was a compensating write: its
  *       notice was posted before the stamp, and a lost CAS left the trusted stamp behind.
+ *
+ * TEAM-6152 (review round 5), below: the ETag alone does not identify THIS caller's provisional
+ * write (S3's single-part SSE-S3 ETag is the MD5 of the body, so a byte-identical re-establishment
+ * by another drain keeps the ETag) ⇒ every (re-)establishment carries a fresh `provisionalNonce`
+ * and the finalize requires it; the record-write tripwire fires only on a real same-amendment
+ * finalize (a provisional PASS and a PASS report both have no amendment); and a stale residual
+ * replay acts only on the admission the record holds (its stamp's amendment, never a PASS).
+ * The shared fake now defaults to content-hash ETags (`fake.etagMode`), which is what hid F1.
  */
 
 const FAKES = "./__fixtures__/ticket-fakes.mjs";
@@ -257,6 +265,7 @@ describe("TEAM-6151 F2 — a queued non-PASS review's admission is finalized by 
     expect(record(R_KEY).securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND });
     const bodies = keyPuts(R_KEY).slice(putsBefore).map(bodyOf);
     expect(bodies.map((b) => b.securityReview?.provisional), "provisional (step 6), finalized, applied").toEqual([true, undefined, undefined]);
+    expect(bodies.map((b) => typeof b.securityReview?.provisionalNonce), "TEAM-6152: the nonce lives exactly as long as the marker").toEqual(["string", "undefined", "undefined"]);
     expect(bodies[2]).toMatchObject({ ticketWrites: "applied" });
     expect(seenAtDone?.securityReview?.provisional, "never a Done on a provisional record").toBeUndefined();
     twinsAdmitAdmission(R_KEY);
@@ -274,7 +283,7 @@ describe("TEAM-6151 F3 — a replayed admission is re-established PROVISIONALLY 
     expect(out.outcome).toBe("retry");
     expect(fake.tickets.get(BUILD).status).not.toBe("Done");
     expect(transitionsOf(BUILD)).toHaveLength(0);
-    expect(record(B_KEY).securityReview, "the marker landed BEFORE the confirm, so the lost compensation changes nothing").toEqual({ verdict: "FAIL", amendmentTicketId: AMEND_B, provisional: true });
+    expect(record(B_KEY).securityReview, "the marker landed BEFORE the confirm, so the lost compensation changes nothing").toEqual({ verdict: "FAIL", amendmentTicketId: AMEND_B, provisional: true, provisionalNonce: expect.any(String) });
     twinsRefuseAdmission(B_KEY, /PROVISIONAL securityReview admission on amendment TEAM-5698/);
     fake.putError = null;
     const again = await drainQueued();
@@ -315,6 +324,7 @@ describe("TEAM-6151 F3 — a replayed admission is re-established PROVISIONALLY 
     expect(out.outcome, `drain: ${out.reason || ""}`).toBe("applied");
     const bodies = keyPuts(B_KEY).slice(putsBefore).map(bodyOf);
     expect(bodies.map((b) => b.securityReview?.provisional), "provisional (step 6), finalized, applied").toEqual([true, undefined, undefined]);
+    expect(bodies.map((b) => typeof b.securityReview?.provisionalNonce), "TEAM-6152: the nonce lives exactly as long as the marker").toEqual(["string", "undefined", "undefined"]);
     expect(bodies[2]).toMatchObject({ ticketWrites: "applied" });
     expect(seenAtDone?.securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND_B });
     expect(record(B_KEY).securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND_B });
@@ -329,7 +339,8 @@ describe("TEAM-6151 — the ONE conditional finalize", () => {
     expect(typeof finalizeProvisionalRecord, "exported").toBe("function");
     const key = "completions/UNIT-6151.json";
     const put = (obj) => { setRecord(key, obj); return fake.etags.get(key); };
-    const provisional = () => ({ status: "complete", securityReview: { verdict: "FAIL", amendmentTicketId: "TEAM-1", provisional: true } });
+    // TEAM-6152: a provisional write carries the nonce that identifies it (what the ETag alone cannot).
+    const provisional = () => ({ status: "complete", securityReview: { verdict: "FAIL", amendmentTicketId: "TEAM-1", provisional: true, provisionalNonce: "nonce-A" } });
     const base = () => ({ record: record(key), etag: fake.etags.get(key) });
 
     // (a) no marker on the record this caller wrote ⇒ refused, no PUT at all
@@ -381,7 +392,7 @@ describe("TEAM-6151 — the ONE conditional finalize", () => {
     fake.putError = null;
 
     // (f) the brief marker: the same helper, the release becomes trusted in one CAS
-    put({ status: "complete_pending_brief", briefPending: true, briefHoldReason: "provisional", briefDisposition: { release: true, kind: "gate_settled", provisional: true } });
+    put({ status: "complete_pending_brief", briefPending: true, briefHoldReason: "provisional", briefDisposition: { release: true, kind: "gate_settled", provisional: true, provisionalNonce: "nonce-B" } });
     r = await finalizeProvisionalRecord({ key, base: base(), what: "brief", apply: (rec) => { rec.briefPending = false; delete rec.briefDisposition.provisional; delete rec.briefHoldReason; rec.status = "complete"; return rec; } });
     expect(r.ok).toBe(true);
     expect(record(key)).toMatchObject({ status: "complete", briefPending: false, briefDisposition: { release: true, kind: "gate_settled" } });
@@ -392,6 +403,20 @@ describe("TEAM-6151 — the ONE conditional finalize", () => {
     r = await finalizeProvisionalRecord({ key, base: base(), what: "brief", apply: (rec) => rec });
     expect(r.ok).toBe(false);
     expect(fake.puts.length).toBe(puts);
+
+    // (g) TEAM-6152: a marker with NO nonce is not a write this caller made ⇒ refused, no PUT
+    for (const base6152 of [
+      { record: { status: "complete", securityReview: { verdict: "FAIL", amendmentTicketId: "TEAM-1", provisional: true } }, what: "securityReview", apply: finalizeSecurityReview },
+      { record: { briefPending: true, briefDisposition: { release: true, kind: "gate_settled", provisional: true } }, what: "brief", apply: (rec) => rec },
+    ]) {
+      put(base6152.record);
+      puts = fake.puts.length;
+      r = await finalizeProvisionalRecord({ key, base: base(), what: base6152.what, apply: base6152.apply });
+      expect(r.ok, base6152.what).toBe(false);
+      expect(r.superseded).toBeUndefined();
+      expect(r.error).toMatch(/provisionalNonce/);
+      expect(fake.puts.length, "no PUT").toBe(puts);
+    }
   });
 
   it("T9 the record write refuses to act as an admission finalizer: a failed-Done rewrite that re-reads a newer PROVISIONAL stamp leaves it standing", async () => {
@@ -412,5 +437,231 @@ describe("TEAM-6151 — the ONE conditional finalize", () => {
     expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
     expect(record(R_KEY).securityReview, "B's provisional stamp was NOT rewritten away").toEqual({ verdict: "FAIL", amendmentTicketId: AMEND, provisional: true });
     twinsRefuseAdmission(R_KEY);
+  });
+});
+
+// ─── TEAM-6152 (review round 5) ───
+const NONCE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+/** The queued message with only its residual findings (no follow-ups, no brief): the shape whose step-6 write is byte-identical across drains. */
+const residualOnly = () => ({ ...JSON.parse(fake.queue[0].Body), followUps: [], brief: undefined });
+
+describe("TEAM-6152 F1 — a byte-identical re-establishment keeps the ETag (MD5), so the finalize needs a per-write nonce", () => {
+  /**
+   * Two REAL drains on one residual-only message. A writes its step-6 provisional stamp, re-confirms
+   * the amendment done, and is held at its FINALIZE PUT; there the amendment reopens and drain B runs
+   * end to end (step 0 reads A's provisional record, step 6 re-establishes the marker, step 7 sees the
+   * amendment open and drops - its drop stamp 503s). A then resumes with its single CAS.
+   */
+  const twoDrains = async () => {
+    await withResidual();
+    patchRecord(B_KEY, { securityReview: { verdict: "FAIL", amendmentTicketId: AMEND_B } });
+    const msg = residualOnly();
+    const seen = { b: null, etagAfterA: null, etagAfterB: null };
+    let inB = false;
+    let paused = false;
+    fake.beforePut = async (input) => {
+      if (inB || paused || input.Key !== B_KEY) return;
+      const body = bodyOf(input);
+      if (body.securityReview && body.securityReview.provisional === undefined) {
+        paused = true;
+        seen.etagAfterA = fake.etags.get(B_KEY);
+        fake.tickets.get(AMEND_B).status = "To Do";
+        inB = true;
+        fake.putError = (i) => (i.Key === B_KEY && bodyOf(i).ticketWrites === "dropped" ? awsError("InternalError", 503, "We encountered an internal error") : null);
+        seen.b = await output.drainCompletion(msg);
+        fake.putError = null;
+        inB = false;
+        seen.etagAfterB = fake.etags.get(B_KEY);
+      }
+    };
+    const a = await output.drainCompletion(msg);
+    fake.beforePut = null;
+    return { a, ...seen };
+  };
+
+  it("T10 content ETags: B re-marks A's provisional stamp between A's confirm and A's finalize, the amendment reopened ⇒ A's finalize LOSES, no Done, both twins refuse; the next tick drops", async () => {
+    const r = await twoDrains();
+    expect(r.b.outcome, "B saw the amendment reopen; its drop stamp 503'd").toBe("retry");
+    expect(fake.tickets.get(BUILD).status, "no Done while the amendment is To Do").toBe("In Progress");
+    expect(transitionsOf(BUILD)).toHaveLength(0);
+    expect(r.a.outcome, `A: ${r.a.reason || ""}`).toBe("retry");
+    expect(r.a.reason).toMatch(/could not be FINALIZED/);
+    expect(r.etagAfterB, "B's re-establishment is a DIFFERENT write (fresh nonce ⇒ different bytes ⇒ different MD5)").not.toBe(r.etagAfterA);
+    const sr = record(B_KEY).securityReview;
+    expect(sr).toMatchObject({ verdict: "FAIL", amendmentTicketId: AMEND_B, provisional: true });
+    expect(sr.provisionalNonce).toMatch(NONCE_RE);
+    twinsRefuseAdmission(B_KEY, /PROVISIONAL securityReview admission on amendment TEAM-5698/);
+    const again = await output.drainCompletion(residualOnly());
+    expect(again).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+  });
+
+  it("T11 sequence ETags (the pre-6152 fake): the same interleaving was always safe - every PUT a new ETag - which is what hid F1", async () => {
+    fake.etagMode = "sequence";
+    const r = await twoDrains();
+    expect(r.b.outcome).toBe("retry");
+    expect(r.a.outcome).toBe("retry");
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+  });
+
+  it("T12 the brief twin: two drains release the SAME gate_settled brief with the same timestamp (identical bodies) ⇒ A's finalize must lose to B's re-establishment; no Done with the gate open", async () => {
+    await seedBrief();
+    await holdUnnamed();
+    allGatesDone();
+    // Both drains stamp `briefDisposition.at` / `by` identically: the timestamp is pinned so the only
+    // thing that can make the two step-6 bodies differ is the nonce.
+    const iso = vi.spyOn(Date.prototype, "toISOString").mockReturnValue("2026-10-14T12:00:00.000Z");
+    try {
+      const msg = { ...JSON.parse(fake.queue[0].Body), followUps: [] };
+      const seen = { b: null, etagAfterA: null, etagAfterB: null, bStepSix: false };
+      let inB = false;
+      let paused = false;
+      fake.beforeTool = (tool, params) => {
+        // B's post-write confirm: the gate reopened after B's step-6 write.
+        if (inB && seen.bStepSix && tool === "Tickets___get_issue" && params.ticket_id === GATE) fake.tickets.get(GATE).status = "To Do";
+      };
+      fake.beforePut = async (input) => {
+        if (input.Key !== B_KEY) return;
+        const body = bodyOf(input);
+        if (inB) { if (body.briefDisposition?.provisional === true) seen.bStepSix = true; return; }
+        if (paused) return;
+        if (body.briefPending === false && body.briefDisposition?.release === true) {
+          paused = true;
+          seen.etagAfterA = fake.etags.get(B_KEY);
+          inB = true;
+          // B's off-gate re-hold cannot be stamped (503): the record it leaves is its step-6 write.
+          fake.putError = (i) => (i.Key === B_KEY && bodyOf(i).briefPending === true && bodyOf(i).briefDisposition === undefined ? awsError("InternalError", 503, "We encountered an internal error") : null);
+          seen.b = await output.drainCompletion(msg);
+          fake.putError = null;
+          inB = false;
+          seen.etagAfterB = fake.etags.get(B_KEY);
+        }
+      };
+      const a = await output.drainCompletion(msg);
+      fake.beforePut = null;
+      fake.beforeTool = null;
+      expect(seen.bStepSix, "B re-established the provisional release").toBe(true);
+      expect(seen.b.outcome, `B: ${seen.b.reason || ""}`).toBe("retry");
+      expect(fake.tickets.get(BUILD).status, "no Done with the gate open").toBe("In Progress");
+      expect(a.outcome, `A: ${a.reason || ""}`).toBe("retry");
+      expect(seen.etagAfterB, "B's re-establishment is a different write").not.toBe(seen.etagAfterA);
+      const r = record(B_KEY);
+      expect(r.briefPending).toBe(true);
+      expect(r.briefDisposition).toMatchObject({ release: true, kind: "gate_settled", provisional: true });
+      expect(r.briefDisposition.provisionalNonce).toMatch(NONCE_RE);
+      twinsRefuseBrief(B_KEY);
+    } finally {
+      iso.mockRestore();
+    }
+  });
+});
+
+describe("TEAM-6152 F2 — a legitimate PASS must recover from a stale FAIL replay", () => {
+  const PASS = { summary: "Verdict: PASS. Design reviewed against main and the feature branch, read-only; no blocking findings.\n\nNo tool failures." };
+
+  it("T13 FAIL queued (Done 503) → PASS re-review (Done 503, deduped onto the FAIL message) → the amendment reopens and the stale FAIL replays → the PASS retry completes", async () => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503 };
+    expect(await reportReview()).toMatchObject({ status: "complete", ticketWrites: "queued" });
+    expect(record(R_KEY).securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND });
+    expect(await reportReview(PASS)).toMatchObject({ status: "complete", ticketWrites: "queued" });
+    expect(record(R_KEY).securityReview).toEqual({ verdict: "PASS" });
+    expect(fake.queue, "the PASS re-report was deduped onto the FAIL message").toHaveLength(1);
+    expect(JSON.parse(fake.queue[0].Body).residual.verdict).toBe("FAIL");
+    fake.failTool = null;
+    fake.tickets.get(AMEND).status = "To Do";
+    const out = await drainQueued();
+    expect(out.outcome).toBe("dropped");
+    expect(record(R_KEY).securityReview, "a stale residual replay never re-marks a newer PASS admission").toEqual({ verdict: "PASS" });
+    twinsAdmitAdmission(R_KEY);
+    const res = await reportReview(PASS);
+    expect(res, `PASS retry: ${res.reason || ""}`).toMatchObject({ status: "complete" });
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    twinsAdmitAdmission(R_KEY);
+  });
+
+  it("T14 the record-write tripwire fires only on a real same-amendment finalize: a PASS report over a provisional PASS, or over a provisional FAIL, is a different admission and writes", async () => {
+    seedReview();
+    setRecord(R_KEY, { ticket_id: REVIEW, status: "complete", securityReview: { verdict: "PASS", provisional: true } });
+    expect(await reportReview(PASS)).toMatchObject({ status: "complete" });
+    expect(record(R_KEY).securityReview).toEqual({ verdict: "PASS" });
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    fake.tickets.get(REVIEW).status = "In Progress";
+    setRecord(R_KEY, { ticket_id: REVIEW, status: "complete", securityReview: { verdict: "FAIL", amendmentTicketId: AMEND, provisional: true, provisionalNonce: "n-1" } });
+    expect(await reportReview(PASS)).toMatchObject({ status: "complete" });
+    expect(record(R_KEY).securityReview).toEqual({ verdict: "PASS" });
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+  });
+});
+
+describe("TEAM-6152 sibling — a stale residual replay acts only on the admission the record holds", () => {
+  const AMEND_B2 = "TEAM-5699";
+  /** The message names round 1's amendment (AMEND_B); the record's admission is round 2's (AMEND_B2), deduped onto the same message. */
+  const roundTwo = async () => {
+    await withResidual();
+    seedTicket({ ticketId: AMEND_B2, title: "Amend design: db9sx9 (round 2)", status: "Done", assignee: "agentcore_hub_backend_designer", parentKey: EPIC });
+    patchRecord(B_KEY, { securityReview: { verdict: "FAIL", amendmentTicketId: AMEND_B2 } });
+  };
+
+  it("T15 the record's (newer) amendment reopened while the message's is Done ⇒ the replay confirms the RECORD's amendment, drops, and marks that stamp provisional; no Done", async () => {
+    await roundTwo();
+    fake.tickets.get(AMEND_B2).status = "To Do";
+    const out = await output.drainCompletion(residualOnly());
+    expect(out, out.reason).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    expect(transitionsOf(BUILD)).toHaveLength(0);
+    expect(fake.calls.some((c) => c.tool === "Tickets___get_issue" && c.params?.ticket_id === AMEND_B2), "the record's amendment was re-read").toBe(true);
+    expect(record(B_KEY).securityReview).toMatchObject({ verdict: "FAIL", amendmentTicketId: AMEND_B2, provisional: true, provisionalNonce: expect.any(String) });
+    twinsRefuseAdmission(B_KEY, /on amendment TEAM-5699/);
+  });
+
+  it("T16 the message's amendment reopened but the record's (newer) admission is Done ⇒ that stamp is re-marked, re-confirmed and finalized on ITS amendment; Done", async () => {
+    await roundTwo();
+    fake.tickets.get(AMEND_B).status = "To Do";
+    const out = await output.drainCompletion(residualOnly());
+    expect(out.outcome, out.reason).toBe("applied");
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    expect(record(B_KEY).securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND_B2 });
+    twinsAdmitAdmission(B_KEY);
+  });
+});
+
+describe("TEAM-6152 — the provisionalNonce lifecycle and the readers that must ignore it", () => {
+  it("T17 writers mint a FRESH nonce per (re-)establishment; the finalize helpers remove it with the marker; the caller's disposition is not mutated", () => {
+    const { holdSecurityReviewProvisional, finalizeSecurityReview, holdBriefOnProvisionalRelease, clearBriefHoldOnRelease } = output;
+    const rec = { securityReview: { verdict: "FAIL", amendmentTicketId: "TEAM-1" } };
+    holdSecurityReviewProvisional(rec);
+    const first = rec.securityReview.provisionalNonce;
+    expect(rec.securityReview.provisional).toBe(true);
+    expect(first).toMatch(NONCE_RE);
+    holdSecurityReviewProvisional(rec);
+    expect(rec.securityReview.provisionalNonce, "a re-establishment is a NEW write").not.toBe(first);
+    expect(rec.securityReview.provisionalNonce).toMatch(NONCE_RE);
+    finalizeSecurityReview(rec);
+    expect(rec.securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-1" });
+    expect(holdSecurityReviewProvisional({ status: "complete" })).toEqual({ status: "complete" });
+    expect(holdSecurityReviewProvisional({ securityReview: "PASS" }).securityReview).toBe("PASS");
+
+    const disposition = { release: true, kind: "gate_settled", observed: [{ ticketId: "G" }], at: "2026-10-14T12:00:00.000Z", by: "drain" };
+    const b1 = holdBriefOnProvisionalRelease({ briefPending: true }, disposition);
+    const b2 = holdBriefOnProvisionalRelease({ briefPending: true }, disposition);
+    expect(b1.briefDisposition).toMatchObject({ ...disposition, provisional: true });
+    expect(b1.briefDisposition.provisionalNonce).toMatch(NONCE_RE);
+    expect(b2.briefDisposition.provisionalNonce).not.toBe(b1.briefDisposition.provisionalNonce);
+    expect(disposition.provisional, "the caller's disposition is not mutated").toBeUndefined();
+    expect(disposition.provisionalNonce).toBeUndefined();
+    clearBriefHoldOnRelease(b1, disposition);
+    expect(b1.briefDisposition).toEqual(disposition);
+    expect(b1.briefPending).toBe(false);
+  });
+
+  it("T18 both twins' Done guards ignore the nonce: a finalized stamp beside a stray nonce is admitted, a marked one is refused; the brief hold reads as before", () => {
+    for (const twin of TWIN_GUARDS) {
+      expect(twin.securityReviewRecordRefusal("k", { securityReview: { verdict: "FAIL", amendmentTicketId: "TEAM-1", provisionalNonce: "n-1" } })).toBeNull();
+      expect(twin.securityReviewRecordRefusal("k", { securityReview: { verdict: "FAIL", amendmentTicketId: "TEAM-1", provisional: true, provisionalNonce: "n-1" } })).toMatch(/PROVISIONAL securityReview admission on amendment TEAM-1/);
+      expect(twin.securityReviewRecordRefusal("k", { securityReview: { verdict: "PASS", provisionalNonce: "n-1" } })).toBeNull();
+      expect(twin.judgeBriefHold("k", JSON.stringify({ briefPending: true, briefDisposition: { release: true, kind: "gate_settled", provisional: true, provisionalNonce: "n-1" } }))).toMatchObject({ proven: false });
+      expect(twin.judgeBriefHold("k", JSON.stringify({ briefPending: false, briefDisposition: { release: true, kind: "gate_settled", provisionalNonce: "n-1" } }))).toBeNull();
+    }
   });
 });
