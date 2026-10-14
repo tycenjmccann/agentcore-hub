@@ -581,6 +581,10 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
             # TEAM-5710: the section-scoped epic parse and the cancel-wait grace.
             "_workflow_context_epic",
             "_FAIL_CLOSED_CANCEL_GRACE_S",
+            # TEAM-5999: the shared "Error: …" reader (_annotate calls it) and the
+            # in-flight outage-deadline cut raised inside _stream_with_retry.
+            "_tool_error",
+            "StreamRetryDeadlineExceeded",
         ],
     )
 
