@@ -1218,6 +1218,10 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // failed) is not a Done in flight: the write proceeds, bounded by the twins' TTL.
   let recordBase = { record: earlyPrior?.record ?? null, etag: earlyPrior?.etag };
   let deliveredNow = false;
+  // TEAM-6158: has THIS call landed its own securityReview stamp (a won record write that
+  // carried one, or the finalize)? Every later attempt is a rewrite, and a provisional
+  // admission found on the record from then on is NEWER than this call's.
+  let ownStampWritten = false;
   const writeRecord = async (statusOf, { forceHold = false } = {}) => {
     for (let attempt = 1; attempt <= RECORD_CAS_ATTEMPTS; attempt++) {
       adoptHold(report, recordBase.record, { deliveredNow, forceHold });
@@ -1225,16 +1229,22 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       // TEAM-6151: this write is never a FINALIZE. A finalize is one CAS on the provisional
       // write's own ETag (finalizeProvisionalRecord); this loop re-reads and re-applies the
       // same `report`, which is exactly how a stale admission was rebased over a newer
-      // provisional stamp. Narrow on the amendment: a PASS re-review over a prior provisional
-      // FAIL writes a different admission and is not a finalize. TEAM-6152: a REAL same-amendment
-      // finalize only - both ids present and equal. Two absent ids (a provisional PASS a stale
-      // replay once left behind, and a fresh PASS report) are not the same admission; comparing
-      // them equal refused every legitimate PASS retry (completion_record_contended, forever).
+      // provisional stamp. TEAM-6158 (replaces TEAM-6152's same-amendment rule): the question
+      // is not WHICH amendment but WHEN. Once this call has landed its own stamp
+      // (ownStampWritten), a provisional re-markable admission on the record - the drain's
+      // one predicate, reMarkableAdmission: non-PASS, any amendment - was established AFTER
+      // it (every establishment is a fresh write, see holdSecurityReviewProvisional), so it is
+      // newer than this call's admission and wins: the trusted stamp this attempt would
+      // serialize over it (the failed-Done rewrite, the queued stamp) is refused, whether it
+      // names the same amendment, another one, or none (a PASS). Comparing amendment ids let
+      // a trusted X rebase over a provisional Y, and a trusted PASS over any provisional FAIL.
+      // Before this call's first write, a provisional stamp predates it and a fresh report
+      // SUPERSEDES it (a PASS over a stale provisional PASS or FAIL writes - T14).
       const curStamp = recordBase.record?.securityReview;
-      const ownAmendment = asText(report.securityReview?.amendmentTicketId);
-      if (curStamp?.provisional === true && report.securityReview && typeof report.securityReview === "object"
-        && report.securityReview.provisional !== true && ownAmendment && ownAmendment === asText(curStamp.amendmentTicketId)) {
-        return { ok: false, error: `${key} carries a PROVISIONAL securityReview admission this write would finalize - a finalize goes through finalizeProvisionalRecord, never the record write` };
+      if (ownStampWritten && carriesProvisional(recordBase.record, "securityReview") && reMarkableAdmission(recordBase.record)
+        && report.securityReview && typeof report.securityReview === "object" && !carriesProvisional(report, "securityReview")) {
+        const cur = `${String(curStamp.verdict || "").toUpperCase() || "no verdict"}${asText(curStamp.amendmentTicketId) ? ` on amendment ${asText(curStamp.amendmentTicketId)}` : ""}`;
+        return { ok: false, error: `${key} carries a PROVISIONAL securityReview admission (${cur}) newer than this call's - the record write never finalizes or overwrites it; a finalize goes through finalizeProvisionalRecord, and the newer admission's own caller decides` };
       }
       const holdWritten = (report.followUpsPending === true && recordBase.record?.followUpsPending !== true)
         || (report.briefPending === true && recordBase.record?.briefPending !== true);
@@ -1249,6 +1259,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       const r = await conditionalPut(key, JSON.stringify(report, null, 2), recordBase.etag !== undefined ? { ifMatch: recordBase.etag } : {});
       if (r.outcome === "won") {
         recordBase = { record: JSON.parse(JSON.stringify(report)), etag: r.etag };
+        if (report.securityReview && typeof report.securityReview === "object") ownStampWritten = true;
         return { ok: true };
       }
       if (r.outcome === "error") throw r.err;
@@ -1639,6 +1650,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
         return { ...admissionNotFinalized(ticket_id, key, final.error, { posted: true }), residualFindings };
       }
       recordBase = { record: final.record, etag: final.etag };
+      ownStampWritten = true;
       // TEAM-6152: marker AND nonce off the in-memory report too (the failed-Done rewrite below serializes it).
       finalizeSecurityReview(report);
       console.log(`[report_completion] ${ticket_id}: design amendment ${amendment} re-confirmed done after the residual posts - securityReview admission FINALIZED`);
@@ -1896,16 +1908,25 @@ export function mergeBriefKey(keys) {
 
 /**
  * One FIFO message per completion. The group is the run, so a follow-up lands
- * before a later ticket's Done; the dedup id is the ticket, its follow-up hashes and
- * the transition, so a re-report inside SQS's 5-minute window is one message.
+ * before a later ticket's Done; the dedup id is the ticket, its follow-up hashes, the
+ * transition and (TEAM-6158) the residual's identity - its verdict and amendment id - so
+ * a re-report inside SQS's 5-minute window is one message only when it is the SAME
+ * admission. Without the residual, a PASS re-review was collapsed onto the earlier
+ * FAIL message: the drain replayed the stale FAIL, and the agent (answered "do NOT
+ * retry") had no path to Done without a manual re-run. A PASS carries no residual.
  */
+export function ticketWritesDedupId({ ticketId, entries = [], residual = null }) {
+  const residualId = residual ? `${String(residual.verdict || "").toUpperCase()}|${asText(residual.amendmentTicketId)}` : "";
+  return createHash("sha256").update([ticketId, ...entries.map((e) => e.hash).sort(), "done", residualId].join("|")).digest("hex");
+}
+
 async function enqueueTicketWrites({ ticketId, workflowId, agentId, epicKey, entries, residual, briefKey, reportKey, journey }) {
   const body = {
     v: 1, workflowId: workflowId || null, ticketId, agentId: agentId || null, epicKey: epicKey || null, transition: "done",
     followUps: entries, residual, brief: briefKey ? { s3Key: briefKey } : null, reportKey, journey,
     queuedAt: new Date().toISOString(),
   };
-  const dedup = createHash("sha256").update([ticketId, ...entries.map((e) => e.hash).sort(), "done"].join("|")).digest("hex");
+  const dedup = ticketWritesDedupId({ ticketId, entries, residual });
   const r = await sqs.send(new SendMessageCommand({
     QueueUrl: TICKET_REPLAY_QUEUE_URL,
     MessageBody: JSON.stringify(body),
@@ -2767,10 +2788,30 @@ export async function drainCompletion(msg) {
       const confirm = await confirmDoneAtCommit({ ticketIds: [amendment] });
       if (!confirm.ok) return retry(`get_issue ${amendment} (re-confirming the design amendment is done before the Done): ${confirm.error}`);
       if (!confirm.done) {
-        const stamp = reMarkableAdmission(rec.record, amendment) ? { securityReview: holdSecurityReviewProvisional(JSON.parse(JSON.stringify(rec.record))).securityReview } : {};
-        return drop("amendment", `design amendment ${confirm.why} - the security review's admission is PROVISIONAL again (securityReview.provisional:true, which both ticket providers refuse); re-review the amended design and re-run WorkflowOutput___report_completion`, {
-          epicKey, record: stamp,
-        });
+        // TEAM-6158: the notice says only what this drop WRITES. Three records can be here:
+        //  - a re-markable stamp (this replay's own admission): re-marked, "PROVISIONAL again";
+        //  - a trusted PASS: a NEWER admission this message does not own (a PASS re-review
+        //    whose own message is behind this one in the FIFO group, or whose agent's retry
+        //    closes the ticket). Its residual findings are superseded: nothing to re-mark,
+        //    nothing to say on the ticket, no drop stamp (`replayDropped` would ride every
+        //    later write via adoptHold) and no TicketReplayDropped alarm - the next message
+        //    Dones the ticket. The probe deletes a `dropped` message, so it never redelivers;
+        //  - no record, or no object stamp: nothing to re-mark, the ticket really is left
+        //    open, and the full drop (notice, stamp, metric) is right - but the notice must
+        //    not claim a marker that was never written.
+        if (reMarkableAdmission(rec.record, amendment)) {
+          const stamp = { securityReview: holdSecurityReviewProvisional(JSON.parse(JSON.stringify(rec.record))).securityReview };
+          return drop("amendment", `design amendment ${confirm.why} - the security review's admission is PROVISIONAL again (securityReview.provisional:true, which both ticket providers refuse); re-review the amended design and re-run WorkflowOutput___report_completion`, {
+            epicKey, record: stamp,
+          });
+        }
+        const recordVerdict = String(rec.record?.securityReview?.verdict || "").toUpperCase();
+        if (rec.record?.securityReview && typeof rec.record.securityReview === "object" && recordVerdict === "PASS") {
+          const reason = `superseded: ${reportKey} carries a trusted PASS securityReview admission newer than this message's ${String(msg.residual.verdict || "").toUpperCase() || "non-PASS"} residual findings (design amendment ${confirm.why}) - nothing re-marked, no notice posted, no drop stamped; the PASS admission's own queued message or report_completion retry closes ${ticketId}`;
+          console.warn(`[ticket-replay] ${ticketId}: SUPERSEDED - ${reason}`);
+          return { outcome: "dropped", superseded: true, reason };
+        }
+        return drop("amendment", `design amendment ${confirm.why} and the completion record ${rec.record ? "carries no securityReview admission to re-mark" : "does not exist"} (nothing written); re-review the amended design and re-run WorkflowOutput___report_completion`, { epicKey });
       }
       if (rec.record && carriesProvisional(rec.record, "securityReview") && reMarkableAdmission(rec.record, amendment)) {
         const final = await finalizeProvisionalRecord({ key: reportKey, base: { record: rec.record, etag: recordEtag }, what: "securityReview", apply: finalizeSecurityReview });
