@@ -1248,7 +1248,7 @@ async function markTaskComplete(workflow, ticketId, assignee) {
   if (!stamped) { if (prior?.completedAt) entry.completedAt = prior.completedAt; else delete entry.completedAt; }
   if (!workflow.agentTasks) workflow.agentTasks = {};
   workflow.agentTasks[ticketId] = entry;
-  await harvestCompletionEvidence(workflow, ticketId);
+  await harvestCompletionEvidence(workflow, ticketId, stamped && Boolean(prior?.completedAt)); // TEAM-5900: a rework re-completion
 }
 
 /**
@@ -1264,11 +1264,11 @@ async function markTaskComplete(workflow, ticketId, assignee) {
  * cascade itself: runs before completeWorkflow's fresh agentTasks re-read, so
  * the gate sees it in the same pass.
  *
- * Fills only when the entry has no evidence yet (a webhook merge that DID land
- * wins), and never throws — a missing record (human gates, legacy tickets)
- * just means the gate won't see harvested evidence for this ticket.
+ * Fills only what the entry lacks (a webhook merge that DID land wins) — except on
+ * a `transitioned` rework re-completion (accepted stamp over a prior one) with a record no
+ * older than startedAt (TEAM-5900: the new head), whose non-empty fields overwrite. Never throws.
  */
-async function harvestCompletionEvidence(workflow, ticketId) {
+async function harvestCompletionEvidence(workflow, ticketId, transitioned = false) {
   if (!ARTIFACT_BUCKET) return;
   const entry = workflow.agentTasks?.[ticketId];
   const hasEvidence =
@@ -1283,7 +1283,7 @@ async function harvestCompletionEvidence(workflow, ticketId) {
     (typeof entry?.mergeCommit === "string" && entry.mergeCommit.trim().length > 0) ||
     (typeof entry?.commitSha === "string" && entry.commitSha.trim().length > 0) ||
     (typeof entry?.outcome === "string" && entry.outcome.trim().length > 0);
-  if (hasEvidence && hasShipSignal) return;
+  if (hasEvidence && hasShipSignal && !transitioned) return;
   try {
     // Shared per-invocation read (TEAM-4121 FR-9): the live-reverify hook needs
     // the same record moments later, and one GET serves both.
@@ -1292,22 +1292,20 @@ async function harvestCompletionEvidence(workflow, ticketId) {
       console.warn(`[orchestrator] evidence harvest skipped for ${ticketId}: no readable completions/${ticketId}.json`);
       return;
     }
-    const fields = {};
-    // Deliverable evidence — only fill when absent (a webhook metadata merge that
-    // DID land wins), exactly as before.
-    if (!hasEvidence) {
+    const fields = {}, fresh = transitioned && record.completed_at >= entry?.startedAt, take = (k) => fresh || !entry?.[k];
+    // Deliverable evidence — fill when absent, overwrite when `fresh` (TEAM-5900).
+    if (!hasEvidence || fresh) {
       const summary = typeof record.summary === "string" ? record.summary.trim() : "";
       if (summary) fields.output = summary.slice(0, 10000);
       if (record.branch) fields.branch = record.branch;
     }
-    // Ship/CD verdict signals — harvested regardless of deliverable evidence,
-    // each filled only when the entry doesn't already carry it (additive; legacy
-    // records simply lack these keys). commit_sha/pr_url kept here too so the
-    // ship gate + the final PR label can find them.
-    if (record.commit_sha && !entry?.commitSha) fields.commitSha = record.commit_sha;
-    if (record.pr_url && !entry?.prUrl) fields.prUrl = record.pr_url;
-    if (record.merge_commit && !entry?.mergeCommit) fields.mergeCommit = record.merge_commit;
-    if (!entry?.outcome) {
+    // Ship/CD verdict signals — harvested regardless of deliverable evidence, each
+    // only when the record carries it and take() admits it (legacy records lack these
+    // keys). commit_sha/pr_url kept here so the ship gate + final PR label find them.
+    if (record.commit_sha && take("commitSha")) fields.commitSha = record.commit_sha;
+    if (record.pr_url && take("prUrl")) fields.prUrl = record.pr_url;
+    if (record.merge_commit && take("mergeCommit")) fields.mergeCommit = record.merge_commit;
+    if (take("outcome")) {
       // The admitted set lives beside shipVerdictOf (TEAM-4763 P1-A) because what
       // may be harvested and what it MEANS are one decision: they had drifted, and
       // `handoff` — writable by report_completion since TEAM-4740 — was dropped
@@ -1315,7 +1313,7 @@ async function harvestCompletionEvidence(workflow, ticketId) {
       const oc = harvestableShipOutcome(record.outcome);
       if (oc) fields.outcome = oc;
     }
-    if (record.block_reason && !entry?.blockReason) {
+    if (record.block_reason && take("blockReason")) {
       fields.blockReason = String(record.block_reason).slice(0, 500);
     }
     if (Object.keys(fields).length === 0) return;
