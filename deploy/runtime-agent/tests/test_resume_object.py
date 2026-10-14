@@ -31,6 +31,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
 from typing import Any
 
 import pytest
@@ -96,14 +97,44 @@ class _Body:
         return self._raw
 
 
-def _load(bucket: str = "test-artifacts", stored: dict[str, bytes] | None = None) -> tuple[dict, _FakeS3]:
-    """The REAL resume functions, exec'd against a fake S3 client and bucket name."""
+class _FakeWorkflows:
+    """TEAM-5999: the `_ddb_events_client` stand-in for the workflows-table read
+    behind the claim fence. `task` is the `agentTasks[<ticket>]` entry in DynamoDB
+    JSON (None = no entry); `has_row` / `has_tasks` shape the two "nothing there"
+    responses GetItem can give; `fail_get` raises."""
+
+    def __init__(self, task: dict | None = None, has_row: bool = True, has_tasks: bool = True) -> None:
+        self.task = task
+        self.has_row = has_row
+        self.has_tasks = has_tasks
+        self.fail_get = False
+        self.gets: list[dict] = []
+
+    def get_item(self, **kwargs: Any) -> dict:
+        self.gets.append(kwargs)
+        if self.fail_get:
+            raise RuntimeError("ProvisionedThroughputExceededException")
+        if not self.has_row:
+            return {}
+        if not self.has_tasks:
+            return {"Item": {}}
+        ticket = kwargs["ExpressionAttributeNames"]["#tid"]
+        tasks = {ticket: {"M": self.task}} if self.task is not None else {}
+        return {"Item": {"agentTasks": {"M": tasks}}}
+
+
+def _load(bucket: str = "test-artifacts", stored: dict[str, bytes] | None = None,
+          claims: _FakeWorkflows | None = None) -> tuple[dict, _FakeS3]:
+    """The REAL resume functions, exec'd against a fake S3 client and bucket name
+    (and, TEAM-5999, a fake workflows-table reader for the claim fence)."""
     tree = ast.parse(MAIN_PY.read_text())
     nodes = _module_scope_nodes(
         tree,
         [
             "_RESUME_ARTIFACT_KEY_CAP",
             "_RESUME_TEXT_LIMIT",
+            "_WORKFLOWS_TABLE",
+            "_claim_generation_now",
             "_resume_object_key",
             "_write_resume_object",
             "_read_resume_object",
@@ -114,11 +145,14 @@ def _load(bucket: str = "test-artifacts", stored: dict[str, bytes] | None = None
     s3 = _FakeS3(stored)
     ns: dict[str, Any] = {
         "json": json,
+        "os": os,
         "logger": logging.getLogger("test-resume-object"),
         "s3_client": s3,
         "ARTIFACT_BUCKET": bucket,
+        "_ddb_events_client": claims if claims is not None else _FakeWorkflows(),
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(MAIN_PY), "exec"), ns)  # noqa: S102
+    ns["_WORKFLOWS_TABLE"] = "test-workflows"
     return ns, s3
 
 
@@ -392,7 +426,8 @@ def test_artifact_keys_alone_are_worth_a_block() -> None:
 def test_the_read_happens_right_after_the_ticket_id_is_bound() -> None:
     """Any later and part of the prompt has already been assembled without it."""
     source = MAIN_PY.read_text()
-    bind = source.index('_CURRENT_TICKET_ID = payload.get("ticket_id"')
+    # TEAM-6000: the ticket id is bound into the turn's own local first.
+    bind = source.index('_turn_ticket_id = payload.get("ticket_id"')
     read = source.index("_read_resume_object(", bind)
     between = source[bind:read]
     assert between.count("\n") <= 8, (
@@ -454,3 +489,115 @@ async def test_a_turn_runs_normally_when_there_is_nothing_to_resume() -> None:
         )
     ]
     assert any("contentBlockDelta" in f.get("event", {}) for f in frames)
+
+
+# ─── 6. TEAM-5999: the write is fenced on the claim generation ────────────────
+#
+# A late turn whose claim was stolen used to recreate the ticket-scoped object
+# after the NEWER claim had completed and deleted it. The write now reads the
+# claim generation (`agentTasks[<ticket>].startedAt`, strongly consistent — the
+# same field and read the ticket Lambda fences a park with) right before the put:
+# equal → write and stamp; different or absent → skip; a READ ERROR or no
+# generation of our own → write unfenced, with a warning either way.
+
+GEN = "2026-10-14T10:00:00.000Z"
+NEWER = "2026-10-14T10:05:00.000Z"
+
+
+def _task(started_at: str, status: str = "running") -> dict:
+    return {"startedAt": {"S": started_at}, "status": {"S": status}}
+
+
+def test_team5999_a_moved_claim_generation_writes_nothing(caplog: Any) -> None:
+    claims = _FakeWorkflows(_task(NEWER))
+    ns, s3 = _load(claims=claims)
+    with caplog.at_level(logging.WARNING):
+        ns["_write_resume_object"](WF, AGENT, TICKET, last_text="half a thought", claim_started_at=GEN)
+    assert s3.puts == [], "a stale generation must not recreate the resume object"
+    assert len(claims.gets) == 1
+    assert any(
+        "claim generation moved" in r.getMessage() and GEN in r.getMessage() and NEWER in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+@pytest.mark.parametrize(
+    "claims",
+    [
+        _FakeWorkflows(has_row=False),
+        _FakeWorkflows(has_tasks=False),
+        _FakeWorkflows(task=None),
+        _FakeWorkflows({"status": {"S": "running"}}),
+    ],
+    ids=["no-workflow-row", "no-agentTasks", "no-entry-for-ticket", "entry-without-startedAt"],
+)
+def test_team5999_a_missing_claim_entry_skips_the_write(claims: _FakeWorkflows, caplog: Any) -> None:
+    """No claim on record for our generation is read as moved, not as unknown."""
+    ns, s3 = _load(claims=claims)
+    with caplog.at_level(logging.WARNING):
+        ns["_write_resume_object"](WF, AGENT, TICKET, last_text="half", claim_started_at=GEN)
+    assert s3.puts == []
+    assert any("no claim on record" in r.getMessage() and GEN in r.getMessage() for r in caplog.records), (
+        [r.getMessage() for r in caplog.records]
+    )
+
+
+def test_team5999_the_current_generation_writes_and_stamps_it() -> None:
+    claims = _FakeWorkflows(_task(GEN))
+    ns, s3 = _load(claims=claims)
+    ns["_write_resume_object"](WF, AGENT, TICKET, last_text="half a thought",
+                              last_stream_at="2026-10-14T10:01:00+00:00", claim_started_at=GEN)
+    assert len(s3.puts) == 1 and s3.puts[0]["Key"] == KEY
+    assert _body(s3) == {
+        "lastText": "half a thought",
+        "lastStreamAt": "2026-10-14T10:01:00+00:00",
+        "artifactKeys": [],
+        "claimStartedAt": GEN,
+    }
+    (get,) = claims.gets
+    assert get["TableName"] == "test-workflows"
+    assert get["Key"] == {"workflowId": {"S": WF}}
+    assert get["ConsistentRead"] is True, "the fence must read the claim strongly consistently"
+    assert get["ProjectionExpression"] == "agentTasks.#tid"
+    assert get["ExpressionAttributeNames"] == {"#tid": TICKET}
+
+
+def test_team5999_a_stolen_unreissued_claim_still_writes() -> None:
+    """The detector's stealClaim flips status to ready but keeps startedAt; until a
+    re-dispatch mints a new generation there is no newer owner, and the remnant is
+    exactly what that re-dispatch should read. So the fence is on startedAt alone,
+    deliberately not on status like the park fence."""
+    ns, s3 = _load(claims=_FakeWorkflows(_task(GEN, status="ready")))
+    ns["_write_resume_object"](WF, AGENT, TICKET, last_text="half", claim_started_at=GEN)
+    assert len(s3.puts) == 1 and _body(s3)["claimStartedAt"] == GEN
+
+
+def test_team5999_a_claim_read_error_fails_open(caplog: Any) -> None:
+    """A read ERROR (not an absent claim) proves nothing about the generation, and
+    the resume object is advisory: write it, say why it is unfenced."""
+    claims = _FakeWorkflows(_task(NEWER))
+    claims.fail_get = True
+    ns, s3 = _load(claims=claims)
+    with caplog.at_level(logging.WARNING):
+        ns["_write_resume_object"](WF, AGENT, TICKET, last_text="half", claim_started_at=GEN)
+    assert len(s3.puts) == 1 and _body(s3)["claimStartedAt"] == GEN
+    assert any(
+        "unverifiable" in r.getMessage() and "ProvisionedThroughputExceededException" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+
+
+def test_team5999_no_claim_generation_writes_unfenced(caplog: Any) -> None:
+    """A dispatch that carried no claim_started_at (a pre-TEAM-5719 orchestrator, a
+    hand-rolled invoke) has nothing to compare against: written as before, no
+    stamp, no read, and a warning so the unfenced write is visible."""
+    claims = _FakeWorkflows(_task(NEWER))
+    ns, s3 = _load(claims=claims)
+    with caplog.at_level(logging.WARNING):
+        ns["_write_resume_object"](WF, AGENT, TICKET, last_text="half", claim_started_at="")
+    assert len(s3.puts) == 1
+    assert "claimStartedAt" not in _body(s3), "omit-when-empty, like agent.died's stamp"
+    assert claims.gets == [], "nothing to fence against — no read"
+    assert any("no claim generation" in r.getMessage() for r in caplog.records), (
+        [r.getMessage() for r in caplog.records]
+    )
