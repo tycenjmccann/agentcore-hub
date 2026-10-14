@@ -227,6 +227,10 @@ run_deploy() {
   # before the registry existed. deploy-fleet.sh exports MODEL_ID, so its
   # "Model:" banner is what actually lands here.
   # shellcheck disable=SC2086 # PROMPT_ENV/MCP_ENV deliberately word-split into --env args
+  # EVENTS_TABLE/WORKFLOWS_TABLE (TEAM-6023): the ${VAR:-default} tail mirrors
+  # config.sh's own default for each, so a rename in config.sh (or .env.local)
+  # reaches the runtime once deploy.sh's exports flow down to this child —
+  # never bake the table name as a literal here.
   agentcore deploy \
     --auto-update-on-conflict \
     --env "BYPASS_TOOL_CONSENT=true" \
@@ -234,7 +238,8 @@ run_deploy() {
     --env "MODEL_ID=${MODEL_ID:-us.anthropic.claude-fable-5-1}" \
     --env "READ_TIMEOUT=1200" \
     --env "AWS_REGION=us-east-1" \
-    --env "EVENTS_TABLE=agentcore-hub-events" \
+    --env "EVENTS_TABLE=${EVENTS_TABLE:-agentcore-hub-events}" \
+    --env "WORKFLOWS_TABLE=${WORKFLOWS_TABLE:-agentcore-hub-workflows}" \
     --env "TICKET_TOOLS_LAMBDA=${TICKET_TOOLS_LAMBDA:-agentcore-hub-jira}" \
     --env "AGENTCORE_HUB_ARTIFACT_BUCKET=${ARTIFACT_BUCKET}" \
     --env "CLAUDE_CODE_USE_BEDROCK=1" \

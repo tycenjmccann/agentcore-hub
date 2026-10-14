@@ -55,7 +55,11 @@ def build_env_vars(agent_name: str, prompt_key: str) -> dict[str, str]:
         "MODEL_ID": os.environ.get("MODEL_ID", "us.anthropic.claude-fable-5-1"),
         "READ_TIMEOUT": "1200",
         "AWS_REGION": "us-east-1",
-        "EVENTS_TABLE": "agentcore-hub-events",
+        # TEAM-6023: forward from the environment (config.sh's default), never
+        # bake the table name as a literal — a rename in config.sh must reach
+        # the baked image the same way it reaches the lightweight CodeZip path.
+        "EVENTS_TABLE": os.environ.get("EVENTS_TABLE", "agentcore-hub-events"),
+        "WORKFLOWS_TABLE": os.environ.get("WORKFLOWS_TABLE", "agentcore-hub-workflows"),
         "TICKET_TOOLS_LAMBDA": os.environ.get("TICKET_TOOLS_LAMBDA", "agentcore-hub-jira"),
         "PIPELINE_TOOLS_LAMBDA": os.environ.get("PIPELINE_TOOLS_LAMBDA", "agentcore-hub-pipeline-tools"),
         "AGENTCORE_HUB_ARTIFACT_BUCKET": os.environ["ARTIFACT_BUCKET"],
