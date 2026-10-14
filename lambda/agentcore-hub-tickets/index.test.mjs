@@ -227,6 +227,8 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           if (name === "PutCommand") {
             // TEAM-4739: a journey event and a new ticket both arrive as a Put;
             // `eventId` is what tells them apart.
+            // TEAM-6091: a token-less create's derived IDEMP# lock row is not a ticket.
+            if (String(cmd.input.Item?.ticketId).startsWith("IDEMP#")) return {};
             if (cmd.input.Item?.eventId) h.state.events.push(cmd.input.Item);
             else h.state.puts.push(cmd.input.Item);
             return {};
