@@ -30,7 +30,7 @@ ORCH="lambda/orchestrator"
 MODULES_ALLOW="scripts/orchestrator-modules.allow"
 ENV_ALLOW="scripts/orchestrator-env.allow"
 # Budgets: actual + ~3% after the 2026-09 cleanup (PR 2). Lower freely; raise only with a DL entry.
-ORCH_LOC_BUDGET=13153  # TEAM-6108 (DL-038) ticket-stated follow-up PR base +3 (completion.mjs); before that: exact measured total after main-sync (merge of TEAM-6021 -12 into the TEAM-6032 line): DL-038 (TEAM-6032) follow-up PR gate; (TEAM-6062) record pr_url / PR-set notice / every repo; (TEAM-6075) shared parseGitHubUrl + non-string pr_url skip; TEAM-6000 dead-session-detector 666 -> 695; TEAM-6021 lease.mjs + detector page loops folded into findEventSince
+ORCH_LOC_BUDGET=13167  # TEAM-6133 (DL-038) shared host-anchored githubPrRef +14 (completion.mjs; index.mjs call sites line-neutral); before that: TEAM-6108 (DL-038) ticket-stated follow-up PR base +3 (completion.mjs); before that: exact measured total after main-sync (merge of TEAM-6021 -12 into the TEAM-6032 line): DL-038 (TEAM-6032) follow-up PR gate; (TEAM-6062) record pr_url / PR-set notice / every repo; (TEAM-6075) shared parseGitHubUrl + non-string pr_url skip; TEAM-6000 dead-session-detector 666 -> 695; TEAM-6021 lease.mjs + detector page loops folded into findEventSince
 ORCH_INDEX_BUDGET=5175
 
 RULE="DL-009: the orchestrator is cascade/dispatch/claim/reaper/completion only.
