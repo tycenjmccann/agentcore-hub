@@ -61,6 +61,9 @@ import {
   judgeCompletionRecord,
   judgeBriefHold,
   briefHoldUnknown,
+  judgePostCommitHold,
+  postCommitHoldConflict,
+  postCommitUncheckedWarning,
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
   designAmendmentRefusal,
@@ -378,7 +381,7 @@ async function isShipPhaseTicket(labels) {
  * missing-record and indeterminate texts are byte-unchanged; only a record that
  * exists and says its follow-ups are still pending is newly refused.
  */
-async function completionRecordProven(ticketId, opts = {}) {
+async function completionRecordProven(ticketId, opts = {}, capture = null) {
   const key = `completions/${ticketId}.json`;
   if (!ARTIFACT_BUCKET) {
     return { proven: false, why: `ARTIFACT_BUCKET is unset, so ${key} cannot be read` };
@@ -389,6 +392,7 @@ async function completionRecordProven(ticketId, opts = {}) {
     // Inside the try on purpose: a stream that fails mid-read, or a response with no
     // Body at all, is the same "could not tell" as the GetObject itself throwing.
     bodyText = await res.Body.transformToString();
+    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText, recordGated: true });
   } catch (err) {
     const status = err?.$metadata?.httpStatusCode;
     if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
@@ -417,7 +421,7 @@ async function completionRecordProven(ticketId, opts = {}) {
  * `unknown: true`, so the caller says so), the same positive-evidence rule as completionRecordProven. A body
  * that reads but cannot be judged refuses too (judgeBriefHold).
  */
-async function briefHoldOf(ticketId) {
+async function briefHoldOf(ticketId, capture = null) {
   const key = `completions/${ticketId}.json`;
   if (!ARTIFACT_BUCKET) return null;
   let bodyText;
@@ -426,9 +430,13 @@ async function briefHoldOf(ticketId) {
     // Inside the try on purpose, as in completionRecordProven: a stream that fails
     // mid-read, or no Body at all, is the same "could not tell".
     bodyText = await res.Body.transformToString();
+    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText });
   } catch (err) {
     const status = err?.$metadata?.httpStatusCode;
-    if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) return null;
+    if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
+      if (capture) Object.assign(capture, { key, absent: true });
+      return null;
+    }
     return briefHoldUnknown(key, `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})`);
   }
   return judgeBriefHold(key, bodyText);
@@ -471,14 +479,16 @@ function completionRecordRequiredError(ticketId, why, what = "a ship-phase ticke
  * Both gates on a `→ Done` transition, in order: TEAM-4706's ship-phase completion
  * record (unchanged), then the typed-gate probe.
  *
+ * @param {object} [admitted] TEAM-5926: filled with the completion-record read the
+ *   guard admitted on ({key, etag, absent, bodyText}), for postCommitHoldCheck
  * @returns {Promise<object|null>} the verification to stamp, or null when this
  *   ticket is not a probed gate. Throws to refuse.
  */
-async function gateConditionCleared(ticketId, labels, description) {
+async function gateConditionCleared(ticketId, labels, description, admitted = null) {
   // TEAM-4706 (DL-030), unchanged: a ship-phase ticket cannot reach Done without
   // its completion record.
   if (await isShipPhaseTicket(labels)) {
-    const proof = await completionRecordProven(ticketId);
+    const proof = await completionRecordProven(ticketId, {}, admitted);
     if (!proof.proven) {
       console.warn(
         `[agentcore-hub-jira] ${ticketId}: refusing done on a ship-phase ticket — ${proof.why}`
@@ -491,7 +501,7 @@ async function gateConditionCleared(ticketId, labels, description) {
     // (design_amendment_required). A direct `→ Done` would walk around that, so
     // the record must carry the securityReview stamp that only an ADMITTED report
     // writes — an existing record alone (say one written on a FAIL) is not enough.
-    const proof = await completionRecordProven(ticketId, { securityReview: true });
+    const proof = await completionRecordProven(ticketId, { securityReview: true }, admitted);
     if (!proof.proven) {
       console.warn(
         `[agentcore-hub-jira] ${ticketId}: refusing done on a security-review ticket — ${proof.why}`
@@ -504,7 +514,7 @@ async function gateConditionCleared(ticketId, labels, description) {
     // replay stamped when it could not put the brief on the gate; a direct `→ Done`
     // would release the gate without it. No record ⇒ admit; a record S3 cannot read ⇒
     // refuse.
-    const hold = await briefHoldOf(ticketId);
+    const hold = await briefHoldOf(ticketId, admitted);
     if (hold) {
       const what = hold.unknown ? "a ticket whose merge-brief hold cannot be read" : "a ticket whose merge brief is held";
       console.warn(`[agentcore-hub-jira] ${ticketId}: refusing done on ${what} — ${hold.why}`);
@@ -2194,13 +2204,15 @@ async function transitionTicket(params) {
   // of its completion record (TEAM-5832: the brief hold is read for every ticket).
   let gateVerification = null;
   let gateLabels = [];
+  const admitted = {};
   if (effectiveStatus.toLowerCase() === "done") {
     const issue = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=labels,description`);
     gateLabels = issue?.fields?.labels || [];
     gateVerification = await gateConditionCleared(
       ticket_id,
       gateLabels,
-      adfToText(issue?.fields?.description)
+      adfToText(issue?.fields?.description),
+      admitted
     );
   }
 
@@ -2353,6 +2365,8 @@ async function transitionTicket(params) {
   }
 
   const conflict = finalStatus === "done" ? await flagDoneOverCancelled(ticket_id) : false;
+  const hold = finalStatus === "done" && admitted.key ? await postCommitHoldCheck(ticket_id, admitted) : {};
+  const warnings = [conflict ? DONE_OVER_CANCELLED_WARNING : null, hold.warning].filter(Boolean);
   console.log(`[jira-tools] Transitioned ${ticket_id} to ${finalStatus} in Jira${blockers.length ? ` (blocked_by +${blockers.join(",")})` : ""}`);
   return {
     ticketId: ticket_id,
@@ -2360,7 +2374,8 @@ async function transitionTicket(params) {
     message: `Transitioned to ${finalStatus}`,
     ...(blockers.length ? { blockedByAdded: blockers } : {}),
     ...(gateVerification ? { gateVerification } : {}),
-    ...(conflict ? { conflict: "done_over_cancelled", warning: DONE_OVER_CANCELLED_WARNING } : {}),
+    ...(conflict ? { conflict: "done_over_cancelled" } : hold.conflict ? { conflict: hold.conflict } : {}),
+    ...(warnings.length ? { warning: warnings.join(" ") } : {}),
   };
 }
 
@@ -2560,6 +2575,46 @@ export async function flagDoneOverCancelled(ticket_id) {
     console.warn(`[jira-tools] ${ticket_id}: done-over-cancelled check failed: ${err.message}`);
     return false;
   }
+}
+
+/**
+ * TEAM-5926 (TEAM-5799 ship-review F1): the Done guard read the completion record,
+ * then the reason comment and the provider calls ran before the Done committed. A
+ * replay drain that CAS-stamped `briefPending:true` inside that window (or, on a ticket
+ * the guard admitted through completionRecordProven, `followUpsPending:true`) is found here,
+ * by re-reading the record after the commit (judgePostCommitHold in gate-contract.mjs).
+ * DETECTION ONLY, like flagDoneOverCancelled: the Done stands, a Conflict comment flags
+ * it, the result carries `conflict` + `warning`, and the drain's own post-stamp
+ * re-read converges the record. A re-read S3 cannot answer (one retry) is a warning,
+ * never a throw over the committed move.
+ */
+export async function postCommitHoldCheck(ticket_id, admitted) {
+  const reread = async () => {
+    try {
+      const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: admitted.key }));
+      return { etag: res.ETag, absent: false, bodyText: await res.Body.transformToString() };
+    } catch (err) {
+      const status = err?.$metadata?.httpStatusCode;
+      if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) return { absent: true };
+      return { error: `could not read ${admitted.key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})` };
+    }
+  };
+  let now = await reread();
+  if (now.error) now = await reread();
+  const verdict = judgePostCommitHold(admitted.key, admitted, now);
+  if (!verdict) return {};
+  if (verdict.unchecked) {
+    console.warn(`[jira-tools] ${ticket_id}: post-commit hold check could not run: ${verdict.why}`);
+    return { warning: postCommitUncheckedWarning(verdict.why) };
+  }
+  const fields = postCommitHoldConflict(verdict);
+  console.warn(`[jira-tools] ${ticket_id}: Done committed over a concurrent hold on ${admitted.key} (${verdict.kinds.join(", ")})`);
+  try {
+    await addComment({ ticket_id, comment: `Conflict: ${fields.warning}` });
+  } catch (err) {
+    console.warn(`[jira-tools] ${ticket_id}: ${fields.conflict} comment failed: ${err.message}`);
+  }
+  return fields;
 }
 
 async function updateTicket(params) {

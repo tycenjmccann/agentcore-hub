@@ -66,6 +66,9 @@ import {
   judgeCompletionRecord,
   judgeBriefHold,
   briefHoldUnknown,
+  judgePostCommitHold,
+  postCommitHoldConflict,
+  postCommitUncheckedWarning,
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
   designAmendmentRefusal,
@@ -375,7 +378,7 @@ async function isShipPhaseTicket(item) {
  * missing-record and indeterminate texts are byte-unchanged; only a record that
  * exists and says its follow-ups are still pending is newly refused.
  */
-async function completionRecordProven(ticketId, opts = {}) {
+async function completionRecordProven(ticketId, opts = {}, capture = null) {
   const key = `completions/${ticketId}.json`;
   if (!ARTIFACT_BUCKET) {
     return { proven: false, why: `ARTIFACT_BUCKET is unset, so ${key} cannot be read` };
@@ -386,6 +389,7 @@ async function completionRecordProven(ticketId, opts = {}) {
     // Inside the try on purpose: a stream that fails mid-read, or a response with no
     // Body at all, is the same "could not tell" as the GetObject itself throwing.
     bodyText = await res.Body.transformToString();
+    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText, recordGated: true });
   } catch (err) {
     const status = err?.$metadata?.httpStatusCode;
     if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
@@ -414,7 +418,7 @@ async function completionRecordProven(ticketId, opts = {}) {
  * `unknown: true`, so the caller says so), the same positive-evidence rule as completionRecordProven. A body
  * that reads but cannot be judged refuses too (judgeBriefHold).
  */
-async function briefHoldOf(ticketId) {
+async function briefHoldOf(ticketId, capture = null) {
   const key = `completions/${ticketId}.json`;
   if (!ARTIFACT_BUCKET) return null;
   let bodyText;
@@ -423,9 +427,13 @@ async function briefHoldOf(ticketId) {
     // Inside the try on purpose, as in completionRecordProven: a stream that fails
     // mid-read, or no Body at all, is the same "could not tell".
     bodyText = await res.Body.transformToString();
+    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText });
   } catch (err) {
     const status = err?.$metadata?.httpStatusCode;
-    if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) return null;
+    if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
+      if (capture) Object.assign(capture, { key, absent: true });
+      return null;
+    }
     return briefHoldUnknown(key, `could not read ${key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})`);
   }
   return judgeBriefHold(key, bodyText);
@@ -474,14 +482,16 @@ function completionRecordRequired(issueKey, why, what = "a ship-phase ticket") {
 
 /**
  * The ship-phase completion gate, then the typed-gate check.
+ * @param {object} [admitted] TEAM-5926: filled with the completion-record read the
+ *   guard admitted on ({key, etag, absent, bodyText}), for postCommitHoldCheck
  * @returns {Promise<{refusal?:object, verification?:object}>} `refusal` ⇒ return it
  *   verbatim and write NOTHING; `verification` ⇒ fold it into the status update.
  */
-async function gateConditionCleared(issueKey, item) {
+async function gateConditionCleared(issueKey, item, admitted = null) {
   // TEAM-4706 (DL-030), unchanged: a ship-phase ticket cannot reach done without
   // its completion record.
   if (await isShipPhaseTicket(item)) {
-    const proof = await completionRecordProven(issueKey);
+    const proof = await completionRecordProven(issueKey, {}, admitted);
     if (!proof.proven) {
       console.warn(
         `[agentcore-hub-tickets] ${issueKey}: refusing done on a ship-phase ticket — ${proof.why}`
@@ -494,7 +504,7 @@ async function gateConditionCleared(issueKey, item) {
     // (design_amendment_required). A direct `→ done` would walk around that, so
     // the record must carry the securityReview stamp that only an ADMITTED report
     // writes — an existing record alone (say one written on a FAIL) is not enough.
-    const proof = await completionRecordProven(issueKey, { securityReview: true });
+    const proof = await completionRecordProven(issueKey, { securityReview: true }, admitted);
     if (!proof.proven) {
       console.warn(
         `[agentcore-hub-tickets] ${issueKey}: refusing done on a security-review ticket — ${proof.why}`
@@ -506,7 +516,7 @@ async function gateConditionCleared(issueKey, item) {
     // included — may carry a merge-brief hold (briefPending) that a replay stamped
     // when it could not put the brief on the gate; a direct `→ done` would release the
     // gate without it. No record ⇒ admit; a record S3 cannot read ⇒ refuse.
-    const hold = await briefHoldOf(issueKey);
+    const hold = await briefHoldOf(issueKey, admitted);
     if (hold) {
       const what = hold.unknown ? "a ticket whose merge-brief hold cannot be read" : "a ticket whose merge brief is held";
       console.warn(`[agentcore-hub-tickets] ${issueKey}: refusing done on ${what} — ${hold.why}`);
@@ -2116,8 +2126,9 @@ async function transitionIssue(args) {
   // no probe — only, with ARTIFACT_BUCKET set, one S3 read of its completion record
   // for the brief hold (TEAM-5805; TEAM-5832 made that every ticket, not the operator's).
   let gateVerification = null;
+  const admitted = {};
   if (transition.to === "done") {
-    const gate = await gateConditionCleared(issueKey, current.Item);
+    const gate = await gateConditionCleared(issueKey, current.Item, admitted);
     if (gate.refusal) return gate.refusal;
     gateVerification = gate.verification || null;
   }
@@ -2310,6 +2321,8 @@ async function transitionIssue(args) {
     }
   }
 
+  // TEAM-5926: the Done is committed; flag a brief hold that landed since the guard read.
+  const hold = transition.to === "done" && admitted.key ? await postCommitHoldCheck(issueKey, admitted) : {};
   return {
     key: issueKey,
     status: "transitioned",
@@ -2319,7 +2332,48 @@ async function transitionIssue(args) {
     ...(reason ? { skipReason: reason } : {}),
     ...(blockedByAdded.length ? { blockedByAdded } : {}),
     ...(gateVerification ? { gateVerification } : {}),
+    ...(hold.conflict ? { conflict: hold.conflict } : {}),
+    ...(hold.warning ? { warning: hold.warning } : {}),
   };
+}
+
+/**
+ * TEAM-5926 (TEAM-5799 ship-review F1): twin of the jira Lambda's postCommitHoldCheck.
+ * The Done guard read the completion record before the status write; a replay drain
+ * that CAS-stamped `briefPending:true` in between (or `followUpsPending:true` on a ticket
+ * admitted through completionRecordProven) is found by re-reading the record
+ * after the write (judgePostCommitHold in gate-contract.mjs). DETECTION ONLY: the done
+ * stands, a Conflict comment flags it, the result carries `conflict` + `warning`, and
+ * the drain's own post-stamp re-read converges the record. A re-read S3 cannot answer
+ * (one retry) is a warning, never a throw over the committed write.
+ */
+async function postCommitHoldCheck(issueKey, admitted) {
+  const reread = async () => {
+    try {
+      const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: admitted.key }));
+      return { etag: res.ETag, absent: false, bodyText: await res.Body.transformToString() };
+    } catch (err) {
+      const status = err?.$metadata?.httpStatusCode;
+      if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) return { absent: true };
+      return { error: `could not read ${admitted.key} (${err?.name || "S3Error"}${status ? ` ${status}` : ""})` };
+    }
+  };
+  let now = await reread();
+  if (now.error) now = await reread();
+  const verdict = judgePostCommitHold(admitted.key, admitted, now);
+  if (!verdict) return {};
+  if (verdict.unchecked) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: post-commit hold check could not run: ${verdict.why}`);
+    return { warning: postCommitUncheckedWarning(verdict.why) };
+  }
+  const fields = postCommitHoldConflict(verdict);
+  console.warn(`[agentcore-hub-tickets] ${issueKey}: Done committed over a concurrent hold on ${admitted.key} (${verdict.kinds.join(", ")})`);
+  try {
+    await addComment({ issue_key: issueKey, body: `Conflict: ${fields.warning}` });
+  } catch (err) {
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: ${fields.conflict} comment failed: ${err.message}`);
+  }
+  return fields;
 }
 
 async function getTransitions(args) {

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import * as gateContract from "./gate-contract.mjs"; // TEAM-5926 (namespace: the suite still loads where an export is missing)
 
 /**
  * TEAM-3619 D4c — create_ticket's spawnedBy/phase pass-through.
@@ -76,6 +77,10 @@ const h = vi.hoisted(() => ({
     staleItems: /** @type {Record<string, any>} */ ({}),
     // TEAM-5716: orchestrator workflows rows by workflowId (WORKFLOWS_TABLE GetItem).
     workflows: /** @type {Record<string, any>} */ ({}),
+    /** TEAM-5926: awaited inside every status write, before it lands (a concurrent writer). */
+    onStatusWrite: /** @type {null | ((input: any) => void | Promise<void>)} */ (null),
+    /** TEAM-5926: every add_comment write (list_append on `comments`). */
+    commentUpdates: /** @type {any[]} */ ([]),
   },
 }));
 
@@ -128,7 +133,8 @@ vi.mock("@aws-sdk/client-s3", () => ({
             : typeof record === "string"
               ? record
               : JSON.stringify(record);
-        return { Body: { transformToString: async () => text } };
+        // TEAM-5926: an ETag per body, as S3 serves one.
+        return { ETag: `"${Buffer.from(text).toString("base64").slice(-16)}${text.length}"`, Body: { transformToString: async () => text } };
       }
       if (!(key in h.state.s3)) throw new Error(`NoSuchKey: ${key}`);
       const body = h.state.s3[key];
@@ -175,9 +181,11 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
                 err.name = "ConditionalCheckFailedException";
                 throw err;
               }
+              await h.state.onStatusWrite?.(cmd.input);
               h.state.statusUpdates.push(cmd.input);
               return {};
             }
+            if (cmd.input.ExpressionAttributeValues?.[":comment"] !== undefined) h.state.commentUpdates.push(cmd.input);
             const title = cmd.input.ExpressionAttributeValues?.[":t"];
             if (title !== undefined) {
               // TEAM-4537: editIssue's title write (ReturnValues: ALL_NEW) — echo
@@ -255,6 +263,8 @@ beforeEach(async () => {
   h.state.gets.length = 0;
   h.state.staleItems = {};
   h.state.workflows = {};
+  h.state.onStatusWrite = null;
+  h.state.commentUpdates.length = 0;
   delete process.env.ARTIFACT_BUCKET;
   // TEAM-5716: read at module load; unset ⇒ the claim fence is inert.
   delete process.env.WORKFLOWS_TABLE;
@@ -1163,7 +1173,8 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect("reason" in res).toBe(false);
     expect(h.state.statusUpdates).toHaveLength(1);
     expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("done");
-    expect(h.state.s3RecordReads).toEqual([RECORD_KEY]);
+    // TEAM-5926: the guard read, then the post-commit brief-hold re-read.
+    expect(h.state.s3RecordReads).toEqual([RECORD_KEY, RECORD_KEY]);
   });
 
   it("(c) a NON-ship ticket closes with no record — one brief-hold read, a 404 admits (TEAM-5832)", async () => {
@@ -1179,7 +1190,8 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(res).toMatchObject({ key: "TEAM-4067", status: "transitioned", to: "done" });
     expect(h.state.statusUpdates).toHaveLength(1);
     // TEAM-5832: every non-ship Done reads its record for the brief hold; no record ⇒ admit.
-    expect(h.state.s3RecordReads).toEqual(["completions/TEAM-4067.json"]);
+    // TEAM-5926: and re-reads it once the done is written.
+    expect(h.state.s3RecordReads).toEqual(["completions/TEAM-4067.json", "completions/TEAM-4067.json"]);
   });
 
   it("(d) a human-assigned gate closes with no record — the UI/Telegram approve path", async () => {
@@ -1199,7 +1211,8 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
     expect(res).toMatchObject({ key: "TEAM-4068", status: "transitioned", from: "in_review", to: "done" });
     expect(h.state.statusUpdates).toHaveLength(1);
     // TEAM-5832: the gate reads its (absent) record for the brief hold — the 404 admits.
-    expect(h.state.s3RecordReads).toEqual(["completions/TEAM-4068.json"]);
+    // TEAM-5926: and re-reads it once the done is written.
+    expect(h.state.s3RecordReads).toEqual(["completions/TEAM-4068.json", "completions/TEAM-4068.json"]);
   });
 
   it("(e) ship phase detected from the assignee's ROSTER phase, with no phase stamp", async () => {
@@ -1482,6 +1495,130 @@ describe("transition_ticket — ship-phase Done needs a completion record (TEAM-
 
     expect(res).toMatchObject({ status: "transitioned", to: "done" });
     expect(h.state.s3RecordReads).toEqual([]);
+  });
+});
+
+// ─── TEAM-5926 (TEAM-5799 ship-review F1): a done over a concurrent brief hold ───
+// The guard reads the record, then the status write is sent. A replay drain's CAS stamp
+// of briefPending:true landing in between used to leave a done ticket under a held
+// record with nothing said. The done stands (the hub does not undo moves); the
+// post-commit re-read flags it.
+describe("transition_ticket — a done over a concurrent brief hold is flagged (TEAM-5926)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const ID = "TEAM-4067";
+  const KEY = `completions/${ID}.json`;
+  const HOLD = { ticketId: ID, briefPending: true, briefDelivered: "off_gate", ticketWrites: "dropped" };
+  const BRIEF_HOLD_REFUSAL_RE = /\bhas briefPending:true \(brief /; // workflow-output's isBriefHoldRefusal
+  const devTicket = () => ({ ticketId: ID, status: "in_progress", assignee: "agentcore_hub_backend_dev", phase: "development" });
+  const commentBodies = () => h.state.commentUpdates.map((u) => u.ExpressionAttributeValues[":comment"][0].content);
+
+  beforeEach(async () => {
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    h.state.s3 = { "config/agents.json": { agents: [{ agentId: "agentcore_hub_backend_dev", phase: "development" }] } };
+    vi.resetModules();
+    ({ handler } = await import("./index.mjs"));
+  });
+  afterEach(() => {
+    delete process.env.ARTIFACT_BUCKET;
+  });
+
+  it("(t1) a brief hold stamped before the status write lands ⇒ the done stands, flagged conflict + Conflict comment", async () => {
+    h.state.items[ID] = devTicket();
+    h.state.onStatusWrite = () => { h.state.s3Objects[KEY] = HOLD; };
+
+    const res = await transition({ ticket_id: ID, to_status: "done", reason: "implemented" });
+
+    expect(res).toMatchObject({ key: ID, status: "transitioned", to: "done", conflict: "done_over_brief_hold", warning: gateContract.DONE_OVER_BRIEF_HOLD_WARNING });
+    expect(res.warning).not.toMatch(BRIEF_HOLD_REFUSAL_RE);
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(h.state.statusUpdates[0].ExpressionAttributeValues[":s"]).toBe("done");
+    expect(commentBodies()).toEqual([`Conflict: ${gateContract.DONE_OVER_BRIEF_HOLD_WARNING}`]);
+    expect(h.state.s3RecordReads).toEqual([KEY, KEY]);
+  });
+
+  it("(t1b) a ship ticket whose proven record turns into a hold mid-call is flagged too", async () => {
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager", phase: "ship" };
+    h.state.s3Objects[`completions/${SHIP}.json`] = { ticketId: SHIP, summary: "shipped" };
+    h.state.onStatusWrite = () => { h.state.s3Objects[`completions/${SHIP}.json`] = { ticketId: SHIP, summary: "shipped", briefPending: true, briefDelivered: "off_gate" }; };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ status: "transitioned", conflict: "done_over_brief_hold" });
+    expect(commentBodies()).toHaveLength(1);
+  });
+
+  it("(t5) a ship ticket whose proven record turns into followUpsPending:true mid-call is flagged", async () => {
+    const key = `completions/${SHIP}.json`;
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager", phase: "ship" };
+    h.state.s3Objects[key] = { ticketId: SHIP, summary: "shipped", status: "complete", followUpsPending: false };
+    h.state.onStatusWrite = () => { h.state.s3Objects[key] = { ticketId: SHIP, summary: "shipped", status: "pending_follow_ups", followUpsPending: true, ticketWrites: "dropped" }; };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "done", conflict: "done_over_follow_ups_hold", warning: gateContract.DONE_OVER_FOLLOW_UPS_HOLD_WARNING });
+    expect(res.error).toBeUndefined();
+    expect(res.warning).not.toMatch(BRIEF_HOLD_REFUSAL_RE);
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(commentBodies()).toEqual([`Conflict: ${gateContract.DONE_OVER_FOLLOW_UPS_HOLD_WARNING}`]);
+    expect(h.state.s3RecordReads).toEqual([key, key]);
+  });
+
+  it("(t5b) followUpsPending:true appearing on a NON-ship ticket's record is not flagged — its done never gated on it", async () => {
+    h.state.items[ID] = devTicket();
+    h.state.onStatusWrite = () => { h.state.s3Objects[KEY] = { ticketId: ID, followUpsPending: true, ticketWrites: "dropped" }; };
+
+    const res = await transition({ ticket_id: ID, to_status: "done" });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "done" });
+    expect(res.conflict).toBeUndefined();
+    expect(commentBodies()).toEqual([]);
+  });
+
+  it("(t2) no concurrent stamp ⇒ no conflict, no Conflict comment", async () => {
+    h.state.items[ID] = devTicket();
+
+    const res = await transition({ ticket_id: ID, to_status: "done", reason: "implemented" });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "done" });
+    expect("conflict" in res).toBe(false);
+    expect("warning" in res).toBe(false);
+    expect(commentBodies()).toEqual([]);
+    expect(h.state.s3RecordReads).toEqual([KEY, KEY]);
+  });
+
+  it("(t3) the post-commit re-read fails twice ⇒ still a success, with a could-not-run warning", async () => {
+    h.state.items[ID] = devTicket();
+    h.state.recordImpl = () => {
+      if (h.state.s3RecordReads.length === 1) {
+        throw Object.assign(new Error("NoSuchKey"), { name: "NoSuchKey", $metadata: { httpStatusCode: 404 } });
+      }
+      throw Object.assign(new Error("ServiceUnavailable"), { name: "ServiceUnavailable", $metadata: { httpStatusCode: 503 } });
+    };
+
+    const res = await transition({ ticket_id: ID, to_status: "done", reason: "implemented" });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "done" });
+    expect("conflict" in res).toBe(false);
+    expect(res.warning).toMatch(/post-commit completion-record check could not run \(could not read completions\/TEAM-4067\.json \(ServiceUnavailable 503\)\)/);
+    expect(res.warning).not.toMatch(BRIEF_HOLD_REFUSAL_RE);
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(commentBodies()).toEqual([]);
+    expect(h.state.s3RecordReads).toEqual([KEY, KEY, KEY]);
+  });
+
+  it.each([
+    ["a record that is not a hold (briefPending:false)", { ticketId: ID, briefPending: false, briefDelivered: "gate" }],
+    ["a body that cannot be judged (doubt is not flagged)", "{not json"],
+  ])("(t4) the record changed into %s ⇒ no conflict", async (_name, body) => {
+    h.state.items[ID] = devTicket();
+    h.state.onStatusWrite = () => { h.state.s3Objects[KEY] = body; };
+
+    const res = await transition({ ticket_id: ID, to_status: "done" });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "done" });
+    expect("conflict" in res).toBe(false);
+    expect("warning" in res).toBe(false);
+    expect(commentBodies()).toEqual([]);
   });
 });
 
