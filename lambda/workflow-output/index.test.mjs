@@ -390,7 +390,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord, doneIntentFresh, DONE_INTENT_TTL_MS, holdDeferredOnDoneIntent, deferHoldOnDoneIntent } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord, doneIntentFresh, DONE_INTENT_TTL_MS, holdDeferredOnDoneIntent, deferHoldOnDoneIntent, clearBriefHoldOnRelease, holdBriefOnProvisionalRelease, finalizeSecurityReview } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -1680,6 +1680,33 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "off_gate" }, { forceHold: true }).briefPending).toBe(true);
     // a stale disposition on `report` goes when the current record's hold has none
     expect(adoptHold({ ...fresh(), briefDisposition: released.briefDisposition }, { briefPending: true, briefDelivered: "off_gate" }).briefDisposition).toBeUndefined();
+  });
+
+  it("TEAM-6140 (DL-039): a PROVISIONAL release is a hold - adoptHold carries it and a refusal drops it; the helpers prune only on finalize; the security stamp finalizes idempotently", () => {
+    const fresh = () => ({ ticket_id: "T", status: "complete" });
+    const disposition = { release: true, kind: "gate_settled", observed: [{ ticketId: "G", status: "Done" }], at: "2026-10-14T00:00:00.000Z", by: "drain" };
+    const provisional = { briefPending: true, briefDelivered: "off_gate", briefDisposition: { ...disposition, provisional: true } };
+    // carried as a hold field, never read as delivered (deliveredSince needs briefPending:false)
+    expect(adoptHold(fresh(), provisional)).toMatchObject({ briefPending: true, briefDisposition: { provisional: true } });
+    const forced = adoptHold(fresh(), provisional, { forceHold: true });
+    expect(forced.briefPending).toBe(true);
+    expect(forced.briefDisposition).toBeUndefined();
+    // the helper leaves the standing hold's evidence in place; finalize prunes it and drops the marker
+    const held = { briefPending: true, briefFallbackReason: "not on the gate: two open gates", undelivered: [{ part: "brief", s3Key: "k" }, { part: "residual_findings", ticketId: "D" }] };
+    holdBriefOnProvisionalRelease(held, disposition);
+    expect(held).toMatchObject({ briefPending: true, briefDisposition: { ...disposition, provisional: true }, briefFallbackReason: "not on the gate: two open gates" });
+    expect(held.undelivered).toHaveLength(2);
+    expect(held.briefHoldReason).toMatch(/^provisional: the gate_settled release \(G\)/);
+    expect(disposition.provisional, "the caller's disposition is not mutated").toBeUndefined();
+    clearBriefHoldOnRelease(held, disposition);
+    expect(held).toMatchObject({ briefPending: false, briefDisposition: disposition, undelivered: [{ part: "residual_findings", ticketId: "D" }] });
+    expect(held.briefDisposition.provisional).toBeUndefined();
+    expect(held.briefFallbackReason).toBeUndefined();
+    // the security stamp
+    const stamped = { securityReview: { verdict: "FAIL", amendmentTicketId: "A", provisional: true } };
+    expect(finalizeSecurityReview(stamped).securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "A" });
+    expect(finalizeSecurityReview(stamped).securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "A" });
+    expect(finalizeSecurityReview({ status: "complete" })).toEqual({ status: "complete" });
   });
 
   it("TEAM-5941: adoptHold carries the twins' doneIntent verbatim — hold or no hold, delivered or not — and drops a copy the current record no longer has", () => {

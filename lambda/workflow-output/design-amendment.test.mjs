@@ -30,12 +30,23 @@ const h = vi.hoisted(() => ({
   issueStatus: new Map(), issueError: new Map(),
   // TEAM-6130: flip the board at a seam — before an S3 PUT, or on the n-th get_issue of a ticket.
   beforePut: null, beforeGetIssue: null, getIssueCount: new Map(),
+  // TEAM-6140: a PUT S3 refuses (`(input) => Error | null`, e.g. a 412), the PUTs that LANDED,
+  // and one sequence of PUTs (`put:<Key>`) and tool calls, so write-vs-call order is testable.
+  putError: null, landed: [], seq: [],
 }));
 
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
-      if (cmd?.constructor?.name === "PutObjectCommand") { h.beforePut?.(cmd.input); h.puts.push(cmd.input); return { ETag: '"e1"' }; }
+      if (cmd?.constructor?.name === "PutObjectCommand") {
+        h.beforePut?.(cmd.input);
+        h.puts.push(cmd.input);
+        const refused = h.putError?.(cmd.input);
+        if (refused) throw refused;
+        h.landed.push(cmd.input);
+        h.seq.push(`put:${cmd.input.Key}`);
+        return { ETag: '"e1"' };
+      }
       const err = new Error("NoSuchKey");
       err.name = cmd?.constructor?.name === "HeadObjectCommand" ? "NotFound" : "NoSuchKey";
       err.$metadata = { httpStatusCode: 404 };
@@ -62,6 +73,7 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       const tool = call.tool_name;
       const params = call.parameters || {};
       h.calls.push({ tool, params });
+      h.seq.push(tool);
       const reply = (obj) => ({ Payload: new TextEncoder().encode(JSON.stringify(obj)) });
       const idOf = (r) => r.key || r.ticketId;
       const withComments = (row) => {
@@ -106,7 +118,9 @@ const report = (extra = {}) => handler({
 }).then((res) => JSON.parse(res.content[0].text));
 const tools = () => h.calls.map((c) => c.tool);
 const wroteRecord = () => h.puts.some((p) => p.Key?.startsWith("completions/"));
-const record = () => JSON.parse(h.puts.find((p) => p.Key?.startsWith("completions/")).Body);
+// TEAM-6140: the record as it STANDS — the last completion PUT that landed (the admitted path now
+// writes twice: provisional, then final).
+const record = () => JSON.parse(h.landed.filter((p) => p.Key?.startsWith("completions/")).at(-1).Body);
 const transitioned = () => tools().includes("Tickets___transition_ticket");
 const clone = (v) => JSON.parse(JSON.stringify(v));
 /** A row with its status set, in its own twin's shape. */
@@ -123,6 +137,9 @@ beforeEach(() => {
   h.beforePut = null;
   h.beforeGetIssue = null;
   h.getIssueCount = new Map();
+  h.putError = null;
+  h.landed.length = 0;
+  h.seq.length = 0;
 });
 
 for (const twin of ["dynamodb", "jira"]) {
@@ -270,7 +287,8 @@ for (const twin of ["dynamodb", "jira"]) {
       h.beforePut = (input) => { if (input.Key?.startsWith("completions/") && flipped === 0) { flipped = 1; h.issueStatus.set("TEAM-5399", "To Do"); } };
       const res = await report();
       expect(flipped).toBe(1);
-      expect(res).toMatchObject({ ok: false, reason: "design_amendment_required", amendmentTicketId: "TEAM-5399", recorded: true });
+      // TEAM-6140: and says, truthfully, that the rollback landed.
+      expect(res).toMatchObject({ ok: false, reason: "design_amendment_required", amendmentTicketId: "TEAM-5399", recorded: true, rollback: { ok: true } });
       expect(res.detail).toMatch(/^amendment TEAM-5399 is still open \(confirmed done, then read To Do after the record was written\)$/);
       expect(res.message).toContain("WITHOUT the admission");
       expect(res.message).not.toContain("Nothing was recorded");
@@ -294,6 +312,78 @@ for (const twin of ["dynamodb", "jira"]) {
       expect(wroteRecord()).toBe(false);
       expect(h.comments.size).toBe(0);
       expect(transitioned()).toBe(false);
+    });
+
+
+    // TEAM-6140 (DL-039): the admission is written PROVISIONALLY (`securityReview.provisional:true`,
+    // which both twins refuse) and finalized by a second write only after the post-write
+    // confirm. A compensation that loses every CAS attempt can no longer leave a trusted stamp
+    // behind, and the answer says whether it landed.
+    const landedCompletions = () => h.landed.filter((p) => p.Key?.startsWith("completions/")).map((p) => JSON.parse(p.Body));
+    const lastLanded = () => landedCompletions().at(-1);
+    const SEC_KEY = "completions/TEAM-5357.json";
+    /** The first `n` completion PUTs land; every later one is refused 412 (a lost compare-and-swap). */
+    const loseCompletionPutsAfter = (n) => {
+      let puts = 0;
+      h.putError = (input) => (input.Key?.startsWith("completions/") && ++puts > n
+        ? Object.assign(new Error("At least one of the pre-conditions you specified did not hold"), { name: "PreconditionFailed", $metadata: { httpStatusCode: 412 } })
+        : null);
+    };
+
+    it("TEAM-6140 S1 the amendment reopens at the record PUT and the rollback loses every CAS attempt ⇒ the record keeps a PROVISIONAL stamp both twins refuse; the answer says the rollback did NOT land", async () => {
+      load("done");
+      let flipped = 0;
+      h.beforePut = (input) => { if (input.Key?.startsWith("completions/") && flipped === 0) { flipped = 1; h.issueStatus.set("TEAM-5399", "To Do"); } };
+      loseCompletionPutsAfter(1);
+      const res = await report();
+      expect(flipped).toBe(1);
+      expect(res).toMatchObject({ ok: false, reason: "design_amendment_required", amendmentTicketId: "TEAM-5399", recorded: true, rollback: { ok: false } });
+      expect(res.message).toMatch(/did NOT land/);
+      expect(res.message).toMatch(/PROVISIONAL/);
+      expect(res.message).not.toContain("written WITHOUT the admission stamp");
+      expect(h.comments.size, "no residual findings reach the dev lanes").toBe(0);
+      expect(transitioned()).toBe(false);
+      expect(landedCompletions()).toHaveLength(1);
+      expect(lastLanded().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399", provisional: true });
+      for (const twin of TWIN_GUARDS) {
+        const m = await twin();
+        expect(m.securityReviewRecordRefusal(SEC_KEY, lastLanded())).toMatch(/PROVISIONAL securityReview admission on amendment TEAM-5399/);
+        expect(m.judgeCompletionRecord(SEC_KEY, JSON.stringify(lastLanded()), { securityReview: true }).proven).toBe(false);
+      }
+    });
+
+    it("TEAM-6140 S3 the admitted path writes the stamp provisional, then final; findings and the Done come only after the finalize", async () => {
+      load("done");
+      const res = await report();
+      expect(res.status).toBe("complete");
+      const landed = landedCompletions();
+      expect(landed).toHaveLength(2);
+      expect(landed[0].securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399", provisional: true });
+      expect(landed[1].securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399" });
+      const putIdx = h.seq.map((e, i) => (e === `put:${SEC_KEY}` ? i : -1)).filter((i) => i >= 0);
+      expect(putIdx).toHaveLength(2);
+      const firstComment = h.seq.indexOf("Tickets___add_comment");
+      expect(firstComment).toBeGreaterThan(putIdx[1]);
+      expect(h.seq.indexOf("Tickets___transition_ticket")).toBeGreaterThan(firstComment);
+      expect(transitioned()).toBe(true);
+    });
+
+    it("TEAM-6140 S4 the finalize write loses every CAS attempt after a successful confirm ⇒ no findings, no Done, the record stays provisional and refused; the re-run finalizes", async () => {
+      load("done");
+      loseCompletionPutsAfter(1);
+      const res = await report();
+      expect(res).toMatchObject({ ok: false, reason: "completion_record_contended", next_action: "retry_report_completion", recorded: true });
+      expect(res.message).toMatch(/PROVISIONAL/);
+      expect(h.comments.size).toBe(0);
+      expect(transitioned()).toBe(false);
+      expect(lastLanded().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399", provisional: true });
+      for (const twin of TWIN_GUARDS) expect((await twin()).securityReviewRecordRefusal(SEC_KEY, lastLanded())).toMatch(/PROVISIONAL/);
+      h.putError = null;
+      const again = await report();
+      expect(again.status).toBe("complete");
+      expect(lastLanded().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "TEAM-5399" });
+      expect(h.comments.get("TEAM-5358")).toHaveLength(1);
+      expect(h.comments.get("TEAM-5359")).toHaveLength(1);
     });
 
     it("(b) PASS goes Done with exactly the calls of any other ticket — no list_tickets", async () => {
