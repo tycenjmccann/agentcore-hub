@@ -26,11 +26,20 @@ import {
 // TEAM-5828: namespace import so a missing export fails per test, not the whole file.
 import * as completion from "./completion.mjs";
 
-// TEAM-5935: per-file proof fixtures — contents routes for one path at the three refs the
-// landing probe reads (base tip, merged head, branch tip); a null sha → 404 (absent).
-const CONTENTS_404 = () => { throw Object.assign(new Error("GitHub GET contents 404: Not Found"), { status: 404 }); };
-const CONTENTS = (path, { base, before, tip }) =>
-  [base, before, tip].map(([ref, sha]) => [`/contents/${path}?ref=${ref}`, sha === null ? CONTENTS_404 : { type: "file", sha }]);
+// TEAM-5935/TEAM-5943: per-file proof fixtures — ONE recursive tree per ref the landing probe
+// reads (base tip, merged head, branch tip). entries: path → sha (a 100644 blob) | [sha, mode]
+// | { sha, mode, type }; an absent path is simply not listed.
+const TREE = (treeSha, entries, { truncated = false } = {}) => [
+  `/git/trees/${treeSha}?recursive=1`,
+  { sha: treeSha, truncated, tree: Object.entries(entries).map(([path, v]) => {
+      const e = Array.isArray(v) ? { sha: v[0], mode: v[1] } : typeof v === "string" ? { sha: v } : v;
+      return { path, type: "blob", mode: "100644", ...e };
+    }) },
+];
+// commit sha → tree sha routes (`GET /git/commits/{sha}` is how the probe finds a ref's tree).
+const COMMIT_TREES = (pairs) => pairs.map(([commit, tree]) => [`/git/commits/${commit}`, { tree: { sha: tree } }]);
+// The three indexes of the TEAM-5828/5868 blocks: base tip "tip", merged head "old111", branch head.
+const TRIPLE = (base, before, tip) => [TREE("tipTree", base), TREE("oldTree", before), TREE("headTree", tip)];
 
 /**
  * TEAM-3619 D4c — per-phase completion re-verify. These pin the three rules
@@ -1400,8 +1409,8 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
     return {};
   };
   const land = (routes) => completion.featureBranchLanding({ owner: "o", repo: "r", base: "main", head: HEAD, api: apiFor(routes) });
-  // TEAM-5913/TEAM-5935: DIFF_TREES only defeats the equal-tree shortcut; a proven strand needs per-file evidence (CONTENTS).
-  const DIFF_TREES = (sha) => [["/git/commits/tip", { tree: { sha: "tipTree" } }], [`/git/commits/${sha}`, { tree: { sha: "headTree" } }]];
+  // TEAM-5913/TEAM-5935: DIFF_TREES only defeats the equal-tree shortcut; a proven strand needs per-file evidence (TRIPLE).
+  const DIFF_TREES = (sha) => COMMIT_TREES([["tip", "tipTree"], ["old111", "oldTree"], [sha, "headTree"]]);
   const merged = { number: 846, merged_at: "2026-10-01T00:00:00Z", state: "closed", head: { sha: "old111" }, base: { ref: "main" }, merge_commit_sha: "m846", html_url: "https://github.com/o/r/pull/846" };
 
   it("merged PR head == branch head → merged (squash-safe even when compare says diverged)", async () => {
@@ -1416,7 +1425,7 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
       ["/compare/main...", { status: "diverged", ahead_by: 6, files: [{ filename: "a.js" }], base_commit: { sha: "tip" } }],
       ...DIFF_TREES("new222"),
       // TEAM-5935: main still holds a.js at its pre-merge content — the positive proof of a strand.
-      ...CONTENTS("a.js", { base: ["tip", "a0"], before: ["old111", "a0"], tip: ["new222", "a1"] }),
+      ...TRIPLE({ "a.js": "a0" }, { "a.js": "a0" }, { "a.js": "a1" }),
     ]);
     expect(r.merged).toBe(false);
     expect(r.reason).toContain(`feature branch ${HEAD} has 2 commit(s) after its merged PR #846 not contained in main and no open PR to main`);
@@ -1452,7 +1461,7 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
       ["/compare/old111...M999", { status: "ahead", ahead_by: 2, files: [{ filename: "a.js" }] }],
       ["/compare/main...", { status: "diverged", ahead_by: 2, files: [{ filename: "a.js" }], base_commit: { sha: "tip" } }],
       ...DIFF_TREES("M999"),
-      ...CONTENTS("a.js", { base: ["tip", "a0"], before: ["old111", "a0"], tip: ["M999", "a1"] }),
+      ...TRIPLE({ "a.js": "a0" }, { "a.js": "a0" }, { "a.js": "a1" }),
     ]);
     expect(r.merged).toBe(false);
   });
@@ -1508,8 +1517,8 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
   const PROOF = { merged: true, mergeCommit: "m846", prUrl: merged.html_url };
   const gone = () => { throw Object.assign(new Error("GitHub GET branches 404: Branch not found"), { status: 404 }); };
   const filler = Array.from({ length: 100 }, (_, i) => ({ number: 1000 + i, merged_at: null, state: "closed", head: { sha: `f${i}` }, base: { ref: "main" } }));
-  // TEAM-5913/TEAM-5935: DIFF_TREES only defeats the equal-tree shortcut; a proven strand needs per-file evidence (CONTENTS).
-  const DIFF_TREES = (sha) => [["/git/commits/tip", { tree: { sha: "tipTree" } }], [`/git/commits/${sha}`, { tree: { sha: "headTree" } }]];
+  // TEAM-5913/TEAM-5935: DIFF_TREES only defeats the equal-tree shortcut; a proven strand needs per-file evidence (TRIPLE).
+  const DIFF_TREES = (sha) => COMMIT_TREES([["tip", "tipTree"], ["old111", "oldTree"], [sha, "headTree"]]);
 
   // ── N1: an empty THREE-dot diff only proves tree(head) == tree(merge-base) ──
   it("N1 revert repro: feature C-H-R (R reverts H), main C-S (squash of H) → empty main...R diff is NOT proof (merged:false)", async () => {
@@ -1520,7 +1529,7 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
       ["/compare/old111...R", { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "feature.txt", status: "removed" }] }],
       ...DIFF_TREES("R"),
       // TEAM-5935: main (post-squash) still has feature.txt exactly as H left it; R removed it → stranded.
-      ...CONTENTS("feature.txt", { base: ["tip", "f0"], before: ["old111", "f0"], tip: ["R", null] }),
+      ...TRIPLE({ "feature.txt": "f0" }, { "feature.txt": "f0" }, {}),
     ]);
     expect(r.merged).toBe(false);
     expect(r.reason).toContain("1 commit(s) after its merged PR #846");
@@ -1565,7 +1574,7 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
       ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 1, files: [], base_commit: { sha: "tip" } }],
       ["/compare/old111...R", { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "feature.txt" }] }],
       ...DIFF_TREES("R"),
-      ...CONTENTS("feature.txt", { base: ["tip", "f0"], before: ["old111", "f0"], tip: ["R", null] }),
+      ...TRIPLE({ "feature.txt": "f0" }, { "feature.txt": "f0" }, {}),
     ]);
     expect(r.merged).toBe(false);
   });
@@ -1634,7 +1643,7 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
       ["/compare/main...", { status: "diverged", ahead_by: 6, behind_by: 3, files: [{ filename: "a.js" }], base_commit: { sha: "tip" } }],
       ...DIFF_TREES("new222"),
       // TEAM-5935: a.js IS provably stranded — only the truncated PR history downgrades it to null.
-      ...CONTENTS("a.js", { base: ["tip", "a0"], before: ["old111", "a0"], tip: ["new222", "a1"] }),
+      ...TRIPLE({ "a.js": "a0" }, { "a.js": "a0" }, { "a.js": "a1" }),
     ]);
     expect(r.merged).toBe(null);
     expect(r.reason).toMatch(/truncated at 10 pages/);
@@ -1725,87 +1734,162 @@ describe("featureBranchLanding — TEAM-5935 (per-file proof; tree inequality is
     ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 3, files: [{ filename: "h.js" }, { filename: "f.js" }], merge_base_commit: { sha: "C" }, base_commit: { sha: "U" } }],
     ["/compare/S...C", { status: "behind", ahead_by: 0, behind_by: 1 }],
     ["/compare/H...F", { status: "ahead", ahead_by: 1, behind_by: 0, files: afterFiles }],
-    ["/git/commits/U", { tree: { sha: "treeU" } }], ["/git/commits/F", { tree: { sha: "treeF" } }],
+    ...COMMIT_TREES([["U", "treeU"], ["H", "treeH"], ["F", "treeF"]]),
   ];
+  // the three indexes: main tip U, merged head H, branch tip F
+  const T = (u, h, f) => [TREE("treeU", u), TREE("treeH", h), TREE("treeF", f)];
+  const ALL = (files, sha) => Object.fromEntries(files.map((f) => [f.filename, sha]));
   const PREFIX = `feature branch ${HEAD} has 1 commit(s) after its merged PR #846 not contained in main and no open PR to main`;
 
   it("regression: F's change landed via T, U adds an unrelated file → trees differ but f.js identical on main → merged:true", async () => {
-    const r = await land([...SHAPE(), ...CONTENTS("f.js", { base: ["U", "f1"], before: ["H", "f0"], tip: ["F", "f1"] })]);
+    const r = await land([...SHAPE(), ...T({ "f.js": "f1", "unrelated.js": "u1" }, { "f.js": "f0" }, { "f.js": "f1" })]);
     expect(r).toEqual({ merged: true, mergeCommit: "U", prUrl: "" }); // base: merged:false
   });
 
   it("T lands F's change, then U edits f.js further → third state on main → merged:null, never false", async () => {
-    const r = await land([...SHAPE(), ...CONTENTS("f.js", { base: ["U", "f2"], before: ["H", "f0"], tip: ["F", "f1"] })]);
+    const r = await land([...SHAPE(), ...T({ "f.js": "f2" }, { "f.js": "f0" }, { "f.js": "f1" })]);
     expect(r.merged).toBe(null);
     expect(r.reason).toMatch(/unresolvable on base: f\.js/);
   });
 
   it("genuinely stranded: main still holds f.js at its pre-merge content, tip differs → merged:false naming the file", async () => {
-    const r = await land([...SHAPE(), ...CONTENTS("f.js", { base: ["U", "f0"], before: ["H", "f0"], tip: ["F", "f1"] })]);
+    const r = await land([...SHAPE(), ...T({ "f.js": "f0" }, { "f.js": "f0" }, { "f.js": "f1" })]);
     expect(r.merged).toBe(false);
     expect(r.reason).toContain(PREFIX);
     expect(r.reason).toContain("main still holds the pre-merge content of: f.js");
   });
 
   it("new file added after the merge and never on main (absent at base AND before) → merged:false", async () => {
-    const r = await land([...SHAPE([{ filename: "new.js", status: "added" }]), ...CONTENTS("new.js", { base: ["U", null], before: ["H", null], tip: ["F", "n1"] })]);
+    const r = await land([...SHAPE([{ filename: "new.js", status: "added" }]), ...T({}, {}, { "new.js": "n1" })]);
     expect(r.merged).toBe(false);
     expect(r.reason).toContain("new.js");
   });
 
   it("mixed: one landed + one stranded → false naming only the stranded path; one landed + one unknown → null", async () => {
     const two = SHAPE([{ filename: "f.js" }, { filename: "g.js" }]);
-    const landedF = CONTENTS("f.js", { base: ["U", "f1"], before: ["H", "f0"], tip: ["F", "f1"] });
-    const r1 = await land([...two, ...landedF, ...CONTENTS("g.js", { base: ["U", "g0"], before: ["H", "g0"], tip: ["F", "g1"] })]);
+    const r1 = await land([...two, ...T({ "f.js": "f1", "g.js": "g0" }, { "f.js": "f0", "g.js": "g0" }, { "f.js": "f1", "g.js": "g1" })]);
     expect(r1.merged).toBe(false);
     expect(r1.reason).toContain("pre-merge content of: g.js");
     expect(r1.reason).not.toContain("f.js");
-    const r2 = await land([...two, ...landedF, ...CONTENTS("g.js", { base: ["U", "g2"], before: ["H", "g0"], tip: ["F", "g1"] })]);
+    const r2 = await land([...two, ...T({ "f.js": "f1", "g.js": "g2" }, { "f.js": "f0", "g.js": "g0" }, { "f.js": "f1", "g.js": "g1" })]);
     expect(r2.merged).toBe(null);
   });
 
-  it("contents returns a directory (array) or a non-404 error for the file → merged:null, never false", async () => {
-    const dir = await land([...SHAPE(), ["/contents/f.js?ref=U", [{ name: "x" }]], ["/contents/f.js?ref=H", { type: "file", sha: "f0" }], ["/contents/f.js?ref=F", { type: "file", sha: "f1" }]]);
+  it("the path is a tree entry (directory), the base tree read fails, or the base tree is truncated → merged:null, never false", async () => {
+    const dir = await land([...SHAPE(), ...T({ "f.js": { sha: "d0", mode: "040000", type: "tree" } }, { "f.js": "f0" }, { "f.js": "f1" })]);
     expect(dir.merged).toBe(null);
     const boom = () => { throw Object.assign(new Error("500"), { status: 500 }); };
-    const err = await land([...SHAPE(), ["/contents/f.js?ref=U", boom], ["/contents/f.js?ref=H", { type: "file", sha: "f0" }], ["/contents/f.js?ref=F", { type: "file", sha: "f1" }]]);
+    const err = await land([...SHAPE(), ["/git/trees/treeU", boom], TREE("treeH", { "f.js": "f0" }), TREE("treeF", { "f.js": "f1" })]);
     expect(err.merged).toBe(null);
-    // and with NO contents evidence at all (routes fall through to {}) → null
+    // truncated index + path missing from it: absence is unknowable → null (a listed path still counts)
+    const trunc = await land([...SHAPE(), TREE("treeU", { "other.js": "o1" }, { truncated: true }), TREE("treeH", { "f.js": "f0" }), TREE("treeF", { "f.js": "f1" })]);
+    expect(trunc.merged).toBe(null);
+    // and with NO tree evidence at all (routes fall through to {}) → null
     expect((await land(SHAPE())).merged).toBe(null);
   });
 
   it("renamed: new path identical on main AND old path absent on main → true; old path still on main → null", async () => {
     const ren = SHAPE([{ filename: "b.js", status: "renamed", previous_filename: "a.js" }]);
-    const newPath = CONTENTS("b.js", { base: ["U", "b1"], before: ["H", null], tip: ["F", "b1"] });
-    expect(await land([...ren, ...newPath, ["/contents/a.js?ref=U", CONTENTS_404]])).toEqual({ merged: true, mergeCommit: "U", prUrl: "" });
-    expect((await land([...ren, ...newPath, ["/contents/a.js?ref=U", { type: "file", sha: "a0" }]])).merged).toBe(null);
+    expect(await land([...ren, ...T({ "b.js": "b1" }, { "a.js": "a0" }, { "b.js": "b1" })])).toEqual({ merged: true, mergeCommit: "U", prUrl: "" });
+    expect((await land([...ren, ...T({ "b.js": "b1", "a.js": "a0" }, { "a.js": "a0" }, { "b.js": "b1" })])).merged).toBe(null);
   });
 
   it("truncation: 300 files all landed → null (list may be truncated); 300 files with one stranded in the first 50 → false", async () => {
     const files = Array.from({ length: 300 }, (_, i) => ({ filename: `p${i}.js` }));
-    const landedAll = (p) => (p.includes("/contents/") ? { type: "file", sha: "same" } : undefined);
-    const r = await land([...SHAPE(files), ["/contents/", landedAll]]);
+    const same = ALL(files, "same");
+    const r = await land([...SHAPE(files), ...T(same, same, same)]);
     expect(r.merged).toBe(null);
     expect(r.reason).toMatch(/truncated/);
-    const r2 = await land([...SHAPE(files), ...CONTENTS("p3.js", { base: ["U", "x0"], before: ["H", "x0"], tip: ["F", "x1"] }), ["/contents/", landedAll]]);
+    const r2 = await land([...SHAPE(files), ...T({ ...same, "p3.js": "x0" }, { ...same, "p3.js": "x0" }, { ...same, "p3.js": "x1" })]);
     expect(r2.merged).toBe(false);
   });
 
   it("cap: 51 files all landed → null (probe cap); 51 files with the first stranded → false", async () => {
     const files = Array.from({ length: 51 }, (_, i) => ({ filename: `p${i}.js` }));
-    const landedAll = (p) => (p.includes("/contents/") ? { type: "file", sha: "same" } : undefined);
-    const r = await land([...SHAPE(files), ["/contents/", landedAll]]);
+    const same = ALL(files, "same");
+    const r = await land([...SHAPE(files), ...T(same, same, same)]);
     expect(r.merged).toBe(null);
     expect(r.reason).toMatch(/probe cap/);
-    const r2 = await land([...SHAPE(files), ...CONTENTS("p0.js", { base: ["U", "x0"], before: ["H", "x0"], tip: ["F", "x1"] }), ["/contents/", landedAll]]);
+    const r2 = await land([...SHAPE(files), ...T({ ...same, "p0.js": "x0" }, { ...same, "p0.js": "x0" }, { ...same, "p0.js": "x1" })]);
     expect(r2.merged).toBe(false);
   });
 
-  it("URL-encodes every path segment of the contents lookup", async () => {
+  it("TEAM-5943: reads exactly ONE recursive tree per ref (matched by verbatim path) and never the Contents API", async () => {
     const calls = [];
-    await land([...SHAPE([{ filename: "src/a b/c#.js" }]), ["/contents/", { type: "file", sha: "same" }]], {}, calls);
-    expect(calls).toContain("/repos/o/r/contents/src/a%20b/c%23.js?ref=U");
-    expect(calls).toContain("/repos/o/r/contents/src/a%20b/c%23.js?ref=H");
-    expect(calls).toContain("/repos/o/r/contents/src/a%20b/c%23.js?ref=F");
+    const r = await land([...SHAPE([{ filename: "src/a b/c#.js" }]), ...T({ "src/a b/c#.js": "same" }, { "src/a b/c#.js": "s0" }, { "src/a b/c#.js": "same" })], {}, calls);
+    expect(r).toEqual({ merged: true, mergeCommit: "U", prUrl: "" });
+    for (const t of ["treeU", "treeH", "treeF"]) expect(calls.filter((c) => c === `/repos/o/r/git/trees/${t}?recursive=1`)).toHaveLength(1);
+    expect(calls.some((c) => c.includes("/contents/"))).toBe(false);
+  });
+});
+
+describe("featureBranchLanding — TEAM-5943 (tree-entry identity: mode + sha, never blob sha alone)", () => {
+  const HEAD = "feature/EPIC-1-x";
+  const apiFor = (routes, calls = []) => async (path) => {
+    calls.push(path);
+    for (const [k, v] of routes) if (path.includes(k)) return typeof v === "function" ? v(path) : v;
+    return {};
+  };
+  const land = (routes, calls = []) =>
+    completion.featureBranchLanding({ owner: "o", repo: "r", base: "main", head: HEAD, api: apiFor(routes, calls) });
+  // Same shape as TEAM-5935: integration C-H-F (PR #846 squashed H as S), main C-S-T-U.
+  const merged = { number: 846, merged_at: "2026-10-01T00:00:00Z", state: "closed", head: { sha: "H" }, base: { ref: "main" }, merge_commit_sha: "S", html_url: "https://github.com/o/r/pull/846" };
+  // GitHub lists a mode-only or type-only change as `modified` with changes: 0.
+  const SHAPE = (path, afterFiles = [{ filename: path, status: "modified", changes: 0, additions: 0, deletions: 0 }]) => [
+    ["/pulls?", [merged]], ["/branches/", { commit: { sha: "F" } }],
+    ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 3, files: [{ filename: "h.js" }, { filename: path }], merge_base_commit: { sha: "C" }, base_commit: { sha: "U" } }],
+    ["/compare/S...C", { status: "behind", ahead_by: 0, behind_by: 1 }],
+    ["/compare/H...F", { status: "ahead", ahead_by: 1, behind_by: 0, files: afterFiles }],
+    ...COMMIT_TREES([["U", "treeU"], ["H", "treeH"], ["F", "treeF"]]),
+  ];
+  // What the Contents API really returns for such a change at EVERY ref: type "file" (even for some
+  // symlinks) and the SAME blob sha — the legacy route the 59edc4b probe read. Present in every fixture
+  // so the tests below are red on the blob-sha implementation and green on tree-entry identity.
+  const LEGACY_CONTENTS = ["/contents/", { type: "file", sha: "X" }];
+  const T = (u, h, f) => [TREE("treeU", u), TREE("treeH", h), TREE("treeF", f)];
+  const REG = ["X", "100644"], EXEC = ["X", "100755"], LINK = ["X", "120000"];
+
+  it("(a) mode-only change (100644 → 100755) not on main: same blob sha at every ref → merged:false (positive strand proof), never true", async () => {
+    const calls = [];
+    const r = await land([...SHAPE("bin/run.sh"), ...T({ "bin/run.sh": REG }, { "bin/run.sh": REG }, { "bin/run.sh": EXEC }), LEGACY_CONTENTS], calls);
+    expect(r.merged).toBe(false);
+    expect(r.reason).toContain("feature branch feature/EPIC-1-x has 1 commit(s) after its merged PR #846 not contained in main");
+    expect(r.reason).toContain("main still holds the pre-merge content of: bin/run.sh");
+    expect(calls.some((c) => c.includes("/contents/"))).toBe(false);
+  });
+
+  it("(b) regular file ↔ symlink with the same blob (target text == old content), both directions, not on main → merged:false, never true", async () => {
+    const toLink = await land([...SHAPE("config/link"), ...T({ "config/link": REG }, { "config/link": REG }, { "config/link": LINK }), LEGACY_CONTENTS]);
+    expect(toLink.merged).toBe(false);
+    expect(toLink.reason).toContain("config/link");
+    const toFile = await land([...SHAPE("config/link"), ...T({ "config/link": LINK }, { "config/link": LINK }, { "config/link": REG }), LEGACY_CONTENTS]);
+    expect(toFile.merged).toBe(false);
+    // main moved the entry to a THIRD state (already a symlink, different blob) → null, never false (TEAM-5935 S2-1)
+    const third = await land([...SHAPE("config/link"), ...T({ "config/link": ["Y", "120000"] }, { "config/link": REG }, { "config/link": LINK }), LEGACY_CONTENTS]);
+    expect(third.merged).toBe(null);
+    expect(third.reason).toMatch(/unresolvable on base: config\/link/);
+  });
+
+  it("(c) mode change landed on main (identical mode + sha on main's tip) → merged:true; content landed without the mode → null, never false", async () => {
+    const landed = await land([...SHAPE("bin/run.sh"), ...T({ "bin/run.sh": EXEC }, { "bin/run.sh": REG }, { "bin/run.sh": EXEC }), LEGACY_CONTENTS]);
+    expect(landed).toEqual({ merged: true, mergeCommit: "U", prUrl: "" });
+    // main took F's new content but kept 100644 → third state (neither pre-merge nor tip) → null
+    const partial = await land([...SHAPE("bin/run.sh"), ...T({ "bin/run.sh": ["X1", "100644"] }, { "bin/run.sh": ["X0", "100644"] }, { "bin/run.sh": ["X1", "100755"] }), LEGACY_CONTENTS]);
+    expect(partial.merged).toBe(null);
+    // S2-1 restated: landed via T, plus an unrelated file on main (trees differ) → still true
+    const unrelated = await land([...SHAPE("bin/run.sh"), ...T({ "bin/run.sh": EXEC, "unrelated.js": "u1" }, { "bin/run.sh": REG }, { "bin/run.sh": EXEC }), LEGACY_CONTENTS]);
+    expect(unrelated.merged).toBe(true);
+  });
+
+  it("(d) identity unverifiable → merged:null, never true or false: no merged-head tree, truncated base index, non-blob entries", async () => {
+    // the merged head's commit lookup fails → no `before` index: LANDED still provable, ABSENT never
+    const noBefore = [...SHAPE("bin/run.sh")].filter(([k]) => k !== "/git/commits/H");
+    expect((await land([...noBefore, ["/git/commits/H", () => { throw Object.assign(new Error("502"), { status: 502 }); }], ...T({ "bin/run.sh": REG }, {}, { "bin/run.sh": EXEC }), LEGACY_CONTENTS])).merged).toBe(null);
+    expect((await land([...noBefore, ["/git/commits/H", () => { throw Object.assign(new Error("502"), { status: 502 }); }], ...T({ "bin/run.sh": EXEC }, {}, { "bin/run.sh": EXEC }), LEGACY_CONTENTS])).merged).toBe(true);
+    // main's recursive tree is truncated and lacks the path → absence is unknowable
+    expect((await land([...SHAPE("bin/run.sh"), TREE("treeU", { "other.js": "o1" }, { truncated: true }), TREE("treeH", { "bin/run.sh": REG }), TREE("treeF", { "bin/run.sh": EXEC }), LEGACY_CONTENTS])).merged).toBe(null);
+    // a submodule (type commit, 160000) or a directory (type tree) entry at the path → unknown
+    expect((await land([...SHAPE("vendor"), ...T({ vendor: { sha: "c1", mode: "160000", type: "commit" } }, { vendor: { sha: "c1", mode: "160000", type: "commit" } }, { vendor: { sha: "c2", mode: "160000", type: "commit" } }), LEGACY_CONTENTS])).merged).toBe(null);
+    expect((await land([...SHAPE("vendor"), ...T({ vendor: { sha: "d1", mode: "040000", type: "tree" } }, { vendor: "v0" }, { vendor: "v1" }), LEGACY_CONTENTS])).merged).toBe(null);
   });
 });

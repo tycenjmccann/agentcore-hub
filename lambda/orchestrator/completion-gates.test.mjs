@@ -858,11 +858,16 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     global.fetch = vi.fn(async (url) => {
       const u = decodeURIComponent(String(url));
       if (branch404 && u.includes("/branches/")) return { ok: false, status: 404, text: async () => JSON.stringify({ message: "Branch not found" }) };
-      if (u.includes("/contents/")) {
-        const [path, ref] = u.split("/contents/")[1].split("?ref=");
-        const sha = contents?.[`${ref}:${path}`];
-        if (sha === null) return { ok: false, status: 404, text: async () => JSON.stringify({ message: "Not Found" }) };
-        return { ok: true, status: 200, text: async () => JSON.stringify(sha ? { type: "file", sha } : {}) };
+      // TEAM-5943: featureBranchLanding reads ONE recursive tree per ref instead of per-path
+      // Contents; `contents` ("<ref>:<path>" -> sha | null) now builds that ref's tree.
+      if (u.includes("/git/trees/")) {
+        const treeSha = u.split("/git/trees/")[1].split("?")[0];
+        const ref = treeSha.startsWith("tree-") ? treeSha.slice("tree-".length) : treeSha;
+        const prefix = `${ref}:`;
+        const tree = Object.entries(contents || {})
+          .filter(([k, sha]) => k.startsWith(prefix) && sha !== null)
+          .map(([k, sha]) => ({ path: k.slice(prefix.length), type: "blob", mode: "100644", sha }));
+        return { ok: true, status: 200, text: async () => JSON.stringify({ sha: treeSha, tree }) };
       }
       const range = u.includes("/compare/") ? u.split("/compare/")[1] : null;
       const body = u.includes("/pulls?")
