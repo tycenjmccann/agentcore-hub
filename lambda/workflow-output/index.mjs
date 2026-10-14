@@ -638,9 +638,15 @@ export const RECORD_CAS_ATTEMPTS = 3;
  *     over this call's own delivery, unless the CURRENT record proves one newer than
  *     that refusal (`false` with the brief on the gate). Every other ambiguous case
  *     fails closed; the next re-run re-delivers (already_posted) and clears it.
+ *   - TEAM-6042: `forceHold` over this call's own delivery, when the current record
+ *     holds the brief ⇒ that hold is adopted whole. The refusal read it, it is newer
+ *     than this call's delivery, and it carries the brief's `undelivered` entry — the
+ *     s3Key the next re-run re-delivers from. Forcing `true` onto this call's gate
+ *     fields (entry pruned) left a hold no re-run could find the brief for.
  */
 export function adoptHold(report, current, { deliveredNow = false, forceHold = false } = {}) {
-  if (!deliveredNow && current && typeof current === "object" && current.briefPending !== undefined) {
+  const adopt = !deliveredNow || (forceHold && current?.briefPending === true);
+  if (adopt && current && typeof current === "object" && current.briefPending !== undefined) {
     for (const f of BRIEF_HOLD_FIELDS) {
       if (current[f] !== undefined) report[f] = current[f];
       else delete report[f];
@@ -655,6 +661,36 @@ export function adoptHold(report, current, { deliveredNow = false, forceHold = f
   if (current && typeof current === "object" && current.doneIntent !== undefined) report.doneIntent = current.doneIntent;
   else delete report.doneIntent;
   return report;
+}
+
+/**
+ * TEAM-6024: a brief now on its gate is no longer undelivered: its `part:"brief"`
+ * entries come off `undelivered` (every other part stays; an empty list is deleted).
+ * TEAM-6042: and the off-gate hold's `briefFallbackReason` goes with them — a record
+ * reading `briefDelivered:"gate"` keeps no reason the brief was not on it.
+ * Mutates and returns `record`.
+ */
+export function pruneDeliveredBrief(record) {
+  if (record && typeof record === "object") delete record.briefFallbackReason;
+  if (!Array.isArray(record?.undelivered)) return record;
+  const rest = record.undelivered.filter((u) => u?.part !== "brief");
+  if (rest.length > 0) record.undelivered = rest;
+  else delete record.undelivered;
+  return record;
+}
+
+/**
+ * TEAM-6029: the drain's one clear for a brief it just put on its gate — a held
+ * `briefPending:true` goes `false` (not deleted: the record keeps the history that it
+ * was held) and its stale `part:"brief"` entry comes off. Step 6 and drop() both call
+ * it, so neither carries the hold over a delivery. TEAM-6052: through pruneDeliveredBrief
+ * the off-gate hold's `briefFallbackReason` comes off too, so a follow-ups-only drop()
+ * stamps a gate delivery exactly as step 6 and report_completion do. Mutates and
+ * returns `record`.
+ */
+export function clearBriefHoldOnGate(record) {
+  if (record.briefPending === true) record.briefPending = false;
+  return pruneDeliveredBrief(record);
 }
 
 /**
@@ -1181,6 +1217,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       }
       if (brief?.ok && brief.gate) {
         Object.assign(report, { briefPending: false, briefDelivered: "gate", briefTargets: [brief.gate] });
+        pruneDeliveredBrief(report);
         deliveredNow = true;
         console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} is on the gate ${brief.gate} (${brief.outcome}) - briefPending cleared`);
       } else {
@@ -1821,7 +1858,12 @@ export async function drainCompletion(msg) {
     if (rec.record) {
       // TEAM-5941: a fresh Done-intent rides along (the spread keeps it); a stale one — the
       // twin that wrote it is gone — comes off with this stamp.
-      const stamped = await putRecordIfUnchanged(reportKey, stripStaleDoneIntent({ ...rec.record, ...(extra || {}), ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } }), recordEtag);
+      const stamp = { ...rec.record, ...(extra || {}) };
+      // TEAM-6029: a follow-ups-only hold whose brief this drain put on the gate clears
+      // the brief hold as step 6 does; the spread alone carried the old `true` and its
+      // stale `part:"brief"` entry over the delivery.
+      if (extra?.briefDelivered === "gate") clearBriefHoldOnGate(stamp);
+      const stamped = await putRecordIfUnchanged(reportKey, stripStaleDoneIntent({ ...stamp, ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } }), recordEtag);
       // TEAM-5830: a record a re-run rewrote since step 0 is not overwritten with the
       // older copy; the message comes back and the next tick decides on the new record
       // (the notices above are marker-deduped). TEAM-5866: and a stamp S3 could not take
@@ -1989,7 +2031,8 @@ export async function drainCompletion(msg) {
     // TEAM-5805: a brief an earlier hold stamped pending is on its gate now, so the
     // twins' Done guard below must read it as delivered. `false`, not deleted: the
     // record keeps the history that it was held.
-    if (record.briefPending === true && brief?.gate) record.briefPending = false;
+    // TEAM-6024: and the hold's `part:"brief"` entry in undelivered[] is stale with it.
+    if (brief?.gate) clearBriefHoldOnGate(record);
     // TEAM-5958: a hold a concurrent Done landed over (doneOverHold) stays `true` — that
     // is the ONLY clear above: gate delivery. The ticket is Done; nothing reads the hold
     // until a new Done is attempted, and then it is the refusal a reopen needs.

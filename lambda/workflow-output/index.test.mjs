@@ -1660,6 +1660,12 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "off_gate" }, { forceHold: true }).briefPending).toBe(true);
     // …even over this call's own delivery, when the current record does not prove it
     expect(adoptHold({ ...fresh(), briefPending: false, briefDelivered: "gate" }, { briefPending: true, briefDelivered: "off_gate" }, { deliveredNow: true, forceHold: true }).briefPending).toBe(true);
+    // TEAM-6042: …and the hold forced is the CURRENT one, whole — its brief entry and
+    // fallback reason, none of this call's gate fields mixed in
+    const drainHold = { briefPending: true, briefDelivered: "off_gate", briefTargets: ["T", "E"], briefFallbackReason: "no open gate", undelivered: [{ part: "brief", s3Key: "b.md" }] };
+    const forced = adoptHold({ ...fresh(), briefPending: false, briefDelivered: "gate", briefTargets: ["G"] }, drainHold, { deliveredNow: true, forceHold: true });
+    expect(forced).toMatchObject(drainHold);
+    expect(forced.replayDropped).toBeUndefined();
     // …except a delivery to the gate newer than the refusal
     expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "gate" }, { forceHold: true }).briefPending).toBe(false);
   });
