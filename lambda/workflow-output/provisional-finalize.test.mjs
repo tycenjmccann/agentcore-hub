@@ -559,24 +559,37 @@ describe("TEAM-6152 F1 — a byte-identical re-establishment keeps the ETag (MD5
 describe("TEAM-6152 F2 — a legitimate PASS must recover from a stale FAIL replay", () => {
   const PASS = { summary: "Verdict: PASS. Design reviewed against main and the feature branch, read-only; no blocking findings.\n\nNo tool failures." };
 
-  it("T13 FAIL queued (Done 503) → PASS re-review (Done 503, deduped onto the FAIL message) → the amendment reopens and the stale FAIL replays → the PASS retry completes", async () => {
+  // TEAM-6158: the PASS re-report is its OWN message (the dedup id carries the residual's
+  // identity), the stale FAIL replay is dropped SILENTLY as superseded (no notice, no drop
+  // stamp, no alarm), and the PASS message Dones the ticket - no manual re-run, which the
+  // agent was told not to make ("do NOT retry"). Before: the PASS was deduped onto the FAIL
+  // message (pinned here as a precondition), the drop posted a false "PROVISIONAL again"
+  // notice, and only a hand-driven PASS retry closed the ticket.
+  it("T13 FAIL queued (Done 503) → PASS re-review (Done 503) is its own message → the amendment reopens: the stale FAIL drops as superseded, the PASS message Dones through the drain alone", async () => {
     seedReview();
     fake.failTool = { Tickets___transition_ticket: PROVIDER_503 };
     expect(await reportReview()).toMatchObject({ status: "complete", ticketWrites: "queued" });
     expect(record(R_KEY).securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND });
     expect(await reportReview(PASS)).toMatchObject({ status: "complete", ticketWrites: "queued" });
     expect(record(R_KEY).securityReview).toEqual({ verdict: "PASS" });
-    expect(fake.queue, "the PASS re-report was deduped onto the FAIL message").toHaveLength(1);
+    expect(fake.queue, "the PASS re-report is its own message, not deduped onto the FAIL").toHaveLength(2);
     expect(JSON.parse(fake.queue[0].Body).residual.verdict).toBe("FAIL");
+    expect(JSON.parse(fake.queue[1].Body).residual).toBeNull();
     fake.failTool = null;
     fake.tickets.get(AMEND).status = "To Do";
-    const out = await drainQueued();
-    expect(out.outcome).toBe("dropped");
+    const callsBefore = fake.calls.length;
+    const stale = await drainQueued();
+    expect(stale, stale.reason).toMatchObject({ outcome: "dropped", superseded: true });
+    expect(stale.permanent, "not a surfaced drop: no TicketReplayDropped alarm").toBeUndefined();
     expect(record(R_KEY).securityReview, "a stale residual replay never re-marks a newer PASS admission").toEqual({ verdict: "PASS" });
+    expect(record(R_KEY).ticketWrites, "no drop stamp").toBe("queued");
+    expect(record(R_KEY).replayDropped).toBeUndefined();
+    expect(fake.calls.slice(callsBefore).filter((c) => c.tool === "Tickets___add_comment" && /PROVISIONAL again|replay-dropped/.test(String(c.params.comment))), "no notice").toHaveLength(0);
     twinsAdmitAdmission(R_KEY);
-    const res = await reportReview(PASS);
-    expect(res, `PASS retry: ${res.reason || ""}`).toMatchObject({ status: "complete" });
+    const pass = await output.drainCompletion(JSON.parse(fake.queue[1].Body));
+    expect(pass, pass.reason).toMatchObject({ outcome: "applied" });
     expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    expect(record(R_KEY)).toMatchObject({ ticketWrites: "applied", securityReview: { verdict: "PASS" } });
     twinsAdmitAdmission(R_KEY);
   });
 
@@ -663,5 +676,118 @@ describe("TEAM-6152 — the provisionalNonce lifecycle and the readers that must
       expect(twin.judgeBriefHold("k", JSON.stringify({ briefPending: true, briefDisposition: { release: true, kind: "gate_settled", provisional: true, provisionalNonce: "n-1" } }))).toMatchObject({ proven: false });
       expect(twin.judgeBriefHold("k", JSON.stringify({ briefPending: false, briefDisposition: { release: true, kind: "gate_settled", provisionalNonce: "n-1" } }))).toBeNull();
     }
+  });
+});
+
+// ─── TEAM-6158 (review round 6 on #967) ───
+/**
+ * F1: the record write's tripwire compared AMENDMENT IDS, so a trusted stamp on X was rebased over
+ * a newer provisional stamp on Y (and a trusted PASS over any provisional FAIL) by the failed-Done
+ * rewrite - the drain then confirmed X and Doned the ticket while round Y was open. The rule is now
+ * ownership in TIME: once this call has landed its own stamp, a provisional re-markable admission
+ * (reMarkableAdmission, the drain's one predicate) on the record is newer and wins.
+ * F2: the drop notice claimed "PROVISIONAL again" when nothing was re-marked; and the dedup id
+ * omitted the residual, so a PASS re-report was collapsed onto the FAIL message (T13).
+ */
+describe("TEAM-6158 F1 — a trusted stamp never lands over a provisional admission established after this call's own", () => {
+  const PASS = { summary: "Verdict: PASS. Design reviewed against main and the feature branch, read-only; no blocking findings.\n\nNo tool failures." };
+  const AMEND2 = "TEAM-5400";
+  const Y_STAMP = { verdict: "FAIL", amendmentTicketId: AMEND2, provisional: true, provisionalNonce: "n-y" };
+
+  it("T19 cross-amendment: a newer provisional FAIL on amendment Y lands before the failed-Done rewrite ⇒ the rewrite is refused, Y's stamp stands, both twins refuse", async () => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: "Jira API 400: stuck" };
+    let n = 0;
+    fake.putError = (input) => {
+      if (input.Key !== R_KEY) return null;
+      // PUT 1 = the provisional first write (X), PUT 2 = the finalize, PUT 3 = the failed-Done
+      // rewrite. Writer B (round Y's report, or a drain) lands a provisional stamp on Y just
+      // before PUT 3, which therefore 412s; the re-read must REFUSE, not re-apply trusted X.
+      if (++n === 3) patchRecord(R_KEY, { securityReview: Y_STAMP });
+      return null;
+    };
+    const res = await reportReview();
+    expect(res).toMatchObject({ status: "complete_transition_failed", next_action: "retry_report_completion" });
+    expect(n, "no fourth write: the 412'd rewrite was refused on re-read, not re-applied").toBe(3);
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    expect(record(R_KEY).securityReview, "Y's newer provisional admission was NOT overwritten by trusted X").toEqual(Y_STAMP);
+    twinsRefuseAdmission(R_KEY, /on amendment TEAM-5400/);
+  });
+
+  it("T20 the PASS variant: a PASS report's first write landed, Done failed, and a newer provisional FAIL lands before the rewrite ⇒ refused; the PASS is not rebased over it", async () => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: "Jira API 400: stuck" };
+    let n = 0;
+    fake.putError = (input) => {
+      if (input.Key !== R_KEY) return null;
+      // PUT 1 = the PASS first write (a PASS is never provisional, so no finalize), PUT 2 = the rewrite.
+      if (++n === 2) patchRecord(R_KEY, { securityReview: Y_STAMP });
+      return null;
+    };
+    const res = await reportReview(PASS);
+    expect(res).toMatchObject({ status: "complete_transition_failed", next_action: "retry_report_completion" });
+    expect(n, "no third write").toBe(2);
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    expect(record(R_KEY).securityReview, "the newer provisional FAIL was NOT overwritten by the PASS").toEqual(Y_STAMP);
+    twinsRefuseAdmission(R_KEY, /on amendment TEAM-5400/);
+  });
+});
+
+describe("TEAM-6158 F2 — the drop notice says only what was written; the dedup id carries the residual's identity", () => {
+  const PASS = { summary: "Verdict: PASS. Design reviewed against main and the feature branch, read-only; no blocking findings.\n\nNo tool failures." };
+
+  it("T21 a stale FAIL replay over a trusted PASS posts no 'PROVISIONAL again' notice and stamps no drop", async () => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503 };
+    expect(await reportReview()).toMatchObject({ ticketWrites: "queued" });
+    expect(await reportReview(PASS)).toMatchObject({ ticketWrites: "queued" });
+    fake.failTool = null;
+    fake.tickets.get(AMEND).status = "To Do";
+    const callsBefore = fake.calls.length;
+    expect(JSON.parse(fake.queue[0].Body).residual.verdict).toBe("FAIL");
+    const out = await output.drainCompletion(JSON.parse(fake.queue[0].Body));
+    expect(out.outcome, out.reason).toBe("dropped");
+    const notices = fake.calls.slice(callsBefore).filter((c) => c.tool === "Tickets___add_comment" && /PROVISIONAL again|replay-dropped/.test(String(c.params.comment)));
+    expect(notices, "no notice claims a marker that was not written").toHaveLength(0);
+    expect(record(R_KEY).securityReview).toEqual({ verdict: "PASS" });
+    expect(record(R_KEY).ticketWrites).not.toBe("dropped");
+    expect(record(R_KEY).replayDropped).toBeUndefined();
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+  });
+
+  it("T22 the dedup id: identical retries collapse into one message; a PASS re-report (no residual) and a FAIL on another amendment are their own", async () => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503 };
+    expect(await reportReview()).toMatchObject({ ticketWrites: "queued" });
+    expect(await reportReview()).toMatchObject({ ticketWrites: "queued" });
+    expect(fake.queue, "an identical re-report is one message").toHaveLength(1);
+    expect(new Set(fake.sends.map((s) => s.MessageDeduplicationId)).size).toBe(1);
+    expect(await reportReview(PASS)).toMatchObject({ ticketWrites: "queued" });
+    expect(fake.queue, "a PASS re-report is a different admission: its own message").toHaveLength(2);
+    expect(new Set(fake.sends.map((s) => s.MessageDeduplicationId)).size).toBe(2);
+    // The pure rule, for the three residual shapes a message can carry.
+    const { ticketWritesDedupId } = output;
+    const failX = ticketWritesDedupId({ ticketId: REVIEW, residual: { verdict: "FAIL", amendmentTicketId: AMEND } });
+    expect(ticketWritesDedupId({ ticketId: REVIEW, residual: { verdict: "fail", amendmentTicketId: AMEND } })).toBe(failX);
+    expect(ticketWritesDedupId({ ticketId: REVIEW, residual: { verdict: "FAIL", amendmentTicketId: "TEAM-5400" } })).not.toBe(failX);
+    expect(ticketWritesDedupId({ ticketId: REVIEW, residual: null })).not.toBe(failX);
+    expect(ticketWritesDedupId({ ticketId: REVIEW, residual: { verdict: "CHANGES_NEEDED", amendmentTicketId: AMEND } })).not.toBe(failX);
+  });
+
+  it("T23 no record to re-mark: the drop notice says nothing was written, never 'PROVISIONAL again'; the ticket is left open", async () => {
+    await withResidual();
+    fake.objects.delete(B_KEY);
+    fake.etags.delete(B_KEY);
+    fake.tickets.get(AMEND_B).status = "To Do";
+    const out = await output.drainCompletion(residualOnly());
+    expect(out, out.reason).toMatchObject({ outcome: "dropped", permanent: true });
+    const notices = fake.calls.filter((c) => c.tool === "Tickets___add_comment" && String(c.params.comment).startsWith(`[replay-dropped:${BUILD}:amendment]`));
+    expect(notices.length, "the drop IS surfaced: nobody else will close this ticket").toBeGreaterThan(0);
+    for (const c of notices) {
+      expect(String(c.params.comment)).not.toMatch(/PROVISIONAL again/);
+      expect(String(c.params.comment)).toMatch(/does not exist \(nothing written\)/);
+    }
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    expect(fake.objects.has(B_KEY), "no record was conjured by the drop").toBe(false);
   });
 });
