@@ -671,6 +671,17 @@ export function pruneDeliveredBrief(record) {
 }
 
 /**
+ * TEAM-6029: the drain's one clear for a brief it just put on its gate — a held
+ * `briefPending:true` goes `false` (not deleted: the record keeps the history that it
+ * was held) and its stale `part:"brief"` entry comes off. Step 6 and drop() both call
+ * it, so neither carries the hold over a delivery. Mutates and returns `record`.
+ */
+export function clearBriefHoldOnGate(record) {
+  if (record.briefPending === true) record.briefPending = false;
+  return pruneDeliveredBrief(record);
+}
+
+/**
  * TEAM-5805: the twins' Done guard refused because the record still holds the merge
  * brief (gate-contract.mjs briefHoldRefusal: `<key> has briefPending:true (brief …`).
  * No retry of the same write lifts it: the brief has to reach the gate first.
@@ -1835,7 +1846,12 @@ export async function drainCompletion(msg) {
     if (rec.record) {
       // TEAM-5941: a fresh Done-intent rides along (the spread keeps it); a stale one — the
       // twin that wrote it is gone — comes off with this stamp.
-      const stamped = await putRecordIfUnchanged(reportKey, stripStaleDoneIntent({ ...rec.record, ...(extra || {}), ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } }), recordEtag);
+      const stamp = { ...rec.record, ...(extra || {}) };
+      // TEAM-6029: a follow-ups-only hold whose brief this drain put on the gate clears
+      // the brief hold as step 6 does; the spread alone carried the old `true` and its
+      // stale `part:"brief"` entry over the delivery.
+      if (extra?.briefDelivered === "gate") clearBriefHoldOnGate(stamp);
+      const stamped = await putRecordIfUnchanged(reportKey, stripStaleDoneIntent({ ...stamp, ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } }), recordEtag);
       // TEAM-5830: a record a re-run rewrote since step 0 is not overwritten with the
       // older copy; the message comes back and the next tick decides on the new record
       // (the notices above are marker-deduped). TEAM-5866: and a stamp S3 could not take
@@ -2003,9 +2019,8 @@ export async function drainCompletion(msg) {
     // TEAM-5805: a brief an earlier hold stamped pending is on its gate now, so the
     // twins' Done guard below must read it as delivered. `false`, not deleted: the
     // record keeps the history that it was held.
-    if (record.briefPending === true && brief?.gate) record.briefPending = false;
     // TEAM-6024: and the hold's `part:"brief"` entry in undelivered[] is stale with it.
-    if (brief?.gate) pruneDeliveredBrief(record);
+    if (brief?.gate) clearBriefHoldOnGate(record);
     // TEAM-5958: a hold a concurrent Done landed over (doneOverHold) stays `true` — that
     // is the ONLY clear above: gate delivery. The ticket is Done; nothing reads the hold
     // until a new Done is attempted, and then it is the refusal a reopen needs.

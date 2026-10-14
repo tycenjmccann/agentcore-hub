@@ -485,6 +485,35 @@ describe("TEAM-5592 — drain order and idempotency", () => {
     expect(record().undelivered).toEqual([RESIDUAL]);
   });
 
+  // TEAM-6029: the same delivery on the drop() path — a follow-up no retry can file keeps
+  // the hold (follow_ups), but the brief is on the gate now, so the brief hold is cleared
+  // and its stale entry comes off, as step 6 does; the twins refuse on the follow-ups only.
+  const redeliverOverUnfiled = async ({ withResidual = false } = {}) => {
+    const body = fake.queue[0].Body;
+    fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    await holdBrief({ withResidual });
+    expect(record()).toMatchObject({ followUpsPending: true, replayDropped: { step: "follow_ups+brief" } });
+    fake.queue.push({ MessageId: "redelivered", Body: body, group: "wf_db9sx9", inFlight: null, receives: 0 });
+    expect((await tick()).out.drained).toMatchObject({ applied: 0, dropped: 1 });
+    expect(record()).toMatchObject({ followUpsPending: true, briefPending: false, briefDelivered: "gate", briefTargets: [GATE], ticketWrites: "dropped", replayDropped: { step: "follow_ups" } });
+  };
+
+  it("TEAM-6029 a redelivered drain lands the held brief on the gate while a follow-up still cannot be filed ⇒ briefPending:false, the stale brief entry gone", async () => {
+    await redeliverOverUnfiled();
+    expect(record().undelivered).toBeUndefined();
+    for (const twin of TWIN_GUARDS) {
+      const v = (await twin()).judgeCompletionRecord(`completions/${BUILD}.json`, fake.objects.get(`completions/${BUILD}.json`));
+      expect(v).toMatchObject({ proven: false });
+      expect(v.why).not.toMatch(/has briefPending:true/);
+    }
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+  });
+
+  it("TEAM-6029 a redelivered drain lands the held brief on the gate while a follow-up still cannot be filed ⇒ only the brief entry comes off, other parts stay", async () => {
+    await redeliverOverUnfiled({ withResidual: true });
+    expect(record().undelivered).toEqual([RESIDUAL]);
+  });
+
   it("a Done the twins refuse on the brief hold is a surfaced drop, not a retry to the DLQ (step 7)", async () => {
     fake.failTool = { Tickets___transition_ticket: (p) => (p.ticket_id === BUILD ? `Cannot move ${BUILD} to Done: a ticket whose merge brief is held needs its completion record first — call WorkflowOutput___report_completion(ticket_id=…) (completions/${BUILD}.json has briefPending:true (brief off_gate) — the merge brief has not reached the Merge Approval gate; …)` : null) };
     const t = await tick();
