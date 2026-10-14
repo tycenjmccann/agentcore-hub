@@ -748,6 +748,33 @@ export function clearBriefHoldOnRelease(record, disposition) {
 }
 
 /**
+ * TEAM-6140 (DL-039): the PROVISIONAL twin of clearBriefHoldOnRelease, for a release the
+ * caller will re-confirm AFTER this write and Done in the same call. The hold stays on
+ * (`briefPending:true` - every reader already refuses it) and the disposition is recorded
+ * with `provisional:true`, so a reader sees why it is held. Nothing is pruned: the standing
+ * hold's `undelivered` entry and `briefFallbackReason` stay until the finalize write
+ * (clearBriefHoldOnRelease, with the un-marked disposition) makes the release trusted. A
+ * compensation that fails after this write leaves a record nobody trusts, which is the
+ * point. Mutates and returns `record`; `disposition` is not mutated.
+ */
+export function holdBriefOnProvisionalRelease(record, disposition) {
+  record.briefPending = true;
+  record.briefDisposition = { ...disposition, provisional: true };
+  record.briefHoldReason = `provisional: the ${disposition.kind} release (${(disposition.observed || []).map((o) => o.ticketId).join(", ")}) is re-confirmed after this write, before the Done`;
+  return record;
+}
+
+/**
+ * TEAM-6140 (DL-039): the securityReview stamp is written `provisional:true` (both twins
+ * refuse it) and this takes the marker off once the amendment is re-confirmed done after
+ * the write. Idempotent; a record with no stamp is returned as is.
+ */
+export function finalizeSecurityReview(record) {
+  if (record?.securityReview && typeof record.securityReview === "object") delete record.securityReview.provisional;
+  return record;
+}
+
+/**
  * TEAM-5805: the twins' Done guard refused because the record still holds the merge
  * brief (gate-contract.mjs briefHoldRefusal: `<key> has briefPending:true (brief …`).
  * No retry of the same write lifts it: the brief has to reach the gate first.
@@ -997,8 +1024,10 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   }
   // The admission, on the record: the twins' Done guard closes a security review
   // only on a record carrying it, so a record written any other way cannot.
+  // TEAM-6140 (DL-039): a non-PASS admission is PROVISIONAL until the amendment is re-confirmed
+  // done after the record write (finalizeSecurityReview, below); both twins refuse the marker.
   if (review.verdict) {
-    report.securityReview = { verdict: review.verdict, ...(review.amendmentTicketId ? { amendmentTicketId: review.amendmentTicketId } : {}) };
+    report.securityReview = { verdict: review.verdict, ...(review.amendmentTicketId ? { amendmentTicketId: review.amendmentTicketId, provisional: true } : {}) };
   }
 
   // ─── TEAM-4740 FR-5 / TEAM-4752 D3: a fix to main must carry the PR to main ──
@@ -1309,10 +1338,18 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
         // it goes through the same CAS write as a delivery (`deliveredNow`).
         // TEAM-6097: through the drain's own release clear (prune included).
         Object.assign(report, { briefDelivered: "off_gate", briefTargets: brief.targets });
-        clearBriefHoldOnRelease(report, { ...brief.disposition, at: new Date().toISOString(), by: "report_completion" });
+        const disposition = { ...brief.disposition, at: new Date().toISOString(), by: "report_completion" };
+        // TEAM-6140 (DL-039): a gate_settled release this call will Done on is written
+        // PROVISIONALLY (the hold stays on) and finalized only after the post-write confirm.
+        if (brief.disposition.kind === "gate_settled" && mayTransition) {
+          holdBriefOnProvisionalRelease(report, disposition);
+          releasedNow = { observed: brief.disposition.observed, disposition };
+          console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} needs no gate (${brief.disposition.kind}: ${brief.disposition.why}) - release recorded PROVISIONALLY, re-confirmed after the write`);
+        } else {
+          clearBriefHoldOnRelease(report, disposition);
+          console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} needs no gate (${brief.disposition.kind}: ${brief.disposition.why}) - briefPending cleared`);
+        }
         deliveredNow = true;
-        if (brief.disposition.kind === "gate_settled") releasedNow = brief;
-        console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} needs no gate (${brief.disposition.kind}: ${brief.disposition.why}) - briefPending cleared`);
       } else {
         briefHeld = true;
         report.briefHoldReason = !briefKey ? "the report names no merge brief (evidence_keys has no shared/merge-brief.md) and the record lists none"
@@ -1352,20 +1389,43 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   }
   console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
   // TEAM-6130: a gate_settled release this call just recorded is re-asked once more before
-  // the Done it admits. A gate open now puts the hold back on the record (this call's own
-  // write, so adoptHold re-adopts nothing) and withholds the Done; the agent's retry
-  // re-chooses the gate.
-  if (releasedNow && !briefHeld && mayTransition) {
-    const confirm = await confirmDoneAtCommit({ ticketIds: releasedNow.disposition.observed.map((o) => o.ticketId) });
-    if (!confirm.ok || !confirm.done) {
+  // the Done it admits. TEAM-6140 (DL-039): the record above holds it PROVISIONALLY
+  // (briefPending:true, briefDisposition.provisional), so this block is what makes it
+  // trusted: a confirmed gate ⇒ the FINALIZE write (clearBriefHoldOnRelease) and only then
+  // the Done; a gate open now ⇒ the hold reason is stamped best-effort and the Done is
+  // withheld - whether that tidy-up lands cannot change what any reader does, because the
+  // record is already refused. A finalize that loses its CAS leaves the record provisional
+  // and withholds the Done the same way; the agent's retry re-chooses the gate.
+  if (releasedNow && mayTransition) {
+    const confirm = await confirmDoneAtCommit({ ticketIds: releasedNow.observed.map((o) => o.ticketId) });
+    if (confirm.ok && confirm.done) {
+      clearBriefHoldOnRelease(report, releasedNow.disposition);
+      const final = await writeRecord(() => {
+        briefHeld = report.briefPending === true;
+        if (!briefHeld) delete report.briefHoldReason;
+        return !mayTransition ? STATUS_PENDING_FOLLOW_UPS : briefHeld ? STATUS_PENDING_BRIEF : "complete";
+      });
+      if (final.ok) {
+        console.log(`[report_completion] ${ticket_id}: the Merge Approval gate(s) re-confirmed Done after the write - release FINALIZED (briefPending:false)`);
+      } else {
+        holdBriefOnProvisionalRelease(report, releasedNow.disposition);
+        report.briefHoldReason = `provisional release not finalized (${final.error}) - the record holds the release provisionally (briefPending:true); the retry re-chooses the gate`;
+        briefHeld = true;
+        console.error(`[report_completion] ${ticket_id}: the release was confirmed but could not be FINALIZED on ${key} (${final.error}) - the record stays provisional (briefPending:true), Done withheld; the retry re-chooses the gate`);
+      }
+    } else {
       const why = confirm.ok ? `the Merge Approval gate ${confirm.why} after the release was recorded` : `the Merge Approval gate ${confirm.ticketId} could not be re-read after the release was recorded (${confirm.error})`;
       report.briefPending = true;
       delete report.briefDisposition;
       report.briefHoldReason = `off_gate: ${why}`;
       briefHeld = true;
       const back = await writeRecord(() => STATUS_PENDING_BRIEF);
-      if (!back.ok) console.error(`[report_completion] ${ticket_id}: ${why}, and the hold could not be put back on ${key} (${back.error}) - Done withheld; the retry restamps`);
-      else console.warn(`[report_completion] ${ticket_id}: ${why} - release taken back (briefPending:true), Done withheld`);
+      if (!back.ok) {
+        report.briefHoldReason += ` (the hold reason could not be stamped on the record: ${back.error}; the record still holds the PROVISIONAL release, which every reader refuses)`;
+        console.error(`[report_completion] ${ticket_id}: ${why}, and the hold reason could not be stamped on ${key} (${back.error}) - the record still holds the PROVISIONAL release (briefPending:true), Done withheld; the retry re-chooses the gate`);
+      } else {
+        console.warn(`[report_completion] ${ticket_id}: ${why} - release taken back (briefPending:true), Done withheld`);
+      }
     }
   }
   // Done waits on both holds: every follow-up filed AND the merge brief on its gate.
@@ -1398,17 +1458,31 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // unreadable): the stamp comes back off the record — both twins then refuse Done
     // without it — no findings are posted, no Done is made, and the answer is the
     // amendment refusal saying what WAS recorded.
+    // TEAM-6140 (DL-039): the stamp above is PROVISIONAL (both twins refuse it), so this block
+    // is what admits the Done: the amendment confirmed ⇒ the FINALIZE write takes the marker
+    // off, then the findings and the Done. Reopened ⇒ the stamp is taken off best-effort and
+    // the answer says whether that landed (a provisional stamp left behind is refused anyway).
+    // A finalize that loses its CAS ⇒ no findings, no Done, a retryable answer.
     if (review.residual && review.amendmentTicketId) {
       const confirm = await confirmDoneAtCommit({ ticketIds: [review.amendmentTicketId] });
       if (!confirm.ok || !confirm.done) {
         delete report.securityReview;
         const back = await writeRecord(() => STATUS_TRANSITION_FAILED);
+        const rollback = { ok: back.ok, ...(back.ok ? {} : { error: back.error }) };
         const what = confirm.ok ? `design amendment ${confirm.why}` : `design amendment ${review.amendmentTicketId} could not be re-read (${confirm.error})`;
-        console.warn(`[report_completion] REFUSED ${ticket_id}: ${what} after the record was written - securityReview stamp ${back.ok ? "removed" : `NOT removed (${back.error})`}, no residual findings posted, ticket not transitioned`);
+        console.warn(`[report_completion] REFUSED ${ticket_id}: ${what} after the record was written - provisional securityReview stamp ${back.ok ? "removed" : `NOT removed (${back.error}); it stays PROVISIONAL, which both twins refuse`}, no residual findings posted, ticket not transitioned`);
         return confirm.ok
-          ? designAmendmentRefusal({ ticketId: ticket_id, verdict: review.verdict, open: { ticketId: review.amendmentTicketId }, note: `confirmed done, then ${amendmentReread(confirm)} after the record was written`, findings: countFindings(summary), recorded: true })
-          : amendmentScanRefusal({ ticketId: ticket_id, verdict: review.verdict, detail: `get_issue ${review.amendmentTicketId} (re-confirming the design amendment is done after the record write): ${confirm.error}`, recorded: true });
+          ? designAmendmentRefusal({ ticketId: ticket_id, verdict: review.verdict, open: { ticketId: review.amendmentTicketId }, note: `confirmed done, then ${amendmentReread(confirm)} after the record was written`, findings: countFindings(summary), recorded: true, rollback })
+          : amendmentScanRefusal({ ticketId: ticket_id, verdict: review.verdict, detail: `get_issue ${review.amendmentTicketId} (re-confirming the design amendment is done after the record write): ${confirm.error}`, recorded: true, rollback });
       }
+      finalizeSecurityReview(report);
+      const final = await writeRecord(() => report.status);
+      if (!final.ok) {
+        report.securityReview.provisional = true;
+        console.error(`[report_completion] REFUSED ${ticket_id}: the design amendment re-confirmed done but the admission could not be FINALIZED on ${key} (${final.error}) - the record keeps the PROVISIONAL stamp (both twins refuse it), no residual findings posted, ticket not transitioned; retry`);
+        return admissionNotFinalized(ticket_id, key, final.error);
+      }
+      console.log(`[report_completion] ${ticket_id}: design amendment ${review.amendmentTicketId} re-confirmed done after the write - securityReview admission FINALIZED`);
     }
     // TEAM-5426: round 2 closes on a non-PASS verdict — the findings go onto the
     // dev lanes BEFORE the Done that releases them, so the cascade cannot dispatch
@@ -2435,7 +2509,11 @@ export async function drainCompletion(msg) {
     // TEAM-6097 (TEAM-5995): or no gate needs it (a released briefDisposition, audited
     // by postResolvedBrief above) — the same clear, through the release twin. Any other
     // brief outcome supersedes an earlier release, so its briefDisposition comes off.
+    // TEAM-6140 (DL-039): a gate_settled release the Done below rests on is written
+    // PROVISIONALLY (the hold stays on) and finalized only after the post-write confirm.
+    const provisionalRelease = !!settledGates && !alreadyDone;
     if (brief?.gate) clearBriefHoldOnGate(record);
+    else if (brief?.disposition?.release && provisionalRelease) holdBriefOnProvisionalRelease(record, briefDelivery.briefDisposition);
     else if (brief?.disposition?.release) clearBriefHoldOnRelease(record, briefDelivery.briefDisposition);
     else if (briefDelivery) delete record.briefDisposition;
     // TEAM-5958: a hold a concurrent Done landed over (doneOverHold) stays `true` — that
@@ -2448,19 +2526,30 @@ export async function drainCompletion(msg) {
     if (!restamped.ok) return retry(restamped.moved ? restamped.error : `record ${reportKey} not restamped (${restamped.error})`);
     recordEtag = restamped.etag;
     // TEAM-6130: and once more after the write, before the Done it admits — the Done is
-    // the irreversible, cascading act. A gate open now takes the release back off the
-    // record (the off-gate hold, on the ETag just received), and no Done is made: the
-    // message comes back and the next tick puts the brief on the reopened gate.
-    if (settledGates && !alreadyDone) {
+    // the irreversible, cascading act. TEAM-6140 (DL-039): the write above holds the release
+    // PROVISIONALLY, so this is what makes it trusted: a confirmed gate ⇒ the FINALIZE write
+    // (clearBriefHoldOnRelease, on the ETag just received), then the Done. A gate open now ⇒
+    // the off-gate hold is stamped best-effort and no Done is made - whether the stamp lands
+    // cannot change what any reader does, because the record is already refused. A finalize
+    // that loses its CAS ⇒ no Done either; the message comes back and the next tick
+    // re-chooses the gate on the record as it is then.
+    if (provisionalRelease) {
       const confirm = await confirmDoneAtCommit({ ticketIds: settledGates });
-      if (!confirm.ok || !confirm.done) {
+      if (confirm.ok && confirm.done) {
+        clearBriefHoldOnRelease(record, briefDelivery.briefDisposition);
+        delete record.briefHoldReason;
+        const final = await putRecordIfUnchanged(reportKey, record, recordEtag);
+        if (!final.ok) return retry(`the Merge Approval gate(s) re-confirmed Done but the release could not be FINALIZED on ${reportKey} (${final.error}); the record holds it PROVISIONALLY (briefPending:true) and no Done is made - the next tick re-chooses the gate`);
+        recordEtag = final.etag;
+      } else {
         const reason = confirm.ok ? `the Merge Approval gate ${confirm.why} after the release was recorded` : `the Merge Approval gate ${confirm.ticketId} could not be re-read after the release was recorded (${confirm.error})`;
         const reheld = { ...record, briefPending: true, briefFallbackReason: `not on the gate: ${reason}` };
         delete reheld.briefDisposition;
+        delete reheld.briefHoldReason;
         reheld.undelivered = mergeUndelivered(record.undelivered, [{ part: "brief", s3Key: msg.brief.s3Key, reason: `not on the gate: ${reason}`, postedOn: brief.targets }], []);
         const back = await putRecordIfUnchanged(reportKey, reheld, recordEtag);
-        if (!back.ok) console.error(`[ticket-replay] ${ticketId}: ${reason}, and the release could not be taken back off ${reportKey} (${back.error}) - no Done is made; the next tick re-reads the record`);
-        return retry(`${reason}; the release is ${back.ok ? "taken back (hold re-stamped)" : "NOT taken back"} and no Done is made - the next tick re-chooses the gate`);
+        if (!back.ok) console.error(`[ticket-replay] ${ticketId}: ${reason}, and the off-gate hold could not be stamped on ${reportKey} (${back.error}) - the record still holds the PROVISIONAL release (briefPending:true), which every reader refuses; no Done is made`);
+        return retry(`${reason}; the hold is ${back.ok ? "re-stamped" : `NOT re-stamped (${back.error}) but the record still holds the release provisionally (briefPending:true)`} and no Done is made - the next tick re-chooses the gate`);
       }
     }
   }
@@ -3382,6 +3471,12 @@ async function readTicketDone(ticketId) {
  * later is a race, and the completion record's ETag cannot fence a status change on
  * ANOTHER ticket. Every status of X read in the same invocation after the first confirm
  * (`earlier`: postResolvedBrief's audit-time get_issue reads) is honoured first.
+ *
+ * TEAM-6140 (DL-039): the write between the two confirms records the decision
+ * PROVISIONALLY (briefPending:true + briefDisposition.provisional; securityReview.provisional),
+ * a form every reader already refuses, and the post-write confirm is followed by a FINALIZE
+ * write before the Done. So a compensation after a failed post-write confirm is tidy-up only:
+ * whether it lands cannot change what the next reader does.
  *
  *   { ok: true, done: true, issues: Map<ticketId, issue> }
  *   { ok: true, done: false, open: [{ ticketId, status, error?, seenAt: "audit"|"commit" }], why }
@@ -4799,19 +4894,44 @@ export function designAmendmentsOf(siblings, reviewTicketId) {
  * ticket's Done without one (securityReviewRecordRefusal) — the twin reads its
  * own row, so identity is settled where it cannot be supplied by the caller.
  */
-/** The last sentence of an amendment refusal: what this call left behind. */
-const amendmentRefusalTail = (recorded) => (recorded
-  ? `The completion record was written WITHOUT the admission stamp (status ${STATUS_TRANSITION_FAILED}), so both ticket providers refuse Done until a re-run of WorkflowOutput___report_completion re-judges and restamps it; the ticket was NOT transitioned.`
-  : "Nothing was recorded and the ticket was NOT transitioned.");
+/**
+ * The last sentence of an amendment refusal: what this call left behind. TEAM-6140 (DL-039):
+ * `rollback` says whether the post-write compensation (taking the provisional stamp off)
+ * landed - truthfully, because a stamp left behind is PROVISIONAL and refused either way.
+ */
+const amendmentRefusalTail = (recorded, rollback = null) => {
+  if (!recorded) return "Nothing was recorded and the ticket was NOT transitioned.";
+  if (rollback && rollback.ok === false) {
+    return `The completion record was written with a PROVISIONAL admission stamp and the attempt to remove it did NOT land (${rollback.error}); both ticket providers refuse a provisional stamp, so Done stays refused until a re-run of WorkflowOutput___report_completion re-judges, restamps and finalizes it; the ticket was NOT transitioned.`;
+  }
+  return `The completion record was written WITHOUT the admission stamp (status ${STATUS_TRANSITION_FAILED}; the provisional stamp was REMOVED), so both ticket providers refuse Done until a re-run of WorkflowOutput___report_completion re-judges and restamps it; the ticket was NOT transitioned.`;
+};
 
 /** TEAM-6130: the retryable "could not read whether the amendment is done" refusal, one shape for every site. */
-export function amendmentScanRefusal({ ticketId, verdict, detail, recorded = false }) {
+export function amendmentScanRefusal({ ticketId, verdict, detail, recorded = false, rollback = null }) {
   return {
     ok: false,
     reason: FOLLOW_UP_SCAN_FAILED,
     detail,
     ...(recorded ? { recorded: true } : {}),
-    message: `${ticketId} is a ${verdict} security review, and whether its design amendment exists could not be read (${detail}). ${recorded ? amendmentRefusalTail(true) : "Nothing was recorded and the ticket was NOT transitioned"} - retry WorkflowOutput___report_completion with the same arguments.`,
+    ...(recorded && rollback ? { rollback } : {}),
+    message: `${ticketId} is a ${verdict} security review, and whether its design amendment exists could not be read (${detail}). ${recorded ? amendmentRefusalTail(true, rollback) : "Nothing was recorded and the ticket was NOT transitioned"} - retry WorkflowOutput___report_completion with the same arguments.`,
+  };
+}
+
+/**
+ * TEAM-6140 (DL-039): the amendment re-confirmed done after the write, but the FINALIZE write
+ * (taking `securityReview.provisional` off) lost every compare-and-swap. The record stands,
+ * provisional - both twins refuse Done on it - and nothing else was done; `ok:false` and a
+ * status that is not "complete" keep the persona retrying.
+ */
+export function admissionNotFinalized(ticketId, key, error) {
+  return {
+    ok: false,
+    reason: "completion_record_contended",
+    next_action: "retry_report_completion",
+    recorded: true,
+    message: `report_completion for ${ticketId} was written to ${key} with a PROVISIONAL securityReview admission (both ticket providers refuse Done on it) but the admission could not be finalized (${error}): another writer owns the record right now. No residual findings were posted and the ticket was NOT transitioned. Retry the call with the SAME arguments.`,
   };
 }
 
@@ -4819,9 +4939,9 @@ export function amendmentScanRefusal({ ticketId, verdict, detail, recorded = fal
  * TEAM-6130: the design_amendment_required refusal, one shape for every site. `open` is
  * the amendment still owed (null: none exists); `note` says why a listed/confirmed Done
  * did not count; `recorded` says the record was written before the refusal (the stamp
- * taken back off it).
+ * taken back off it); `rollback` (TEAM-6140) says whether taking it off landed.
  */
-export function designAmendmentRefusal({ ticketId, verdict, open, note = null, findings, recorded = false }) {
+export function designAmendmentRefusal({ ticketId, verdict, open, note = null, findings, recorded = false, rollback = null }) {
   return {
     ok: false,
     reason: DESIGN_AMENDMENT_REQUIRED,
@@ -4830,9 +4950,10 @@ export function designAmendmentRefusal({ ticketId, verdict, open, note = null, f
     findings_count: findings,
     ...(open ? { amendmentTicketId: open.ticketId } : {}),
     ...(recorded ? { recorded: true } : {}),
+    ...(recorded && rollback ? { rollback } : {}),
     message: open
-      ? `${ticketId} is a ${verdict} security review and its design amendment ${open.ticketId} is not done yet. Stay blocked behind it; when it is done, re-review the amended design and call WorkflowOutput___report_completion again. ${amendmentRefusalTail(recorded)}`
-      : `${ticketId} is a ${verdict} security review: the dev lanes it blocks must not start on this design. File ONE "Amend design: ..." ticket (Tickets___create_ticket with parent_id=<your epic>, spawned_by_kind="review_fix", spawned_by_origin_id="${ticketId}", phase="design", the fix contract, assigned to the designer, every finding verbatim), park ${ticketId} blocked behind it, and call WorkflowOutput___report_completion after re-reviewing the amended design. ${amendmentRefusalTail(recorded)}`,
+      ? `${ticketId} is a ${verdict} security review and its design amendment ${open.ticketId} is not done yet. Stay blocked behind it; when it is done, re-review the amended design and call WorkflowOutput___report_completion again. ${amendmentRefusalTail(recorded, rollback)}`
+      : `${ticketId} is a ${verdict} security review: the dev lanes it blocks must not start on this design. File ONE "Amend design: ..." ticket (Tickets___create_ticket with parent_id=<your epic>, spawned_by_kind="review_fix", spawned_by_origin_id="${ticketId}", phase="design", the fix contract, assigned to the designer, every finding verbatim), park ${ticketId} blocked behind it, and call WorkflowOutput___report_completion after re-reviewing the amended design. ${amendmentRefusalTail(recorded, rollback)}`,
   };
 }
 
