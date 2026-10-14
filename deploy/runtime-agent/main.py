@@ -4006,7 +4006,8 @@ _AGENT_ERROR_PUBLISH_BACKOFF_S = (0.5, 1.0)
 
 
 def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
-                         ticket_id: str = "") -> None:
+                         ticket_id: str = "", reason: str = "",
+                         claim_started_at: str = "") -> None:
     """Surface a failure to the events table so the workflow board and nudge
     system can see it — a detached-run crash (a detached task has no caller to
     error to) or a failed nested coding-runtime handoff (TEAM-3119: those used
@@ -4017,7 +4018,13 @@ def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
     errors instead of letting error surfacing break the turn it reports.
     Best-effort is not single-shot, though: a throttle or network blip here
     loses the only record of the failure, so the put is retried a couple of
-    times with short backoff before giving up (TEAM-3307)."""
+    times with short backoff before giving up (TEAM-3307).
+
+    TEAM-6044: `reason` and `claim_started_at` are stamped into `detail.reason` /
+    `detail.claimStartedAt` only when given (same omit-when-empty rule as
+    `_publish_agent_died`). A transient exhaustion passes both, so cost-report
+    pairs this error with its agent.died by claim identity — the timestamp
+    fraction is random, so the two rows' string order is not their real order."""
     import time as _t
     try:
         for attempt in range(1, _AGENT_ERROR_PUBLISH_ATTEMPTS + 1):
@@ -4027,18 +4034,23 @@ def _publish_agent_error(workflow_id: str, agent_id: str, error: str,
                 # timestamp's fractional part must stay NUMERIC — workflow-analyzer
                 # Date.parse()s it, so hex there would poison lastSignificantEventAge().
                 digits = f"{uuid.uuid4().int % 10**6:06d}"
+                detail = {
+                    "agentId": {"S": agent_id},
+                    "workflowId": {"S": workflow_id or "unknown"},
+                    "ticketId": {"S": ticket_id or ""},
+                    "error": {"S": (error or "")[:1000]},
+                }
+                if reason:
+                    detail["reason"] = {"S": reason}
+                if claim_started_at:
+                    detail["claimStartedAt"] = {"S": claim_started_at}
                 _ddb_events_client.put_item(
                     TableName=_EVENTS_TABLE,
                     Item={
                         "workflowId": {"S": workflow_id or "unknown"},
                         "eventId": {"S": f"{int(_t.time() * 1000)}-err-{digits}"},
                         "type": {"S": "agent.error"},
-                        "detail": {"M": {
-                            "agentId": {"S": agent_id},
-                            "workflowId": {"S": workflow_id or "unknown"},
-                            "ticketId": {"S": ticket_id or ""},
-                            "error": {"S": (error or "")[:1000]},
-                        }},
+                        "detail": {"M": detail},
                         "timestamp": {"S": _t.strftime("%Y-%m-%dT%H:%M:%S", _t.gmtime())
                                       + f".{digits}Z"},
                     },
@@ -5304,7 +5316,13 @@ async def _run_agent_invocation(payload, context):
                             workflow_id, agent_id,
                             f"stream failed after {attempt} attempt(s): "
                             f"{type(exc).__name__}: {str(exc)[:400]}",
-                            ticket_id=_turn_ticket_id)
+                            ticket_id=_turn_ticket_id,
+                            # TEAM-6044: the claim identity cost-report pairs
+                            # this error with its agent.died by. A crash
+                            # (verdict "fail") has no death, so no stamp.
+                            **({"reason": "transient_exhaustion",
+                                "claim_started_at": _turn_claim_started_at}
+                               if verdict == "retry" else {}))
                         try:
                             # The detached runner must not publish it a second time.
                             exc._agent_error_published = True

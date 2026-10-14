@@ -1450,30 +1450,47 @@ export function dedupeEvents(events) {
  * {reason:"transient_exhaustion"}, and the enforce-mode reaper then announces the
  * same claim as agent.error{reason:"dead_session"} — one outage, three rows.
  * Each such death absorbs at most one runtime agent.error on the same
- * ticket+agent since the previous exhaustion death there (that error carries no
- * claim stamp), and at most one dead_session agent.error whose
+ * ticket+agent, and at most one dead_session agent.error whose
  * detectorMeta.claimStartedAt is the death's own claimStartedAt. Every other
  * row counts as before. Takes dedupeEvents() output.
+ *
+ * TEAM-6044: the runtime error is paired by identity, never by timestamp
+ * string order — the runtime fills a timestamp's fraction with UUID digits, and
+ * the error and death of one exhaustion land in the same second, so the error
+ * sorted after its death about half the time. A stamped error (detail.claimStartedAt,
+ * written since TEAM-6044) folds into the death with the same ticket+agent+claim.
+ * An unstamped legacy error folds into the next exhaustion death on its
+ * ticket+agent since the previous one, ordered by eventId's epoch-ms prefix
+ * when both rows have one, else at whole-second granularity.
  */
 export function countErrors(events) {
   const TYPES = ["agent.error", "error", "agent.died", "agent.retry"];
   let total = events.filter((e) => TYPES.includes(e.type)).length;
-  const tsOf = (e) => String(e.timestamp || "");
+  const msOf = (e) => /^(\d{13})-/.exec(String(e.eventId || ""))?.[1];
+  const secOf = (e) => String(e.timestamp || "").slice(0, 19);
+  // <0 / 0 / >0 like localeCompare; ms when both rows carry it, else whole seconds.
+  const cmp = (a, b) => {
+    const ma = msOf(a), mb = msOf(b);
+    return ma && mb ? Number(ma) - Number(mb) : secOf(a).localeCompare(secOf(b));
+  };
   const deaths = events
     .filter((e) => e.type === "agent.died" && e.detail?.reason === "transient_exhaustion")
-    .sort((a, b) => tsOf(a).localeCompare(tsOf(b)));
+    .sort(cmp);
   const consumed = new Set();
-  const prevDeathAt = new Map(); // ticket|agent -> previous exhaustion death ts
+  const prevDeath = new Map(); // ticket|agent -> previous exhaustion death row
+  const sameSeat = (e, d) => (e.detail?.ticketId || "") === (d.ticketId || "") && (e.detail?.agentId || "") === (d.agentId || "");
+  const isRuntimeErr = (e) => e.type === "agent.error" && !consumed.has(e) && e.detail?.reason !== "dead_session";
   for (const died of deaths) {
     const d = died.detail || {};
     const key = `${d.ticketId || ""}|${d.agentId || ""}`;
-    const after = prevDeathAt.get(key) ?? "";
-    prevDeathAt.set(key, tsOf(died));
-    const runtimeErr = events
-      .filter((e) => e.type === "agent.error" && !consumed.has(e) && e.detail?.reason !== "dead_session"
-        && (e.detail?.ticketId || "") === (d.ticketId || "") && (e.detail?.agentId || "") === (d.agentId || "")
-        && tsOf(e) <= tsOf(died) && tsOf(e) > after)
-      .sort((a, b) => tsOf(b).localeCompare(tsOf(a)))[0];
+    const prev = prevDeath.get(key);
+    prevDeath.set(key, died);
+    const runtimeErr = (d.claimStartedAt
+      && events.find((e) => isRuntimeErr(e) && sameSeat(e, d) && e.detail?.claimStartedAt === d.claimStartedAt))
+      || events
+        .filter((e) => isRuntimeErr(e) && sameSeat(e, d) && !e.detail?.claimStartedAt
+          && cmp(e, died) <= 0 && (!prev || cmp(e, prev) > 0))
+        .sort((a, b) => cmp(b, a))[0];
     if (runtimeErr) { consumed.add(runtimeErr); total--; }
     if (!d.claimStartedAt) continue;
     const reaped = events.find((e) => e.type === "agent.error" && !consumed.has(e) && e.detail?.reason === "dead_session"

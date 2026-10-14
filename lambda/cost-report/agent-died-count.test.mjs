@@ -115,3 +115,80 @@ test("an agent.died row is countable: it survives dedupe and matches by type", (
   assert.equal(count("agent.error"), 1);
   assert.equal(count("agent.died") + count("agent.error") + count("error"), 2);
 });
+
+// TEAM-6044 — the runtime fills a timestamp's fraction with UUID digits, not
+// elapsed time, and the exhaustion path writes its agent.error and agent.died in
+// the same second. So the error's timestamp sorts AFTER the death's about half
+// the time; pairing on that string order counted one exhaustion as 2 (or 3).
+// eventId's 13-digit prefix is the real epoch-ms, and a stamped error carries
+// the claim generation, so neither depends on the fraction.
+const T12 = 1791979200000; // 2026-10-14T12:00:00Z
+const T13 = 1791982800000; // 2026-10-14T13:00:00Z
+const withId = (row, ms, tag) => ({ ...row, eventId: `${ms}-${tag}-${row.timestamp.slice(20, 26)}` });
+const stampedErr = (ticketId, ts, gen) => {
+  const e = runtimeErr(ticketId, ts);
+  return { ...e, detail: { ...e.detail, reason: "transient_exhaustion", claimStartedAt: gen } };
+};
+
+test("countErrors: a same-second triple whose error fraction sorts after the death is ONE error (TEAM-6044)", () => {
+  const G = "2026-10-14T11:00:00.000Z";
+  const rows = dedupeEvents([
+    withId(runtimeErr("TEAM-1", "2026-10-14T12:00:00.900000Z"), T12 + 400, "err"),
+    withId(exhaustionDeath("TEAM-1", "2026-10-14T12:00:00.100000Z", G), T12 + 450, "died"),
+    reaperErr("TEAM-1", "2026-10-14T12:35:00.000Z", G),
+  ]);
+  assert.equal(costReport.countErrors(rows), 1);
+});
+
+test("countErrors: the same-second triple with no eventId (legacy rows) is still ONE error (TEAM-6044)", () => {
+  const G = "2026-10-14T11:00:00.000Z";
+  const rows = dedupeEvents([
+    runtimeErr("TEAM-1", "2026-10-14T12:00:00.900000Z"),
+    exhaustionDeath("TEAM-1", "2026-10-14T12:00:00.100000Z", G),
+    reaperErr("TEAM-1", "2026-10-14T12:35:00.000Z", G),
+  ]);
+  assert.equal(costReport.countErrors(rows), 1);
+});
+
+test("countErrors: two same-second-reversed exhaustions on one ticket are TWO errors (TEAM-6044)", () => {
+  const G1 = "2026-10-14T11:00:00.000Z";
+  const G2 = "2026-10-14T12:30:00.000Z";
+  const rows = dedupeEvents([
+    withId(runtimeErr("TEAM-1", "2026-10-14T12:00:00.900000Z"), T12 + 400, "err"),
+    withId(exhaustionDeath("TEAM-1", "2026-10-14T12:00:00.100000Z", G1), T12 + 450, "died"),
+    reaperErr("TEAM-1", "2026-10-14T12:35:00.000Z", G1),
+    withId(runtimeErr("TEAM-1", "2026-10-14T13:00:00.800000Z"), T13 + 200, "err"),
+    withId(exhaustionDeath("TEAM-1", "2026-10-14T13:00:00.200000Z", G2), T13 + 260, "died"),
+    reaperErr("TEAM-1", "2026-10-14T13:35:00.000Z", G2),
+  ]);
+  assert.equal(costReport.countErrors(rows), 2);
+});
+
+test("countErrors: an unrelated error and an exhaustion death in the same second still count 2 (TEAM-6044)", () => {
+  // Same second, error ordered first — but on another ticket, so it is not this
+  // death's error.
+  const rows = dedupeEvents([
+    withId(runtimeErr("TEAM-A", "2026-10-14T12:00:00.050000Z"), T12 + 50, "err"),
+    withId(exhaustionDeath("TEAM-B", "2026-10-14T12:00:00.100000Z", "2026-10-14T11:00:00.000Z"), T12 + 100, "died"),
+  ]);
+  assert.equal(costReport.countErrors(rows), 2);
+});
+
+test("countErrors: a stamped exhaustion error folds by claimStartedAt whatever its order (TEAM-6044)", () => {
+  const G = "2026-10-14T11:00:00.000Z";
+  const rows = dedupeEvents([
+    // Written after the death by every clock the row has — only identity pairs it.
+    withId(stampedErr("TEAM-1", "2026-10-14T12:00:01.900000Z", G), T12 + 1900, "err"),
+    withId(exhaustionDeath("TEAM-1", "2026-10-14T12:00:00.100000Z", G), T12 + 100, "died"),
+    reaperErr("TEAM-1", "2026-10-14T12:35:00.000Z", G),
+  ]);
+  assert.equal(costReport.countErrors(rows), 1);
+});
+
+test("countErrors: a stamped error from ANOTHER claim is not folded into this death (TEAM-6044)", () => {
+  const rows = dedupeEvents([
+    withId(stampedErr("TEAM-1", "2026-10-14T12:00:00.050000Z", "2026-10-14T10:00:00.000Z"), T12 + 50, "err"),
+    withId(exhaustionDeath("TEAM-1", "2026-10-14T12:00:00.100000Z", "2026-10-14T11:00:00.000Z"), T12 + 100, "died"),
+  ]);
+  assert.equal(costReport.countErrors(rows), 2);
+});
