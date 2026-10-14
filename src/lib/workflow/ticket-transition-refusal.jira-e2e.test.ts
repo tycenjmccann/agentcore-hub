@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { provesTransitioned } from "./ticket-transition-refusal";
+import { provesTransitioned, jiraStatusToInternal, jiraDisplayNameOf, HUB_STATUSES } from "./ticket-transition-refusal";
 import { JIRA_DONE_SUCCESS, JIRA_NAME_MATCH_CLOSED } from "./__fixtures__/ticket-transition-success";
 
 /**
@@ -64,10 +64,15 @@ function installFakeJira(transitions: Array<{ id: string; name: string; to: { na
   return posts;
 }
 
-async function loadHandler(): Promise<Handler> {
+type JiraModule = { handler: Handler; mapStatusToInternal: (name: unknown) => string };
+
+async function loadJira(): Promise<JiraModule> {
   vi.resetModules();
-  const mod = (await import("../../../lambda/agentcore-hub-jira/index.mjs")) as { handler: Handler };
-  return mod.handler;
+  return (await import("../../../lambda/agentcore-hub-jira/index.mjs")) as JiraModule;
+}
+
+async function loadHandler(): Promise<Handler> {
+  return (await loadJira()).handler;
 }
 
 const transitionDone = (handler: Handler) =>
@@ -146,5 +151,54 @@ describe("the REAL jira Lambda's transition_ticket return × provesTransitioned 
 
     expect(res).toEqual({ ...JIRA_DONE_SUCCESS, matchedTransition: { id: "41", name: "Resolve it", to: "Done" } });
     expect(provesTransitioned(res, "done", TICKET)).toBe(true);
+  });
+});
+
+/**
+ * TEAM-6141 — the validator now mirrors the Lambda's status map (mapStatusToInternal) and
+ * its match rule (name or destination equals the target's Jira display name). These pin
+ * the mirror against the REAL Lambda module, and show that the fail-open shape (c) — a
+ * transition NAMED for something else — is one the Lambda never emits for a requested done.
+ */
+describe("the TS status-map mirror × the REAL jira Lambda's mapStatusToInternal (TEAM-6141)", () => {
+  // Every Jira display name the mirror knows (via each hub status), the cancelled spellings,
+  // and a few names the hub does NOT model — the generic lowercase + underscore rule.
+  const NAMES: unknown[] = [
+    ...HUB_STATUSES.map((s) => jiraDisplayNameOf(s)),
+    "To Do", "Ready", "In Progress", "In Review", "Blocked", "Done", "Won't Do",
+    "WONT DO", "wont do", "Cancelled", "Canceled",
+    "Closed", "Resolved", "Waiting for review", "Ready for QA",
+    "  In Progress ", "DONE", "", null, undefined,
+  ];
+
+  it.each(NAMES.map((n) => [n]))("jiraStatusToInternal(%j) === mapStatusToInternal(%j)", async (name) => {
+    const { mapStatusToInternal } = await loadJira();
+    expect(jiraStatusToInternal(name)).toBe(mapStatusToInternal(name));
+  });
+
+  it("every hub status round-trips through its Jira display name in BOTH implementations", async () => {
+    const { mapStatusToInternal } = await loadJira();
+    for (const s of HUB_STATUSES) {
+      const display = jiraDisplayNameOf(s);
+      expect(display, `no Jira display name for ${s}`).not.toBe("");
+      expect(mapStatusToInternal(display)).toBe(s);
+      expect(jiraStatusToInternal(display)).toBe(s);
+    }
+  });
+
+  it('(c) a workflow offering only "Start Review → Waiting for review" REFUSES a requested done — the Lambda never emits that pair', async () => {
+    const posts = installFakeJira([{ id: "51", name: "Start Review", to: { name: "Waiting for review" } }]);
+    const handler = await loadHandler();
+
+    await expect(transitionDone(handler)).rejects.toThrow(/No transition to "Done" found/);
+    expect(posts).toEqual([]);
+    // …so the validator refusing that shape costs nothing real.
+    expect(
+      provesTransitioned(
+        { ticketId: TICKET, status: "waiting_for_review", requested: "done", matchedTransition: { id: "51", name: "Start Review", to: "Waiting for review" } },
+        "done",
+        TICKET
+      )
+    ).toBe(false);
   });
 });

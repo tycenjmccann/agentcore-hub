@@ -433,3 +433,45 @@ describe("POST /api/workflow/webhook — proof names the requested ticket and st
     expect(h.sends.length).toBe(0);
   });
 });
+
+/**
+ * TEAM-6141 (review fix round 3, P2) — the TEAM-6131 pair proved too much: an absent or
+ * empty `status` normalized to "" (not a hub column) and fell into a fallback that only
+ * checked `requested` + three non-empty metadata strings. Nothing related the landed
+ * status to the echoed destination, or the transition's name to the requested action, so
+ * all of these answered 200. They are shapes the real Lambda never emits for a requested
+ * done (see ticket-transition-refusal.jira-e2e.test.ts); the real Done → Closed shape
+ * still 200s (regression guard above).
+ */
+describe("POST /api/workflow/webhook — the Jira pair must account for the move (TEAM-6141)", () => {
+  const unconfirmed = async (payload: unknown) => {
+    lambdaAnswers(payload);
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ error: "tickets Lambda did not confirm the transition", ticketId: "TEAM-7" });
+    expect(h.sends.length).toBe(0);
+    expect(h.invokes).toHaveLength(1);
+  };
+
+  it("(a) no `status` + requested done + an unrelated matched transition (Start Progress → In Progress) → 502, no direct write", () =>
+    unconfirmed({ ticketId: "TEAM-7", requested: "done", matchedTransition: { id: "21", name: "Start Progress", to: "In Progress" } }));
+
+  it('(b) `status:""` + requested done + the real Done → Closed transition → 502, no direct write', () =>
+    unconfirmed({ ...JIRA_NAME_MATCH_CLOSED, status: "" }));
+
+  it("(c) landed waiting_for_review via a transition NAMED Start Review (as written in the ticket, no id) → 502, no direct write", () =>
+    unconfirmed({ ticketId: "TEAM-7", status: "waiting_for_review", requested: "done", matchedTransition: { name: "Start Review", to: "Waiting for review" } }));
+
+  it("(c) …and with an id — the complete metadata that used to be enough → 502, no direct write", () =>
+    unconfirmed({ ticketId: "TEAM-7", status: "waiting_for_review", requested: "done", matchedTransition: { id: "51", name: "Start Review", to: "Waiting for review" } }));
+
+  it("a landed status that is not the echoed destination's (closed vs → Resolved) → 502, no direct write", () =>
+    unconfirmed({ ...JIRA_NAME_MATCH_CLOSED, matchedTransition: { id: "31", name: "Done", to: "Resolved" } }));
+
+  it("regression: the real Done → Closed shape still 200s", async () => {
+    lambdaAnswers(JIRA_NAME_MATCH_CLOSED);
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+  });
+});
