@@ -733,6 +733,19 @@ describe("TEAM-5830 — briefPending survives concurrent writers", () => {
   // so two actors that both read the gate before either posts each post one copy. That
   // is harmless — the marker's only reader is that same dedupe, the description write is
   // idempotent, the hold clears once and the Done happens once — and this pins it.
+  it.each(["null", "[]", '"string"', "42"])("TEAM-5925: drain step 0 on a record that parses to a non-object (%s) is a retry - no record write, no Done", async (body) => {
+    fake.objects.set(KEY, body);
+    fake.etags.set(KEY, '"odd"');
+    const putsBefore = fake.puts.length;
+    const t = await tick();
+    expect(t.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expect(fake.queue).toHaveLength(1);
+    expect(fake.puts.slice(putsBefore).filter((p) => p.Key === KEY)).toHaveLength(0);
+    expect(tools("Tickets___transition_ticket")).toHaveLength(0);
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    expect(fake.objects.get(KEY)).toBe(body);
+  });
+
   it("9. concurrent drain + re-run on a held brief: both may post, the hold ends cleared, Done once, and two copies still dedupe", async () => {
     const body = fake.queue[0].Body;
     fake.tickets.get(GATE).status = "Done";

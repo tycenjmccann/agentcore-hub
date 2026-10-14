@@ -390,7 +390,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -1691,6 +1691,62 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(written()).toHaveLength(0);
     expect(transitioned()).toBe(false);
     expect(h.objects.get(HELD_KEY)).toBe(body);
+  });
+
+  // TEAM-5925: valid JSON that is not a plain object has the same unknowable hold state as
+  // bad JSON (the twins' judgeBriefHold refuses it), so it is refused the same way.
+  const NON_OBJECT_BODIES = ["null", "[]", '"string"', "42"];
+
+  it.each(NON_OBJECT_BODIES)("TEAM-5925: a prior record that parses to a non-object (%s) is refused - no IfMatch replacement, no Done", async (body) => {
+    h.objects.set(HELD_KEY, body);
+    h.etags.set(HELD_KEY, '"held"');
+    const res = result(await report({}));
+    expect(res).toMatchObject({ ok: false, reason: "completion_record_unreadable", next_action: "retry_report_completion" });
+    expect(res.message).toMatch(/not an object/);
+    expect(res.message).toMatch(/repair or delete/);
+    expect(res.status).toBeUndefined();
+    expect(written()).toHaveLength(0);
+    expect(transitioned()).toBe(false);
+    expect(calls("Tickets___create_ticket")).toHaveLength(0);
+    expect(calls("Tickets___add_comment")).toHaveLength(0);
+    expect(h.objects.get(HELD_KEY)).toBe(body);
+  });
+
+  it.each(NON_OBJECT_BODIES)("TEAM-5925: a CAS re-read (after a 412) that finds a non-object (%s) gives up - no second write, no Done", async (body) => {
+    seedHeld({ briefPending: false, briefDelivered: "gate" });
+    let fired = false;
+    // The first conditional write loses: another writer left `body` under a new ETag.
+    h.putGate = (input) => {
+      if (input.Key !== HELD_KEY || fired) return null;
+      fired = true;
+      h.objects.set(HELD_KEY, body);
+      h.etags.set(HELD_KEY, '"moved"');
+      return Object.assign(new Error("At least one of the pre-conditions you specified did not hold"), { name: "PreconditionFailed", $metadata: { httpStatusCode: 412 } });
+    };
+    const res = result(await report({}));
+    h.putGate = null;
+    expect(res.ok).toBe(false);
+    expect(res.message).toMatch(/not an object/);
+    expect(res.status).toBeUndefined();
+    expect(written()).toHaveLength(1);
+    expect(written()[0].IfMatch).toBe('"held"');
+    expect(transitioned()).toBe(false);
+    expect(h.objects.get(HELD_KEY)).toBe(body);
+  });
+
+  it("TEAM-5925 parity: every body the twins' judgeBriefHold cannot judge, parseCompletionRecord refuses - and a plain object passes both", async () => {
+    const twins = [await import("../agentcore-hub-tickets/gate-contract.mjs"), await import("../agentcore-hub-jira/gate-contract.mjs")];
+    for (const body of [...NON_OBJECT_BODIES, "", "   ", '{"ticket_id":"T",']) {
+      for (const twin of twins) expect(twin.judgeBriefHold(HELD_KEY, body), body).toMatchObject({ proven: false });
+      expect(() => parseCompletionRecord(body), body).toThrow();
+    }
+    for (const [body, shape] of [["null", "null"], ["[]", "an array"], ['"string"', "string"], ["42", "number"]]) {
+      expect(() => parseCompletionRecord(body)).toThrow(`parsed to ${shape}, not an object`);
+      for (const twin of twins) expect(twin.judgeBriefHold(HELD_KEY, body).why).toContain(`parsed to ${shape}, not an object`);
+    }
+    const ok = '{"ticket_id":"T","briefPending":false}';
+    for (const twin of twins) expect(twin.judgeBriefHold(HELD_KEY, ok)).toBeNull();
+    expect(parseCompletionRecord(ok)).toEqual({ ticket_id: "T", briefPending: false });
   });
 
   it("the typed-gate refusal is a failure too — prose the classifier cannot know", async () => {
@@ -3771,6 +3827,19 @@ describe("report_completion — FR-10 empty_sweep", () => {
     for (const p of h.puts.filter((p) => p.Key?.startsWith("completions/") && p.Key !== "completions/TEAM-4640.json")) {
       expect(p.IfNoneMatch, p.Key).toBe("*");
     }
+  });
+
+  it.each(["null", "[]", '"string"', "42"])("TEAM-5925: a sibling whose record parses to a non-object (%s) is NOT skipped - no overwrite, no transition, reported in emptySweepFailed", async (body) => {
+    const KEY = "completions/TEAM-4645.json";
+    h.objects.set(KEY, body);
+    h.etags.set(KEY, '"odd-4645"');
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    expect(h.puts.filter((p) => p.Key === KEY)).toHaveLength(0);
+    expect(calls("Tickets___transition_ticket").map((p) => p.ticket_id)).not.toContain("TEAM-4645");
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4644", "TEAM-4643"]);
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4645", reason: expect.stringMatching(/unreadable.*not an object/) }]);
+    expect(h.objects.get(KEY)).toBe(body);
   });
 
   it("TEAM-5866 (3b): a skip write that loses its conditional (412) refuses and surfaces - never a bare put, never a transition", async () => {

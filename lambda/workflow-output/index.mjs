@@ -1572,11 +1572,24 @@ async function missingBriefNotice({ ticketId, s3Key }) {
     `${marker}\n\nThe merge brief this ticket's completion named (s3://${BUCKET}/${s3Key}) does not exist, so it was NOT posted on the Merge Approval gate. A human must write and post the brief before approving the merge.`);
 }
 
-/** Read a completion record; `{ record: null }` when absent, `{ error }` when S3 could not say. */
+/**
+ * TEAM-5925: a completion record body → the record, or a throw. The same readable shape as
+ * the twins' judgeBriefHold/judgeCompletionRecord (gate-contract.mjs, which this zip cannot
+ * import): valid JSON that is not a plain object has an unknowable hold state, exactly like
+ * bad JSON, so every reader below treats it as unreadable rather than as "no record".
+ */
+export function parseCompletionRecord(text) {
+  const v = JSON.parse(text);
+  if (v && typeof v === "object" && !Array.isArray(v)) return v;
+  const shape = v === null ? "null" : Array.isArray(v) ? "an array" : typeof v;
+  throw Object.assign(new Error(`parsed to ${shape}, not an object`), { name: "MalformedRecord" });
+}
+
+/** Read a completion record; `{ record: null }` when absent, `{ error }` when S3 could not say or the body is not a JSON object. */
 async function readRecord(key) {
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
-    return { record: JSON.parse(await r.Body.transformToString()), etag: r?.ETag };
+    return { record: parseCompletionRecord(await r.Body.transformToString()), etag: r?.ETag };
   } catch (err) {
     if (err?.name === "NoSuchKey" || err?.name === "NotFound" || err?.$metadata?.httpStatusCode === 404) return { record: null };
     return { error: `${err?.name || "Error"}: ${err?.message || ""}` };
@@ -3747,7 +3760,8 @@ export function commentBodiesOf(payload) {
  *             conditions on), undefined when there is none;
  *   error     TEAM-5830: set on anything but a provable 404 — S3 refused (AccessDenied,
  *             throttle, 5xx), the body stream failed after S3 answered, or the body is
- *             not JSON (TEAM-5866) — reportCompletion refuses on it rather than replace
+ *             not JSON (TEAM-5866) or not a JSON object (TEAM-5925: null, an array, a
+ *             string, a number) — reportCompletion refuses on it rather than replace
  *             a record it never read. Same rule as readRecord.
  */
 async function readPriorRecord(key, ticketId) {
@@ -3761,8 +3775,8 @@ async function readPriorRecord(key, ticketId) {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
     etag = r?.ETag;
     body = await r.Body.transformToString();
-    const prior = JSON.parse(body);
-    if (prior && typeof prior === "object" && !Array.isArray(prior)) record = prior;
+    const prior = parseCompletionRecord(body);
+    record = prior;
     const m = prior?.followUpsMaterialized || {};
     const rows = (v) => (Array.isArray(v) ? v : []);
     for (const row of rows(m.failed)) {
@@ -3781,11 +3795,11 @@ async function readPriorRecord(key, ticketId) {
       // a hold may be on it, and a write conditioned on this read's ETag would erase it.
       // That covers a refused GET (AccessDenied, throttle, 5xx), a body stream that died
       // after S3 answered (`body` still undefined) AND a body that arrived but is not
-      // JSON: the hold state of an unparseable record is unknowable, so it is refused,
+      // a JSON object (TEAM-5925: parseCompletionRecord): the hold state of an unparseable record is unknowable, so it is refused,
       // never "repaired" — the twins' Done guard fails closed on it too (judgeBriefHold),
       // and this Lambda only ever writes JSON under CAS, so the remedy is an operator's.
       error = body === undefined ? why
-        : `${why} - the body S3 returned for ${key} is not valid JSON, so whether it holds a merge-brief or follow-up hold is unknowable; an operator must repair or delete s3://${BUCKET}/${key} before this ticket can complete (retrying with the same arguments will not lift this)`;
+        : `${why} - the body S3 returned for ${key} is not a JSON object, so whether it holds a merge-brief or follow-up hold is unknowable; an operator must repair or delete s3://${BUCKET}/${key} before this ticket can complete (retrying with the same arguments will not lift this)`;
       console.warn(`[report_completion] ${ticketId}: prior completion record ${key} was unreadable (${why}) - unfiled-notice dedupe falls back to the comment marker`);
     }
   }
