@@ -69,6 +69,7 @@ else:
     os.environ["PATH"] = f"/tmp/node-v20.18.0-linux-arm64/bin:/tmp/.npm-global/bin:{os.environ.get('PATH', '')}"
 
 import base64
+import concurrent.futures
 import contextvars
 import hashlib
 import importlib.metadata
@@ -342,6 +343,128 @@ def _persona_cache_kwargs() -> dict:
     }
 
 
+# TEAM-6020: the invocation_state key carrying `_stream_with_retry`'s per-attempt
+# cancel event down to the model (strands passes invocation_state to model.stream).
+_ATTEMPT_CANCEL_KEY = "_hub_attempt_cancel"
+
+# TEAM-6074: the executor every ConverseStream worker runs on. strands 1.54 uses
+# asyncio.to_thread, i.e. the loop's DEFAULT executor, shared with sync @tools
+# (claude_code, codex, kiro) and with our own to_thread helpers; a cut attempt
+# whose socket went silent blocks its worker until READ_TIMEOUT, and on the
+# default pool that starves them all. Here it only ties up a slot no one else
+# uses. Threads start on demand, so the cap (CPython's own default-pool ceiling)
+# costs nothing idle; a small one would let leaked workers queue model calls.
+_MODEL_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=32, thread_name_prefix="bedrock-model")
+
+
+async def _model_to_thread(func, /, *args, **kwargs):
+    """TEAM-6074: `asyncio.to_thread` (CPython 3.13 asyncio/threads.py) on
+    `_MODEL_EXECUTOR` instead of the default executor. The same context copy, so
+    the OTel/botocore span context reaches the worker exactly as before."""
+    import asyncio
+    import contextvars
+    import functools
+    loop = asyncio.get_running_loop()
+    ctx = contextvars.copy_context()
+    func_call = functools.partial(ctx.run, func, *args, **kwargs)
+    return await loop.run_in_executor(_MODEL_EXECUTOR, func_call)
+
+
+class _EitherSignal:
+    """TEAM-6020: set when strands' own cancel signal OR the attempt's is set.
+
+    Duck-types the only surface strands 1.54's Bedrock model path uses on a
+    cancel_signal: truthiness, `is not None` and `is_set()` (bedrock.py
+    `_poll_cancel_signal` and the per-chunk check in `_stream`)."""
+
+    def __init__(self, strands_signal, attempt_signal):
+        self._strands_signal = strands_signal
+        self._attempt_signal = attempt_signal
+
+    def is_set(self) -> bool:
+        return ((self._strands_signal is not None and self._strands_signal.is_set())
+                or self._attempt_signal.is_set())
+
+
+class _AttemptCancelledBedrockModel(BedrockModel):
+    """TEAM-6020: a BedrockModel whose worker thread a deadline cut can stop.
+
+    strands runs ConverseStream in `asyncio.to_thread`; an asyncio cancel only
+    DETACHES that worker, which keeps reading the socket on a default-executor
+    slot. The worker checks `cancel_signal` per chunk, but strands hands it
+    `agent._cancel_signal`, which `stream_async`'s finally CLEARS during the very
+    cancellation that cut the attempt — so a caller `cancel_signal=` never reaches
+    it. Here the worker also watches the attempt's own event, which nothing
+    clears and no later attempt reuses; once set, the worker closes the stream at
+    the next chunk.
+
+    TEAM-6074: a SILENT socket yields no next chunk, so that worker stays blocked
+    until READ_TIMEOUT. It therefore runs on `_MODEL_EXECUTOR`, never the default
+    executor, so a cut never leaves it holding a shared slot. `stream` is strands
+    1.54.0's `BedrockModel.stream` line for line, with only the `_EitherSignal`
+    wrap and `_model_to_thread` in place of `asyncio.to_thread` (strands offers no
+    executor hook); test_stream_retry §10 pins the mirrored source."""
+
+    async def stream(self, messages, tool_specs=None, system_prompt=None, *,
+                     tool_choice=None, system_prompt_content=None, cancel_signal=None,
+                     **kwargs):
+        import asyncio
+        from strands.models.bedrock import (
+            _next_stream_event, _poll_cancel_signal, _suppress_task_exception)
+
+        attempt_signal = (kwargs.get("invocation_state") or {}).get(_ATTEMPT_CANCEL_KEY)
+        if attempt_signal is not None:
+            cancel_signal = _EitherSignal(cancel_signal, attempt_signal)
+
+        def callback(event=None):
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+            if event is None:
+                return
+
+        loop = asyncio.get_event_loop()
+        queue = asyncio.Queue()
+
+        # Handle backward compatibility: if system_prompt is provided but system_prompt_content is None
+        if system_prompt and system_prompt_content is None:
+            system_prompt_content = [{"text": system_prompt}]
+
+        thread = _model_to_thread(  # TEAM-6074: was asyncio.to_thread
+            self._stream,
+            callback,
+            messages,
+            tool_specs,
+            system_prompt_content,
+            tool_choice,
+            kwargs.get("dynamic_trailing_blocks", 0),
+            cancel_signal,
+        )
+        task = asyncio.create_task(thread)
+        cancel_poll = asyncio.ensure_future(_poll_cancel_signal(cancel_signal)) if cancel_signal else None
+
+        try:
+            while True:
+                event = await _next_stream_event(queue, cancel_poll)
+                if event is None:
+                    break
+
+                yield event
+
+            if cancel_poll is not None and cancel_poll.done():
+                # The worker thread owns the event stream and closes it at its next chunk boundary.
+                # Detaching it rather than awaiting keeps a stalled read from delaying the caller.
+                task.add_done_callback(_suppress_task_exception)
+                return
+
+            await task
+        except BaseException:
+            task.add_done_callback(_suppress_task_exception)
+            raise
+        finally:
+            if cancel_poll is not None:
+                cancel_poll.cancel()
+
+
 def _build_bedrock_model(model_id: str) -> BedrockModel:
     """Single construction site for every BedrockModel — default + overrides.
 
@@ -357,7 +480,7 @@ def _build_bedrock_model(model_id: str) -> BedrockModel:
         # brownout window lives in _stream_with_retry, and the two layers multiply.
         retries={"total_max_attempts": 3, "mode": "standard"},
     )
-    return BedrockModel(
+    return _AttemptCancelledBedrockModel(
         model_id=model_id,
         region_name=REGION,
         boto_client_config=boto_config,
@@ -5180,6 +5303,7 @@ async def _run_agent_invocation(payload, context):
             down for five minutes is not a reason to strand the ticket in_progress."""
             nonlocal _transient_exhausted
             import asyncio as _sr_asyncio
+            import threading as _sr_threading
             attempt = 0
             slept = 0.0  # log/comment only — the bound is the deadline below
             # A3 / TEAM-5976 F3: armed at the FIRST failure of an outage, cleared
@@ -5266,7 +5390,13 @@ async def _run_agent_invocation(payload, context):
                             f"attempt {attempt} not opened: the "
                             f"{_STREAM_RETRY_DEADLINE_S:.0f}s outage deadline passed "
                             f"during backoff/rollback")
-                    agen = agent.stream_async(stream_input)
+                    # TEAM-6020: one event per attempt, set in the finally below so
+                    # a cut attempt's detached Bedrock worker stops at its next chunk
+                    # (see _AttemptCancelledBedrockModel). Never reused or cleared,
+                    # so it cannot cancel the next attempt.
+                    attempt_cancel = _sr_threading.Event()
+                    agen = agent.stream_async(
+                        stream_input, invocation_state={_ATTEMPT_CANCEL_KEY: attempt_cancel})
                     try:
                         while True:
                             try:
@@ -5289,6 +5419,8 @@ async def _run_agent_invocation(payload, context):
                                 attempt_deadline = outage_deadline = None
                             yield _ev
                     finally:
+                        # TEAM-6020: before aclose — the worker must see the cut.
+                        attempt_cancel.set()
                         # A no-op after the generator raised or finished; on a
                         # cancel/aclose it runs strands' own finalisers now.
                         try:

@@ -587,6 +587,8 @@ def _load_production_entrypoints(overrides: dict[str, Any] | None = None) -> dic
             # in-flight outage-deadline cut raised inside _stream_with_retry.
             "_tool_error",
             "StreamRetryDeadlineExceeded",
+            # TEAM-6020: the invocation_state key for the per-attempt cancel.
+            "_ATTEMPT_CANCEL_KEY",
         ],
     )
 
