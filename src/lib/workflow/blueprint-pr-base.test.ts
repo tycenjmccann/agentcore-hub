@@ -209,11 +209,63 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     expect(offenders).toEqual([]);
   });
 
+  // TEAM-6126: this guard was /\b((?:\S+ ){4,}\S+) \1\b/g, which backtracked O(n²) over
+  // each one-line blueprint (~13s; synchronous, so testTimeout never fired). Same
+  // semantics, near-linear: a back-to-back repeat of k >= minWords words at p has
+  // identical interior words, so p+1 and p+k+1 share a (minWords-2)-word key; only
+  // pairs in one bucket are checked. The edges keep the regex's \b looseness: the
+  // repeat may start mid-word (`a b … a b …) and end before punctuation (… e … e.).
+  const isWord = (c: string | undefined) => c !== undefined && /\w/.test(c);
+  const findRepeatedPhrases = (text: string, minWords = 5) => {
+    const w = text.split(" ").filter(Boolean);
+    const inner = minWords - 2;
+    const at = new Map<string, number[]>();
+    for (let j = 1; j + inner <= w.length; j++) {
+      const key = w.slice(j, j + inner).join(" ");
+      const ps = at.get(key);
+      if (ps) ps.push(j - 1);
+      else at.set(key, [j - 1]);
+    }
+    const hits: [number, number][] = [];
+    for (const ps of at.values()) {
+      for (let a = 0; a < ps.length; a++) {
+        for (let b = a + 1; b < ps.length; b++) {
+          const p = ps[a];
+          const k = ps[b] - p;
+          if (k < minWords || p + 2 * k > w.length) continue;
+          // Second copy's first word is a \b-suffix of the first copy's first word.
+          const head = w[p];
+          const first = w[p + k];
+          const cut = head.length - first.length;
+          if (!head.endsWith(first) || isWord(head[cut - 1]) === isWord(first[0])) continue;
+          // Second copy's last word is the first copy's last word, then \b.
+          const last = w[p + k - 1];
+          const tail = w[p + 2 * k - 1];
+          if (!tail.startsWith(last) || isWord(last[last.length - 1]) === isWord(tail[last.length])) continue;
+          let t = 1;
+          while (t < k - 1 && w[p + t] === w[p + k + t]) t++;
+          if (t === k - 1) {
+            hits.push([p, k]);
+            break;
+          }
+        }
+      }
+    }
+    // One report per repeat, like the regex's non-overlapping matchAll: a repeat's
+    // rotations (… X Y X Y … shifted by one word) all hit, so keep the leftmost.
+    hits.sort((x, y) => x[0] - y[0]);
+    const found: string[] = [];
+    let end = 0;
+    for (const [p, k] of hits) {
+      if (p < end) continue;
+      found.push(w.slice(p, p + k).join(" "));
+      end = p + 2 * k;
+    }
+    return found;
+  };
+
   it("no blueprint repeats any five-plus-word phrase back-to-back", () => {
-    const REPEATED_PHRASE = /\b((?:\S+ ){4,}\S+) \1\b/g;
-    const offenders = blueprints.flatMap(({ file, text }) =>
-      [...text.matchAll(REPEATED_PHRASE)].map((m) => `${file}: ${m[1]}`)
-    );
+    const offenders = blueprints.flatMap(({ file, text }) => findRepeatedPhrases(text).map((r) => `${file}: ${r}`));
     expect(offenders).toEqual([]);
   });
 
