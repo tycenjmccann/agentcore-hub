@@ -133,18 +133,23 @@ describe("shell deploy scripts' TICKET_PROVIDER default matches DEFAULT_TICKET_P
 describe("runtime deploy scripts' TICKET_TOOLS_LAMBDA default matches ticketToolsLambdaName(DEFAULT_TICKET_PROVIDER)", () => {
   const expected = ticketToolsLambdaName(DEFAULT_TICKET_PROVIDER);
 
-  it("deploy/runtime-agent/deploy-one.sh", () => {
-    const text = repoFile("deploy/runtime-agent/deploy-one.sh");
-    const matches = [...text.matchAll(/TICKET_TOOLS_LAMBDA:-([\w-]+)/g)].map((m) => m[1]);
-    expect(matches.length).toBeGreaterThan(0);
-    for (const value of matches) expect(value).toBe(expected);
+  // Since TEAM-6069 deploy-one.sh takes its defaults from lib/runtime-env-defaults.sh,
+  // which derives TICKET_TOOLS_LAMBDA from TICKET_PROVIDER (default jira).
+  it("deploy/runtime-agent/deploy-one.sh (via lib/runtime-env-defaults.sh)", () => {
+    expect(repoFile("deploy/runtime-agent/deploy-one.sh")).toMatch(/source "\$SCRIPT_DIR\/\.\.\/lib\/runtime-env-defaults\.sh"/);
+    const text = repoFile("deploy/lib/runtime-env-defaults.sh");
+    expect(text).toMatch(new RegExp(`TICKET_PROVIDER:-${DEFAULT_TICKET_PROVIDER}\\}`));
+    const jiraArm = text.match(/if \[ "\$provider" = "jira" \]; then\s*TICKET_TOOLS_LAMBDA="([\w-]+)"/);
+    expect(jiraArm?.[1]).toBe(ticketToolsLambdaName("jira"));
+    expect(ticketToolsLambdaName(DEFAULT_TICKET_PROVIDER)).toBe(expected);
   });
 
-  it("deploy/runtime-agent/deploy-one-robust.py", () => {
+  it("deploy/runtime-agent/deploy-one-robust.py (_ticket_tools_lambda)", () => {
     const text = repoFile("deploy/runtime-agent/deploy-one-robust.py");
-    const matches = [...text.matchAll(/TICKET_TOOLS_LAMBDA",\s*"([\w-]+)"/g)].map((m) => m[1]);
-    expect(matches.length).toBeGreaterThan(0);
-    for (const value of matches) expect(value).toBe(expected);
+    expect(text).toMatch(new RegExp(`os\\.environ\\.get\\("TICKET_PROVIDER", "${DEFAULT_TICKET_PROVIDER}"\\)`));
+    const jiraArm = text.match(/== "jira":\s*return "([\w-]+)"/);
+    expect(jiraArm?.[1]).toBe(ticketToolsLambdaName("jira"));
+    expect(ticketToolsLambdaName(DEFAULT_TICKET_PROVIDER)).toBe(expected);
   });
 
   it("deploy/ticket-provider-probe/deploy.sh", () => {
