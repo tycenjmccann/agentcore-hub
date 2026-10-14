@@ -525,7 +525,7 @@ def _compacting_agent_class(scripts: list[list[Any]], window: int) -> type:
     base = _flaky_agent_class(scripts)
 
     class _Compacting(base):
-        async def stream_async(self, prompt: Any):
+        async def stream_async(self, prompt: Any, **kwargs: Any):
             try:
                 async for ev in super().stream_async(prompt):
                     yield ev

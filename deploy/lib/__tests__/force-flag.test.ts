@@ -36,6 +36,8 @@ import { join, resolve } from "node:path";
 
 const PARSER = resolve(__dirname, "../parse-force-args.sh");
 const GATE = resolve(__dirname, "../check-eval-gate.sh");
+// deploy-one.sh sources this too (TEAM-6069); the fixture must carry it.
+const RUNTIME_ENV = resolve(__dirname, "../runtime-env-defaults.sh");
 const DEPLOY_ONE = resolve(__dirname, "../../runtime-agent/deploy-one.sh");
 const DEPLOY_ALL = resolve(__dirname, "../../runtime-agent/deploy.sh");
 
@@ -158,6 +160,7 @@ function makeRepoWithScripts(name: string, script: string): string {
   mkdirSync(join(dir, "deploy", "runtime-agent"), { recursive: true });
   copyFileSync(GATE, join(dir, "deploy", "lib", "check-eval-gate.sh"));
   copyFileSync(PARSER, join(dir, "deploy", "lib", "parse-force-args.sh"));
+  copyFileSync(RUNTIME_ENV, join(dir, "deploy", "lib", "runtime-env-defaults.sh"));
   copyFileSync(DEPLOY_ONE, join(dir, "deploy", "runtime-agent", "deploy-one.sh"));
   chmodSync(join(dir, "deploy", "runtime-agent", "deploy-one.sh"), 0o755);
   execSync(

@@ -29,13 +29,15 @@ exited_no_done.
      KILLED from outside, and no loop can outlive its bound.
 
 main.py needs strands / bedrock_agentcore / httpx at import time; those are
-stubbed below so this suite runs hermetically (boto3 is real but never called
-against AWS — clients are mocks).
+stubbed below (only when the real package isn't installed — see `_missing`)
+so this suite runs hermetically (boto3 is real but never called against AWS
+— clients are mocks).
 """
 
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -45,9 +47,31 @@ from pathlib import Path
 from unittest import mock
 
 
+def _missing(name):
+    """True only when `name` cannot be imported at all — not merely "not
+    imported yet". `"strands" not in sys.modules` was the old check, and it
+    is wrong: pytest collects this repo's root test_*.py files before
+    tests/*.py, so when THIS module is the first thing to touch strands, the
+    old check stubbed it even though the real strands-agents package is
+    installed. That flat, non-package stub then stuck in sys.modules for the
+    rest of the process, so every later `import strands.hooks` /
+    `from strands.models import Model` in tests/*.py died with "'strands' is
+    not a package" (TEAM-6059). The sys.modules check still comes first here
+    so a module already stubbed by an earlier test doesn't get re-probed
+    with find_spec (a spec-less stub makes find_spec raise ValueError).
+    """
+    return name not in sys.modules and importlib.util.find_spec(name) is None
+
+
 def _install_import_stubs():
-    """Provide just enough of main.py's third-party surface to import it."""
-    if "strands" not in sys.modules:
+    """Provide just enough of main.py's third-party surface to import it.
+
+    Only stubs a package when the real one isn't importable — see
+    `_missing`. When strands-agents (etc.) IS installed, this suite runs
+    against the real package, same as CI's `tests` directory does when it's
+    collected first.
+    """
+    if _missing("strands"):
         strands = types.ModuleType("strands")
         strands.Agent = mock.MagicMock(name="Agent")
         strands.tool = lambda f: f  # used only as a bare decorator
@@ -62,7 +86,7 @@ def _install_import_stubs():
         sys.modules["strands"] = strands
         sys.modules["strands.models"] = strands_models
 
-    if "bedrock_agentcore" not in sys.modules:
+    if _missing("bedrock_agentcore"):
         bac = types.ModuleType("bedrock_agentcore")
         bac_runtime = types.ModuleType("bedrock_agentcore.runtime")
 
@@ -78,7 +102,7 @@ def _install_import_stubs():
         sys.modules["bedrock_agentcore"] = bac
         sys.modules["bedrock_agentcore.runtime"] = bac_runtime
 
-    if "httpx" not in sys.modules:
+    if _missing("httpx"):
         httpx = types.ModuleType("httpx")
 
         class Auth:  # subclassed by _SigV4HttpxAuth at module level
@@ -1289,6 +1313,53 @@ class TestWaitVerdicts(RemoteCodingTestCase):
         self.assertTrue(result.get("error"))
         self.assertLess(clock.slept, 10 ** 9,
                         "the hard stop must bound an absurd cli_bound_s")
+
+
+class TestStubDoesNotPollutePackageWhenRealOneIsInstalled(unittest.TestCase):
+    """Regression for TEAM-6059: this module's import stub must not clobber
+    a REAL strands package with a flat, non-package sys.modules entry — that
+    broke every later `import strands.hooks` / `strands.models.model` in
+    tests/*.py when this file was collected first (pytest's default
+    alphabetical order collects the root test_*.py before tests/*.py).
+
+    Runs in a fresh subprocess so the result can't depend on what pytest's
+    collector already did to sys.modules in-process — this reproduces the
+    bug (or proves the fix) regardless of run order.
+    """
+
+    def test_strands_submodules_still_importable_after_this_module_loads(self):
+        # Checked in a FRESH subprocess, not in-process: by the time this test
+        # runs, this file has already been imported once for collection,
+        # which (on the buggy version) already stubbed "strands" with no
+        # __spec__ — so an in-process importlib.util.find_spec("strands")
+        # would itself raise ValueError here, masking the very bug this test
+        # exists to catch.
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import importlib.util, sys; "
+             "sys.exit(0 if importlib.util.find_spec('strands') else 1)"],
+            cwd=str(Path(__file__).parent),
+            capture_output=True, text=True,
+        )
+        if probe.returncode != 0:
+            self.skipTest("real strands-agents is not installed in this env")
+
+        script = (
+            "import sys, test_remote_coding\n"
+            "import strands.hooks\n"
+            "assert hasattr(sys.modules['strands'], '__path__'), "
+            "'strands stub replaced the real package'\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(Path(__file__).parent),
+            capture_output=True, text=True,
+        )
+        self.assertEqual(
+            proc.returncode, 0,
+            f"importing strands.hooks after test_remote_coding failed:\n"
+            f"stdout={proc.stdout}\nstderr={proc.stderr}",
+        )
 
 
 if __name__ == "__main__":

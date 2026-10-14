@@ -1130,14 +1130,16 @@ describe("Done-intent reservation — doneIntentReservation / isIntentOnlyReserv
     expect((agree("rejudgeAdmitted(reservation, gated)", (m) => m.rejudgeAdmitted(key, JSON.stringify({ reservation: "done-intent", ticketId: "TEAM-1", doneIntent: intent }), { recordGated: true })) as { what: string }).what).toBe("a ship-phase ticket");
   });
 
-  it("the hub mirror agrees with the canonical predicate on every row", async () => {
+  it("the hub and orchestrator mirrors agree with the canonical predicate on every row", async () => {
     const ts = await import("./completion-evidence");
+    const orch = await import("../../../lambda/orchestrator/completion.mjs"); // TEAM-5996
     for (const record of [
       { reservation: "done-intent", ticketId: "T", doneIntent: intent }, { reservation: "done-intent", ticketId: "T" }, { reservation: "done-intent", ticketId: "T", briefPending: true },
       { reservation: "done-intent", ticketId: "T", summary: "s" }, { reservation: "x" }, {}, null,
     ]) {
       const canonical = agree("isIntentOnlyReservation (canonical)", (m) => m.isIntentOnlyReservation(record));
       expect(ts.isIntentOnlyReservation(record), `completion-evidence.ts on ${JSON.stringify(record)}`).toBe(canonical);
+      expect(orch.isIntentOnlyReservation(record), `orchestrator completion.mjs on ${JSON.stringify(record)}`).toBe(canonical);
     }
   });
 });

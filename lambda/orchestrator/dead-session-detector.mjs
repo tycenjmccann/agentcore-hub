@@ -52,11 +52,12 @@
  * sweep runs against a stub client + stub store with no AWS.
  */
 
-import { QueryCommand, ScanCommand } from "@aws-sdk/lib-dynamodb";
+import { ScanCommand } from "@aws-sdk/lib-dynamodb";
 // The ONE open-workflow scan, shared with reconcile-sweep.mjs (TEAM-3839): the
 // capped window ROTATES across sweeps (TEAM-3764 F5) so >SWEEP_CAP open
 // workflows can never permanently starve the older tail.
 import { SWEEP_CAP, createOpenWorkflowScan } from "./sweep-scan.mjs";
+import { findEventSince } from "./lease.mjs";
 
 // Sweep bounds and threshold knobs. The silence threshold is derived per-agent
 // from its own recent run durations; these frame that derivation.
@@ -130,32 +131,17 @@ export function createDetector(deps) {
    * status would normally already read "complete", but the status write and the
    * event aren't atomic; this closes the window where the event landed first.
    * DynamoDB applies Limit BEFORE the filter, so a single small page can miss a
-   * match deeper in the partition — paginate until a match or the partition is
-   * exhausted, bounded at COMPLETION_SCAN_PAGES × 500 scanned items (the same
-   * bound lease.lastAgentActivity uses). The first match suffices.
+   * match deeper in the partition — paginate (lease.findEventSince, key-bounded
+   * on eventId from the claim start, TEAM-6021) until a match or the range is
+   * exhausted, ≤ COMPLETION_SCAN_PAGES × 500 items per range. First match wins.
    */
   async function hasCompletionSince(workflowId, ticketId, sinceIso) {
-    let lastKey;
-    for (let page = 0; page < COMPLETION_SCAN_PAGES; page++) {
-      const res = await ddb.send(new QueryCommand({
-        TableName: eventsTable,
-        KeyConditionExpression: "workflowId = :w",
-        FilterExpression: "#t = :complete AND detail.ticketId = :tid AND #ts >= :since",
-        ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
-        ExpressionAttributeValues: {
-          ":w": workflowId,
-          ":complete": "agent.complete",
-          ":tid": ticketId,
-          ":since": sinceIso || "",
-        },
-        Limit: 500,
-        ExclusiveStartKey: lastKey,
-      }));
-      if ((res.Items || []).length > 0) return true;
-      lastKey = res.LastEvaluatedKey;
-      if (!lastKey) break;
-    }
-    return false;
+    return !!(await findEventSince(ddb, {
+      TableName: eventsTable,
+      FilterExpression: "#t = :complete AND detail.ticketId = :tid AND #ts >= :since",
+      ExpressionAttributeNames: { "#t": "type", "#ts": "timestamp" },
+      ExpressionAttributeValues: { ":w": workflowId, ":complete": "agent.complete", ":tid": ticketId, ":since": sinceIso || "" },
+    }, sinceIso, (items) => items.length > 0, { pages: COMPLETION_SCAN_PAGES }));
   }
 
   /**

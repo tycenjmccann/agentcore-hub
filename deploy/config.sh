@@ -38,11 +38,13 @@ export LAMBDA_ROLE_ARN="${LAMBDA_ROLE_ARN:-arn:aws:iam::${ACCOUNT_ID}:role/agent
 # S3 — single bucket shared by App Runner, Lambdas, and runtime agents
 export ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${AWS_REGION}}"
 
-# DynamoDB tables
-export EVENTS_TABLE="${EVENTS_TABLE:-agentcore-hub-events}"
+# DynamoDB tables. The ones the fleet runtime reads (EVENTS_TABLE,
+# WORKFLOWS_TABLE, CLOUD_CODE_TABLE) live in lib/runtime-env-defaults.sh so
+# deploy-one.sh can load them without this file's side effects (TEAM-6069) —
+# rename them THERE.
+# shellcheck disable=SC1091 # resolved relative to this file at runtime
+. "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)/lib/runtime-env-defaults.sh"
 export TICKETS_TABLE="${TICKETS_TABLE:-agentcore-hub-tickets}"
-export WORKFLOWS_TABLE="${WORKFLOWS_TABLE:-agentcore-hub-workflows}"
-export CLOUD_CODE_TABLE="${CLOUD_CODE_TABLE:-agentcore-hub-cloud-code-sessions}"
 export ROUTINES_TABLE="${ROUTINES_TABLE:-agentcore-hub-routines}"
 # eval-packager's cross-delivery dedup seen-set (PK dedupKey, TTL on expiresAt).
 # Created by deploy/continuous-improvement/deploy-all.sh, granted by
@@ -94,8 +96,6 @@ export MCP_GATEWAY_NAME="${MCP_GATEWAY_NAME:-agentis_gateway}"
 # runtime (comma-separated agent ids, or "all"). Empty = every persona runs the
 # CLI locally in its own microVM (legacy behavior). Roll out by wave.
 export REMOTE_CODING_PERSONAS="${REMOTE_CODING_PERSONAS:-}"
-# DynamoDB table the fleet records workflow coding sessions into (Cloud Code tab reads it).
-export CLOUD_CODE_TABLE="${CLOUD_CODE_TABLE:-agentcore-hub-cloud-code-sessions}"
 # Tenant that owns workflow coding sessions. Multi-tenant deployments must set
 # this to their tenant id or the Cloud Code tab (tenant-scoped reads) won't
 # list workflow sessions.

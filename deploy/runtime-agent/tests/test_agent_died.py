@@ -305,7 +305,7 @@ def _fake_agent_class(script: list[Any]) -> type:
             self.hooks = list(kwargs.get("hooks") or [])
             type(self).instances.append(self)
 
-        async def stream_async(self, prompt: str):
+        async def stream_async(self, prompt: str, **kwargs: Any):
             for step in script:
                 if callable(step):
                     step(self)

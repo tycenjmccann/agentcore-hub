@@ -184,6 +184,10 @@ export default defineConfig({
       // after the death reaps it via the positive-death path (GUARD 1 still
       // first), and TEAM-4703 gets exactly two auto-resumes then a human.
       "lambda/orchestrator/replay-agent-died.test.mjs",
+      // sweep-read-cost (TEAM-6021) — counting fake DDB under the REAL detector +
+      // lease.mjs: 50 live leases, non-death tickets read zero pre-claim rows
+      // and the sweep's events Queries stay bounded by the in-window rows.
+      "lambda/orchestrator/sweep-read-cost.test.mjs",
       // replay-watchdog-coverage (TEAM-4739 WP5) — the three runs the watchdog
       // never paged on (fz514x, 37ule1) plus the one it must NOT page on
       // (TEAM-4660), replayed through the REAL reconcile sweep's W2/W3 watches.

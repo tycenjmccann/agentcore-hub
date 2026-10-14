@@ -870,6 +870,75 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
       });
     });
 
+    // TEAM-5933: the matcher read Allow statements only, so an explicit Deny on
+    // completions/TEAM-*.json or ship-approvals/* passed verify-infra while IAM refused
+    // the write at runtime. Same rule as deploy/lib/twin-preflight.mjs policyDenies /
+    // policyMayDenyUnder: any Deny that may apply fails the check, conditioned or not,
+    // and a NotAction/NotResource Deny fails closed.
+    describe("an explicit Deny that may apply fails the check (TEAM-5933)", () => {
+      const NS = `${ARTIFACT_BUCKET_ARN}/completions/`;
+      const SHIP_NS = `${ARTIFACT_BUCKET_ARN}/pipeline-artifacts/ship-approvals/`;
+      const MARKER = "pipeline-artifacts/ship-approvals/*.rejected.json";
+      const under = (action, prefix, fixture) => runIamCheck(`role_policy_grants_under role ${action} ${prefix}`, fixture);
+      const deny = (Action, Resource, extra = {}) => ({ Effect: "Deny", Action, Resource, ...extra });
+
+      it("fails role_policy_grants_under for completions/ PutObject behind a Deny on completions/TEAM-*.json", async () => {
+        expect(await under("s3:PutObject", NS, inlineOnly(doc(ticketsS3Fence)))).toBe(0);
+        expect(await under("s3:PutObject", NS, inlineOnly(doc(ticketsS3Fence, deny("s3:PutObject", `${NS}TEAM-*.json`))))).not.toBe(0);
+      });
+
+      it("fails role_policy_grants_under for ship-approvals/ PutObject behind a Deny on ship-approvals/*", async () => {
+        const policy = structuredClone(buildInlinePolicy(BASE));
+        policy.Statement.push(deny("s3:PutObject", `${SHIP_NS}*`));
+        expect(await under("s3:PutObject", SHIP_NS, inlineOnly(policy))).not.toBe(0);
+      });
+
+      it("fails role_policy_grants for ListBucket behind a Deny s3:List* on the bucket", async () => {
+        expect(
+          await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(...ticketsStatements, deny("s3:List*", ARTIFACT_BUCKET_ARN))))
+        ).not.toBe(0);
+      });
+
+      it("fails role_policy_grants_prefix behind a Deny ListBucket on the bucket", async () => {
+        const policy = structuredClone(buildInlinePolicy(BASE));
+        policy.Statement.push(deny("s3:ListBucket", ARTIFACT_BUCKET_ARN));
+        expect(
+          await runIamCheck(`role_policy_grants_prefix role s3:ListBucket ${ARTIFACT_BUCKET_ARN} '${MARKER}'`, inlineOnly(policy))
+        ).not.toBe(0);
+      });
+
+      it("a Condition does not exempt the Deny, nor does living only in a managed policy", async () => {
+        const Condition = { Bool: { "aws:SecureTransport": "false" } };
+        expect(await under("s3:PutObject", NS, inlineOnly(doc(ticketsS3Fence, deny("s3:PutObject", `${NS}*`, { Condition }))))).not.toBe(0);
+        expect(
+          await under("s3:PutObject", NS, {
+            inline: { inline: doc(ticketsS3Fence) },
+            managed: { [managedArn("m")]: { version: "v1", doc: doc(deny("s3:PutObject", `${NS}TEAM-*.json`)) } },
+          })
+        ).not.toBe(0);
+      });
+
+      it.each([
+        ["NotAction", { Effect: "Deny", NotAction: "s3:GetObject", Resource: "*" }],
+        ["NotResource", { Effect: "Deny", Action: "s3:*", NotResource: `${ARTIFACT_BUCKET_ARN}/*` }],
+      ])("a %s Deny fails closed", async (_label, st) => {
+        expect(await under("s3:PutObject", NS, inlineOnly(doc(ticketsS3Fence, st)))).not.toBe(0);
+        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(...ticketsStatements, st)))).not.toBe(0);
+      });
+
+      it("a Deny that cannot apply still passes (the DenyRegistryWrite shape, another action)", async () => {
+        const registry = deny(["s3:PutObject", "s3:DeleteObject"], `${ARTIFACT_BUCKET_ARN}/config/models.json`);
+        expect(await under("s3:PutObject", NS, inlineOnly(doc(ticketsS3Fence, registry)))).toBe(0);
+        expect(await under("s3:PutObject", NS, inlineOnly(doc(ticketsS3Fence, deny("s3:DeleteObject", `${NS}*`))))).toBe(0);
+        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(...ticketsStatements, registry)))).toBe(0);
+      });
+
+      it("an Allow with no Deny passes", async () => {
+        expect(await under("s3:GetObject", NS, inlineOnly(doc(ticketsS3Read)))).toBe(0);
+        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(...ticketsStatements)))).toBe(0);
+      });
+    });
+
     it("recognises the grant when it lives only in an attached managed policy", async () => {
       const policy = structuredClone(buildInlinePolicy(BASE));
       const write = sid(policy, "ShipApprovalRecordWrite");
@@ -975,9 +1044,10 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
         ).toBe(0);
       });
 
-      it("does not regress Deny handling: a conditioned Deny is still ignored, and still not a grant", async () => {
+      it("a conditioned Deny that may apply fails the grant (TEAM-5933), and is still not a grant", async () => {
         const deny = { Effect: "Deny", Action: "s3:*", Resource: "*", Condition: PREFIX_COND };
-        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(ticketsS3List, deny)))).toBe(0);
+        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(ticketsS3List)))).toBe(0);
+        expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(ticketsS3List, deny)))).not.toBe(0);
         expect(await grants("s3:ListBucket", ARTIFACT_BUCKET_ARN, inlineOnly(doc(deny)))).not.toBe(0);
       });
 
@@ -1274,10 +1344,10 @@ describe("buildInlinePolicy — the ship-rejection marker probe (TEAM-4740, TEAM
       ).not.toBe(0);
     });
 
-    it("ignores a Deny statement — it is not a grant (TEAM-5821)", async () => {
+    it("an explicit Deny that may apply fails the prefix check (TEAM-5933)", async () => {
       const policy = structuredClone(buildInlinePolicy(BASE));
       policy.Statement.push({ Effect: "Deny", Action: "s3:*", Resource: "*" });
-      expect(await verify(policy)).toBe(0);
+      expect(await verify(policy)).not.toBe(0);
     });
   });
 });

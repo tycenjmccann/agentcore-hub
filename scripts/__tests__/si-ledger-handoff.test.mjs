@@ -326,7 +326,10 @@ const FAKE_CHILDREN = [
   "deploy/ecs-express/set-env.sh",
   "scripts/si-ledger-backfill.mjs",
 ];
-const REAL_LIBS = ["deploy/lib/agentcore-lookup.sh"];
+// TEAM-6069: config.sh now sources this for the fleet runtime table defaults
+// (EVENTS_TABLE/WORKFLOWS_TABLE/CLOUD_CODE_TABLE) — without a real copy here,
+// the fake repo's config.sh dies with "No such file or directory" at source time.
+const REAL_LIBS = ["deploy/lib/agentcore-lookup.sh", "deploy/lib/runtime-env-defaults.sh"];
 
 function makeFakeRepo() {
   const dir = mkdtempSync(join(tmpdir(), "si-handoff-apply-"));
