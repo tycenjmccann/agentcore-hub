@@ -28,12 +28,14 @@ const h = vi.hoisted(() => ({
   // from the list_tickets row — `issueStatus` rewrites the status, `issueError`
   // answers `{ error }` in the jira twin's `Jira API <status>:` idiom.
   issueStatus: new Map(), issueError: new Map(),
+  // TEAM-6130: flip the board at a seam — before an S3 PUT, or on the n-th get_issue of a ticket.
+  beforePut: null, beforeGetIssue: null, getIssueCount: new Map(),
 }));
 
 vi.mock("@aws-sdk/client-s3", () => ({
   S3Client: class {
     async send(cmd) {
-      if (cmd?.constructor?.name === "PutObjectCommand") { h.puts.push(cmd.input); return { ETag: '"e1"' }; }
+      if (cmd?.constructor?.name === "PutObjectCommand") { h.beforePut?.(cmd.input); h.puts.push(cmd.input); return { ETag: '"e1"' }; }
       const err = new Error("NoSuchKey");
       err.name = cmd?.constructor?.name === "HeadObjectCommand" ? "NotFound" : "NoSuchKey";
       err.$metadata = { httpStatusCode: 404 };
@@ -68,6 +70,9 @@ vi.mock("@aws-sdk/client-lambda", () => ({
         return row.fields ? { ...row, fields: { ...row.fields, comment: { total: comments.length, comments } } } : { ...row, comments };
       };
       if (tool === "Tickets___get_issue") {
+        const nth = (h.getIssueCount.get(params.ticket_id) || 0) + 1;
+        h.getIssueCount.set(params.ticket_id, nth);
+        h.beforeGetIssue?.(params.ticket_id, nth);
         if (h.issueError.has(params.ticket_id)) return reply({ error: h.issueError.get(params.ticket_id) });
         let row = idOf(h.issue) === params.ticket_id ? h.issue : h.siblings.find((s) => idOf(s) === params.ticket_id);
         if (row && h.issueStatus.has(params.ticket_id)) {
@@ -92,6 +97,8 @@ vi.mock("@aws-sdk/client-lambda", () => ({
 
 process.env.ARTIFACT_BUCKET = "test-bucket";
 const { handler, parseReviewVerdict, countFindings, residualMarker } = await import("./index.mjs");
+// TEAM-6130: both twins' Done guard, judged on the record a late refusal leaves behind.
+const TWIN_GUARDS = [() => import("../agentcore-hub-jira/gate-contract.mjs"), () => import("../agentcore-hub-tickets/gate-contract.mjs")];
 
 const report = (extra = {}) => handler({
   tool_name: "WorkflowOutput___report_completion",
@@ -113,6 +120,9 @@ beforeEach(() => {
   h.listIncomplete = false;
   h.issueStatus = new Map();
   h.issueError = new Map();
+  h.beforePut = null;
+  h.beforeGetIssue = null;
+  h.getIssueCount = new Map();
 });
 
 for (const twin of ["dynamodb", "jira"]) {
@@ -232,6 +242,58 @@ for (const twin of ["dynamodb", "jira"]) {
       const confirm = h.calls.findIndex((c) => c.tool === "Tickets___get_issue" && c.params.ticket_id === "TEAM-5399");
       expect(confirm, "the strong read precedes the record write and the Done").toBeGreaterThan(order.indexOf("Tickets___list_tickets"));
       expect(confirm).toBeLessThan(order.indexOf("Tickets___transition_ticket"));
+    });
+
+    // TEAM-6130: TEAM-6124's confirm was one read; the admission is committed by the
+    // record PUT (the twins trust the stamp) and the Done. An amendment reopened after
+    // the confirm must refuse at the write, and again after the write before the Done.
+    const completionPuts = () => h.puts.filter((p) => p.Key?.startsWith("completions/"));
+    const lastRecord = () => JSON.parse(completionPuts().at(-1).Body);
+    const amendmentReads = () => h.calls.filter((c) => c.tool === "Tickets___get_issue" && c.params.ticket_id === "TEAM-5399").length;
+
+    it("TEAM-6130 (pre-write) the amendment is reopened after the TEAM-6124 confirm, before the record write ⇒ refused naming it: no record, no residual comments, no transition", async () => {
+      load("done");
+      h.beforeGetIssue = (id, nth) => { if (id === "TEAM-5399" && nth === 2) h.issueStatus.set("TEAM-5399", "To Do"); };
+      const res = await report();
+      expect(res).toMatchObject({ ok: false, reason: "design_amendment_required", missing: ["design_amendment"], amendmentTicketId: "TEAM-5399" });
+      expect(res.detail).toMatch(/^amendment TEAM-5399 is still open \(confirmed done, then read To Do before the record was written\)$/);
+      expect(res.message).toContain("Nothing was recorded");
+      expect(wroteRecord()).toBe(false);
+      expect(h.comments.size, "no residual findings reach the dev lanes").toBe(0);
+      expect(transitioned()).toBe(false);
+      expect(h.calls.filter((c) => c.tool === "Tickets___get_issue").map((c) => c.params.ticket_id)).toEqual(["TEAM-5357", "TEAM-5399", "TEAM-5399"]);
+    });
+
+    it("TEAM-6130 (post-write) the amendment is reopened after the record was written, before the Done ⇒ the stamp is taken back off the record, no residual comments, no transition; both twins refuse the record", async () => {
+      load("done");
+      let flipped = 0;
+      h.beforePut = (input) => { if (input.Key?.startsWith("completions/") && flipped === 0) { flipped = 1; h.issueStatus.set("TEAM-5399", "To Do"); } };
+      const res = await report();
+      expect(flipped).toBe(1);
+      expect(res).toMatchObject({ ok: false, reason: "design_amendment_required", amendmentTicketId: "TEAM-5399", recorded: true });
+      expect(res.detail).toMatch(/^amendment TEAM-5399 is still open \(confirmed done, then read To Do after the record was written\)$/);
+      expect(res.message).toContain("WITHOUT the admission");
+      expect(res.message).not.toContain("Nothing was recorded");
+      expect(completionPuts()).toHaveLength(2);
+      expect(lastRecord().securityReview).toBeUndefined();
+      expect(lastRecord().status).toBe("complete_transition_failed");
+      expect(h.comments.size, "no residual findings reach the dev lanes").toBe(0);
+      expect(transitioned()).toBe(false);
+      expect(amendmentReads()).toBe(3);
+      for (const twin of TWIN_GUARDS) {
+        expect((await twin()).securityReviewRecordRefusal("completions/TEAM-5357.json", lastRecord())).toMatch(/carries no securityReview verdict/);
+      }
+    });
+
+    it("TEAM-6130 the pre-write re-read of the amendment answers 503 ⇒ sibling_scan_failed (retryable), nothing written", async () => {
+      load("done");
+      h.beforeGetIssue = (id, nth) => { if (id === "TEAM-5399" && nth === 2) h.issueError.set("TEAM-5399", 'Jira API 503: {"errorMessage":"Service Unavailable"}'); };
+      const res = await report();
+      expect(res.reason).toBe("sibling_scan_failed");
+      expect(res.detail).toMatch(/^get_issue TEAM-5399 \(re-confirming the design amendment is done before the record write\): Jira API 503/);
+      expect(wroteRecord()).toBe(false);
+      expect(h.comments.size).toBe(0);
+      expect(transitioned()).toBe(false);
     });
 
     it("(b) PASS goes Done with exactly the calls of any other ticket — no list_tickets", async () => {

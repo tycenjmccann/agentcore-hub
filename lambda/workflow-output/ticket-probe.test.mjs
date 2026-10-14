@@ -2137,4 +2137,126 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     expect(output.mergeUndelivered([a], [], ["residual_findings|T-1"])).toBeUndefined();
     expect(output.mergeUndelivered(undefined, undefined)).toBeUndefined();
   });
+
+  // ─── TEAM-6130: confirm-at-commit. TEAM-6124 confirmed the gates Done once (readTicketDone),
+  // then posted the brief and the [brief-resolved] audits and committed the release later
+  // without re-asking. A gate reopened in between ended released: briefPending:false,
+  // gate_settled on the record, the gate To Do with no brief, the task Done. The release is
+  // now re-confirmed immediately before the record write and again after it, before the Done.
+  const flipGateOnFirstAudit = () => {
+    let flipped = 0;
+    fake.beforeTool = (tool, p) => {
+      if (tool === "Tickets___add_comment" && p.comment.startsWith(`[brief-resolved:${BUILD}]`) && flipped === 0) { flipped = 1; fake.tickets.get(GATE).status = "To Do"; }
+    };
+    return () => flipped;
+  };
+  const flipGateOnRecordPut = () => {
+    let flipped = 0;
+    fake.putError = (input) => {
+      if (input.Key === KEY && flipped === 0) { flipped = 1; fake.tickets.get(GATE).status = "To Do"; }
+      return null;
+    };
+    return () => flipped;
+  };
+
+  it("TEAM-6130 drain (pre-write): the gate is reopened after the release was confirmed, before step 6 ⇒ no release recorded, retried; the next tick puts the brief on the gate", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    const flipped = flipGateOnFirstAudit();
+    const t1 = await tick();
+    expect(flipped()).toBe(1);
+    expect(t1.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expect(record().ticketWrites).toBe("queued");
+    expect(record().briefDisposition).toBeUndefined();
+    expect(record().briefPending).not.toBe(false);
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    expect(briefComments(GATE)).toHaveLength(0);
+    fake.beforeTool = null;
+    expireVisibility();
+    expect((await tick()).out.drained).toMatchObject({ applied: 1 });
+    expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE], briefPending: false, ticketWrites: "applied" });
+    expect(record().briefDisposition).toBeUndefined();
+    expect(briefComments(GATE)).toHaveLength(1);
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+  });
+
+  it("TEAM-6130 drain: the audit-time get_issue of the gate reads it open ⇒ no [brief-resolved] anywhere, the brief goes on the gate in the same tick", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    let reads = 0;
+    // Read 1 is the TEAM-6124 confirm; read 2 is postMarkedComment's own get_issue before the audit.
+    fake.beforeTool = (tool, p) => { if (tool === "Tickets___get_issue" && p.ticket_id === GATE && ++reads === 2) fake.tickets.get(GATE).status = "To Do"; };
+    const t = await tick();
+    expect(reads).toBeGreaterThanOrEqual(2);
+    expect(t.out.drained).toMatchObject({ applied: 1, dropped: 0, retried: 0 });
+    for (const id of [BUILD, "TEAM-5600", GATE]) expect(resolvedNotices(id)).toHaveLength(0);
+    expect(briefComments(GATE)).toHaveLength(1);
+    expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE], briefPending: false });
+    expect(record().briefDisposition).toBeUndefined();
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+  });
+
+  it("TEAM-6130 retry (pre-write): the gate is reopened after the release was confirmed, before the record write ⇒ complete_pending_brief, hold kept, no Done; the next re-run puts the brief on it", async () => {
+    await holdUnnamed();
+    allGatesDone();
+    const flipped = flipGateOnFirstAudit();
+    fake.calls.length = 0;
+    const res = await rerun();
+    expect(flipped()).toBe(1);
+    expect(res).toMatchObject({ status: "complete_pending_brief", next_action: "retry_report_completion" });
+    expect(tools("Tickets___transition_ticket")).toHaveLength(0);
+    expectHeld();
+    expect(record().status).toBe("complete_pending_brief");
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    await twinsRefuse();
+    fake.beforeTool = null;
+    expect((await rerun()).status).toBe("complete");
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE] });
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+  });
+
+  it("TEAM-6130 drain drop(): a follow-ups-only hold whose release is unconfirmed at commit does not stamp the release ⇒ retried, record untouched", async () => {
+    fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    fake.tickets.get(GATE).status = "Done";
+    const flipped = flipGateOnFirstAudit();
+    const t = await tick();
+    expect(flipped()).toBe(1);
+    expect(t.out.drained).toMatchObject({ dropped: 0, retried: 1 });
+    expect(record().ticketWrites).toBe("queued");
+    expect(record().briefDisposition).toBeUndefined();
+    expect(record().replayDropped).toBeUndefined();
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+  });
+
+  it("TEAM-6130 drain (post-write): the gate is reopened after step 6 wrote the release, before the Done ⇒ re-held on the record, no Done, retried; the next tick puts the brief on the gate", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    const flipped = flipGateOnRecordPut();
+    const t1 = await tick();
+    expect(flipped()).toBe(1);
+    expect(t1.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expectHeld();
+    expect(record().undelivered).toEqual([expect.objectContaining({ part: "brief", s3Key: fixture.mergeBrief.s3Key })]);
+    expect(record().ticketWrites).toBe("queued");
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    await twinsRefuse();
+    fake.putError = null;
+    expireVisibility();
+    expect((await tick()).out.drained).toMatchObject({ applied: 1 });
+    expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE], briefPending: false, ticketWrites: "applied" });
+    expect(record().undelivered).toBeUndefined();
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+  });
+
+  it("TEAM-6130 retry (post-write): the gate is reopened after the record wrote the release, before the Done ⇒ re-held, complete_pending_brief, no Done", async () => {
+    await holdUnnamed();
+    allGatesDone();
+    const flipped = flipGateOnRecordPut();
+    fake.calls.length = 0;
+    const res = await rerun();
+    expect(flipped()).toBe(1);
+    expect(res).toMatchObject({ status: "complete_pending_brief", next_action: "retry_report_completion" });
+    expect(tools("Tickets___transition_ticket")).toHaveLength(0);
+    expect(record()).toMatchObject({ status: "complete_pending_brief", briefPending: true });
+    expect(record().briefDisposition).toBeUndefined();
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    await twinsRefuse();
+  });
 });
