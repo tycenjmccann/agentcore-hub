@@ -2164,3 +2164,48 @@ describe("TEAM-6108 follow-up PR gate: ticket-stated base", () => {
     expect(await gate(ON("release/2.1"), null)).toEqual([]);
   });
 });
+
+// TEAM-6133 (ship review F4) — the PR-URL host is parsed, not substring-matched:
+// an uppercase github.com host must not bypass the gate, and a foreign host whose
+// name or path merely contains "github.com" must not pass as a same-repo PR.
+describe("TEAM-6133 follow-up PR host anchoring", () => {
+  const R = [{ owner: "o", repo: "r", defaultBranch: "main" }];
+  const refsOf = (prUrl) => completionMod.followUpPrRefs({ F: { prUrl } }, R);
+
+  it("TEAM-6133 followUpPrRefs: uppercase host GITHUB.COM is the same github.com PR", () => {
+    expect(refsOf("https://GITHUB.COM/o/r/pull/12")).toEqual([{ ...R[0], number: 12, url: "https://GITHUB.COM/o/r/pull/12" }]);
+  });
+
+  it("TEAM-6133 followUpPrRefs: notgithub.com is not github.com", () => {
+    expect(refsOf("https://notgithub.com/o/r/pull/12")).toEqual([]);
+  });
+
+  it("TEAM-6133 followUpPrRefs: github.com in another host's path is not github.com", () => {
+    expect(refsOf("https://example.org/github.com/o/r/pull/12")).toEqual([]);
+  });
+
+  it("TEAM-6133 followUpPrRefs: a PR url inside free text still parses (no regression)", () => {
+    expect(refsOf("PR opened: https://github.com/o/r/pull/12 (draft)").map((r) => r.number)).toEqual([12]);
+  });
+
+  it("TEAM-6133 followUpPrGate: an open GITHUB.COM follow-up PR into main is returned", async () => {
+    const P = "https://GITHUB.COM/o/r/pull/12";
+    const tasks = { S: { agentId: "rm", mergeCommit: "m1" }, F: { prUrl: P } };
+    const open = await completionMod.followUpPrGate({
+      workflow: { id: "wf", featureBranch: "feature/E-1-x", repoConfig: { repos: [{ url: "https://github.com/o/r", defaultBranch: "main" }] } },
+      agentTasks: tasks, mergeProof: null, getAgentPhase: (id) => (id === "rm" ? "ship" : "development"), warn: () => {},
+      api: async (path) => (path === "/repos/o/r/pulls/12" ? { state: "open", head: { ref: "fix/a" }, base: { ref: "main" } } : null),
+    });
+    expect(open).toEqual([P]);
+  });
+
+  it("TEAM-6133 githubPrRef: the one PR-url parser (also behind index.mjs review diff-scope + PR label)", () => {
+    const ref = completionMod.githubPrRef;
+    expect(ref("https://GITHUB.COM/o/r/pull/12")).toEqual({ owner: "o", repo: "r", number: 12 });
+    expect(ref("https://github.com/O/my.repo/pull/7/files")).toEqual({ owner: "O", repo: "my.repo", number: 7 });
+    expect(ref("http://github.com/o/r/pull/3/")).toEqual({ owner: "o", repo: "r", number: 3 });
+    for (const bad of ["https://notgithub.com/o/r/pull/12", "https://example.org/github.com/o/r/pull/12", "https://github.com@evil.com/o/r/pull/1", "https://github.com/o/r/issues/1", "https://github.com/o/r", "TBD", "", null, undefined, 12]) {
+      expect(ref(bad)).toBeNull();
+    }
+  });
+});

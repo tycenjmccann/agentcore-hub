@@ -853,6 +853,20 @@ export function repoTargets(repoConfig) {
 }
 
 /**
+ * TEAM-6133 — the ONE PR-url parser: the first http(s) URL token in `text` whose host is
+ * exactly github.com (any case; `new URL` lowercases it) and whose path is
+ * /<owner>/<repo>/pull/<n>. A look-alike host (notgithub.com, example.org/github.com/…) is null.
+ */
+export function githubPrRef(text) {
+  for (const tok of String(text ?? "").match(/https?:\/\/\S+/gi) || []) {
+    let u; try { u = new URL(tok); } catch { continue; }
+    const p = u.pathname.split("/"), n = /^\d+/.exec(p[4] || "");
+    if (u.hostname === "github.com" && p[1] && p[2] && p[3] === "pull" && n) return { owner: p[1], repo: p[2], number: Number(n[0]) };
+  }
+  return null;
+}
+
+/**
  * TEAM-6032 (DL-038) — the run's PRs in its configured repos, one per repo+number.
  * TEAM-6062: `prUrl` is fill-once, so a re-dispatched ticket's completion record
  * (`records[ticketId].pr_url`) is read too. Pure; foreign repos and non-PR urls are dropped.
@@ -862,10 +876,10 @@ export function followUpPrRefs(agentTasks, repos, records = {}) {
   for (const [tid, e] of Object.entries(agentTasks || {})) {
     for (const url of [records?.[tid]?.pr_url, e?.prUrl]) {
       if (typeof url !== "string") continue; // TEAM-6075: a non-string record pr_url must not disable the gate
-      const m = url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
-      const r = m && [].concat(repos).find((x) => m[1].toLowerCase() === String(x?.owner).toLowerCase() && m[2].toLowerCase() === String(x?.repo).toLowerCase());
-      const key = r && `${r.owner}/${r.repo}#${m[3]}`.toLowerCase();
-      if (r && !refs.has(key)) refs.set(key, { owner: r.owner, repo: r.repo, defaultBranch: r.defaultBranch, number: Number(m[3]), url: url.trim() });
+      const m = githubPrRef(url);
+      const r = m && [].concat(repos).find((x) => m.owner.toLowerCase() === String(x?.owner).toLowerCase() && m.repo.toLowerCase() === String(x?.repo).toLowerCase());
+      const key = r && `${r.owner}/${r.repo}#${m.number}`.toLowerCase();
+      if (r && !refs.has(key)) refs.set(key, { owner: r.owner, repo: r.repo, defaultBranch: r.defaultBranch, number: m.number, url: url.trim() });
     }
   }
   return [...refs.values()];

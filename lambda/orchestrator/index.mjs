@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES, isIntentOnlyReservation } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, githubPrRef, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES, isIntentOnlyReservation } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -1780,11 +1780,11 @@ function resolvePrUrlForReview(workflow, gateTicket, upstream) {
  * enforceDiffScope's rename handling.
  */
 async function computeReviewChangeSet(prUrl) {
-  const m = String(prUrl || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  const m = githubPrRef(prUrl); // TEAM-6133: host-anchored, shared with the follow-up PR gate
   if (!m) return null;
-  const [, owner, repo, number] = m;
+  const { owner, repo, number } = m;
   try {
-    const files = await callGitHub("list_pr_files", { owner, repo, pull_number: Number(number) });
+    const files = await callGitHub("list_pr_files", { owner, repo, pull_number: number });
     if (!Array.isArray(files) || files.length === 0) return null;
     const paths = [];
     for (const f of files) {
@@ -3760,9 +3760,9 @@ async function closeWorkflowBlocked(workflow, verdict) {
  * label is created on demand by GitHub if it doesn't exist yet.
  */
 async function labelPullRequest(prUrl, label) {
-  const m = String(prUrl || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  const m = githubPrRef(prUrl); // TEAM-6133: host-anchored, shared with the follow-up PR gate
   if (!m) throw new Error(`unrecognized PR url: ${prUrl}`);
-  const [, owner, repo, number] = m;
+  const { owner, repo, number } = m;
   await githubApi(`/repos/${owner}/${repo}/issues/${number}/labels`, "POST", { labels: [label] });
 }
 

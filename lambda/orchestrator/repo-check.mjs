@@ -17,7 +17,7 @@ const GITHUB_API = "https://api.github.com";
  * names may contain dots (`my.repo`). Returns null when it is not a github.com URL.
  */
 export function parseGitHubUrl(url) {
-  const m = String(url || "").trim().match(/github\.com[:/]([^/\s]+)\/([^/\s#?]+?)(?:\.git)?\/?(?:[/?#].*)?$/i);
+  const m = String(url || "").trim().match(/^(?:(?:https?|ssh|git):\/\/(?:[^@/\s]+@)?|[^@/\s:]+@)?github\.com[:/]([^/\s]+)\/([^/\s#?]+?)(?:\.git)?\/?(?:[/?#].*)?$/i);
   return m ? { owner: m[1], repo: m[2] } : null;
 }
 

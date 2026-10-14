@@ -64,6 +64,11 @@ describe("parseGitHubUrl", () => {
     expect(parseGitHubUrl(" https://github.com/o/my.repo/pull/12 \n")).toEqual({ owner: "o", repo: "my.repo" });
     expect(parseGitHubUrl("   ")).toBeNull();
   });
+  // TEAM-6133: the host is anchored — a name or path that merely contains github.com is not github.com.
+  it("TEAM-6133: rejects look-alike hosts, keeps every real github.com form", () => {
+    for (const u of ["https://notgithub.com/o/r", "https://example.org/github.com/o/r", "https://www.github.com/o/r"]) expect(parseGitHubUrl(u)).toBeNull();
+    for (const u of ["https://GitHub.com/o/r", "http://github.com/o/r", "ssh://git@github.com/o/r.git", "git@github.com:o/r.git", "github.com/o/r"]) expect(parseGitHubUrl(u)).toEqual({ owner: "o", repo: "r" });
+  });
 });
 
 describe("checkRepoUrl — GitHub", () => {

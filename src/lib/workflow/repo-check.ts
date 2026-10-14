@@ -47,7 +47,7 @@ export interface RepoCheckOptions {
 const GITHUB_API = "https://api.github.com";
 
 export function parseGitHubUrl(url: string): { owner: string; repo: string } | null {
-  const m = String(url || "").trim().match(/github\.com[:/]([^/\s]+)\/([^/\s#?]+?)(?:\.git)?\/?(?:[/?#].*)?$/i); // TEAM-6075: mirror of repo-check.mjs; TEAM-6092: trim
+  const m = String(url || "").trim().match(/^(?:(?:https?|ssh|git):\/\/(?:[^@/\s]+@)?|[^@/\s:]+@)?github\.com[:/]([^/\s]+)\/([^/\s#?]+?)(?:\.git)?\/?(?:[/?#].*)?$/i); // TEAM-6075: mirror of repo-check.mjs; TEAM-6092: trim
   return m ? { owner: m[1], repo: m[2] } : null;
 }
 
