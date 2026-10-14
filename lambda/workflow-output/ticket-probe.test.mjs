@@ -1362,3 +1362,67 @@ describe("TEAM-5941 — the drain and a twin's Done-intent fence", () => {
     expect(tools("Tickets___transition_ticket")).toHaveLength(1);
   });
 });
+
+// TEAM-6057: a later drain whose brief object is gone records briefDelivered:"undelivered".
+// Both of its writes merge onto the prior record — step 6's Object.assign (ticket already
+// Done) and drop()'s spread (the brief hold) — so an earlier outcome's briefTargets (the
+// gate's, or an off-gate post's) and off-gate briefFallbackReason must come off with it.
+describe("TEAM-6057 — an undelivered brief keeps no earlier outcome's targets", () => {
+  const redeliverWithoutBrief = async () => {
+    fake.objects.delete(fixture.mergeBrief.s3Key);
+    fake.queue.push({ MessageId: "redelivered", Body: body0, group: "wf_db9sx9", inFlight: null, receives: 0 });
+    return (await tick()).out.drained;
+  };
+  let body0;
+  beforeEach(() => {
+    fake.down = false;
+    h.fetchStatus = 200;
+    body0 = fake.queue[0].Body;
+  });
+
+  // Step 6 stamps the brief on the gate, then the Done 400s (step 7): a dropped record
+  // carrying briefTargets:[GATE] that a redelivered message drains again.
+  const gateThenDoneRefused = async () => {
+    fake.failTool = { Tickets___transition_ticket: (p) => (p.ticket_id === BUILD ? "Jira API 400: a required field is missing" : null) };
+    expect((await tick()).out.drained).toMatchObject({ applied: 0, dropped: 1 });
+    expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE], ticketWrites: "dropped", replayDropped: { step: "transition" } });
+    fake.failTool = null;
+  };
+
+  it("TEAM-6057 gate, then undelivered on step 6 (ticket already Done) ⇒ the gate's briefTargets is gone", async () => {
+    await gateThenDoneRefused();
+    fake.tickets.get(BUILD).status = "Done";
+    expect(await redeliverWithoutBrief()).toMatchObject({ applied: 1, dropped: 0 });
+    expect(record()).toMatchObject({ briefDelivered: "undelivered", ticketWrites: "applied" });
+    expect(record().briefTargets).toBeUndefined();
+    expect(record().briefFallbackReason).toBeUndefined();
+    expect(record().undelivered).toEqual([expect.objectContaining({ part: "brief", reason: expect.stringMatching(/does not exist/) })]);
+  });
+
+  it("TEAM-6057 gate, then undelivered on the hold path (ticket still open) ⇒ the gate's briefTargets is gone, the hold stands", async () => {
+    await gateThenDoneRefused();
+    expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+    expect(await redeliverWithoutBrief()).toMatchObject({ applied: 0, dropped: 1 });
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "undelivered", ticketWrites: "dropped", replayDropped: { step: "brief" } });
+    expect(record().briefTargets).toBeUndefined();
+    expect(record().briefFallbackReason).toBeUndefined();
+    for (const twin of TWIN_GUARDS) {
+      const v = (await twin()).judgeCompletionRecord(`completions/${BUILD}.json`, fake.objects.get(`completions/${BUILD}.json`));
+      expect(v).toMatchObject({ proven: false, why: expect.stringContaining("has briefPending:true (brief undelivered)") });
+    }
+  });
+
+  it("TEAM-6057 off the gate, then undelivered ⇒ the off-gate briefTargets and briefFallbackReason are gone", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    await tick();
+    expect(record()).toMatchObject({
+      briefPending: true, briefDelivered: "off_gate", briefTargets: [BUILD, "TEAM-5600"],
+      briefFallbackReason: expect.stringMatching(/no open Merge Approval gate/),
+    });
+    expect(await redeliverWithoutBrief()).toMatchObject({ applied: 0, dropped: 1 });
+    expect(record()).toMatchObject({ briefPending: true, briefDelivered: "undelivered", ticketWrites: "dropped" });
+    expect(record().briefTargets).toBeUndefined();
+    expect(record().briefFallbackReason).toBeUndefined();
+    expect(record().undelivered).toEqual([expect.objectContaining({ part: "brief", reason: expect.stringMatching(/does not exist/) })]);
+  });
+});

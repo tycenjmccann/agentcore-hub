@@ -150,8 +150,9 @@ idempotent:
    `briefDelivered:"gate"`. Move the brief onto the gate by hand.
    If the brief object is gone, it is recorded as **undelivered**
    (`briefDelivered:"undelivered"`, `undelivered[]` on the record and the journey
-   event) and a `[brief-missing:<sha12>]` comment on the ticket names the S3 key
-   and says a human must write and post the brief. A 5xx on any of these comments
+   event; no `briefTargets` or `briefFallbackReason` from an earlier outcome
+   stays beside it) and a `[brief-missing:<sha12>]` comment on the ticket names
+   the S3 key and says a human must write and post the brief. A 5xx on any of these comments
    or on the gate write means `retry`.
    A brief that is not on its gate (off the gate, or undelivered) **holds the
    Done**: a Done would make the gate Ready without the brief in front of the

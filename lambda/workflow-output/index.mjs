@@ -702,6 +702,18 @@ export function isBriefHoldRefusal(error) {
   return /\bhas briefPending:true \(brief /.test(String(error || ""));
 }
 
+/**
+ * TEAM-6057: a brief the drain records `briefDelivered:"undelivered"` went nowhere, so
+ * no earlier outcome's `briefTargets` (a gate's, or an off-gate post's) or off-gate
+ * `briefFallbackReason` may sit beside it — the merge onto the prior record carried
+ * them over. `undelivered[]` says why. Mutates and returns `record`.
+ */
+export function clearUndeliveredBriefTargets(record) {
+  delete record.briefTargets;
+  delete record.briefFallbackReason;
+  return record;
+}
+
 async function reportCompletion({ ticket_id, summary, artifacts = "", branch, commit_sha, pr_url, workflow_id, agent_id, evidence_kind, evidence_keys, ci_status, ci_build_id, ci_head_sha, merge_commit, approved_head_sha, outcome, block_reason, pipeline_execution_id, pipeline_name, follow_ups }) {
   const key = `completions/${ticket_id}.json`;
   const report = {
@@ -1861,6 +1873,9 @@ export async function drainCompletion(msg) {
       console.error(`[ticket-replay] ${ticketId}: no readable ticket or known epic to post the drop notice on - the metric, record and journey event carry it`);
     }
     const notice = notices[0] || null;
+    // TEAM-6057: the stamp below spreads `extra` over the prior record, which cannot drop
+    // a stale `briefTargets`/`briefFallbackReason` beside an undelivered brief.
+    if (rec.record && extra?.briefDelivered === "undelivered") clearUndeliveredBriefTargets(rec.record);
     if (rec.record) {
       // TEAM-5941: a fresh Done-intent rides along (the spread keeps it); a stale one — the
       // twin that wrote it is gone — comes off with this stamp.
@@ -2034,6 +2049,8 @@ export async function drainCompletion(msg) {
     if (entries.length > 0) record.followUpsMaterialized = materialized;
     if (undelivered.length > 0) record.undelivered = undelivered;
     if (briefDelivery) Object.assign(record, briefDelivery);
+    // TEAM-6057: and an undelivered brief keeps no earlier outcome's targets or reason.
+    if (briefDelivery?.briefDelivered === "undelivered") clearUndeliveredBriefTargets(record);
     // TEAM-5805: a brief an earlier hold stamped pending is on its gate now, so the
     // twins' Done guard below must read it as delivered. `false`, not deleted: the
     // record keeps the history that it was held.
