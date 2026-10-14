@@ -3,15 +3,20 @@
  *
  * THIN handler — writes status to DynamoDB only.
  * The DynamoDB Stream triggers the Orchestration Lambda for all downstream logic.
+ *
+ * Only live caller: Jira status-change webhooks (`jira_transition` / no
+ * event_type — see docs/architecture.md "Jira Integration"). The `agent_completion`
+ * case was removed (TEAM-5953): it wrote ticket status "done" straight to
+ * DynamoDB, bypassing the tickets Lambda's transition_ticket (judgeCompletionRecord
+ * + the TEAM-5941 doneIntent fence), and nothing in the repo ever posted it.
  */
 
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
-import { DynamoDBDocumentClient, UpdateCommand, GetCommand } from "@aws-sdk/lib-dynamodb";
+import { DynamoDBDocumentClient, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
-const WORKFLOWS_TABLE = process.env.WORKFLOWS_TABLE || "agentcore-hub-workflows";
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "dev-secret";
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), {
@@ -44,48 +49,6 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
 
   try {
     switch (eventType) {
-      case "agent_completion": {
-        const workflowId = body.workflow_id as string;
-        const agentId = body.agent_id as string;
-        if (!workflowId || !agentId) {
-          return NextResponse.json({ error: "workflow_id and agent_id required" }, { status: 400 });
-        }
-
-        // Prefer the ticket_id carried on the request — with fix-ticket
-        // fan-out one agent can hold several concurrent entries and the
-        // newest-active heuristic below can pick a sibling.
-        let ticketId = (body.ticket_id as string) || null;
-        if (ticketId) {
-          const wf = await getWorkflowFromDynamo(workflowId);
-          if (!wf?.agentTasks?.[ticketId]) ticketId = null;
-        }
-        if (!ticketId) ticketId = await findTicketForAgent(workflowId, agentId);
-        if (!ticketId) {
-          return NextResponse.json({ received: true, warning: "Ticket not found" });
-        }
-
-        // Write "done" to DynamoDB — Stream handles the rest
-        await ddb.send(new UpdateCommand({
-          TableName: TICKETS_TABLE,
-          Key: { ticketId },
-          UpdateExpression: "SET #s = :s, #u = :u",
-          ExpressionAttributeNames: { "#s": "status", "#u": "updatedAt" },
-          ExpressionAttributeValues: { ":s": "done", ":u": new Date().toISOString() },
-        }));
-
-        if (body.branch || body.commit_sha || body.pr_url) {
-          await updateWorkflowTaskMetadata(workflowId, ticketId, {
-            branch: body.branch as string,
-            commitSha: body.commit_sha as string,
-            prUrl: body.pr_url as string,
-            output: (body.output as string)?.slice(0, 10000),
-          });
-        }
-
-        console.log(`[webhook:lambda] Wrote "done" for ${ticketId} (agent: ${agentId}). Stream handles cascade.`);
-        return NextResponse.json({ received: true, ticketId, mode: "lambda" });
-      }
-
       case "jira_transition":
       case undefined: {
         const issueKey = (body.issue_key as string) || (body.issue as { key?: string })?.key;
@@ -117,69 +80,6 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
 }
 
 // ─── Shared Helpers ──────────────────────────────────────────────────────────────
-
-/**
- * agentTasks is keyed by TICKET id (the orchestrator's claim key). Resolve the
- * agent's ACTIVE ticket — with fix-ticket fan-out one agent can hold several
- * entries, and "any entry for this agent" picks the wrong one.
- */
-async function findTicketForAgent(workflowId: string, agentId: string): Promise<string | null> {
-  const wf = await getWorkflowFromDynamo(workflowId);
-  const tasks: Record<string, Record<string, unknown>> = wf?.agentTasks || {};
-  const candidates = Object.values(tasks)
-    .filter((t) => t.agentId === agentId && t.ticketId)
-    .sort((a, b) => {
-      const active = (t: Record<string, unknown>) => (t.status === "running" || t.status === "in_progress" ? 0 : 1);
-      if (active(a) !== active(b)) return active(a) - active(b);
-      return String(b.startedAt || "").localeCompare(String(a.startedAt || ""));
-    });
-  return (candidates[0]?.ticketId as string) || null;
-}
-
-async function getWorkflowFromDynamo(workflowId: string) {
-  const result = await ddb.send(new GetCommand({ TableName: WORKFLOWS_TABLE, Key: { workflowId } }));
-  return result.Item || null;
-}
-
-/**
- * Scoped per-field merge into agentTasks[ticketId]. The previous version
- * rewrote the ENTIRE agentTasks map from a read snapshot (keyed by agentId,
- * doubly wrong) — resurrecting pre-claim state over concurrent sibling
- * invocation claims (study P1).
- */
-async function updateWorkflowTaskMetadata(workflowId: string, ticketId: string, metadata: Record<string, unknown>) {
-  const names: Record<string, string> = { "#tid": ticketId, "#u": "updatedAt" };
-  const values: Record<string, unknown> = { ":u": new Date().toISOString() };
-  const sets = ["#u = :u"];
-  let i = 0;
-  for (const [k, v] of Object.entries({
-    ...metadata,
-    status: "complete",
-    completedAt: new Date().toISOString(),
-  })) {
-    if (v === undefined || v === null) continue;
-    i++;
-    names[`#f${i}`] = k;
-    values[`:v${i}`] = v;
-    sets.push(`agentTasks.#tid.#f${i} = :v${i}`);
-  }
-  try {
-    await ddb.send(new UpdateCommand({
-      TableName: WORKFLOWS_TABLE,
-      Key: { workflowId },
-      UpdateExpression: `SET ${sets.join(", ")}`,
-      ConditionExpression: "attribute_exists(agentTasks.#tid)",
-      ExpressionAttributeNames: names,
-      ExpressionAttributeValues: values,
-    }));
-  } catch (err) {
-    // Entry not tracked yet — drop the metadata rather than materializing a
-    // partial entry the orchestrator's claim path doesn't own. Anything else
-    // (throttle, auth, service error) must propagate so the delivery retries.
-    if ((err as { name?: string }).name !== "ConditionalCheckFailedException") throw err;
-    console.warn(`[webhook:lambda] task metadata skipped for ${ticketId}: no tracked entry`);
-  }
-}
 
 function mapJiraStatus(jiraStatus: string): string {
   const map: Record<string, string> = {
