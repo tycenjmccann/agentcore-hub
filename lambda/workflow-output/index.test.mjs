@@ -3516,8 +3516,10 @@ describe("report_completion — TEAM-6149: a follow-up CD reads its own ledger",
     expect(gotKeys()).not.toContain(CD_LEDGER_KEY);
   });
 
-  it("(b) the unified CD path is unchanged: a matching pr_url, no pr_url, or a ledger with no prUrl all derive", async () => {
-    for (const [ledgerPr, reportPr] of [[PR_A, PR_A], [PR_A, undefined], [undefined, PR_B]]) {
+  it("(b) the unified CD path is unchanged: a matching pr_url, or a report with no pr_url, derives", async () => {
+    // TEAM-6154 (R3-F3): the `[undefined, PR_B]` tuple that used to be here - a ledger
+    // with NO prUrl adopted by a report that names a PR - was the wildcard; see (h).
+    for (const [ledgerPr, reportPr] of [[PR_A, PR_A], [PR_A, undefined]]) {
       h.puts.length = 0; h.created.length = 0; h.siblings.length = 0; h.objects.clear(); h.gets.length = 0;
       h.siblings.push(CD);
       unified({ ...(ledgerPr ? { prUrl: ledgerPr } : {}), handoff: ["Enable the flag in the console"] });
@@ -3607,6 +3609,112 @@ describe("report_completion — TEAM-6149: a follow-up CD reads its own ledger",
     // and it still reached the unified key, so nothing else about the call changed
     expect(gotKeys()).toContain(CD_LEDGER_KEY);
     expect(r.status).toBe("complete");
+  });
+
+  // ─── TEAM-6154 (ship review r3 of #954): F2 canonical PR identity, F3 ownership, F4 body shape ──
+
+  it("(c3) R3-F2: the unified prUrl is THIS PR under a different host/owner/repo case, a #fragment, /files or ?query - adopted", async () => {
+    for (const ledgerPr of ["https://GITHUB.COM/Owner/Repo/pull/42", `${PR_A}#discussion_r1`, `${PR_A}/files`, `${PR_A}?x=1`, "HTTPS://github.com/OWNER/REPO/pull/42/"]) {
+      h.puts.length = 0; h.created.length = 0; h.siblings.length = 0; h.objects.clear(); h.gets.length = 0; h.warns.length = 0;
+      h.siblings.push(CD);
+      unified({ prUrl: ledgerPr, handoff: ["Enable the flag in the console"] });
+      const r = result(await shipReport({ pr_url: PR_A }));
+      expect(r.status, ledgerPr).toBe("complete");
+      expect(record().followUps, ledgerPr).toHaveLength(1);
+      expect(record().followUps[0].kind).toBe("console_handoff");
+      expect(h.created, ledgerPr).toHaveLength(1);
+      expect(h.warns.join("\n"), ledgerPr).not.toMatch(/treated as no ledger/);
+    }
+  });
+
+  it("(c4) R3-F2: the identity is strict - junk after the number, an encoded slash, or a different number is ANOTHER PR", async () => {
+    const one = "https://github.com/owner/repo/pull/1";
+    for (const [ledgerPr, reportPr] of [
+      ["https://github.com/owner/repo/pull/1not-a-pr", one],
+      ["https://github.com/owner/repo/pull/1%2Fnot-a-pr", one],
+      [one, "https://github.com/owner/repo/pull/1not-a-pr"],
+      [PR_A, "https://github.com/owner/repo/pull/420"],
+      [PR_A, "https://github.com/owner/other-repo/pull/42"],
+    ]) {
+      h.puts.length = 0; h.created.length = 0; h.siblings.length = 0; h.objects.clear(); h.gets.length = 0; h.warns.length = 0;
+      h.siblings.push(CD);
+      unified({ prUrl: ledgerPr, handoff: ["Enable the flag"], unmerged: { commits: ["a1b2c3d"] } });
+      const r = result(await shipReport({ pr_url: reportPr }));
+      expect(r.status, `${ledgerPr} / ${reportPr}`).toBe("complete");
+      expect("followUps" in record(), `${ledgerPr} / ${reportPr}`).toBe(false);
+      expect(h.created).toHaveLength(0);
+      expect(h.warns.join("\n")).toMatch(/treated as no ledger/);
+    }
+  });
+
+  it("(h) R3-F3: a unified ledger with NO prUrl is not a wildcard - a follow-up CD naming a PR derives nothing from it", async () => {
+    h.siblings.push(CD);
+    unified({ unmerged: { commits: ["old-unmerged"] }, handoff: ["Stale console step"] });
+    const r = result(await shipReport({ pr_url: "https://github.com/owner/repo/pull/99" }));
+    expect(r.status).toBe("complete");
+    expect("followUps" in record()).toBe(false);
+    expect(h.created).toHaveLength(0);
+    expect(transitioned()).toBe(true);
+    expect(gotKeys()).toEqual([CD_LEDGER_TICKET_KEY, CD_LEDGER_KEY]);
+    expect(h.warns.join("\n")).toMatch(/names no prUrl/);
+  });
+
+  it("(h2) R3-F3: an anonymous unified ledger IS adopted on deploy evidence - its executionId or mergeCommit is the one reported - and only then", async () => {
+    const cases = [
+      ["executionId", { executionId: EXEC_ID }, true],
+      ["execution_id", { execution_id: EXEC_ID.toUpperCase() }, true],
+      ["mergeCommit", { mergeCommit: MERGE_COMMIT }, true],
+      ["another executionId", { executionId: "ffffffff-1234-4f56-89ab-cdef01234567" }, false],
+      ["another mergeCommit", { mergeCommit: "1111111111" }, false],
+    ];
+    for (const [label, fields, adopts] of cases) {
+      h.puts.length = 0; h.created.length = 0; h.siblings.length = 0; h.objects.clear(); h.gets.length = 0; h.warns.length = 0;
+      h.siblings.push(CD);
+      unified({ ...fields, handoff: ["Enable the flag"] });
+      const r = result(await shipReport({ pr_url: PR_B }));
+      expect(r.status, label).toBe("complete");
+      expect("followUps" in record(), label).toBe(adopts);
+      expect(h.created, label).toHaveLength(adopts ? 1 : 0);
+      if (!adopts) expect(h.warns.join("\n"), label).toMatch(/names no prUrl/);
+    }
+  });
+
+  it("(h3) R3-F3: a ledger that names ANOTHER PR is a mismatch even when its executionId is the one reported", async () => {
+    h.siblings.push(CD);
+    unified({ prUrl: PR_A, executionId: EXEC_ID, handoff: ["Enable the flag"] });
+    const r = result(await shipReport({ pr_url: PR_B }));
+    expect(r.status).toBe("complete");
+    expect("followUps" in record()).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/treated as no ledger/);
+  });
+
+  for (const [label, body] of [["null", "null"], ["an array", "[]"], ["a number", "7"], ["a string", "\"x\""]]) {
+    it(`(i) R3-F4: a per-ticket ledger whose body is ${label} is UNREADABLE, not absent - refused naming that key, no fall-through`, async () => {
+      h.siblings.push(CD);
+      h.objects.set(CD_LEDGER_TICKET_KEY, body);
+      unified({ prUrl: PR_A, handoff: ["Enable the flag"] });
+      const r = result(await shipReport({ pr_url: PR_A }));
+      expect(r.ok, label).toBe(false);
+      expect(r.reason, label).toBe("cd_ledger_unreadable");
+      expect(r.message).toContain(CD_LEDGER_TICKET_KEY);
+      expect(r.message).not.toContain(`(${CD_LEDGER_KEY})`);
+      expect(gotKeys(), label).toEqual([CD_LEDGER_TICKET_KEY]);
+      expect(wroteRecord()).toBe(false);
+      expect(transitioned()).toBe(false);
+      expect(calls("Tickets___get_issue")).toHaveLength(0);
+      expect(h.created).toHaveLength(0);
+    });
+  }
+
+  it("(i2) R3-F4: a unified ledger whose body is null is UNREADABLE too", async () => {
+    h.siblings.push(CD);
+    h.objects.set(CD_LEDGER_KEY, "null");
+    const r = result(await shipReport({ pr_url: PR_A }));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("cd_ledger_unreadable");
+    expect(r.message).toContain(CD_LEDGER_KEY);
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
   });
 });
 
