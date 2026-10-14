@@ -145,8 +145,9 @@ vi.mock("@aws-sdk/client-s3", () => ({
         : key === "config/workflows.json" ? (h.state.workflowsConfig || h.state.s3WorkflowsConfig)
         // CD registry: the fixtures' repo (o/r) is registered, so the ship phase
         // these suites exercise is in force (an unregistered repo is HANDOFF —
-        // no ship phase at all; covered by cd-handoff.test.mjs).
-        : key === "config/cd-registry.json" ? { version: 1, repos: [{ repo: "o/r" }] }
+        // no ship phase at all; covered by cd-handoff.test.mjs). TEAM-6075: o/my.repo
+        // is registered too, so the dotted-repo-name gate test reaches the merge gate.
+        : key === "config/cd-registry.json" ? { version: 1, repos: [{ repo: "o/r" }, { repo: "o/my.repo" }] }
         : null;
       if (!body) throw new Error("NoSuchKey");
       return { Body: { transformToString: async () => JSON.stringify(body) } };
@@ -1043,6 +1044,39 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     expect(h.state.storeCompletions.length).toBe(0);
     expect(global.fetch.mock.calls.some((c) => decodeURIComponent(String(c[0])).includes("/repos/o/r2/pulls/34"))).toBe(true);
     expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${R2}`))).toBe(true);
+    error.mockRestore();
+  });
+
+  // TEAM-6075 — review round 2 of #928: dotted repo names reach GitHub whole, and a
+  // non-string completions pr_url on one ticket must not disable the gate for the rest.
+  it("TEAM-6075: dotted repo config url → merge probe and follow-up fetch hit /repos/o/my.repo/…, open follow-up refuses", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const DOTTED = "https://github.com/o/my.repo/pull/12";
+    h.state.snapshots = [FU_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...SHIP_TASKS, "B-6": { ticketId: "B-6", output: "fix PR opened", prUrl: DOTTED } } };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, 12: fuPr() } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF, repoConfig: { layout: "multi-repo", repos: [{ platform: "backend", url: "https://github.com/o/my.repo.git", defaultBranch: "main" }] } });
+    const urls = global.fetch.mock.calls.map((c) => decodeURIComponent(String(c[0])));
+    expect(urls.some((u) => u.includes("/repos/o/my.repo/pulls?"))).toBe(true);
+    expect(urls.some((u) => u.includes("/repos/o/my.repo/pulls/12"))).toBe(true);
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${DOTTED}`))).toBe(true);
+    error.mockRestore();
+  });
+
+  it("TEAM-6075: non-string completions pr_url on one ticket → another ticket's open follow-up still refuses", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    const PR13 = "https://github.com/o/r/pull/13";
+    h.state.snapshots = [[...FU_CHILDREN, { ticketId: "B-7", assignee: "agentcore_hub_bug_fixer", type: "task", status: "done", phase: "development" }]];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...FU_TASKS, "B-7": { ticketId: "B-7", output: "second fix", prUrl: PR13 } } };
+    // A one-element array stringifies to a PR URL, which is what made `.trim()` throw.
+    h.state.s3Completions["completions/B-6.json"] = { ticket_id: "B-6", summary: "x", pr_url: [FU_URL] };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, 12: fuPr({ state: "closed", merged_at: "2026-09-03T10:00:00Z" }), 13: fuPr({ number: 13, head: { ref: "fix/B-7" } }) } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${PR13}`))).toBe(true);
     error.mockRestore();
   });
 

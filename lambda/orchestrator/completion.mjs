@@ -22,6 +22,7 @@
  * fixes with their originating upstream phase, so a ship-review fix filed against
  * a dev still gates the SHIP phase), else the assignee's roster phase.
  */
+import { parseGitHubUrl } from "./repo-check.mjs";
 
 /**
  * TEAM-4121 FR-8 — PARITY MIRROR of FIX_KINDS in lambda/orchestrator/fix-contract.mjs
@@ -844,11 +845,11 @@ function shortHash(s) {
   return h.toString(16).padStart(8, "0");
 }
 
-/** TEAM-6062 — every configured GitHub repo with its own default branch (same url rule as parseRepoUrl). */
+/** TEAM-6062 — every configured GitHub repo with its own default branch (TEAM-6075: one parser, shared with parseRepoUrl). */
 export function repoTargets(repoConfig) {
   return (repoConfig?.repos || []).flatMap((r) => {
-    const m = String(r?.url || "").match(/github\.com[:/]([^/]+)\/([^/.]+)/);
-    return m ? [{ owner: m[1], repo: m[2], defaultBranch: r.defaultBranch || "main" }] : [];
+    const m = parseGitHubUrl(r?.url);
+    return m ? [{ ...m, defaultBranch: r.defaultBranch || "main" }] : [];
   });
 }
 
@@ -861,7 +862,8 @@ export function followUpPrRefs(agentTasks, repos, records = {}) {
   const refs = new Map();
   for (const [tid, e] of Object.entries(agentTasks || {})) {
     for (const url of [records?.[tid]?.pr_url, e?.prUrl]) {
-      const m = String(url || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+      if (typeof url !== "string") continue; // TEAM-6075: a non-string record pr_url must not disable the gate
+      const m = url.match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
       const r = m && [].concat(repos).find((x) => m[1].toLowerCase() === String(x?.owner).toLowerCase() && m[2].toLowerCase() === String(x?.repo).toLowerCase());
       const key = r && `${r.owner}/${r.repo}#${m[3]}`.toLowerCase();
       if (r && !refs.has(key)) refs.set(key, { owner: r.owner, repo: r.repo, defaultBranch: r.defaultBranch, number: Number(m[3]), url: url.trim() });
@@ -902,7 +904,8 @@ export async function openFollowUpPrs({ owner, repo, refs, featureBranch, defaul
  * open follow-up PRs into the default branch. Fail-open: an unreadable PR or a
  * thrown probe never refuses. `repoRef()` returns `[{ owner, repo, defaultBranch }]`
  * (may throw); `readCompletionRecord(ticketId)` is read only past the merge check
- * and a null/failed read falls back to the cached `prUrl` (TEAM-6062).
+ * and a null/failed read falls back to the cached `prUrl` (TEAM-6062): one record
+ * read per ticket per completion attempt, memoized per invocation by the caller.
  */
 export async function followUpPrGate({ workflow, agentTasks, mergeProof, repoRef = () => repoTargets(workflow.repoConfig), readCompletionRecord = async () => null, getAgentPhase, api, warn = console.warn }) {
   try {
