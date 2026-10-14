@@ -1441,12 +1441,23 @@ def _scripted_model(steps: list[Any]) -> Any:
         def __init__(self) -> None:
             super().__init__()
             self.calls = 0
+            # TEAM-5999 F3: the history each call was handed, so a test can prove
+            # the retried call saw the toolResult rather than trusting the script.
+            self.seen: list[list[dict]] = []
 
-        async def stream(self, *args: Any, **kwargs: Any):
+        async def stream(self, messages: Any = None, *args: Any, **kwargs: Any):
+            import copy
+
             step = steps[min(self.calls, len(steps) - 1)]
             self.calls += 1
+            self.seen.append(copy.deepcopy(messages) if messages is not None else [])
             if isinstance(step, BaseException):
                 raise step
+            if inspect.iscoroutinefunction(step):
+                # TEAM-5999 F1: a model call that never answers — cancelled from
+                # outside, or it never returns at all.
+                await step()
+                return
             yield {"messageStart": {"role": "assistant"}}
             if step == "tool":
                 yield {"contentBlockStart": {"start": {"toolUse": {
@@ -1681,3 +1692,371 @@ async def test_team5976_a_comment_error_string_is_logged(caplog) -> None:
         for r in caplog.records
     ), [r.getMessage() for r in caplog.records]
     assert len(deaths) == 1 and len(ns["_test_resumes"]) == 1
+
+
+# ─── 8. TEAM-5999: the round-2 review findings on the TEAM-5976 retry ─────────
+#
+# F1 — once the outage clock is armed, an attempt that HANGS is cut at the
+# deadline (not at botocore's 1200s read_timeout, times the attempt cap), the
+# heartbeat stops with it, and the cut ends the turn on the transient-exhaustion
+# path. F2 — the death path hands its claim generation to the resume write. F3 —
+# the real-agent retry test proves the retried model call saw the toolResult.
+# F4 — a partial already flushed to DDB is DELETED by the rollback.
+
+
+async def _drain(agen: Any) -> list[dict]:
+    return [f async for f in agen]
+
+
+async def _run_or_fail(agen: Any, timeout: float = 5.0) -> Any:
+    """The turn as a task under a hard guard. A turn still running after `timeout`
+    is the base-branch defect (a hung attempt nobody cuts), so it is cancelled and
+    reported as a failure instead of hanging the suite. Returns the finished task;
+    read `.result()` / `.exception()`."""
+    import asyncio
+
+    task = asyncio.ensure_future(_drain(agen))
+    done, _ = await asyncio.wait({task}, timeout=timeout)
+    if not done:
+        task.cancel()
+        try:
+            await task
+        except BaseException:  # noqa: BLE001 — the cancel is the point
+            pass
+        pytest.fail(f"the turn was still running after {timeout}s — the hung attempt was never cut")
+    return task
+
+
+GEN = "2026-10-14T10:00:00.000Z"
+
+
+@pytest.mark.asyncio
+async def test_team5999_a_hung_retry_attempt_is_cut_at_the_outage_deadline() -> None:
+    """The defect: `remaining` was computed only in the except block, so a retry
+    attempt that never yielded was bounded by botocore's 1200s read_timeout alone,
+    and the in-flight heartbeat renewed the lease for the whole hang. Once the
+    outage clock is armed each attempt is cut at the deadline, the heartbeat stops
+    with it, and the cut is exhaustion: one agent.error, one death with
+    reason=transient_exhaustion, the resume object written first."""
+    import asyncio
+
+    hang = asyncio.Event()
+
+    async def _hang_forever(agent: Any) -> None:
+        await hang.wait()
+
+    puts: list[dict] = []
+    ns, agent_cls, errors, deaths = _load(
+        [
+            [EventStreamError("stream closed")],  # failure 1 arms the clock
+            [_model_call_starts, _hang_forever],  # the retry never yields
+        ],
+        _ddb_events_client=SimpleNamespace(put_item=lambda **kw: puts.append(kw)),
+    )
+    ns["_STREAM_RETRY_DEADLINE_S"] = 0.3
+    ns["_STREAM_RETRY_INFLIGHT_HEARTBEAT_S"] = 0.02
+    ns["_stream_heartbeat_wait"] = asyncio.sleep  # real, tiny: beats accumulate during the hang
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    task = await _run_or_fail(ns["_run_agent_invocation"](PAYLOAD, CTX))
+
+    elapsed = loop.time() - started
+    exc = task.exception()
+    assert isinstance(exc, ns["StreamRetryDeadlineExceeded"]), repr(exc)
+    assert isinstance(exc, TimeoutError), "the cut must read as a timeout to every classifier"
+    assert elapsed < 2.0, f"the cut must land near the 0.3s deadline; took {elapsed:.2f}s"
+    (agent,) = agent_cls.instances
+    assert agent.attempts == 2, f"the hung attempt is the last; got {agent.attempts}"
+    beats = len(_detail_rows(puts, "heartbeat"))
+    assert beats >= 1, "the quiet in-flight call must have beaten before the cut"
+    await asyncio.sleep(0.1)
+    assert len(_detail_rows(puts, "heartbeat")) == beats, "the heartbeat kept beating after the cut"
+    assert _pending_tasks() == [], "the heartbeat task outlived the turn"
+    assert _inflight_hook(agent).inflight is False
+    assert len(errors) == 1 and "StreamRetryDeadlineExceeded" in errors[0][0][2], errors
+    assert len(deaths) == 1 and deaths[0][1].get("reason") == "transient_exhaustion", deaths
+    assert ns["_test_log"] == ["comment", "error", "resume", "died"], ns["_test_log"]
+    (comment,) = ns["_test_comments"]
+    assert "StreamRetryDeadlineExceeded" in comment["comment"], comment["comment"]
+
+
+@pytest.mark.asyncio
+async def test_team5999_progress_inside_a_bounded_attempt_lifts_the_bound() -> None:
+    """Regression guard for the re-arm: a bounded attempt that COMPLETES a message
+    is progress, so the rest of that attempt is no longer under the outage
+    deadline — a slow but healthy continuation must not be cut."""
+    import asyncio
+
+    message = {"message": {"role": "assistant", "content": [{"text": "x"}]}}
+
+    async def _slow(agent: Any) -> None:
+        await asyncio.sleep(0.5)  # longer than the whole deadline
+
+    ns, agent_cls, errors, deaths = _load([
+        [EventStreamError("stream closed")],
+        [message, _slow, {"data": "ok"}, _engage_completion],
+    ])
+    ns["_STREAM_RETRY_DEADLINE_S"] = 0.3
+
+    task = await _run_or_fail(ns["_run_agent_invocation"](PAYLOAD, CTX))
+
+    assert _deltas(task.result()) == ["ok"]
+    assert agent_cls.instances[0].attempts == 2
+    assert errors == [] and deaths == []
+
+
+@pytest.mark.asyncio
+async def test_team5999_real_agent_deadline_cut_leaves_history_consistent() -> None:
+    """Through a REAL strands Agent: a tool cycle completes, the next model call
+    hangs, the deadline cuts it. strands commits an assistant message only after
+    the stream's stop, and `_run_loop`'s finally runs conversation management on
+    any unwind, so the cut must leave history exactly as a botocore ReadTimeout
+    does today — toolResult last, no partial — with the task's cancellation
+    consumed by the timeout (strands must not swallow the CancelledError) and the
+    Agent still usable afterwards."""
+    import asyncio
+    import json
+
+    import strands
+
+    hang = asyncio.Event()
+
+    async def _hang_forever() -> None:
+        await hang.wait()
+
+    class _RecordingAgent(strands.Agent):
+        instances: list[Any] = []
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            type(self).instances.append(self)
+
+    _RecordingAgent.instances = []
+    # Call 1 asks for the tool, call 2 breaks (arms the outage clock), call 3 —
+    # the retry — hangs and is cut; call 4 is the manual re-entry below.
+    model = _scripted_model(
+        ["tool", EventStreamError("stream closed after the tool"), _hang_forever, "done"]
+    )
+    ns, _unused, errors, deaths = _load(
+        [[]], Agent=_RecordingAgent, json=json, _build_bedrock_model=lambda model_id: model,
+    )
+    ns["_STREAM_RETRY_DEADLINE_S"] = 0.3
+
+    task = await _run_or_fail(ns["_run_agent_invocation"](UNBOUND, CTX))
+
+    exc = task.exception()
+    assert isinstance(exc, ns["StreamRetryDeadlineExceeded"]), repr(exc)
+    assert asyncio.current_task().cancelling() == 0, (
+        "the timeout did not consume its own cancel — strands swallowed the CancelledError"
+    )
+    assert _pending_tasks() == []
+    (agent,) = _RecordingAgent.instances
+    roles = [m["role"] for m in agent.messages]
+    assert roles == ["user", "assistant", "user"], f"a partial leaked into history: {roles}"
+    assert any(
+        c.get("toolResult", {}).get("toolUseId") == "tu-e2e"
+        for c in agent.messages[-1]["content"] if isinstance(c, dict)
+    ), agent.messages[-1]
+    assert model.calls == 3, f"tool, break, hung retry; got {model.calls}"
+    assert model.seen[2] == model.seen[1], "the hung retry was handed a different history"
+    assert len(errors) == 1
+
+    # Still usable: the same Agent, re-entered with [], completes on that history.
+    frames = [e async for e in agent.stream_async([])]
+    assert frames and model.calls == 4
+    assert model.seen[3] == model.seen[2], "the re-entry must see the same history again"
+    assert [m["role"] for m in agent.messages] == ["user", "assistant", "user", "assistant"]
+    assert agent.messages[-1]["content"][0]["text"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_team5999_the_death_path_hands_the_claim_generation_to_the_resume_write() -> None:
+    """F2: the resume write is fenced on the claim generation, which only the
+    turn's `finally` knows (`_CURRENT_CLAIM_STARTED_AT` from the dispatch
+    payload) — so the write site must pass it, as the death publish already does."""
+    ns, agent_cls, errors, deaths = _load([[ServiceUnavailableException("unavailable")]])
+    ns["_STREAM_RETRY_MAX_ATTEMPTS"] = 1
+
+    with pytest.raises(ServiceUnavailableException):
+        async for _ in ns["_run_agent_invocation"]({**PAYLOAD, "claim_started_at": GEN}, CTX):
+            pass
+
+    (resume,) = ns["_test_resumes"]
+    assert resume[1]["claim_started_at"] == GEN, resume
+    assert deaths[0][1]["claim_started_at"] == GEN
+
+
+@pytest.mark.asyncio
+async def test_team5999_the_retried_model_call_sees_the_tool_result() -> None:
+    """F3: the scripted model ignores history, so the TEAM-5976 real-agent test
+    could not tell a retry that re-sent the prompt (or dropped the toolResult)
+    from a correct one. Pin it on the real stack: the tool ran exactly once, the
+    retried call was handed the identical history ending in that toolResult, and
+    the Agent's own history is one prompt, one tool cycle, one reply."""
+    import json
+
+    from botocore.exceptions import ReadTimeoutError as BotoReadTimeoutError
+    import strands
+    from strands import tool
+
+    tool_calls: list[str] = []
+
+    @tool
+    def claude_code(task: str) -> str:
+        """Counting stub of the claude_code delegation tool."""
+        tool_calls.append(task)
+        return "stub-result"
+
+    class _RecordingAgent(strands.Agent):
+        instances: list[Any] = []
+
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            type(self).instances.append(self)
+
+    _RecordingAgent.instances = []
+    model = _scripted_model(
+        ["tool", BotoReadTimeoutError(endpoint_url="https://bedrock-runtime"), "done"]
+    )
+    ns, _unused, errors, deaths = _load(
+        [[]], Agent=_RecordingAgent, json=json, random=_CeilingRandom(),
+        _build_bedrock_model=lambda model_id: model, claude_code=claude_code,
+    )
+    ns["_STREAM_RETRY_BASE_S"] = 1.0
+
+    frames = [f async for f in ns["_run_agent_invocation"](UNBOUND, CTX)]
+
+    assert tool_calls == ["look"], f"the tool must run exactly once; got {tool_calls}"
+    assert model.calls == 3 and _deltas(frames) == ["done"]
+    assert model.seen[2] == model.seen[1], (
+        "the retried model call must be handed the SAME history as the call that broke"
+    )
+    last = model.seen[2][-1]
+    assert last["role"] == "user" and any(
+        c.get("toolResult", {}).get("toolUseId") == "tu-e2e" for c in last["content"] if isinstance(c, dict)
+    ), f"the retried call did not see the toolResult: {last}"
+    (agent,) = _RecordingAgent.instances
+    assert [m["role"] for m in agent.messages] == ["user", "assistant", "user", "assistant"]
+    assert any(
+        c.get("toolResult", {}).get("toolUseId") == "tu-e2e"
+        for c in agent.messages[2]["content"] if isinstance(c, dict)
+    )
+    assert _prompt_copies(agent, UNBOUND["prompt"]) == 1
+    assert errors == []
+
+
+# F4 — the rollback reaches the rows already flushed to DDB.
+
+
+def _ddb_recorder() -> tuple[Any, list[dict], list[dict]]:
+    puts: list[dict] = []
+    deletes: list[dict] = []
+    client = SimpleNamespace(
+        put_item=lambda **kw: puts.append(kw),
+        delete_item=lambda **kw: deletes.append(kw),
+    )
+    return client, puts, deletes
+
+
+def _row_key(put: dict) -> tuple[str, str]:
+    return put["Item"]["workflowId"]["S"], put["Item"]["eventId"]["S"]
+
+
+def _surviving_text(puts: list[dict], deletes: list[dict]) -> str:
+    """What every stored-stream reader (agent-output route, lastStreamedText, the
+    dossier) sees: the text rows that still exist, concatenated in order."""
+    gone = {(d["Key"]["workflowId"]["S"], d["Key"]["eventId"]["S"]) for d in deletes}
+    return "".join(
+        p["Item"]["detail"]["M"]["content"]["S"]
+        for p in puts
+        if p["Item"]["type"]["S"] == "agent.streaming"
+        and p["Item"]["detail"]["M"].get("type", {}).get("S") == "text"
+        and p["Item"]["detail"]["M"].get("retryBackoff", {}).get("S") != "true"
+        and _row_key(p) not in gone
+    )
+
+
+@pytest.mark.asyncio
+async def test_team5999_a_flushed_partial_is_deleted_from_ddb_on_rollback() -> None:
+    """The defect: TEAM-5976 F5 rolled the partial out of final_text and the
+    UNFLUSHED buffer, but a partial past the 200-char flush threshold was already
+    a DDB row, so every stored-stream reader showed it twice. The rollback now
+    deletes the rows it flushed since the last completed message."""
+    client, puts, deletes = _ddb_recorder()
+    ns, agent_cls, errors, deaths = _load(
+        [
+            [{"data": "A" * 250}, EventStreamError("stream closed")],
+            [{"data": "B" * 250}, _engage_completion],
+        ],
+        _ddb_events_client=client,
+    )
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+
+    assert _deltas(frames) == ["A" * 250, NOTICE, "B" * 250]
+    assert _surviving_text(puts, deletes) == "B" * 250, (
+        f"the stored stream still holds the partial: {len(_surviving_text(puts, deletes))} chars"
+    )
+    [a_row] = [p for p in puts if p["Item"]["detail"]["M"].get("content", {}).get("S") == "A" * 250]
+    assert len(deletes) == 1, deletes
+    assert deletes[0]["TableName"] == "test-events"
+    assert (deletes[0]["Key"]["workflowId"]["S"], deletes[0]["Key"]["eventId"]["S"]) == _row_key(a_row)
+    assert ns["_test_saved"][-1][-1] == "B" * 250
+    assert errors == [] and deaths == []
+
+
+@pytest.mark.asyncio
+async def test_team5999_rows_of_a_completed_message_survive_the_rollback() -> None:
+    """Only the broken attempt's rows go: text strands already committed (here,
+    before a tool cycle) stays in DDB exactly as it stays in the reply."""
+    client, puts, deletes = _ddb_recorder()
+    ns, agent_cls, errors, deaths = _load(
+        [
+            [
+                {"data": "X" * 250},
+                {"message": {"role": "assistant", "content": [{"text": "X" * 250}]}},
+                _tool_cycle_closed,
+                {"data": "Y" * 250},
+                EventStreamError("stream closed after the cycle"),
+            ],
+            [{"data": "Z"}, _engage_completion],
+        ],
+        _ddb_events_client=client,
+    )
+
+    frames = [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+
+    assert _deltas(frames) == ["X" * 250, "Y" * 250, NOTICE, "Z"]
+    assert _surviving_text(puts, deletes) == "X" * 250 + "Z"
+    [y_row] = [p for p in puts if p["Item"]["detail"]["M"].get("content", {}).get("S") == "Y" * 250]
+    assert [(d["Key"]["workflowId"]["S"], d["Key"]["eventId"]["S"]) for d in deletes] == [_row_key(y_row)]
+    assert errors == [] and deaths == []
+
+
+@pytest.mark.asyncio
+async def test_team5999_a_row_never_straddles_a_completed_message() -> None:
+    """A message boundary flushes the buffer, so no DDB row can hold the tail of a
+    committed message AND the head of the next one — otherwise the rollback could
+    neither delete that row (it would lose committed text) nor keep it (it holds
+    a partial). Here nothing past the boundary ever reached DDB, so nothing is
+    deleted and the stored stream is still exact."""
+    client, puts, deletes = _ddb_recorder()
+    ns, agent_cls, errors, deaths = _load(
+        [
+            [
+                {"data": "X" * 150},
+                {"message": {"role": "assistant", "content": [{"text": "X" * 150}]}},
+                {"data": "Y" * 100},
+                EventStreamError("stream closed"),
+            ],
+            [{"data": "Z"}, _engage_completion],
+        ],
+        _ddb_events_client=client,
+    )
+
+    [f async for f in ns["_run_agent_invocation"](PAYLOAD, CTX)]
+
+    assert _surviving_text(puts, deletes) == "X" * 150 + "Z"
+    assert deletes == [], "the partial never reached DDB, so there was nothing to delete"
+    assert errors == [] and deaths == []

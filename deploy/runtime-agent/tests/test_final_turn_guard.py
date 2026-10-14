@@ -27,7 +27,7 @@ import pytest
 
 from test_agent_died import _hook, _transition
 from test_stream_retry import _flaky_agent_class
-from test_telemetry_spans import _load_production_entrypoints
+from test_telemetry_spans import MAIN_PY, _load_production_entrypoints
 
 CTX = SimpleNamespace(session_id="test-session-final-turn")
 TICKET = "TEAM-5696"
@@ -65,10 +65,12 @@ class _Tickets:
     def __init__(self, parent_type: str = "Epic", create_ok: bool = True,
                  transition_text: Any = '{"key": "%s", "status": "transitioned"}' % TICKET,
                  issue_ok: bool = True, children: list[dict] | None = None,
-                 status: str | None = None) -> None:
+                 status: str | None = None, comment_ok: bool = True) -> None:
         self.calls: list[tuple[str, dict]] = []
         self._parent_type = parent_type
         self._create_ok = create_ok
+        # TEAM-5999: the ticket tools report a failed comment by RETURNING "Error: …".
+        self._comment_ok = comment_ok
         self._transition_texts = (list(transition_text) if isinstance(transition_text, list)
                                   else [transition_text])
         self._issue_ok = issue_ok
@@ -109,6 +111,8 @@ class _Tickets:
 
     def add_comment(self, ticket_id: str, comment: str) -> str:
         self.calls.append(("add_comment", {"ticket_id": ticket_id, "comment": comment}))
+        if not self._comment_ok:
+            return "Error: comment refused"
         return json.dumps({"ok": True})
 
     def of(self, name: str) -> list[dict]:
@@ -904,3 +908,51 @@ async def test_the_invocation_passes_its_runtime_session_to_the_token() -> None:
     _fail_closed_ns(direct)["_harness_fail_closed"](
         BOUND["workflow_id"], BOUND["agent_id"], TICKET, "prose", session_id=CTX.session_id)
     assert created.get("client_token") and created["client_token"] == _tokens(direct)[0]
+
+
+# ─── TEAM-5999 F5: the orphan annotation reads the tool's error STRING ─────────
+#
+# `_annotate` dropped `Tickets___add_comment`'s return, so a comment the Lambda
+# refused ("Error: …", never an exception) looked like a success. Its sibling
+# `_comment_transient_exhaustion` already checked the string (TEAM-5976 F7); both
+# now go through ONE helper.
+
+
+@pytest.mark.asyncio
+async def test_team5999_an_annotate_error_string_is_logged(caplog) -> None:
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        out = await _run([PROSE, PROSE], tickets=_Tickets(transition_text=REFUSED, comment_ok=False))
+    tickets = out["tickets"]
+    assert len(tickets.of("add_comment")) == 1, "the orphan escalation is still annotated once"
+    assert any(
+        "annotate" in r.getMessage() and ESCALATION in r.getMessage() and "comment refused" in r.getMessage()
+        for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+    assert len(out["deaths"]) == 1 and _parks(tickets) == [], "exactly one outcome: the death"
+
+
+def test_team5999_tool_error_reads_only_the_error_string() -> None:
+    ns = _load_production_entrypoints()
+    assert ns["_tool_error"]("Error: 'body' is required") == "Error: 'body' is required"
+    assert ns["_tool_error"]("Error") == "Error"
+    for ok in ('{"ok": true}', "transitioned", "", None, {"status": "ok"}, "status precondition failed"):
+        assert ns["_tool_error"](ok) == "", f"{ok!r} is not a tool error string"
+
+
+def test_team5999_both_comment_sites_share_the_error_helper() -> None:
+    """One reader for the tools' failure convention, not two inline copies — a
+    third site that forgets the check should have one obvious thing to call."""
+    import ast
+
+    tree = ast.parse(MAIN_PY.read_text())
+    wanted = {"_annotate", "_comment_transient_exhaustion", "_tool_error"}
+    found = {n.name: n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef) and n.name in wanted}
+    assert set(found) == wanted, f"missing: {wanted - set(found)}"
+    for name in ("_annotate", "_comment_transient_exhaustion"):
+        src = ast.unparse(found[name])
+        assert "_tool_error(" in src, f"{name} does not use the shared helper"
+        assert "startswith('Error')" not in src and 'startswith("Error")' not in src, (
+            f"{name} still checks the string inline"
+        )
