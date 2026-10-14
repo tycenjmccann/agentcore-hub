@@ -417,11 +417,31 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
   it("report_completion reads the follow-up CD's own ledger first, unified only on a prUrl match (TEAM-6149)", () => {
     const rm = read("release-manager");
     const ledger = section(rm, "#### The CD ledger", "1. **Preflight:**");
-    expect(ledger).toContain("reads your `cd-ledger-<CD ticket id>.json` first and falls back to `shared/cd-ledger.json` only when its `prUrl` is your `pr_url`");
+    expect(ledger).toContain("reads your `cd-ledger-<CD ticket id>.json` first and falls back to `shared/cd-ledger.json` only when its `prUrl` is the same PR as your `pr_url`");
     expect(ledger).toContain("`pr_url=<the follow-up PR>`");
     expect(rm).not.toContain("which probes only `shared/cd-ledger.json`");
     expect(ARCH).toContain("`cd-ledger-<ticket_id>.json` first, then `cd-ledger.json` only when its `prUrl` matches the report's `pr_url`");
     expect(ARCH).not.toContain("carries no `handoff[]` / `unmerged`");
+  });
+
+  // TEAM-6154 (ship review r3 of #954): the TEAM-6149 match was a string compare (a
+  // different host/owner/repo case or a #fragment on the unified CD's OWN PR dropped
+  // its handoffs), a prUrl-less unified ledger matched every report (a follow-up CD
+  // re-derived the unified deploy's stale unmerged), and a `null` body read as 404.
+  // The blueprint and the architecture record state the ownership rule, not the
+  // string rule, and the non-object-body refusal.
+  it("the unified-ledger fallback is canonical PR identity or deploy evidence, and a non-object body refuses (TEAM-6154)", () => {
+    const rm = read("release-manager");
+    const ledger = section(rm, "#### The CD ledger", "1. **Preflight:**");
+    expect(ledger).toContain("owner/repo case-insensitive, same number");
+    expect(ledger).toContain("or when it names no `prUrl` but its `executionId` / `mergeCommit` is the one you report");
+    expect(ledger).toContain("a `prUrl`-less ledger nothing ties to your report, is no ledger");
+    expect(ledger).toContain("or whose body is not a JSON object, refuses the report");
+    expect(ledger).not.toContain("(or no `pr_url` was passed); a mismatch is no ledger");
+    expect(ARCH).toContain("by canonical PR identity (owner/repo case-insensitive + number, via a byte-mirror of the orchestrator's `githubPrRef` in `lambda/workflow-output/github-pr-ref.mjs`, parity-pinned)");
+    expect(ARCH).toContain("a `prUrl`-less ledger nothing ties to the report derives nothing (source `anonymous`)");
+    expect(ARCH).toContain("including a body that exists but is not a JSON object (`null`, an array, a scalar) - refuses the report");
+    expect(ARCH).not.toContain("(trim and trailing slash normalized)");
   });
 
   it("qa-verifier treats a post-merge fix delivered only on its follow-up CD merge_commit", () => {

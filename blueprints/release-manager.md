@@ -804,10 +804,15 @@ triggered yet) is the FIRST thing you do on EVERY invocation of the CD ticket.
   terminal and passes `pipeline_name` on `report_completion` with
   `merge_commit`, outcome and `pr_url=<the follow-up PR>`, exactly as below.
   `report_completion` reads your `cd-ledger-<CD ticket id>.json` first and
-  falls back to `shared/cd-ledger.json` only when its `prUrl` is your `pr_url`
-  (or no `pr_url` was passed); a mismatch is no ledger, and a key it cannot
-  read refuses the report (`cd_ledger_unreadable`, naming that key). The
-  legacy check HEADs the same two keys in the same order.
+  falls back to `shared/cd-ledger.json` only when its `prUrl` is the same PR
+  as your `pr_url` (owner/repo case-insensitive, same number; host case,
+  `/files`, `?query` and `#fragment` do not matter), or when it names no
+  `prUrl` but its `executionId` / `mergeCommit` is the one you report (the
+  unified CD passes no `pr_url`, which also adopts). Another PR, or a
+  `prUrl`-less ledger nothing ties to your report, is no ledger; a key it
+  cannot read, or whose body is not a JSON object, refuses the report
+  (`cd_ledger_unreadable`, naming that key). The legacy check HEADs the same
+  two keys in the same order.
 - Legacy mode writes NO ledger. Its absence, together with passing no
   `pipeline_name`, is exactly how `report_completion` recognises a legacy
   DEPLOY.md ship and accepts `outcome="shipped"` with a merge commit and no
