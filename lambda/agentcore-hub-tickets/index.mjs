@@ -1058,6 +1058,12 @@ const TRANSITIONS = {
     { id: "block", name: "Request Changes", to: "blocked" },
   ],
   blocked: [
+    // TEAM-6147: a self-transition so transition_ticket(blocked, blocked_by=...) can ADD a
+    // blocker to a ticket that is already blocked (a follow-up chain link missing its
+    // predecessor edge). Pure blocker union: status is unchanged, so the orchestrator's
+    // stream handler ignores the MODIFY (no cascade), and nothing else in transitionIssue
+    // keys off a blocked->blocked move.
+    { id: "block", name: "Block", to: "blocked" },
     { id: "unblock", name: "Unblock", to: "todo" },
     { id: "ready", name: "Mark Ready", to: "ready" },
     { id: "start", name: "Start Progress", to: "in_progress" },
