@@ -644,6 +644,8 @@ async def test_a_deterministic_error_is_not_retried() -> None:
         f"to the claim; got {kwargs}"
     )
     assert "ValidationException" in args[2]
+    # TEAM-6044: a crash is not an exhaustion, so it carries no exhaustion stamp.
+    assert "reason" not in kwargs and "claim_started_at" not in kwargs, kwargs
     # FR-7 disjointness: a turn that published agent.error is NOT also a death.
     assert deaths == [], "agent.error and agent.died must be disjoint"
 
@@ -1043,6 +1045,10 @@ async def test_transient_exhaustion_publishes_one_error_then_death_with_resume()
     assert agent.attempts == ns["_STREAM_RETRY_MAX_ATTEMPTS"] == 10
     assert len(errors) == 1, f"exactly one agent.error; got {errors}"
     assert "10 attempt" in errors[0][0][2]
+    # TEAM-6044: the error carries the claim identity cost-report pairs it with
+    # the death by — their timestamp fractions are random, so order is not.
+    assert errors[0][1]["reason"] == "transient_exhaustion"
+    assert errors[0][1]["claim_started_at"] == "2026-10-14T12:00:00.000Z"
     assert len(deaths) == 1, f"exactly one agent.died; got {deaths}"
     args, kwargs = deaths[0]
     assert args[:3] == ("wf_retry", "agentcore_hub_backend_dev", "TEAM-4739")
