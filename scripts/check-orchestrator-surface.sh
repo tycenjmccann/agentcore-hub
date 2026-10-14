@@ -30,7 +30,7 @@ ORCH="lambda/orchestrator"
 MODULES_ALLOW="scripts/orchestrator-modules.allow"
 ENV_ALLOW="scripts/orchestrator-env.allow"
 # Budgets: actual + ~3% after the 2026-09 cleanup (PR 2). Lower freely; raise only with a DL entry.
-ORCH_LOC_BUDGET=12979
+ORCH_LOC_BUDGET=13054  # DL-038 (TEAM-6032): +75 for the open follow-up PR gate
 ORCH_INDEX_BUDGET=5175
 
 RULE="DL-009: the orchestrator is cascade/dispatch/claim/reaper/completion only.

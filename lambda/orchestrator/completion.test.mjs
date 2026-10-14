@@ -1893,3 +1893,83 @@ describe("featureBranchLanding — TEAM-5943 (tree-entry identity: mode + sha, n
     expect((await land([...SHAPE("vendor"), ...T({ vendor: { sha: "d1", mode: "040000", type: "tree" } }, { vendor: "v0" }, { vendor: "v1" }), LEGACY_CONTENTS])).merged).toBe(null);
   });
 });
+
+// TEAM-6032 (DL-038) — the open follow-up PR gate's pure pieces. Namespace import so a
+// tree without these exports fails only these tests, not the whole file.
+import * as completionMod from "./completion.mjs";
+
+describe("TEAM-6032 followUpPrRefs", () => {
+  it("one ref per PR number in the run's own repo; foreign repos and non-PR urls dropped", () => {
+    const refs = completionMod.followUpPrRefs({
+      a: { prUrl: "https://github.com/o/r/pull/12" },
+      b: { prUrl: "https://github.com/O/R/pull/12" },          // same PR, case-insensitive repo
+      c: { prUrl: "https://github.com/o/r/pull/9" },
+      d: { prUrl: "https://github.com/hub/agentcore-hub/pull/7" }, // hub-infra PR: other repo
+      e: { prUrl: "TBD" },
+      f: { output: "no pr" },
+    }, { owner: "o", repo: "r" });
+    expect(refs).toEqual([{ number: 12, url: "https://github.com/o/r/pull/12" }, { number: 9, url: "https://github.com/o/r/pull/9" }]);
+  });
+});
+
+describe("TEAM-6032 classifyFollowUpPr", () => {
+  const ctx = { featureBranch: "feature/E-1-x", defaultBranch: "main" };
+  const pr = (over) => ({ state: "open", head: { ref: "fix/a" }, base: { ref: "main" }, ...over });
+  it("open PR into the default branch → open", () => expect(completionMod.classifyFollowUpPr(pr(), ctx)).toBe("open"));
+  it("merged or closed-unmerged → closed", () => {
+    expect(completionMod.classifyFollowUpPr(pr({ state: "closed", merged_at: "t" }), ctx)).toBe("closed");
+    expect(completionMod.classifyFollowUpPr(pr({ state: "closed", merged_at: null }), ctx)).toBe("closed");
+  });
+  it("the unified PR (head = feature branch) → skip", () => expect(completionMod.classifyFollowUpPr(pr({ head: { ref: "feature/E-1-x" } }), ctx)).toBe("skip"));
+  it("a PR into the integration branch (pre-merge fix) → skip", () => expect(completionMod.classifyFollowUpPr(pr({ base: { ref: "feature/E-1-x" } }), ctx)).toBe("skip"));
+  it("missing shape → unknown", () => {
+    expect(completionMod.classifyFollowUpPr(null, ctx)).toBe("unknown");
+    expect(completionMod.classifyFollowUpPr({}, ctx)).toBe("unknown");
+  });
+});
+
+describe("TEAM-6032 openFollowUpPrs", () => {
+  it("returns open urls; a failed read is unknown, never open", async () => {
+    const byNo = { 1: { state: "open", head: { ref: "fix/a" }, base: { ref: "main" } }, 2: { state: "closed", merged_at: "t", head: { ref: "fix/b" }, base: { ref: "main" } } };
+    const api = async (path) => {
+      const n = path.split("/pulls/")[1];
+      if (n === "3") throw Object.assign(new Error("500"), { status: 500 });
+      return byNo[n];
+    };
+    const refs = [1, 2, 3].map((n) => ({ number: n, url: `u${n}` }));
+    const r = await completionMod.openFollowUpPrs({ owner: "o", repo: "r", refs, featureBranch: "feature/E-1-x", defaultBranch: "main", api });
+    expect(r).toEqual({ open: ["u1"], unknown: ["u3"] });
+  });
+});
+
+describe("TEAM-6032 completionBlockedNotice open_follow_up_pr", () => {
+  it("own slug, names the PRs and the remedy", () => {
+    const n = completionMod.completionBlockedNotice("open_follow_up_pr", "https://github.com/o/r/pull/12", {});
+    expect(n.slug).toBe("followup_pr");
+    expect(n.details).toContain("https://github.com/o/r/pull/12");
+    expect(n.details).toContain("CI → Ship → Merge Approval → CD");
+  });
+});
+
+describe("TEAM-6032 followUpPrGate", () => {
+  const OPEN = { state: "open", head: { ref: "fix/a" }, base: { ref: "main" } };
+  const wf = (agentTasks) => ({ id: "wf", featureBranch: "feature/E-1-x", repoConfig: { repos: [{ defaultBranch: "main" }] }, agentTasks });
+  const tasks = { S: { agentId: "rm", mergeCommit: "m1" }, F: { prUrl: "https://github.com/o/r/pull/12" } };
+  const base = { repoRef: () => ({ owner: "o", repo: "r" }), getAgentPhase: (id) => (id === "rm" ? "ship" : "development"), warn: () => {} };
+  it("unified PR merged (ship-phase mergeCommit) + open follow-up → returns it", async () => {
+    const open = await completionMod.followUpPrGate({ ...base, workflow: wf(tasks), agentTasks: tasks, mergeProof: null, api: async () => OPEN });
+    expect(open).toEqual(["https://github.com/o/r/pull/12"]);
+  });
+  it("not merged yet → never reads GitHub", async () => {
+    const t = { F: tasks.F };
+    let calls = 0;
+    const open = await completionMod.followUpPrGate({ ...base, workflow: wf(t), agentTasks: t, mergeProof: null, api: async () => (calls++, OPEN) });
+    expect([open, calls]).toEqual([[], 0]);
+  });
+  it("a throwing repoRef is fail-open with a warn", async () => {
+    const warns = [];
+    const open = await completionMod.followUpPrGate({ ...base, repoRef: () => { throw new Error("no repo"); }, warn: (m) => warns.push(m), workflow: wf(tasks), agentTasks: tasks, mergeProof: { merged: true }, api: async () => OPEN });
+    expect(open).toEqual([]);
+    expect(warns[0]).toContain("follow-up PR check skipped");
+  });
+});

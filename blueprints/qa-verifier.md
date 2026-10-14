@@ -186,6 +186,11 @@ live; treating a code-read or a mocked run as that proof is exactly the
   `## Branch` context names, e.g. `release/2.1`), which it passes instead: the
   integration branch is already merged, and a fix PR into it never reaches the
   default branch.
+  That fix rides its own ship chain (the fixer files CI → Ship → Merge
+  Approval → CD for its PR, `load_blueprint("bug-fixer")` → "Post-merge
+  follow-up PR: file its ship chain"). Never treat it as delivered when its PR
+  opens or its fix ticket goes Done — only when its `CD: follow-up PR` ticket
+  reports a `merge_commit`.
 
 ### Step 5: Deliver Verdict
 **Ordering (MANDATORY) — ship, then report.** The moment the deliverable exists

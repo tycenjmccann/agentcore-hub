@@ -145,3 +145,51 @@ describe("blueprint PR-base rules (TEAM-5854)", () => {
     expect(scope).not.toContain("is ALWAYS the pushed integration-branch head");
   });
 });
+
+// TEAM-6032 / TEAM-6034 (DL-038) — a post-merge follow-up PR to the default branch
+// is not delivered when it opens: it ships through its own CI → Ship → Merge
+// Approval → CD chain, filed by the fixer. The orchestrator's completion gate
+// (open_follow_up_pr) is only the backstop; these checks keep the procedure in
+// one blueprint and every caller pointing at it.
+describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
+  const SECTION = "Post-merge follow-up PR: file its ship chain";
+
+  it("no blueprint claims a post-merge PR goes through Merge Approval on its own", () => {
+    const offenders = blueprints.filter(({ text }) => text.includes("Merge Approval like any change")).map((b) => b.file);
+    expect(offenders).toEqual([]);
+  });
+
+  it("bug-fixer owns the procedure: four chain tickets, never self-merge", () => {
+    const t = read("bug-fixer");
+    expect(t).toContain(`### ${SECTION}`);
+    for (const title of ["CI: Certify follow-up PR", "Ship: follow-up PR", "Merge Approval: follow-up PR", "CD: follow-up PR"]) {
+      expect(t).toContain(title);
+    }
+    expect(t).toContain("agentcore_hub_ci_agent");
+    expect(t).toContain("agentcore_hub_release_manager");
+    expect(t).toContain("never merge it yourself");
+  });
+
+  it("the dev blueprints point at the bug-fixer section instead of restating it", () => {
+    for (const name of ["api-dev", "backend-dev", "frontend-dev"]) {
+      expect(read(name)).toContain('load_blueprint("bug-fixer")');
+      expect(read(name)).toContain(SECTION);
+    }
+  });
+
+  it("release-manager ships follow-up pairs, files orphans, and archives the earlier cd-ledger", () => {
+    const t = read("release-manager");
+    expect(t).toContain("Ship: follow-up PR");
+    expect(t).toContain("CD: follow-up PR");
+    expect(t).toContain("Orphan rule (TEAM-6032)");
+    expect(t).toContain("open_follow_up_pr");
+    expect(t).toContain("workflows/{workflow_id}/shared/cd-ledger-<its mergeCommit>.json");
+    expect(t).toMatch(/copy it verbatim to `workflows\/\{workflow_id\}\/shared\/cd-ledger-<its mergeCommit>\.json`.*only THEN start a fresh ledger/);
+  });
+
+  it("qa-verifier treats a post-merge fix delivered only on its follow-up CD merge_commit", () => {
+    const t = read("qa-verifier");
+    expect(t).toContain(SECTION);
+    expect(t).toMatch(/`CD: follow-up PR` ticket reports a `merge_commit`/);
+  });
+});
