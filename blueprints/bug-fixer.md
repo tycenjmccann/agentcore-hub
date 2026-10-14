@@ -72,8 +72,18 @@ qa-verifier.md) — lists the epic's tickets first and reconciles all four links
 for that `pr_url`: a link whose title already names the `pr_url` is reused,
 never re-filed; create only the missing links, each `blocked_by` its
 predecessor above (nothing when that predecessor is already Done); and an
-existing link whose `blocked_by` lacks its not-yet-Done predecessor gets it via
-`Tickets___update_ticket(ticket_id=<link>, blocked_by="<its current blockers + predecessor>")`.
+existing link whose `blocked_by` lacks its not-yet-Done predecessor gets the
+edge ONLY while that link has not started — the listing shows it `todo`,
+`ready` or `blocked` — via
+`Tickets___transition_ticket(ticket_id=<link>, transition_id="blocked", blocked_by="<missing predecessor id>", expected_status="<the status you just read>")`
+(blockers are additive; `Tickets___update_ticket` takes no `blocked_by` and
+cannot repair an edge). `expected_status` makes the ticket Lambda refuse the
+write if the link moved under you — re-list and apply this rule to its new
+status. A link that is `in_progress`, `in_review` or `done` has a live owner or
+is finished: never re-block it. Post one
+`Tickets___add_comment(ticket_id=<link>, comment="Chain edge missing: <link> should be blocked_by <predecessor id>")`
+(skip if an identical comment is already on it) and do not touch that link
+again this pass.
 A chain is complete only when all four exist with those edges. Chains for
 different PRs are not serialized and may run concurrently; each keeps its own
 CI certification and deploy ledger (release-manager.md Step 1 "SHA

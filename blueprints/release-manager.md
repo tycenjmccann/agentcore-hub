@@ -681,7 +681,12 @@ Approval:`, `CD: follow-up PR <url>`) missing, or one not `blocked_by` its
 not-yet-Done predecessor — reconcile its chain yourself per
 `load_blueprint("bug-fixer")` → "Post-merge follow-up PR: file its ship chain":
 create only the missing links and repair only the missing edges (the CI ticket
-blocked_by the fix ticket that opened it, or nothing if that is Done). A PR deliberately folded into another is closed as superseded instead —
+blocked_by the fix ticket that opened it, or nothing if that is Done), under
+that section's status guard: an edge is added with
+`Tickets___transition_ticket(ticket_id=<link>, transition_id="blocked", blocked_by="<predecessor id>", expected_status="<status read>")`
+only on a link still `todo`/`ready`/`blocked`; a link `in_progress`, `in_review`
+or `done` gets one `Tickets___add_comment` naming the missing edge and is
+otherwise left alone. A PR deliberately folded into another is closed as superseded instead —
 a closed PR never holds the run open.
 
 Both kinds share: assignee = the SAME `human:<who>` string as this run's Merge
