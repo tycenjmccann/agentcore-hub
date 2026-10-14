@@ -62,8 +62,7 @@ import {
   judgeBriefHold,
   briefHoldUnknown,
   judgePostCommitHold,
-  DONE_OVER_BRIEF_HOLD,
-  DONE_OVER_BRIEF_HOLD_WARNING,
+  postCommitHoldConflict,
   postCommitUncheckedWarning,
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
@@ -393,7 +392,7 @@ async function completionRecordProven(ticketId, opts = {}, capture = null) {
     // Inside the try on purpose: a stream that fails mid-read, or a response with no
     // Body at all, is the same "could not tell" as the GetObject itself throwing.
     bodyText = await res.Body.transformToString();
-    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText });
+    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText, recordGated: true });
   } catch (err) {
     const status = err?.$metadata?.httpStatusCode;
     if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
@@ -2581,7 +2580,8 @@ export async function flagDoneOverCancelled(ticket_id) {
 /**
  * TEAM-5926 (TEAM-5799 ship-review F1): the Done guard read the completion record,
  * then the reason comment and the provider calls ran before the Done committed. A
- * replay drain that CAS-stamped `briefPending:true` inside that window is found here,
+ * replay drain that CAS-stamped `briefPending:true` inside that window (or, on a ticket
+ * the guard admitted through completionRecordProven, `followUpsPending:true`) is found here,
  * by re-reading the record after the commit (judgePostCommitHold in gate-contract.mjs).
  * DETECTION ONLY, like flagDoneOverCancelled: the Done stands, a Conflict comment flags
  * it, the result carries `conflict` + `warning`, and the drain's own post-stamp
@@ -2604,16 +2604,17 @@ export async function postCommitHoldCheck(ticket_id, admitted) {
   const verdict = judgePostCommitHold(admitted.key, admitted, now);
   if (!verdict) return {};
   if (verdict.unchecked) {
-    console.warn(`[jira-tools] ${ticket_id}: post-commit brief-hold check could not run: ${verdict.why}`);
+    console.warn(`[jira-tools] ${ticket_id}: post-commit hold check could not run: ${verdict.why}`);
     return { warning: postCommitUncheckedWarning(verdict.why) };
   }
-  console.warn(`[jira-tools] ${ticket_id}: Done committed over a concurrent brief hold on ${admitted.key}`);
+  const fields = postCommitHoldConflict(verdict);
+  console.warn(`[jira-tools] ${ticket_id}: Done committed over a concurrent hold on ${admitted.key} (${verdict.kinds.join(", ")})`);
   try {
-    await addComment({ ticket_id, comment: `Conflict: ${DONE_OVER_BRIEF_HOLD_WARNING}` });
+    await addComment({ ticket_id, comment: `Conflict: ${fields.warning}` });
   } catch (err) {
-    console.warn(`[jira-tools] ${ticket_id}: done-over-brief-hold comment failed: ${err.message}`);
+    console.warn(`[jira-tools] ${ticket_id}: ${fields.conflict} comment failed: ${err.message}`);
   }
-  return { conflict: DONE_OVER_BRIEF_HOLD, warning: DONE_OVER_BRIEF_HOLD_WARNING };
+  return fields;
 }
 
 async function updateTicket(params) {

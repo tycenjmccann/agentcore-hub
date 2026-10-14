@@ -4463,6 +4463,47 @@ test("TEAM-5785: a failed post-POST claim read is unknown, not moved: park kept,
     }
   });
 
+  test("TEAM-5926 (j5): a ship ticket whose proven record turns into followUpsPending:true mid-call is flagged", async () => {
+    const recordBodies = { [SHIP_RECORD_KEY]: JSON.stringify({ ticketId: SHIP_TICKET, summary: "shipped", status: "complete", followUpsPending: false }) };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({
+      labels: ["agent:agentcore_hub_release_manager", "phase:ship"],
+      onComment: (i) => { if (i === 0) recordBodies[SHIP_RECORD_KEY] = JSON.stringify({ ticketId: SHIP_TICKET, summary: "shipped", status: "pending_follow_ups", followUpsPending: true, ticketWrites: "dropped" }); },
+    });
+    try {
+      const res = await doneTransition(mod.handler, SHIP_TICKET, { reason: "PR merged" });
+      assert.equal(res.error, undefined, "a committed Done is never reported as refused");
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, "done_over_follow_ups_hold");
+      assert.equal(res.warning, gateContract.DONE_OVER_FOLLOW_UPS_HOLD_WARNING);
+      assert.doesNotMatch(res.warning, BRIEF_HOLD_REFUSAL_RE);
+      assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+      assert.deepEqual(commentTexts(cap), ["PR merged", `Conflict: ${gateContract.DONE_OVER_FOLLOW_UPS_HOLD_WARNING}`]);
+      assert.deepEqual(s3Calls.records, [SHIP_RECORD_KEY, SHIP_RECORD_KEY]);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-5926 (j5b): followUpsPending:true appearing on a NON-ship ticket's record is not flagged — its Done never gated on it", async () => {
+    const recordBodies = {};
+    const { mod } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({
+      labels: DEV_LABELS, ticketId: "TEAM-4067",
+      onComment: (i) => { if (i === 0) recordBodies[KEY] = JSON.stringify({ ticketId: "TEAM-4067", followUpsPending: true, ticketWrites: "dropped" }); },
+    });
+    try {
+      const res = await doneTransition(mod.handler, "TEAM-4067", { reason: "implemented" });
+      assert.equal(res.status, "done");
+      assert.equal(res.conflict, undefined);
+      assert.equal(cap.comments.length, 1);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
   test("TEAM-5926 (j2): no concurrent stamp ⇒ no conflict, no Conflict comment", async () => {
     const { mod, s3Calls } = await loadShipGate();
     const cap = installDoneStub({ labels: DEV_LABELS, ticketId: "TEAM-4067" });

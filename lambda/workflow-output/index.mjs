@@ -1683,14 +1683,18 @@ export async function drainCompletion(msg) {
       // TEAM-5926 (TEAM-5799 ship-review F1): a twin's Done guard may have read the
       // record BEFORE this stamp and committed the Done after it. Re-read the ticket now
       // that the hold is durable: a Done that landed is converged on the next tick
-      // (step 1 sees it Done, the released notice goes out and step 6 restamps
-      // briefPending:false), so this drop is not final and the message stays. A ticket
-      // that cannot be read is the same retry: the hold is on the record, the safe side.
-      if (extra?.briefPending === true) {
+      // (step 1 sees it Done: a brief hold gets the released notice and step 6 restamps
+      // briefPending:false; unfiled follow-ups take the already-Done follow_ups drop,
+      // which keeps followUpsPending:true for the human who files them), so this drop
+      // is not final and the message stays. A ticket that cannot be read is the same
+      // retry: the hold is on the record, the safe side. Only a ticket step 1 read open:
+      // on one already Done there is no race left and the drop is final.
+      const held = extra?.briefPending === true ? "brief hold" : extra?.followUpsPending === true ? "follow-ups hold" : null;
+      if (held && !alreadyDone) {
         const after = await ticketTool("Tickets___get_issue", { ticket_id: ticketId });
         const now = after.ok ? normalizeIssue(after.payload) : null;
-        if (!now) return retry(`post-stamp re-read of ${ticketId} failed (${after.error || "the ticket payload carried no ticket key"}); the brief hold is stamped`);
-        if (isDoneStatus(now.status)) return retry(`${ticketId} reached Done concurrently with the brief hold; converging on the next tick`);
+        if (!now) return retry(`post-stamp re-read of ${ticketId} failed (${after.error || "the ticket payload carried no ticket key"}); the ${held} is stamped`);
+        if (isDoneStatus(now.status)) return retry(`${ticketId} reached Done concurrently with the ${held}; converging on the next tick`);
       }
     }
     await publishJourneyEvent(workflowId || ticketId, "workflow.ticket_replay_dropped", { ticketId, agentId: msg.agentId || null, step, error, notice });

@@ -963,7 +963,47 @@ describe("TEAM-5926 — a Done that lands over the brief hold", () => {
     for (const twin of TWIN_GUARDS) {
       const g = await twin();
       expect(output.isBriefHoldRefusal(g.DONE_OVER_BRIEF_HOLD_WARNING)).toBe(false);
+      expect(output.isBriefHoldRefusal(g.DONE_OVER_FOLLOW_UPS_HOLD_WARNING)).toBe(false);
       expect(output.isBriefHoldRefusal(g.postCommitUncheckedWarning("could not read completions/X.json (InternalError 500)"))).toBe(false);
     }
+  });
+
+  it("(d6) a follow-ups hold stamped, then the ticket reaches Done ⇒ retry, then the already-Done follow_ups drop is final", async () => {
+    // TEAM-5926 sibling: the brief is on its gate, a follow-up no retry can file holds
+    // the ticket, and a twin's Done commits right after the followUpsPending:true stamp.
+    fake.tickets.get(GATE).status = "To Do";
+    fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    let fired = false;
+    fake.putError = (input) => {
+      if (input.Key === KEY && !fired && bodyOf(input).followUpsPending === true) { fired = true; fake.tickets.get(BUILD).status = "Done"; }
+      return null;
+    };
+
+    const t1 = await tick();
+    expect(fired).toBe(true);
+    expect(t1.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expect(fake.queue).toHaveLength(1);
+    expect(record()).toMatchObject({ followUpsPending: true, ticketWrites: "dropped", replayDropped: { step: "follow_ups" } });
+    expect(droppedMetrics()).toHaveLength(0);
+    expect(eventsOf("workflow.ticket_replay_dropped", BUILD)).toHaveLength(0);
+
+    // The next tick reads the ticket Done: the follow-ups are still unfiled, so it is the
+    // already-Done path — the record keeps followUpsPending:true for the human who files
+    // them, and the drop is final, said once.
+    fake.putError = null;
+    expireVisibility();
+    const t2 = await tick();
+    expect(t2.out.drained).toMatchObject({ applied: 0, dropped: 1, retried: 0 });
+    expect(fake.queue).toHaveLength(0);
+    expect(record()).toMatchObject({ followUpsPending: true, ticketWrites: "dropped", replayDropped: { step: "follow_ups" } });
+    expect(record().briefPending).toBeUndefined();
+    expect(droppedMetrics()).toHaveLength(1);
+    expect(eventsOf("workflow.ticket_replay_dropped", BUILD)).toHaveLength(1);
+    for (const id of [BUILD, EPIC]) {
+      expect(dropNotices(id)).toHaveLength(1);
+      expect(released(id)).toHaveLength(0);
+    }
+    expect(tools("Tickets___transition_ticket")).toHaveLength(0);
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
   });
 });

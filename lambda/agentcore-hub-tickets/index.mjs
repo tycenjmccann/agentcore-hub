@@ -67,8 +67,7 @@ import {
   judgeBriefHold,
   briefHoldUnknown,
   judgePostCommitHold,
-  DONE_OVER_BRIEF_HOLD,
-  DONE_OVER_BRIEF_HOLD_WARNING,
+  postCommitHoldConflict,
   postCommitUncheckedWarning,
   SECURITY_REVIEWER_AGENT,
   designAmendmentVerdict,
@@ -390,7 +389,7 @@ async function completionRecordProven(ticketId, opts = {}, capture = null) {
     // Inside the try on purpose: a stream that fails mid-read, or a response with no
     // Body at all, is the same "could not tell" as the GetObject itself throwing.
     bodyText = await res.Body.transformToString();
-    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText });
+    if (capture) Object.assign(capture, { key, etag: res.ETag, absent: false, bodyText, recordGated: true });
   } catch (err) {
     const status = err?.$metadata?.httpStatusCode;
     if (err?.name === "NotFound" || err?.name === "NoSuchKey" || status === 404) {
@@ -2341,7 +2340,8 @@ async function transitionIssue(args) {
 /**
  * TEAM-5926 (TEAM-5799 ship-review F1): twin of the jira Lambda's postCommitHoldCheck.
  * The Done guard read the completion record before the status write; a replay drain
- * that CAS-stamped `briefPending:true` in between is found by re-reading the record
+ * that CAS-stamped `briefPending:true` in between (or `followUpsPending:true` on a ticket
+ * admitted through completionRecordProven) is found by re-reading the record
  * after the write (judgePostCommitHold in gate-contract.mjs). DETECTION ONLY: the done
  * stands, a Conflict comment flags it, the result carries `conflict` + `warning`, and
  * the drain's own post-stamp re-read converges the record. A re-read S3 cannot answer
@@ -2363,16 +2363,17 @@ async function postCommitHoldCheck(issueKey, admitted) {
   const verdict = judgePostCommitHold(admitted.key, admitted, now);
   if (!verdict) return {};
   if (verdict.unchecked) {
-    console.warn(`[agentcore-hub-tickets] ${issueKey}: post-commit brief-hold check could not run: ${verdict.why}`);
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: post-commit hold check could not run: ${verdict.why}`);
     return { warning: postCommitUncheckedWarning(verdict.why) };
   }
-  console.warn(`[agentcore-hub-tickets] ${issueKey}: done committed over a concurrent brief hold on ${admitted.key}`);
+  const fields = postCommitHoldConflict(verdict);
+  console.warn(`[agentcore-hub-tickets] ${issueKey}: Done committed over a concurrent hold on ${admitted.key} (${verdict.kinds.join(", ")})`);
   try {
-    await addComment({ issue_key: issueKey, body: `Conflict: ${DONE_OVER_BRIEF_HOLD_WARNING}` });
+    await addComment({ issue_key: issueKey, body: `Conflict: ${fields.warning}` });
   } catch (err) {
-    console.warn(`[agentcore-hub-tickets] ${issueKey}: done-over-brief-hold comment failed: ${err.message}`);
+    console.warn(`[agentcore-hub-tickets] ${issueKey}: ${fields.conflict} comment failed: ${err.message}`);
   }
-  return { conflict: DONE_OVER_BRIEF_HOLD, warning: DONE_OVER_BRIEF_HOLD_WARNING };
+  return fields;
 }
 
 async function getTransitions(args) {

@@ -1547,6 +1547,33 @@ describe("transition_ticket — a done over a concurrent brief hold is flagged (
     expect(commentBodies()).toHaveLength(1);
   });
 
+  it("(t5) a ship ticket whose proven record turns into followUpsPending:true mid-call is flagged", async () => {
+    const key = `completions/${SHIP}.json`;
+    h.state.items[SHIP] = { ticketId: SHIP, status: "in_progress", assignee: "agentcore_hub_release_manager", phase: "ship" };
+    h.state.s3Objects[key] = { ticketId: SHIP, summary: "shipped", status: "complete", followUpsPending: false };
+    h.state.onStatusWrite = () => { h.state.s3Objects[key] = { ticketId: SHIP, summary: "shipped", status: "pending_follow_ups", followUpsPending: true, ticketWrites: "dropped" }; };
+
+    const res = await transition({ ticket_id: SHIP, to_status: "done" });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "done", conflict: "done_over_follow_ups_hold", warning: gateContract.DONE_OVER_FOLLOW_UPS_HOLD_WARNING });
+    expect(res.error).toBeUndefined();
+    expect(res.warning).not.toMatch(BRIEF_HOLD_REFUSAL_RE);
+    expect(h.state.statusUpdates).toHaveLength(1);
+    expect(commentBodies()).toEqual([`Conflict: ${gateContract.DONE_OVER_FOLLOW_UPS_HOLD_WARNING}`]);
+    expect(h.state.s3RecordReads).toEqual([key, key]);
+  });
+
+  it("(t5b) followUpsPending:true appearing on a NON-ship ticket's record is not flagged — its done never gated on it", async () => {
+    h.state.items[ID] = devTicket();
+    h.state.onStatusWrite = () => { h.state.s3Objects[KEY] = { ticketId: ID, followUpsPending: true, ticketWrites: "dropped" }; };
+
+    const res = await transition({ ticket_id: ID, to_status: "done" });
+
+    expect(res).toMatchObject({ status: "transitioned", to: "done" });
+    expect(res.conflict).toBeUndefined();
+    expect(commentBodies()).toEqual([]);
+  });
+
   it("(t2) no concurrent stamp ⇒ no conflict, no Conflict comment", async () => {
     h.state.items[ID] = devTicket();
 

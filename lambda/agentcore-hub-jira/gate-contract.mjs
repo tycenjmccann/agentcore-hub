@@ -996,6 +996,17 @@ function completionRecordUnreadable(key, detail) {
   };
 }
 
+/** judgeCompletionRecord's follow-ups refusal, on a parsed record; null when none. */
+function followUpsPendingRefusal(k, record) {
+  if (record.followUpsPending !== true) return null;
+  const status =
+    typeof record.status === "string" && record.status.trim() ? record.status.trim() : "unstated";
+  return (
+    `${k} has followUpsPending:true (status ${status}) — re-run ` +
+    `WorkflowOutput___report_completion with the same arguments to materialize the follow-ups`
+  );
+}
+
 /**
  * Judge a completion record's BODY — the pure half of both twins'
  * `completionRecordProven`. Every refusal STRING lives here so the two providers
@@ -1031,16 +1042,8 @@ export function judgeCompletionRecord(key, bodyText, { securityReview = false } 
     return completionRecordUnreadable(k, `parsed to ${shape}, not an object`);
   }
 
-  if (record.followUpsPending === true) {
-    const status =
-      typeof record.status === "string" && record.status.trim() ? record.status.trim() : "unstated";
-    return {
-      proven: false,
-      why:
-        `${k} has followUpsPending:true (status ${status}) — re-run ` +
-        `WorkflowOutput___report_completion with the same arguments to materialize the follow-ups`,
-    };
-  }
+  const followUpsWhy = followUpsPendingRefusal(k, record);
+  if (followUpsWhy) return { proven: false, why: followUpsWhy };
 
   const briefWhy = briefHoldRefusal(k, record);
   if (briefWhy) return { proven: false, why: briefWhy };
@@ -1085,17 +1088,19 @@ export function judgeBriefHold(key, bodyText) {
   return why ? { proven: false, why } : null;
 }
 
-// ── Post-commit brief-hold check (TEAM-5926; TEAM-5799 ship-review F1) ──────
+// ── Post-commit hold check (TEAM-5926; TEAM-5799 ship-review F1) ────────────
 // The Done guard reads the completion record, then awaits the reason comment and
 // the provider before the Done commits. A replay drain can CAS-stamp
-// `briefPending:true` inside that window, so the guard admitted on a record that
-// no longer says what it read. After the commit each twin re-reads the record and
-// asks judgePostCommitHold. The hub does not undo moves (as with DONE_OVER_CANCELLED):
-// a hold that appeared is FLAGGED on the ticket and in the result, and the drain's
-// own post-stamp re-read converges the record. Neither text below contains
-// `has briefPending:true (brief `, so workflow-output's isBriefHoldRefusal never
-// reads a committed Done as a refused one.
+// `briefPending:true` inside that window, or `followUpsPending:true` on a ticket whose
+// guard read the whole record (completionRecordProven: ship-phase and security
+// reviews), so the guard admitted on a record that no longer says what it read. After
+// the commit each twin re-reads the record and asks judgePostCommitHold. The hub does
+// not undo moves (as with DONE_OVER_CANCELLED): a hold that appeared is FLAGGED on the
+// ticket and in the result (postCommitHoldConflict), and the drain's own post-stamp
+// re-read converges the record. No text below contains `has briefPending:true (brief `,
+// so workflow-output's isBriefHoldRefusal never reads a committed Done as a refused one.
 export const DONE_OVER_BRIEF_HOLD = "done_over_brief_hold";
+export const DONE_OVER_FOLLOW_UPS_HOLD = "done_over_follow_ups_hold";
 
 export const DONE_OVER_BRIEF_HOLD_WARNING =
   "Done committed while a concurrent ticket-provider replay held this ticket's merge brief " +
@@ -1103,25 +1108,33 @@ export const DONE_OVER_BRIEF_HOLD_WARNING =
   "The hub does not undo moves: put the merge brief on the gate, or re-run " +
   "WorkflowOutput___report_completion so the replay converges the record.";
 
+export const DONE_OVER_FOLLOW_UPS_HOLD_WARNING =
+  "Done committed while a concurrent ticket-provider replay held this ticket open for " +
+  "follow-ups it could not file (the completion record changed after the Done guard read it " +
+  "and now says followUpsPending:true). The hub does not undo moves: file the follow-ups the " +
+  "completion record lists, or re-run WorkflowOutput___report_completion so the replay files them.";
+
 export function postCommitUncheckedWarning(cause) {
   return (
     `Done committed, but the post-commit completion-record check could not run (${cause}); ` +
-    `a merge-brief hold a concurrent replay stamped, if any, is not flagged here.`
+    `a merge-brief or follow-ups hold a concurrent replay stamped, if any, is not flagged here.`
   );
 }
 
 /**
- * Whether a brief hold appeared on the completion record between the Done guard's
- * read and the committed Done.
+ * Whether a hold appeared on the completion record between the Done guard's read and
+ * the committed Done.
  *
  * @param {string} key completions/<ticketId>.json
- * @param {{etag?: string, absent?: boolean, bodyText?: string}} admitted what the
- *   guard admitted on
+ * @param {{etag?: string, absent?: boolean, bodyText?: string, recordGated?: boolean}} admitted
+ *   what the guard admitted on; `recordGated` when it was completionRecordProven, whose
+ *   followUpsPending refusal the Done then walked past too
  * @param {{etag?: string, absent?: boolean, bodyText?: string} | {error: string}} reread
  *   the post-commit read
- * @returns {{held: true} | {unchecked: true, why: string} | null} null when the record
- *   is unchanged, or changed into anything that is not a PROVEN hold (an unjudgeable
- *   body is doubt, and doubt is not flagged over a committed move)
+ * @returns {{held: true, kinds: string[]} | {unchecked: true, why: string} | null} null
+ *   when the record is unchanged, or changed into anything that is not a PROVEN hold (an
+ *   unjudgeable body is doubt, and doubt is not flagged over a committed move). `kinds`
+ *   are the conflict codes, follow-ups first.
  */
 export function judgePostCommitHold(key, admitted, reread) {
   if (!reread || reread.error) {
@@ -1134,8 +1147,27 @@ export function judgePostCommitHold(key, admitted, reread) {
     if (was.bodyText === reread.bodyText) return null;
   }
   // The guard admitted, so what it read was not a hold: a proven hold now is new.
+  const kinds = [];
+  if (was.recordGated) {
+    let record = null;
+    try {
+      record = JSON.parse(reread.bodyText);
+    } catch {
+      record = null;
+    }
+    if (record && typeof record === "object" && !Array.isArray(record) && followUpsPendingRefusal(String(key || ""), record)) {
+      kinds.push(DONE_OVER_FOLLOW_UPS_HOLD);
+    }
+  }
   const hold = judgeBriefHold(key, reread.bodyText);
-  return hold && hold.proven === false && !hold.unknown ? { held: true } : null;
+  if (hold && hold.proven === false && !hold.unknown) kinds.push(DONE_OVER_BRIEF_HOLD);
+  return kinds.length > 0 ? { held: true, kinds } : null;
+}
+
+/** The result fields for a `held` verdict: the first kind is the conflict, every kind's warning is said. */
+export function postCommitHoldConflict(verdict) {
+  const warnings = { [DONE_OVER_FOLLOW_UPS_HOLD]: DONE_OVER_FOLLOW_UPS_HOLD_WARNING, [DONE_OVER_BRIEF_HOLD]: DONE_OVER_BRIEF_HOLD_WARNING };
+  return { conflict: verdict.kinds[0], warning: verdict.kinds.map((k) => warnings[k]).join(" ") };
 }
 
 // ── Terminal status (TEAM-5421; TEAM-5396 F2 / TEAM-5413) ───────────────────
