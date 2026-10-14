@@ -710,7 +710,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     artifacts,
     branch: branch || null,
     commit_sha: commit_sha || null,
-    pr_url: pr_url || null,
+    // TEAM-6075: only a non-empty string (kept verbatim) or null — the orchestrator's
+    // follow-up PR gate reads this field and must never see another shape.
+    pr_url: typeof pr_url === "string" && pr_url.trim() ? pr_url : null,
     completed_at: new Date().toISOString(),
   };
   // Additive and only when supplied: a record written without them keeps exactly

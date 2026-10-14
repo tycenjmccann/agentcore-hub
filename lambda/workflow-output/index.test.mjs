@@ -631,6 +631,19 @@ describe("report_completion — merge_commit / outcome / block_reason", () => {
     expect(r.block_reason).toHaveLength(500);
     expect(h.warns.join("\n")).toMatch(/oversized merge_commit/);
   });
+
+  // TEAM-6075 — the orchestrator's follow-up PR gate reads this record's pr_url; a
+  // non-string value must never reach it. Strings are kept verbatim (legacy field).
+  it("TEAM-6075: a non-string pr_url is recorded as null; a blank string is null; a string is kept verbatim", async () => {
+    await report({ pr_url: [PR_URL] });
+    expect(record().pr_url).toBeNull();
+    h.puts.length = 0;
+    await report({ pr_url: "  " });
+    expect(record().pr_url).toBeNull();
+    h.puts.length = 0;
+    await report({ pr_url: PR_URL });
+    expect(record().pr_url).toBe(PR_URL);
+  });
 });
 
 // TEAM-4525 AC-3 — the head SHA a human approved at the Merge Approval gate is

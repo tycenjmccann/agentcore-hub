@@ -48,7 +48,7 @@ import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets,
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
-import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
+import { ensureRepoCheck, formatRepoCheckWarning, parseGitHubUrl } from "./repo-check.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 // TEAM-4121 FR-8: the fix-ticket contract lives in a zero-import module that is
@@ -4795,11 +4795,10 @@ function buildManifestContext(manifest, agentPhase, workflow, ticket) {
 
   // Canonical repo info from manifest (single source of truth)
   if (manifest.repoConfig?.repos?.length > 0) {
-    const url = manifest.repoConfig.repos[0].url || "";
-    const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
+    const match = parseGitHubUrl(manifest.repoConfig.repos[0].url);
     if (match) {
       ctx += `### Repository\n`;
-      ctx += `- owner: "${match[1]}"\n- repo: "${match[2]}"\n`;
+      ctx += `- owner: "${match.owner}"\n- repo: "${match.repo}"\n`;
       ctx += `- default_branch: "${manifest.repoConfig.repos[0].defaultBranch || "main"}"\n\n`;
     }
   }
@@ -5083,9 +5082,7 @@ async function publishEvent(ticketId, detailType, detail) {
 // ─── Utilities ─────────────────────────────────────────────────────────────────
 
 function parseRepoUrl(repoConfig) {
-  const url = repoConfig?.repos?.[0]?.url || "";
-  const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
-  return match ? { owner: match[1], repo: match[2] } : { owner: "", repo: "" };
+  return parseGitHubUrl(repoConfig?.repos?.[0]?.url) || { owner: "", repo: "" };
 }
 
 /**

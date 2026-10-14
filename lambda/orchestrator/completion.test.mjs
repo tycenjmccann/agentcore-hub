@@ -2033,3 +2033,96 @@ describe("TEAM-6062 follow-up PR gate", () => {
     expect(open).toEqual([]);
   });
 });
+
+// TEAM-6075 — review round 2 of #928: a non-string record pr_url must not disable the
+// gate (per-value skip, not a thrown TypeError into the fail-open catch), and the repo
+// parser must keep dotted repo names (`my.repo`) whole.
+describe("TEAM-6075 follow-up PR gate hardening", () => {
+  const ON = (base) => ({ state: "open", head: { ref: "fix/a" }, base: { ref: base } });
+  const MERGED = { S: { agentId: "rm", mergeCommit: "m1" } };
+  const getAgentPhase = (id) => (id === "rm" ? "ship" : "development");
+  const byPath = (map) => async (path) => map[path];
+  const R = [{ owner: "o", repo: "r", defaultBranch: "main" }];
+  const wf = (repos) => ({ id: "wf", featureBranch: "feature/E-1-x", repoConfig: { repos } });
+  const P12 = "https://github.com/o/r/pull/12", P13 = "https://github.com/o/r/pull/13";
+
+  it("TEAM-6075 followUpPrGate: readCompletionRecord throws synchronously → falls back to cached prUrl", async () => {
+    const tasks = { ...MERGED, F: { prUrl: P12 } };
+    const open = await completionMod.followUpPrGate({
+      workflow: wf([{ url: "https://github.com/o/r", defaultBranch: "main" }]), agentTasks: tasks, mergeProof: null, getAgentPhase, warn: () => {},
+      readCompletionRecord: () => { throw new Error("s3"); },
+      api: byPath({ "/repos/o/r/pulls/12": ON("main") }),
+    });
+    expect(open).toEqual([P12]);
+  });
+
+  it("TEAM-6075 followUpPrGate: readCompletionRecord rejects → falls back to cached prUrl", async () => {
+    const tasks = { ...MERGED, F: { prUrl: P12 } };
+    const open = await completionMod.followUpPrGate({
+      workflow: wf([{ url: "https://github.com/o/r", defaultBranch: "main" }]), agentTasks: tasks, mergeProof: null, getAgentPhase, warn: () => {},
+      readCompletionRecord: async () => { throw new Error("s3 down"); },
+      api: byPath({ "/repos/o/r/pulls/12": ON("main") }),
+    });
+    expect(open).toEqual([P12]);
+  });
+
+  it("TEAM-6075 followUpPrRefs: empty-string and null record pr_url fall back to cached prUrl", () => {
+    for (const records of [{ F: { pr_url: "" } }, { F: { pr_url: null } }, { F: null }, {}]) {
+      const refs = completionMod.followUpPrRefs({ F: { prUrl: P12 } }, R, records);
+      expect(refs.map((r) => r.number)).toEqual([12]);
+    }
+  });
+
+  it("TEAM-6075 repoTargets: repo entry with no defaultBranch is treated as main", async () => {
+    expect(completionMod.repoTargets({ repos: [{ url: "https://github.com/o/r" }] })).toEqual(R);
+    const tasks = { ...MERGED, F: { prUrl: P12 } };
+    const open = await completionMod.followUpPrGate({
+      workflow: wf([{ url: "https://github.com/o/r" }]), agentTasks: tasks, mergeProof: null, getAgentPhase, warn: () => {},
+      api: byPath({ "/repos/o/r/pulls/12": ON("main") }),
+    });
+    expect(open).toEqual([P12]);
+  });
+
+  it("TEAM-6075 followUpPrRefs: /files suffix, uppercase owner/repo and trailing slash dedupe to one PR", () => {
+    const refs = completionMod.followUpPrRefs({
+      a: { prUrl: P12 },
+      b: { prUrl: "https://github.com/O/R/pull/12/files" },
+      c: { prUrl: "https://github.com/o/r/pull/12/" },
+    }, R);
+    expect(refs).toEqual([{ ...R[0], number: 12, url: P12 }]);
+  });
+
+  it("TEAM-6075 followUpPrGate: non-string record pr_url on one ticket is skipped; another ticket's open PR still refuses", async () => {
+    const tasks = { ...MERGED, F: { prUrl: "https://github.com/o/r/pull/11" }, G: { prUrl: P13 } };
+    const open = await completionMod.followUpPrGate({
+      workflow: wf([{ url: "https://github.com/o/r", defaultBranch: "main" }]), agentTasks: tasks, mergeProof: null, getAgentPhase, warn: () => {},
+      // A one-element array stringifies to a URL the PR regex matches — then `.trim()` throws.
+      readCompletionRecord: async (tid) => (tid === "F" ? { pr_url: [P12] } : null),
+      api: byPath({ "/repos/o/r/pulls/11": ON("feature/E-1-x"), "/repos/o/r/pulls/12": ON("main"), "/repos/o/r/pulls/13": ON("main") }),
+    });
+    expect(open).toEqual([P13]);
+  });
+
+  it("TEAM-6075 followUpPrRefs: non-string pr_url (array / number / object) never throws", () => {
+    for (const bad of [[P12], 12, { url: P12 }, true]) {
+      const refs = completionMod.followUpPrRefs({ F: { prUrl: P13 } }, R, { F: { pr_url: bad } });
+      expect(refs.map((r) => r.number)).toEqual([13]);
+    }
+  });
+
+  it("TEAM-6075 repoTargets: dotted repo name is kept whole (my.repo, my.repo.git, trailing slash)", () => {
+    for (const url of ["https://github.com/o/my.repo", "https://github.com/o/my.repo.git", "https://github.com/o/my.repo/"]) {
+      expect(completionMod.repoTargets({ repos: [{ url, defaultBranch: "main" }] })).toEqual([{ owner: "o", repo: "my.repo", defaultBranch: "main" }]);
+    }
+  });
+
+  it("TEAM-6075 followUpPrGate: dotted repo name — the run's PRs are checked (default repoRef)", async () => {
+    const P5 = "https://github.com/o/my.repo/pull/5";
+    const tasks = { ...MERGED, F: { prUrl: P5 } };
+    const open = await completionMod.followUpPrGate({
+      workflow: wf([{ url: "https://github.com/o/my.repo.git", defaultBranch: "main" }]), agentTasks: tasks, mergeProof: null, getAgentPhase, warn: () => {},
+      api: byPath({ "/repos/o/my.repo/pulls/5": ON("main") }),
+    });
+    expect(open).toEqual([P5]);
+  });
+});

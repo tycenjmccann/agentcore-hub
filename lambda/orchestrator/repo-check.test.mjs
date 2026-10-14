@@ -79,3 +79,26 @@ describe("ensureRepoCheck", () => {
     expect(fallback.results[0]).toMatchObject({ url: BAD, ok: false, definitive: false });
   });
 });
+
+// TEAM-6075 — parseGitHubUrl is the ONE owner/repo parser the orchestrator uses
+// (repoTargets, buildManifestContext, parseRepoUrl): dotted repo names stay whole and
+// anything after owner/repo (a PR path, a tree path, a query, a fragment) is ignored.
+describe("TEAM-6075 parseGitHubUrl — the one shared owner/repo parser", () => {
+  const MY = { owner: "o", repo: "my.repo" };
+  it("TEAM-6075: dotted repo names", () => {
+    for (const u of ["https://github.com/o/my.repo", "https://github.com/o/my.repo.git", "https://github.com/o/my.repo/", "git@github.com:o/my.repo.git"]) {
+      expect(parseGitHubUrl(u)).toEqual(MY);
+    }
+  });
+  it("TEAM-6075: ignores a path after owner/repo", () => {
+    expect(parseGitHubUrl("https://github.com/o/r/pull/12")).toEqual({ owner: "o", repo: "r" });
+    expect(parseGitHubUrl("https://github.com/o/r/pull/12/files")).toEqual({ owner: "o", repo: "r" });
+    expect(parseGitHubUrl("https://github.com/o/my.repo/pull/12")).toEqual(MY);
+    expect(parseGitHubUrl("https://github.com/o/r/tree/main/x")).toEqual({ owner: "o", repo: "r" });
+    expect(parseGitHubUrl("https://github.com/o/r?x=1")).toEqual({ owner: "o", repo: "r" });
+    expect(parseGitHubUrl("https://github.com/o/r#readme")).toEqual({ owner: "o", repo: "r" });
+  });
+  it("TEAM-6075: non-GitHub, missing repo and empty input → null", () => {
+    for (const u of ["https://gitlab.com/x/y", "https://github.com/o", "", null, undefined]) expect(parseGitHubUrl(u)).toBeNull();
+  });
+});
