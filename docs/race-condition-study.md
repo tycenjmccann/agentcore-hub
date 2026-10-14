@@ -145,6 +145,8 @@ Agent invocation writes a lease: `agentTasks[ticketId] = {status: running, lease
 the runtime heartbeats (it already streams events — piggyback: any agent event extends the
 lease). `retry`/`dispatch`/WM `mark-done` become **lease-aware CAS**: they may only steal a
 ticket whose lease is expired, atomically, in the same conditional write that re-claims it.
+(DL-038 / TEAM-6000: the reaper also steals a lease whose holder published its own
+generation-stamped `transient_exhaustion` death — the same CAS on `startedAt` is the fence.)
 This closes the last dual-actor hole (WM retry vs. live agent → duplicate PRs) and replaces
 three inconsistent staleness heuristics (60-min escape hatch, 10-min WM stale, 15-min cooldown)
 with one explicit contract.

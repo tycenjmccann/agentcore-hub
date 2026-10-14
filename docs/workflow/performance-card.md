@@ -139,7 +139,7 @@ to 0:
 | `firstPass` | 30 | ratio | `quality.firstPassYield` | — |
 | `rework` | 20 | rate | `quality.reworkRounds` / `quality.tasks` | 0.6 |
 | `loops` | 20 | count | `quality.loops` | 8 |
-| `stability` | 15 | sum | `quality.errors` (incl. `agent.retry` / `agent.died`) + `quality.nudges` + `quality.interventions` (every WM action) | 6 |
+| `stability` | 15 | sum | `quality.errors` (incl. `agent.retry` / `agent.died`; one per death, so a transient exhaustion's error + death count once) + `quality.nudges` + `quality.interventions` (every WM action) | 6 |
 | `gates` | 10 | excess | `max(0, quality.gateRounds − time.humanGates)` | 4 |
 | `ci` | 5 | verdict | `quality.ci.verdict` (`pass`→1, `fail`→0; `unknown`/`null` neutral) | — |
 
