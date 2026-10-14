@@ -1274,6 +1274,52 @@ describe("positive death via agent.died (TEAM-4739)", () => {
     expect(lease.stealClaim).not.toHaveBeenCalled();
   });
 
+  it("TEAM-5977: enforce issues NO strict transient-exhaustion read; meta records effectiveMode", async () => {
+    const { deps, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
+    lease.hasAgentErrorSince = vi.fn(async () => true);
+    const { runSweep } = createDetector(deps);
+
+    await runSweep("enforce");
+
+    expect(lease.hasAgentErrorSince).toHaveBeenCalledTimes(1);
+    expect(lease.hasAgentErrorSince.mock.calls[0][5]).not.toHaveProperty("reason");
+    const errs = eventsOfType(deps.publishEvent, "agent.error");
+    expect(errs[0][2].detectorMeta.effectiveMode).toBe("enforce");
+  });
+
+  it("TEAM-5977: shadow promotes on a strict read only — loose match + strict miss stays shadow", async () => {
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
+    lease.hasAgentErrorSince = vi.fn(async (_d, _t, _w, _tid, _s, opts) => !opts.strictGeneration);
+    const { runSweep } = createDetector(deps);
+
+    await runSweep("shadow");
+
+    expect(lease.hasAgentErrorSince).toHaveBeenCalledTimes(2);
+    expect(lease.hasAgentErrorSince.mock.calls[1][5]).toEqual({
+      types: ["agent.died"], claimGeneration: FRESH_STARTED,
+      strictGeneration: true, reason: "transient_exhaustion",
+    });
+    const shadow = eventsOfType(deps.publishEvent, "dead_session.shadow");
+    expect(shadow[0][2].detectorMeta.effectiveMode).toBe("shadow");
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+  });
+
+  it("TEAM-5977: a failed strict read in shadow skips the candidate (fail toward silence)", async () => {
+    const { deps, store, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
+    lease.hasAgentErrorSince = vi.fn(async (_d, _t, _w, _tid, _s, opts) => {
+      if (opts.strictGeneration) throw new Error("ProvisionedThroughputExceeded");
+      return true;
+    });
+    const { runSweep } = createDetector(deps);
+
+    const m = await runSweep("shadow");
+
+    expect(lease.hasAgentErrorSince).toHaveBeenCalledTimes(2);
+    expect(m.fired).toBe(0);
+    expect(eventsOfType(deps.publishEvent, "dead_session.shadow")).toHaveLength(0);
+    expect(store.markDeadSessionDetected).not.toHaveBeenCalled();
+  });
+
   it("no agent.died + below threshold: still a no-op (the read cannot invent a death)", async () => {
     const { deps, lease } = makeDeps({ ddb: makeDdb({ workflows: [freshWorkflow()] }) });
     lease.hasAgentErrorSince = vi.fn(async () => false);

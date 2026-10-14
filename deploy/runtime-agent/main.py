@@ -4095,8 +4095,10 @@ def _publish_agent_died(workflow_id: str, agent_id: str, ticket_id: str = "",
 
     TEAM-5963: `reason` ("transient_exhaustion" when a turn's transient retries
     ran out) is stamped into `detail.reason` only when given — same omit-when-empty
-    rule. The detector's agent.died arm does not filter on it; it is for humans
-    and cost-report."""
+    rule. The detector's general agent.died arm does not filter on it, but
+    TEAM-5977 does: a death stamped with the current claim's generation AND
+    reason "transient_exhaustion" is released even with the detector in shadow
+    mode. cost-report counts that death and its agent.error as one error."""
     import time as _t
     try:
         for attempt in range(1, _AGENT_ERROR_PUBLISH_ATTEMPTS + 1):
@@ -5047,8 +5049,9 @@ async def _run_agent_invocation(payload, context):
             (agent.error only). TEAM-5963: a TRANSIENT one that ran out of retries
             also sets `_transient_exhausted`, so the turn ends as a death too
             (agent.died + resume object) and the dead-session detector re-dispatches
-            it — Bedrock being down for five minutes is not a reason to strand the
-            ticket in_progress."""
+            it, even in shadow mode (TEAM-5977), once the lease expires. Bedrock
+            being down for five minutes is not a reason to strand the ticket
+            in_progress."""
             nonlocal _transient_exhausted
             import asyncio as _sr_asyncio
             attempt = 0
@@ -5134,7 +5137,10 @@ async def _run_agent_invocation(payload, context):
                                 f"({slept:.0f}s of backoff; retry deadline "
                                 f"{_STREAM_RETRY_DEADLINE_S:.0f}s). The turn "
                                 f"was released to dead-session recovery (agent.died + "
-                                f"resume object); it re-dispatches once the lease expires.")
+                                f"resume object); the dead-session sweep re-dispatches it "
+                                f"once the lease expires — within the 30 min lease TTL + "
+                                f"one 5 min sweep after the last heartbeat, even with the "
+                                f"detector in shadow mode.")
                         _publish_agent_error(
                             workflow_id, agent_id,
                             f"stream failed after {attempt} attempt(s): "

@@ -1430,6 +1430,46 @@ export function dedupeEvents(events) {
   return out;
 }
 
+/**
+ * The card's error count (kpiVersion 2 sum: agent.error + error + agent.died +
+ * agent.retry), with ONE death counted once (TEAM-5977). A transient-exhaustion
+ * turn (TEAM-5963) publishes the runtime's agent.error AND agent.died
+ * {reason:"transient_exhaustion"}, and the enforce-mode reaper then announces the
+ * same claim as agent.error{reason:"dead_session"} — one outage, three rows.
+ * Each such death absorbs at most one runtime agent.error on the same
+ * ticket+agent since the previous exhaustion death there (that error carries no
+ * claim stamp), and at most one dead_session agent.error whose
+ * detectorMeta.claimStartedAt is the death's own claimStartedAt. Every other
+ * row counts as before. Takes dedupeEvents() output.
+ */
+export function countErrors(events) {
+  const TYPES = ["agent.error", "error", "agent.died", "agent.retry"];
+  let total = events.filter((e) => TYPES.includes(e.type)).length;
+  const tsOf = (e) => String(e.timestamp || "");
+  const deaths = events
+    .filter((e) => e.type === "agent.died" && e.detail?.reason === "transient_exhaustion")
+    .sort((a, b) => tsOf(a).localeCompare(tsOf(b)));
+  const consumed = new Set();
+  const prevDeathAt = new Map(); // ticket|agent -> previous exhaustion death ts
+  for (const died of deaths) {
+    const d = died.detail || {};
+    const key = `${d.ticketId || ""}|${d.agentId || ""}`;
+    const after = prevDeathAt.get(key) ?? "";
+    prevDeathAt.set(key, tsOf(died));
+    const runtimeErr = events
+      .filter((e) => e.type === "agent.error" && !consumed.has(e) && e.detail?.reason !== "dead_session"
+        && (e.detail?.ticketId || "") === (d.ticketId || "") && (e.detail?.agentId || "") === (d.agentId || "")
+        && tsOf(e) <= tsOf(died) && tsOf(e) > after)
+      .sort((a, b) => tsOf(b).localeCompare(tsOf(a)))[0];
+    if (runtimeErr) { consumed.add(runtimeErr); total--; }
+    if (!d.claimStartedAt) continue;
+    const reaped = events.find((e) => e.type === "agent.error" && !consumed.has(e) && e.detail?.reason === "dead_session"
+      && (e.detail?.ticketId || "") === (d.ticketId || "") && e.detail?.detectorMeta?.claimStartedAt === d.claimStartedAt);
+    if (reaped) { consumed.add(reaped); total--; }
+  }
+  return total;
+}
+
 function stableJson(v) {
   if (v == null || typeof v !== "object") return JSON.stringify(v ?? null);
   if (Array.isArray(v)) return `[${v.map(stableJson).join(",")}]`;
@@ -2239,8 +2279,10 @@ export function assembleQuality(workflow, events, agentTasks, { records = {}, ci
     // raised — agent.retry (WM/manual restart) and agent.died (runtime end-of-turn
     // detection, TEAM-4739 — published INSTEAD of agent.error, so a run whose
     // personas were killed mid-turn would otherwise report zero errors) join
-    // agent.error. Before v2 a silent death scored errors=0.
-    errors: count("agent.error") + count("error") + count("agent.died") + count("agent.retry"),
+    // agent.error. Before v2 a silent death scored errors=0. TEAM-5977: one death
+    // counts once — countErrors folds a transient exhaustion's runtime
+    // agent.error + agent.died + the reaper's dead_session agent.error into one.
+    errors: countErrors(events),
     retries: count("agent.retry"),
     // kpiVersion 2: re-invocations by cause; only REWORK_KINDS feed reworkRounds.
     reinvocations,

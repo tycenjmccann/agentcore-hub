@@ -114,7 +114,7 @@ export const FLEET_KPIS: KpiDef[] = [
   { key: "quality.reworkRounds", label: "Rework rounds", unit: "count", group: "quality", floor: 1, help: "Re-invocations caused by a fix ticket or a review rejection (re-wakes after human gates, CI re-certs and retries are not rework)" },
   { key: "quality.loops", label: "Loops", unit: "count", group: "quality", floor: 1, help: "Change requests + fix tickets — times the pipeline went back" },
   { key: "quality.nudges", label: "Nudges", unit: "count", group: "quality", floor: 1, help: "Workflow Manager had to push a stalled run" },
-  { key: "quality.errors", label: "Errors", unit: "count", group: "quality", floor: 1, help: "agent.error events plus dead or restarted sessions (agent.retry / agent.died)" },
+  { key: "quality.errors", label: "Errors", unit: "count", group: "quality", floor: 1, help: "agent.error events plus dead or restarted sessions (agent.retry / agent.died); a transient exhaustion counts once (one per death)" },
   { key: "quality.firstPassYield", label: "First-pass yield", unit: "ratio", group: "quality", floor: 0.1, direction: "lower", help: "Share of agent tasks that needed no rework (higher is better)" },
   { key: "cost.personaCacheHitRate", label: "Persona cache hit rate", unit: "ratio", group: "cost", floor: 0.1, direction: "lower", help: "Share of persona input tokens served from the Bedrock prompt cache (higher is better)" },
   // `floor: 5` is the BAND floor (mirrors the Lambda's BAND_KPIS row for this

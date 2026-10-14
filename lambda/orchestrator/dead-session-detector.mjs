@@ -22,7 +22,10 @@
  * agent.error — shadow is the default, and every agent.error consumer reads that
  * type as a real failure: UI error cards, anomaly agent_error_retry_rate), but
  * ZERO writes (no steal, no retry, no status change); enforce = full behavior,
- * and only enforce ever publishes a real agent.error. The gate
+ * and only enforce ever publishes a real agent.error. One exception (TEAM-5977):
+ * a claim holder's own `agent.died{reason:"transient_exhaustion"}` stamped with
+ * this exact claim generation promotes THAT candidate to enforce in shadow mode
+ * (see transientExhaustionRelease). The gate
  * fails SAFE: the value is trimmed + lowercased, and anything that is not
  * exactly off|shadow|enforce is coerced to shadow with a loud warning — only
  * the literal normalized "enforce" may write.
@@ -288,6 +291,23 @@ export function createDetector(deps) {
   }
 
   /**
+   * TEAM-5977 — does THIS claim generation carry the claim holder's own
+   * transient-exhaustion death? Strict: the row must be stamped with exactly
+   * `task.startedAt` (no legacy unstamped allowance) and carry
+   * reason=transient_exhaustion. The runtime gave up on a Bedrock outage and
+   * released the turn; leaving it to shadow mode strands the ticket in_progress
+   * forever. Never widened beyond that reason. Throws on a failed read — the
+   * caller skips the candidate (fail toward silence).
+   */
+  async function transientExhaustionRelease(workflowId, ticketId, task) {
+    if (!lease.hasAgentErrorSince || !task.startedAt) return false;
+    return lease.hasAgentErrorSince(ddb, eventsTable, workflowId, ticketId, task.startedAt, {
+      types: ["agent.died"], claimGeneration: task.startedAt,
+      strictGeneration: true, reason: "transient_exhaustion",
+    });
+  }
+
+  /**
    * Run one sweep. `mode` is off | shadow | enforce (anything else is coerced
    * to shadow — fail safe). Returns a metrics summary (also emitted as an EMF
    * record) for observability + tests.
@@ -372,7 +392,14 @@ export function createDetector(deps) {
           // The lease-liveness guard doesn't apply here — "ready" is not a live
           // claim status; the steal already happened for this generation.
           if (stalledSteal) {
-            if (mode === "shadow") {
+            let backstopMode = mode;
+            if (mode === "shadow") try {
+              if (await transientExhaustionRelease(workflow.id, ticketId, task)) backstopMode = "enforce";
+            } catch (e) {
+              log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
+              continue;
+            }
+            if (backstopMode === "shadow") {
               log(`detector.would_recover (shadow) — ${ticketId} agent=${agentId} stolen-but-stalled since ${task.deadSessionDetectedAt} (sweep ${sweepId})`);
               continue;
             }
@@ -385,7 +412,7 @@ export function createDetector(deps) {
               log(`detector.recover_skipped — ${ticketId} claim moved since scan (sweep ${sweepId})`);
               continue;
             }
-            log(`detector.recover_stalled — ${ticketId} agent=${agentId} re-driving retry/escalate (sweep ${sweepId})`);
+            log(`detector.recover_stalled — ${ticketId} agent=${agentId} re-driving retry/escalate${backstopMode !== mode ? " (shadow → enforce: transient exhaustion)" : ""} (sweep ${sweepId})`);
             // Idempotent re-drive: the fresh counter read decides retry vs
             // escalate, and a re-dispatch that already landed loses the claim
             // CAS inside redispatch harmlessly.
@@ -396,6 +423,7 @@ export function createDetector(deps) {
                 claimStartedAt: task.startedAt || null,
                 deadSessionDetectedAt: task.deadSessionDetectedAt,
                 recoveredStalledSteal: true,
+                effectiveMode: backstopMode,
                 sweepId,
               },
               m, startedAtMs, sweepId,
@@ -457,6 +485,20 @@ export function createDetector(deps) {
             log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
             continue;
           }
+          // TEAM-5977: in shadow, the claim holder's own transient-exhaustion
+          // death promotes THIS candidate to enforce. Read only when the loose
+          // death read matched (strict ⊂ loose). GUARD 1 already found the lease
+          // dead; the CAS steps, re-check and retry cap below are unchanged.
+          let effectiveMode = mode;
+          if (mode === "shadow" && positiveDeath) try {
+            if (await transientExhaustionRelease(workflow.id, ticketId, task)) {
+              effectiveMode = "enforce";
+              log(`detector.transient_exhaustion_release (shadow → enforce) — ${ticketId} agent=${agentId} gen=${task.startedAt} (sweep ${sweepId})`);
+            }
+          } catch (e) {
+            log(`detector.died_read_failed — ${ticketId} ${e?.message || e} (sweep ${sweepId})`);
+            continue;
+          }
 
           // ── GUARD 2: silence must exceed the per-agent threshold. ────────────
           const { medianMs, sampleCount } = await rollingMedian(agentId);
@@ -484,6 +526,7 @@ export function createDetector(deps) {
             threshold,
             deathClass,
             positiveDeath,
+            effectiveMode,
             claimStartedAt: task.startedAt || null,
             sweepId,
           };
@@ -495,7 +538,7 @@ export function createDetector(deps) {
           // stream maps it to an error card and the anomaly watcher counts it in
           // agent_error_retry_rate. A distinct type keeps the full observation
           // payload without polluting either. Detail is unchanged.
-          if (mode === "shadow") {
+          if (effectiveMode === "shadow") {
             m.fired++;
             if (deathClass === "streamed_then_silent") m.hungToolCalls++;
             await publishEvent(ticketId, "dead_session.shadow", {
