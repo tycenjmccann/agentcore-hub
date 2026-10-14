@@ -58,6 +58,12 @@ describe("parseGitHubUrl", () => {
     for (const u of ["https://gitlab.com/x/y", "https://github.com/o", ""]) expect(parseGitHubUrl(u)).toBeNull();
     for (const u of [null, undefined]) expect(parseGitHubUrl(u as unknown as string)).toBeNull();
   });
+  // TEAM-6092: mirror of lambda/orchestrator/repo-check.test.mjs — surrounding whitespace is ignored.
+  it("TEAM-6092: surrounding whitespace (leading/trailing space, \\n, \\r\\n) is ignored", () => {
+    for (const u of [" https://github.com/o/r", "https://github.com/o/r ", "https://github.com/o/r\n", "https://github.com/o/r\r\n", " https://github.com/o/r.git \n"]) expect(parseGitHubUrl(u)).toEqual({ owner: "o", repo: "r" });
+    expect(parseGitHubUrl(" https://github.com/o/my.repo/pull/12 \n")).toEqual({ owner: "o", repo: "my.repo" });
+    expect(parseGitHubUrl("   ")).toBeNull();
+  });
 });
 
 describe("checkRepoUrl — GitHub", () => {

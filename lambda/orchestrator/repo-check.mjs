@@ -12,12 +12,12 @@ const GITHUB_API = "https://api.github.com";
 
 /**
  * The ONE GitHub owner/repo parser for the orchestrator (TEAM-6075). Accepts
- * https / ssh forms, strips a trailing `.git` and `/`, and ignores anything after
+ * https / ssh forms (surrounding whitespace trimmed, TEAM-6092), strips `.git` / `/`, and ignores anything after
  * owner/repo (`/pull/12`, `/pull/12/files`, `/tree/main`, `?x`, `#frag`). Repo
  * names may contain dots (`my.repo`). Returns null when it is not a github.com URL.
  */
 export function parseGitHubUrl(url) {
-  const m = String(url || "").match(/github\.com[:/]([^/\s]+)\/([^/\s#?]+?)(?:\.git)?\/?(?:[/?#].*)?$/i);
+  const m = String(url || "").trim().match(/github\.com[:/]([^/\s]+)\/([^/\s#?]+?)(?:\.git)?\/?(?:[/?#].*)?$/i);
   return m ? { owner: m[1], repo: m[2] } : null;
 }
 

@@ -1080,6 +1080,26 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     error.mockRestore();
   });
 
+  // TEAM-6092 — review round 3 of #928: a repo config url with trailing whitespace made
+  // parseGitHubUrl null → repoTargets() [] → the follow-up PR gate silently OFF (and the
+  // merge probe went to /repos///pulls). The CD registry trims its key, so such a run still
+  // got the full ship phase and reached the dark gate.
+  it("TEAM-6092: repo config url with trailing whitespace → merge probe + follow-up fetch hit /repos/o/r/…, open follow-up refuses", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.snapshots = [FU_CHILDREN];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: FU_TASKS };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, 12: fuPr() } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF, repoConfig: { layout: "multi-repo", repos: [{ platform: "backend", url: "https://github.com/o/r \n", defaultBranch: "main" }] } });
+    const urls = global.fetch.mock.calls.map((c) => decodeURIComponent(String(c[0])));
+    expect(urls.some((u) => u.includes("/repos/o/r/pulls?"))).toBe(true);
+    expect(urls.some((u) => u.includes("/repos///"))).toBe(false);
+    expect(urls.some((u) => u.includes("/repos/o/r/pulls/12"))).toBe(true);
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(error.mock.calls.some((c) => String(c[0]).includes(`CompletionRejectedOpenFollowUpPr wf_1: ${FU_URL}`))).toBe(true);
+    error.mockRestore();
+  });
+
   it("TEAM-5901 F1: single-PR def (#518, featureBranch null) is never probed by the merge gate, even when GitHub would block", async () => {
     h.state.snapshots = [SHIP_CHILDREN];
     h.state.freshWorkflow = { id: "wf_1", agentTasks: SHIP_TASKS };
