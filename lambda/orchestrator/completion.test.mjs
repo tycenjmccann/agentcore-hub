@@ -1394,6 +1394,8 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
     return {};
   };
   const land = (routes) => completion.featureBranchLanding({ owner: "o", repo: "r", base: "main", head: HEAD, api: apiFor(routes) });
+  // TEAM-5913: a proven strand needs base's tip tree to differ from the head's.
+  const DIFF_TREES = (sha) => [["/git/commits/tip", { tree: { sha: "tipTree" } }], [`/git/commits/${sha}`, { tree: { sha: "headTree" } }]];
   const merged = { number: 846, merged_at: "2026-10-01T00:00:00Z", state: "closed", head: { sha: "old111" }, base: { ref: "main" }, merge_commit_sha: "m846", html_url: "https://github.com/o/r/pull/846" };
 
   it("merged PR head == branch head → merged (squash-safe even when compare says diverged)", async () => {
@@ -1404,8 +1406,9 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
   it("commits after the merged PR, no open PR → merged:false naming branch, count and PR", async () => {
     const r = await land([
       ["/pulls?", [merged]], ["/branches/", { commit: { sha: "new222" } }],
-      ["/compare/old111...new222", { status: "ahead", ahead_by: 2 }],
-      ["/compare/main...", { status: "diverged", ahead_by: 6 }],
+      ["/compare/old111...new222", { status: "ahead", ahead_by: 2, files: [{ filename: "a.js" }] }],
+      ["/compare/main...", { status: "diverged", ahead_by: 6, files: [{ filename: "a.js" }], base_commit: { sha: "tip" } }],
+      ...DIFF_TREES("new222"),
     ]);
     expect(r.merged).toBe(false);
     expect(r.reason).toBe(`feature branch ${HEAD} has 2 commit(s) after its merged PR #846 not contained in main and no open PR to main`);
@@ -1437,8 +1440,9 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
   it("TEAM-5853 #1: same shape but the diff carries a file → still stranded (merged:false)", async () => {
     const r = await land([
       ["/pulls?", [merged]], ["/branches/", { commit: { sha: "M999" } }],
-      ["/compare/old111...M999", { status: "ahead", ahead_by: 2 }],
-      ["/compare/main...", { status: "diverged", ahead_by: 2, files: [{ filename: "a.js" }] }],
+      ["/compare/old111...M999", { status: "ahead", ahead_by: 2, files: [{ filename: "a.js" }] }],
+      ["/compare/main...", { status: "diverged", ahead_by: 2, files: [{ filename: "a.js" }], base_commit: { sha: "tip" } }],
+      ...DIFF_TREES("M999"),
     ]);
     expect(r.merged).toBe(false);
   });
@@ -1451,9 +1455,9 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
 
   it("TEAM-5853 #3: head branch auto-deleted (404) after its PR merged to main → merged, with the PR's proof", async () => {
     const gone = () => { throw Object.assign(new Error("GitHub GET branches 404: Branch not found"), { status: 404 }); };
-    // TEAM-5868: a deleted branch is proof only when the run's LAST recorded head is the PR's head.
+    // TEAM-5913: a deleted branch is proof only when the PR's head contains every recorded head.
     const pr = { ...merged, head: { sha: "old111abc" } };
-    const r = await completion.featureBranchLanding({ owner: "o", repo: "r", base: "main", head: HEAD, api: apiFor([["/pulls?", [pr]], ["/branches/", gone], ["/compare/", gone]]), lastKnownHead: "old111abc" });
+    const r = await completion.featureBranchLanding({ owner: "o", repo: "r", base: "main", head: HEAD, api: apiFor([["/pulls?", [pr]], ["/branches/", gone], ["/compare/", gone]]), recordedHeads: ["old111abc"] });
     expect(r).toEqual({ merged: true, mergeCommit: "m846", prUrl: merged.html_url });
   });
 
@@ -1494,14 +1498,17 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
   const PROOF = { merged: true, mergeCommit: "m846", prUrl: merged.html_url };
   const gone = () => { throw Object.assign(new Error("GitHub GET branches 404: Branch not found"), { status: 404 }); };
   const filler = Array.from({ length: 100 }, (_, i) => ({ number: 1000 + i, merged_at: null, state: "closed", head: { sha: `f${i}` }, base: { ref: "main" } }));
+  // TEAM-5913: a proven strand needs base's tip tree to differ from the head's.
+  const DIFF_TREES = (sha) => [["/git/commits/tip", { tree: { sha: "tipTree" } }], [`/git/commits/${sha}`, { tree: { sha: "headTree" } }]];
 
   // ── N1: an empty THREE-dot diff only proves tree(head) == tree(merge-base) ──
   it("N1 revert repro: feature C-H-R (R reverts H), main C-S (squash of H) → empty main...R diff is NOT proof (merged:false)", async () => {
     const r = await land([
       ["/pulls?", [merged]], ["/branches/", { commit: { sha: "R" } }],
-      ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 1, files: [], merge_base_commit: { sha: "C" } }],
+      ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 1, files: [], merge_base_commit: { sha: "C" }, base_commit: { sha: "tip" } }],
       ["/compare/m846...C", { status: "behind", ahead_by: 0, behind_by: 1 }],
       ["/compare/old111...R", { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "feature.txt", status: "removed" }] }],
+      ...DIFF_TREES("R"),
     ]);
     expect(r.merged).toBe(false);
     expect(r.reason).toContain("1 commit(s) after its merged PR #846");
@@ -1542,113 +1549,49 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
   it("N1 P3: empty diff but no merge_base_commit in the response → not proof, falls to the stranded check", async () => {
     const r = await land([
       ["/pulls?", [merged]], ["/branches/", { commit: { sha: "R" } }],
-      ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 1, files: [] }],
+      ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 1, files: [], base_commit: { sha: "tip" } }],
       ["/compare/old111...R", { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "feature.txt" }] }],
+      ...DIFF_TREES("R"),
     ]);
     expect(r.merged).toBe(false);
   });
 
-  // ── N2: a deleted branch proves nothing unless the run's LAST recorded head is the merged PR's head ──
-  it("N2: branch gone (404) and no last-known head → merged:null naming the PR head", async () => {
+  // ── N2 / TEAM-5913: a deleted branch proves nothing unless the merged PR's head contains EVERY recorded head ──
+  it("N2: branch gone (404) and no recorded head → merged:null naming the PR head", async () => {
     const r = await land([["/pulls?", [merged]], ["/branches/", gone], ["/compare/", gone]]);
     expect(r.merged).toBe(null);
     expect(r.reason).toMatch(/branch feature\/EPIC-1-x is gone/);
-    expect(r.reason).toMatch(/merged PR #846 head old111 is not the last head this run recorded/);
+    expect(r.reason).toMatch(/recorded head \(none\) is not contained in merged PR #846 head old111/);
   });
 
-  it("N2: branch gone, last-known head IS the merged PR head (exact or ≥7-char prefix) → proof", async () => {
+  it("N2: branch gone, the only recorded head IS the merged PR head (exact or ≥7-char prefix) → proof", async () => {
     const full = { ...merged, head: { sha: "old111abcdef0123456789abcdef0123456789ab" } };
-    expect(await land([["/pulls?", [full]], ["/branches/", gone]], { lastKnownHead: full.head.sha })).toEqual(PROOF);
-    expect(await land([["/pulls?", [full]], ["/branches/", gone]], { lastKnownHead: "old111a" })).toEqual(PROOF);
+    expect(await land([["/pulls?", [full]], ["/branches/", gone]], { recordedHeads: [full.head.sha] })).toEqual(PROOF);
+    expect(await land([["/pulls?", [full]], ["/branches/", gone]], { recordedHeads: ["old111a"] })).toEqual(PROOF);
   });
 
-  it("N2: branch gone, last-known head too short (<7) to bind → merged:null", async () => {
-    const r = await land([["/pulls?", [merged]], ["/branches/", gone]], { lastKnownHead: "old111" });
+  it("N2: branch gone, a recorded head too short (<7) to bind → merged:null", async () => {
+    const r = await land([["/pulls?", [merged]], ["/branches/", gone]], { recordedHeads: ["old111"] });
     expect(r.merged).toBe(null);
   });
 
   it("N2 review scenario: H recorded+merged, branch advanced to F (recorded later), then deleted → merged:null", async () => {
-    const r = await land([["/pulls?", [merged]], ["/branches/", gone]], { lastKnownHead: "fff0000" });
+    const r = await land([["/pulls?", [merged]], ["/branches/", gone]], { recordedHeads: ["fff0000"] });
     expect(r.merged).toBe(null);
-    expect(r.reason).toMatch(/not the last head this run recorded \(fff0000\)/);
+    expect(r.reason).toMatch(/recorded head fff0000 is not contained in merged PR #846/);
   });
 
-  describe("latestRecordedHead — the run's LAST reported branch head, by completedAt", () => {
-    const { latestRecordedHead } = completion;
-    it("H then F → F (the later completion wins)", () => {
-      expect(latestRecordedHead({
-        "B-1": { commitSha: "head000aaaa", completedAt: "2026-10-01T00:00:00Z" },
-        "B-2": { commitSha: "fff0000bbbb", completedAt: "2026-10-02T00:00:00Z" },
-        "B-4": { mergeCommit: "m846", completedAt: "2026-10-03T00:00:00Z" },
-      })).toBe("fff0000bbbb");
+  it("TEAM-5884 R3-2 → TEAM-5913: [H, H, F] tied at one instant — F is not contained in the merged head → merged:null, never the merged PR's head", async () => {
+    const t = "2026-10-01T00:00:00Z";
+    const full = { ...merged, head: { sha: "old111abcdef0123456789abcdef0123456789ab" } };
+    const heads = completion.recordedHeads({
+      "B-1": { commitSha: "old111abcdef", completedAt: t },
+      "B-2": { commitSha: "old111abcdef", completedAt: t },
+      "B-3": { commitSha: "fff0000bbbb", completedAt: t },
     });
-    it("insertion order does not matter — ordering is by completedAt", () => {
-      expect(latestRecordedHead({
-        "B-2": { commitSha: "fff0000bbbb", completedAt: "2026-10-02T00:00:00Z" },
-        "B-1": { commitSha: "head000aaaa", completedAt: "2026-10-01T00:00:00Z" },
-      })).toBe("fff0000bbbb");
-    });
-    it("the same head reported twice is still that head", () => {
-      expect(latestRecordedHead({
-        "B-1": { commitSha: "head000aaaa", completedAt: "2026-10-01T00:00:00Z" },
-        "B-2": { commitSha: "head000aaaa", completedAt: "2026-10-02T00:00:00Z" },
-      })).toBe("head000aaaa");
-    });
-    it("a recorded head without completedAt makes the order unknowable → null", () => {
-      expect(latestRecordedHead({
-        "B-1": { commitSha: "head000aaaa", completedAt: "2026-10-01T00:00:00Z" },
-        "B-2": { commitSha: "fff0000bbbb" },
-      })).toBe(null);
-    });
-    it("two different heads at the same instant → null", () => {
-      expect(latestRecordedHead({
-        "B-1": { commitSha: "head000aaaa", completedAt: "2026-10-01T00:00:00Z" },
-        "B-2": { commitSha: "fff0000bbbb", completedAt: "2026-10-01T00:00:00Z" },
-      })).toBe(null);
-    });
-    it("TEAM-5884 R3-2: three entries tied at the newest instant, [H, H, F] → null (every tied head must agree)", () => {
-      const t = "2026-10-01T00:00:00Z";
-      expect(latestRecordedHead({
-        "B-1": { commitSha: "head000aaaa", completedAt: t },
-        "B-2": { commitSha: "head000aaaa", completedAt: t },
-        "B-3": { commitSha: "fff0000bbbb", completedAt: t },
-      })).toBe(null);
-      // The order the entries are listed in cannot rescue it either.
-      expect(latestRecordedHead({
-        "B-3": { commitSha: "fff0000bbbb", completedAt: t },
-        "B-1": { commitSha: "head000aaaa", completedAt: t },
-        "B-2": { commitSha: "head000aaaa", completedAt: t },
-      })).toBe(null);
-    });
-    it("TEAM-5884 R3-2: three entries tied on the SAME head → that head; an older tie is irrelevant", () => {
-      const t = "2026-10-01T00:00:00Z";
-      expect(latestRecordedHead({
-        "B-1": { commitSha: "head000aaaa", completedAt: t },
-        "B-2": { commitSha: "head000aaaa", completedAt: t },
-        "B-3": { commitSha: "head000aaaa", completedAt: t },
-      })).toBe("head000aaaa");
-      expect(latestRecordedHead({
-        "B-1": { commitSha: "head000aaaa", completedAt: t },
-        "B-2": { commitSha: "fff0000bbbb", completedAt: t },
-        "B-3": { commitSha: "ccc0000dddd", completedAt: "2026-10-02T00:00:00Z" },
-      })).toBe("ccc0000dddd");
-    });
-    it("TEAM-5884 R3-2: the [H, H, F] tie feeds the 404 proof as unknown → merged:null, never the merged PR's head", async () => {
-      const t = "2026-10-01T00:00:00Z";
-      const full = { ...merged, head: { sha: "old111abcdef0123456789abcdef0123456789ab" } };
-      const tied = latestRecordedHead({
-        "B-1": { commitSha: "old111abcdef", completedAt: t },
-        "B-2": { commitSha: "old111abcdef", completedAt: t },
-        "B-3": { commitSha: "fff0000bbbb", completedAt: t },
-      });
-      const r = await land([["/pulls?", [full]], ["/branches/", gone]], { lastKnownHead: tied });
-      expect(r.merged).toBe(null); // base picked H → proof (merged:true) for a branch whose last head is unknown
-      expect(r.reason).toMatch(/not the last head this run recorded \(none\)/);
-    });
-    it("no recorded head at all → null", () => {
-      expect(latestRecordedHead({ "B-1": { output: "x" } })).toBe(null);
-      expect(latestRecordedHead(undefined)).toBe(null);
-    });
+    const r = await land([["/pulls?", [full]], ["/branches/", gone], ["/compare/fff0000bbbb...", { status: "diverged", ahead_by: 1, behind_by: 1 }]], { recordedHeads: heads });
+    expect(r.merged).toBe(null);
+    expect(r.reason).toMatch(/recorded head fff0000bbbb is not contained/);
   });
 
   // ── N4: a full 10th page means the PR history was truncated, not exhausted ──
@@ -1674,10 +1617,76 @@ describe("featureBranchLanding — TEAM-5868 review fixes (content proof, bound 
       ["/pulls?", (p) => (p.endsWith("&page=1") ? [merged, ...filler.slice(1)] : filler)],
       ["/branches/", { commit: { sha: "new222" } }],
       ["/compare/old111...new222", { status: "ahead", ahead_by: 2, behind_by: 0, files: [{ filename: "a.js" }] }],
-      ["/compare/main...", { status: "diverged", ahead_by: 6, behind_by: 3, files: [{ filename: "a.js" }] }],
+      ["/compare/main...", { status: "diverged", ahead_by: 6, behind_by: 3, files: [{ filename: "a.js" }], base_commit: { sha: "tip" } }],
+      ...DIFF_TREES("new222"),
     ]);
     expect(r.merged).toBe(null);
     expect(r.reason).toMatch(/truncated at 10 pages/);
     expect(r.reason).toContain("2 commit(s) after its merged PR #846");
+  });
+});
+
+describe("featureBranchLanding — TEAM-5913 (404 binds every recorded head; false needs positive evidence)", () => {
+  const HEAD = "feature/EPIC-1-x";
+  const apiFor = (routes) => async (path) => {
+    for (const [k, v] of routes) if (path.includes(k)) return typeof v === "function" ? v(path) : v;
+    return {};
+  };
+  const land = (routes, extra = {}) => completion.featureBranchLanding({ owner: "o", repo: "r", base: "main", head: HEAD, api: apiFor(routes), ...extra });
+  const merged = { number: 846, merged_at: "2026-10-01T00:00:00Z", state: "closed", head: { sha: "old111abc" }, base: { ref: "main" }, merge_commit_sha: "m846", html_url: "https://github.com/o/r/pull/846" };
+  const gone = () => { throw Object.assign(new Error("GitHub GET branches 404: Branch not found"), { status: 404 }); };
+
+  // integration C-H-F, main C-S-T: S squashes H, T lands F's change via a fresh fix branch.
+  it("TEAM-5913 (3): F landed independently — tip trees equal, compare diverged → merged:true (not a strand)", async () => {
+    const r = await land([
+      ["/pulls?", [merged]], ["/branches/", { commit: { sha: "F" } }],
+      ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 2, files: [{ filename: "f.js" }], merge_base_commit: { sha: "C" }, base_commit: { sha: "T" } }],
+      ["/compare/m846...C", { status: "behind", ahead_by: 0, behind_by: 1 }],
+      ["/compare/old111abc...F", { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "f.js" }] }],
+      ["/git/commits/T", { tree: { sha: "tree1" } }], ["/git/commits/F", { tree: { sha: "tree1" } }],
+    ]);
+    expect(r).toEqual({ merged: true, mergeCommit: "T", prUrl: "" }); // base: merged:false
+  });
+
+  it("TEAM-5913 (4): compares without `files` reaching the fallback → merged:null, never a proven strand", async () => {
+    const r = await land([
+      ["/pulls?", [merged]], ["/branches/", { commit: { sha: "F" } }],
+      ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 2, base_commit: { sha: "T" } }],
+      ["/compare/old111abc...F", { status: "ahead", ahead_by: 1, behind_by: 0 }],
+      ["/git/commits/T", { tree: { sha: "tree1" } }], ["/git/commits/F", { tree: { sha: "tree2" } }],
+    ]);
+    expect(r.merged).toBe(null); // base: merged:false
+    expect(r.reason).toMatch(/no proof of unlanded content/);
+  });
+
+  it("TEAM-5913: a tree lookup that fails → merged:null; files present + trees differ → merged:false", async () => {
+    const routes = (treeF) => [
+      ["/pulls?", [merged]], ["/branches/", { commit: { sha: "F" } }],
+      ["/compare/main...", { status: "diverged", ahead_by: 2, behind_by: 2, files: [{ filename: "f.js" }], base_commit: { sha: "T" } }],
+      ["/compare/old111abc...F", { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "f.js" }] }],
+      ["/git/commits/T", { tree: { sha: "tree1" } }], ["/git/commits/F", treeF],
+    ];
+    expect((await land(routes(() => { throw Object.assign(new Error("500"), { status: 500 }); }))).merged).toBe(null);
+    expect((await land(routes({ tree: { sha: "tree2" } }))).merged).toBe(false);
+  });
+
+  it("TEAM-5913: 404 — every recorded head contained (equal or ancestor) → proof; one not contained, or a short sha → null", async () => {
+    const ok = [["/pulls?", [merged]], ["/branches/", gone], ["/compare/fff0000...old111abc", { status: "ahead", ahead_by: 1, behind_by: 0 }]];
+    expect(await land(ok, { recordedHeads: ["old111abc", "fff0000"] })).toEqual({ merged: true, mergeCommit: "m846", prUrl: merged.html_url });
+    const bad = [["/pulls?", [merged]], ["/branches/", gone], ["/compare/fff0000...old111abc", { status: "behind", ahead_by: 0, behind_by: 1 }]];
+    expect((await land(bad, { recordedHeads: ["old111abc", "fff0000"] })).merged).toBe(null);
+    expect((await land(ok, { recordedHeads: ["old111"] })).merged).toBe(null);
+    expect((await land(ok, { recordedHeads: [] })).merged).toBe(null);
+  });
+
+  it("TEAM-5913: recordedHeads — distinct, trimmed, independent of completedAt and order", () => {
+    const { recordedHeads } = completion;
+    expect(recordedHeads({
+      "B-2": { commitSha: "fff0000bbbb ", completedAt: "2026-10-01T00:00:00Z" },
+      "B-1": { commitSha: "head000aaaa", completedAt: "2026-10-03T00:00:00Z" },
+      "B-3": { commitSha: "head000aaaa" },
+      "B-4": { mergeCommit: "m846" },
+    }).sort()).toEqual(["fff0000bbbb", "head000aaaa"]);
+    expect(recordedHeads(undefined)).toEqual([]);
   });
 });

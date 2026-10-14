@@ -648,23 +648,12 @@ export function resolvePrBase({ workflow, ticketDescription, defaultBranch, getA
 }
 
 /**
- * TEAM-5868 N2 — the LAST branch head this run recorded: the `commitSha` (harvested
- * from report_completion's commit_sha, the branch HEAD the agent reported — TEAM-3755
- * F1) of the most recently completed task entry that carries one, ordered by the
- * entry's `completedAt` (stamped once per completion — a replayed done keeps it, TEAM-5884).
- * Returns null whenever the order cannot be known — a head-bearing entry without
- * completedAt, or ANY two different heads tied at the newest instant — because "any
- * recorded head" is NOT what the 404 proof may bind to: H recorded+merged, then the
- * branch advanced to F, then deleted must not read as "H landed".
+ * TEAM-5913 — every distinct branch head this run recorded (harvested `commitSha`,
+ * TEAM-3755 F1). Deliberately unordered: completedAt is not ancestry (a replay or a
+ * late first completion reorders it), so the 404 proof must account for ALL of them.
  */
-export function latestRecordedHead(agentTasks) {
-  const heads = Object.values(agentTasks || {}).filter((e) => nonEmptyString(e?.commitSha));
-  if (heads.length === 0) return null;
-  if (heads.some((e) => !nonEmptyString(e.completedAt))) return null;
-  heads.sort((a, b) => String(b.completedAt).localeCompare(String(a.completedAt)));
-  const top = heads[0].commitSha.trim();
-  if (heads.some((e) => e.completedAt === heads[0].completedAt && e.commitSha.trim() !== top)) return null;
-  return top;
+export function recordedHeads(agentTasks) {
+  return [...new Set(Object.values(agentTasks || {}).map((e) => e?.commitSha).filter(nonEmptyString).map((s) => s.trim()))];
 }
 
 /**
@@ -672,11 +661,12 @@ export function latestRecordedHead(agentTasks) {
  * `api` is the orchestrator's githubApi (path → json, throws with err.status; the caller
  * fails open). Only PRs INTO `base` count, read across pages (newest first, ≤10 pages;
  * a FULL tenth page means the history was truncated, and truncation turns every
- * "provably not merged" below into "unknown" — N4). `lastKnownHead` is latestRecordedHead().
+ * "provably not merged" below into "unknown" — N4). `recordedHeads` is recordedHeads().
  *   { merged: true,  mergeCommit, prUrl } the latest merged PR's head IS the branch
  *                                         head (squash-safe); or the branch is gone
- *                                         (404) and the run's LAST recorded head is
- *                                         that PR's head (N2); or compare says base
+ *                                         (404) and EVERY recorded head is, or is an
+ *                                         ancestor of, that PR's head (TEAM-5913); or
+ *                                         compare says base
  *                                         contains the branch; or the branch's tree
  *                                         equals what merged (merged-head..head diff
  *                                         empty, P2); or it equals a base state that
@@ -684,14 +674,17 @@ export function latestRecordedHead(agentTasks) {
  *                                         GitHub compare is THREE-dot (merge-base..head),
  *                                         so an empty base...head diff alone proves
  *                                         only tree(head) == tree(merge-base) — and the
- *                                         merge-base may predate the squash (N1).
+ *                                         merge-base may predate the squash (N1). Or
+ *                                         base's tip tree IS the head's tree (TEAM-5913).
  *   { merged: false, reason }             provably not on base and nothing open to
  *                                         carry it — incl. commits pushed AFTER the
  *                                         unified PR merged (the TEAM-5828 strand);
+ *                                         needs files on both compares, and trees that
+ *                                         differ, else null (P2/P3 are not exhaustive);
  *   { merged: null,  reason? }            unknown, or an open PR still carries it.
  * Only `merged === false` refuses completion (TEAM-3721 fail-open).
  */
-export async function featureBranchLanding({ owner, repo, base, head, api, lastKnownHead = null }) {
+export async function featureBranchLanding({ owner, repo, base, head, api, recordedHeads = [] }) {
   const enc = encodeURIComponent;
   const list = [];
   let lastBatch = 0;
@@ -713,10 +706,18 @@ export async function featureBranchLanding({ owner, repo, base, head, api, lastK
     try { headSha = (await api(`/repos/${owner}/${repo}/branches/${enc(head)}`))?.commit?.sha || null; }
     catch (err) {
       if (err?.status !== 404) throw err;
-      // Auto-deleted after merge — proof ONLY if the run's last recorded head is the PR's.
-      const known = nonEmptyString(lastKnownHead) ? lastKnownHead.trim() : "";
-      if (mergedHead && known.length >= 7 && mergedHead.startsWith(known)) return proof();
-      return { merged: null, reason: `branch ${head} is gone and merged PR #${mergedPr.number} head ${mergedHead.slice(0, 12)} is not the last head this run recorded (${known || "none"})` };
+      // Auto-deleted after merge — proof ONLY if the PR's head contains EVERY head this
+      // run recorded (TEAM-5913: order-free, so no replay or late completion can steer it).
+      const heads = recordedHeads.filter(nonEmptyString).map((s) => s.trim());
+      const why = (h) => ({ merged: null, reason: `branch ${head} is gone and recorded head ${h} is not contained in merged PR #${mergedPr.number} head ${mergedHead.slice(0, 12)}` });
+      if (!mergedHead || heads.length === 0) return why("(none)");
+      for (const h of heads) {
+        if (h.length < 7) return why(h);
+        if (mergedHead.startsWith(h)) continue;
+        const c = await api(`/repos/${owner}/${repo}/compare/${enc(h)}...${enc(mergedHead)}`);
+        if (!(c?.behind_by === 0 && (c.status === "identical" || c.status === "ahead"))) return why(h);
+      }
+      return proof();
     }
   }
   if (mergedPr && headSha && mergedHead === headSha) return proof();
@@ -744,6 +745,13 @@ export async function featureBranchLanding({ owner, repo, base, head, api, lastK
   const open = list.find((p) => p.state === "open");
   if (open) return { merged: null, reason: `open PR #${open.number} to ${base}` };
   if (!after) return { merged: null };
+  // TEAM-5913: P2/P3 are sufficient, not exhaustive — refuse only on positive evidence.
+  const treeOf = async (sha) => (sha ? (await api(`/repos/${owner}/${repo}/git/commits/${enc(sha)}`).catch(() => null))?.tree?.sha || null : null);
+  const tipTree = await treeOf(cmp?.base_commit?.sha), headTree = await treeOf(headSha);
+  if (tipTree && tipTree === headTree) return { merged: true, mergeCommit: cmp.base_commit.sha, prUrl: "" };
+  if (!tipTree || !headTree || !Array.isArray(cmp?.files) || !(after.files?.length > 0)) {
+    return { merged: null, reason: `no landing proof for ${head} on ${base}, but no proof of unlanded content either (files/trees unavailable)` };
+  }
   return unmerged(
     `feature branch ${head} has ${after?.ahead_by ?? "?"} commit(s) after its merged PR #${mergedPr.number} not contained in ${base} and no open PR to ${base}`
   );

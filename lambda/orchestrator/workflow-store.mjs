@@ -185,8 +185,8 @@ export async function claimHumanTicket(workflowId, ticketId) {
  * would race the webhook's concurrent metadata merge). Untracked entry: seed whole.
  *
  * TEAM-5890 — the completion stamp is written EXACTLY ONCE, on running -> complete,
- * enforced by the condition: `completedAt` orders the run's heads (completion.mjs
- * latestRecordedHead), so a replayed done / stale-read duplicate must not re-stamp it
+ * enforced by the condition (TEAM-5913: the 404 proof no longer orders heads by it,
+ * but it stays "when it completed"), so a replayed done / stale-read duplicate must not re-stamp it
  * and a legacy complete entry without one is never backfilled. A re-claimed rework
  * generation is `running` again and DOES get a fresh stamp — plain SET, never
  * if_not_exists (that would pin the reworked head to its old time and break
