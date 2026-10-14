@@ -3266,28 +3266,24 @@ async function notifyCompletionBlockedOnce(workflow, offenders, reason = "missin
   const id = `notif_completion_${notice.slug}_${workflow.id}`;
   const list = Array.isArray(workflow.humanNotifications) ? workflow.humanNotifications : [];
   if (list.some((n) => n.id === id && !n.acknowledged)) return false;
-  try {
-    // TEAM-5853: the snapshot check above is only a fast path — two completions on
-    // stale snapshots both pass it. appendEscalationOnce re-reads under a notifVersion
-    // CAS and stands down when an open one exists, so exactly one caller appends.
-    const appended = await store.appendEscalationOnce(workflow.id, id, {
-      type: "manager_escalation",
-      title: notice.title,
-      details: notice.details,
-      reviewer: "completion-gate",
-      timestamp: new Date().toISOString(),
-      acknowledged: false,
-    }, { maxCount: 1 });
-    if (!appended) return false;
-    await publishEvent(workflow.epicId, "workflow.completion_blocked", {
-      workflowId: workflow.id, reason, offenders,
-    });
-    console.log(`[orchestrator] ${workflow.id}: completion blocked (${reason}) — manager_escalation appended (${offenders})`);
-    return true;
-  } catch (err) {
-    console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification failed (non-fatal): ${err?.message || err}`);
-    return false;
-  }
+  // TEAM-5853: the snapshot check above is only a fast path; appendEscalationOnce re-reads
+  // under a notifVersion CAS so exactly one racer appends. TEAM-5914: only its verified
+  // `false` (open row) suppresses the event — a throw or null (not persisted) still publishes.
+  const appended = await store.appendEscalationOnce(workflow.id, id, {
+    type: "manager_escalation",
+    title: notice.title,
+    details: notice.details,
+    reviewer: "completion-gate",
+    timestamp: new Date().toISOString(),
+    acknowledged: false,
+  }, { maxCount: 1 }).catch((err) => {
+    console.warn(`[orchestrator] ${workflow.id}: completion-blocked notification write failed (event still published): ${err?.message || err}`);
+    return null;
+  });
+  if (appended === false) return false;
+  await publishEvent(workflow.epicId, "workflow.completion_blocked", { workflowId: workflow.id, reason, offenders }); // never throws
+  console.log(`[orchestrator] ${workflow.id}: completion blocked (${reason}) — manager_escalation ${appended ? "appended" : "NOT persisted"} (${offenders})`);
+  return appended === true;
 }
 
 /**
