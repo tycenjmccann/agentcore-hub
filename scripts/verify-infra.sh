@@ -369,7 +369,7 @@ if aws lambda get-function-configuration --function-name "$PIPELINE_TOOLS_FUNCTI
 
   if [ -n "$ARTIFACT_BUCKET" ]; then
     check "IAM: $PIPELINE_TOOLS_ROLE grants s3:PutObject on pipeline-artifacts/ship-approvals/*" \
-      "role_policy_grants $PIPELINE_TOOLS_ROLE s3:PutObject arn:aws:s3:::$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/verify-infra-probe.json"
+      "role_policy_grants_under $PIPELINE_TOOLS_ROLE s3:PutObject arn:aws:s3:::$ARTIFACT_BUCKET/pipeline-artifacts/ship-approvals/"
     # TEAM-5600: the third prerequisite. The veto probe lists the marker's exact
     # key; without ListBucket on the bucket S3 answers a missing marker with 403,
     # and every clean deploy reports preapproval reason "rejection_unverified".

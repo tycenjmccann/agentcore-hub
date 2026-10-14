@@ -826,6 +826,32 @@ describe("buildInlinePolicy — the ship-approval record write", () => {
       });
     });
 
+    // TEAM-5924 sibling: verify-infra.sh:372 had the SAME probe-key shape for the
+    // ship-approvals write — a read/write narrowed to ship-approvals/verify-* (or any
+    // other single key) passed the old check while no real ship-approval record
+    // (<merge_commit>.json) was ever granted. Same fix, same helper.
+    describe("role_policy_grants_under: a grant must cover all of ship-approvals/ (TEAM-5924 sibling)", () => {
+      const SHIP_NS = `${ARTIFACT_BUCKET_ARN}/pipeline-artifacts/ship-approvals/`;
+      const under = (action, prefix, fixture) => runIamCheck(`role_policy_grants_under role ${action} ${prefix}`, fixture);
+
+      it("passes against buildInlinePolicy's real ShipApprovalRecordWrite grant", async () => {
+        const policy = buildInlinePolicy(BASE);
+        expect(await under("s3:PutObject", SHIP_NS, inlineOnly(policy))).toBe(0);
+      });
+
+      it("fails for a write narrowed to ship-approvals/verify-* only", async () => {
+        const narrow = { Effect: "Allow", Action: ["s3:PutObject"], Resource: `${SHIP_NS}verify-*` };
+        expect(await under("s3:PutObject", SHIP_NS, inlineOnly(doc(narrow)))).not.toBe(0);
+      });
+
+      it("verify-infra.sh checks the pipeline-tools role's ship-approvals/ write with it, not with a probe key", () => {
+        expect(VERIFY_SH).toMatch(
+          /role_policy_grants_under \$PIPELINE_TOOLS_ROLE s3:PutObject arn:aws:s3:::\$ARTIFACT_BUCKET\/pipeline-artifacts\/ship-approvals\/"/
+        );
+        expect(VERIFY_SH).not.toMatch(/ship-approvals\/verify-infra-probe\.json/);
+      });
+    });
+
     it("recognises the grant when it lives only in an attached managed policy", async () => {
       const policy = structuredClone(buildInlinePolicy(BASE));
       const write = sid(policy, "ShipApprovalRecordWrite");
