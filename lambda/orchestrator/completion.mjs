@@ -22,6 +22,7 @@
  * fixes with their originating upstream phase, so a ship-review fix filed against
  * a dev still gates the SHIP phase), else the assignee's roster phase.
  */
+import { parseGitHubUrl } from "./repo-check.mjs";
 
 /**
  * TEAM-4121 FR-8 — PARITY MIRROR of FIX_KINDS in lambda/orchestrator/fix-contract.mjs
@@ -247,6 +248,14 @@ export function completionBlockedNotice(reason, detail, { featureBranch } = {}) 
       slug: "unmerged",
       title: "Run cannot complete: feature branch has work not on the default branch",
       details: `Every ticket is Done but the ship merge-verify gate refused to close the run: ${detail}. Land it: open a PR from ${featureBranch ? `feature branch ${featureBranch}` : "the feature branch"} to the default branch (or have the release manager open a fresh unified PR through Merge Approval), then re-Done any ticket to re-check.`,
+    };
+  }
+  if (reason === "open_follow_up_pr") {
+    // TEAM-6062: one notice per distinct open-PR set — a later, different set must surface.
+    return {
+      slug: `followup_pr_${shortHash(String(detail).split(", ").sort().join(","))}`,
+      title: "Run cannot complete: a follow-up PR to the default branch or a stated base is still open",
+      details: `Every ticket is Done but this run's unified PR already merged and follow-up PR(s) to the default branch or a stated base are still open: ${detail}. Nothing merges them on its own: file its CI → Ship → Merge Approval → CD chain (release-manager blueprint, "Post-merge follow-up PR"), or close the PR as superseded, then re-Done any ticket to re-check.`,
     };
   }
   return {
@@ -826,6 +835,109 @@ export async function featureBranchLanding({ owner, repo, base, head, api, recor
   }
   if (v.landed) return { merged: true, mergeCommit: tipSha, prUrl: "" };
   return inconclusive(v.why);
+}
+
+/** TEAM-6062 — 8-hex FNV-1a; pure, no node:crypto (src/ imports this module). */
+function shortHash(s) {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) h = Math.imul(h ^ s.charCodeAt(i), 0x01000193) >>> 0;
+  return h.toString(16).padStart(8, "0");
+}
+
+/** TEAM-6062 — every configured GitHub repo with its own default branch (TEAM-6075: one parser, shared with parseRepoUrl). */
+export function repoTargets(repoConfig) {
+  return (repoConfig?.repos || []).flatMap((r) => {
+    const m = parseGitHubUrl(r?.url);
+    return m ? [{ ...m, defaultBranch: r.defaultBranch || "main" }] : [];
+  });
+}
+
+/**
+ * TEAM-6133 — the ONE PR-url parser: the first http(s) URL token in `text` whose host is
+ * exactly github.com (any case; `new URL` lowercases it) and whose path is /<owner>/<repo>/pull/<n>, <n> a WHOLE
+ * positive integer (TEAM-6148: `1not-a-pr`, `1%2Fx`, `0` are null; prose punctuation is stripped off the token first). A look-alike host (notgithub.com, example.org/github.com/…) is null.
+ */
+export function githubPrRef(text) {
+  for (const tok of String(text ?? "").match(/https?:\/\/\S+/gi) || []) {
+    let u; try { u = new URL(tok.replace(/[.,;:!?)\]}>'"]+$/, "")); } catch { continue; } // TEAM-6148: prose punctuation off the token
+    const p = u.pathname.split("/"), n = /^[1-9]\d*$/.exec(p[4] || "");
+    if (u.hostname === "github.com" && p[1] && p[2] && p[3] === "pull" && n) return { owner: p[1], repo: p[2], number: Number(n[0]) };
+  }
+  return null;
+}
+
+/**
+ * TEAM-6032 (DL-038) — the run's PRs in its configured repos, one per repo+number.
+ * TEAM-6062: `prUrl` is fill-once, so a re-dispatched ticket's completion record
+ * (`records[ticketId].pr_url`) is read too. Pure; foreign repos and non-PR urls are dropped.
+ */
+export function followUpPrRefs(agentTasks, repos, records = {}) {
+  const refs = new Map();
+  for (const [tid, e] of Object.entries(agentTasks || {})) {
+    for (const url of [records?.[tid]?.pr_url, e?.prUrl]) {
+      if (typeof url !== "string") continue; // TEAM-6075: a non-string record pr_url must not disable the gate
+      const m = githubPrRef(url);
+      const r = m && [].concat(repos).find((x) => m.owner.toLowerCase() === String(x?.owner).toLowerCase() && m.repo.toLowerCase() === String(x?.repo).toLowerCase());
+      const key = r && `${r.owner}/${r.repo}#${m.number}`.toLowerCase();
+      if (r && !refs.has(key)) refs.set(key, { owner: r.owner, repo: r.repo, defaultBranch: r.defaultBranch, number: m.number, url: url.trim() });
+    }
+  }
+  return [...refs.values()];
+}
+
+/**
+ * TEAM-6032 — one PR after the unified merge: "skip" the unified PR itself and any PR
+ * into neither the default branch nor a `statedBases` entry (TEAM-6108; a pre-merge fix
+ * into the integration branch, or an arbitrary base); "open" is an orphan nothing will
+ * merge; "closed" (merged, or closed as superseded) is fine.
+ */
+export function classifyFollowUpPr(pr, { featureBranch, defaultBranch, statedBases = [] }) {
+  if (!pr || typeof pr.state !== "string" || !nonEmptyString(pr.base?.ref)) return "unknown";
+  if (pr.head?.ref === featureBranch || (pr.base.ref !== defaultBranch && !statedBases.includes(pr.base.ref))) return "skip";
+  return pr.state === "open" ? "open" : "closed";
+}
+
+/**
+ * TEAM-6032 — which of `refs` are still OPEN into the default branch or a stated base. `api` as
+ * in featureBranchLanding; a failed read is `unknown`, never `open` (fail-open, TEAM-3721).
+ */
+export async function openFollowUpPrs({ owner, repo, refs, featureBranch, defaultBranch, statedBases = [], api }) {
+  const open = [], unknown = [];
+  for (const ref of refs) {
+    const pr = await api(`/repos/${ref.owner || owner}/${ref.repo || repo}/pulls/${ref.number}`).catch(() => null);
+    const c = classifyFollowUpPr(pr, { featureBranch, defaultBranch: ref.defaultBranch || defaultBranch, statedBases });
+    if (c === "open") open.push(ref.url);
+    else if (c === "unknown") unknown.push(ref.url);
+  }
+  return { open, unknown };
+}
+
+/**
+ * TEAM-6032 (DL-038) — the completion backstop: once the unified PR merged
+ * (`mergeProof` from GitHub, or a ship-phase mergeCommit per resolvePrBase), the
+ * open follow-up PRs into the default branch, or (TEAM-6108) into a `base_branch:` a
+ * roster ticket's description states that is not the integration branch, whenever the
+ * PR was opened. Fail-open: an unreadable PR or a thrown probe never refuses. `repoRef()` returns `[{ owner, repo, defaultBranch }]`
+ * (may throw); `readCompletionRecord(ticketId)` is read only past the merge check
+ * and a null/failed read falls back to the cached `prUrl` (TEAM-6062): one record
+ * read per ticket per completion attempt, memoized per invocation by the caller.
+ */
+export async function followUpPrGate({ workflow, agentTasks, tickets = [], mergeProof, repoRef = () => repoTargets(workflow.repoConfig), readCompletionRecord = async () => null, getAgentPhase, api, warn = console.warn }) {
+  try {
+    const repos = [].concat(repoRef());
+    const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
+    if (!mergeProof && resolvePrBase({ workflow: { ...workflow, agentTasks }, defaultBranch, getAgentPhase }).reason !== "unified_pr_merged") return [];
+    const ids = Object.keys(agentTasks || {});
+    const recs = await Promise.all(ids.map((tid) => Promise.resolve().then(() => readCompletionRecord(tid)).catch(() => null)));
+    const records = Object.fromEntries(ids.map((tid, i) => [tid, recs[i]]));
+    const statedBases = [...new Set([].concat(tickets || []).map((t) => BASE_BRANCH_LINE_RE.exec(String(t?.description || ""))?.[1]).filter((b) => b && b !== workflow.featureBranch))];
+    const r = await openFollowUpPrs({ refs: followUpPrRefs(agentTasks, repos, records), featureBranch: workflow.featureBranch, defaultBranch, statedBases, api });
+    if (r.unknown.length > 0) warn(`[orchestrator] follow-up PR state unknown for ${workflow.id}: ${r.unknown.join(", ")}`);
+    return [...r.open].sort();
+  } catch (err) {
+    warn(`[orchestrator] follow-up PR check skipped for ${workflow.id}: ${err.message}`);
+    return [];
+  }
 }
 
 /**

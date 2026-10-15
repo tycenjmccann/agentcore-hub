@@ -58,6 +58,14 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
               t.set("__COUNTER__", { ticketId: "__COUNTER__", nextNum: h.state.counter });
               return { Attributes: { nextNum: h.state.counter } };
             }
+            // TEAM-6091: the derived lock's takeover CAS — honoured atomically.
+            if (String(cmd.input.Key.ticketId).startsWith("IDEMP#") && cmd.input.ConditionExpression === "reservedTicketId = :old") {
+              const lock = t.get(cmd.input.Key.ticketId);
+              const v = cmd.input.ExpressionAttributeValues;
+              if (!lock || lock.reservedTicketId !== v[":old"]) throw condFail();
+              t.set(lock.ticketId, { ...lock, reservedTicketId: v[":new"], lockedAt: v[":now"], ttl: v[":ttl"] });
+              return {};
+            }
             return {};
           }
           if (name === "PutCommand") {
@@ -197,9 +205,12 @@ describe("TEAM-5712 — create_ticket client_token", () => {
     expect(tickets()).toHaveLength(1);
   });
 
-  it("(f) no token: no lock row, and two creates are two tickets (unchanged)", async () => {
-    const a = await create({ ...ESCALATION });
-    const b = await create({ ...ESCALATION });
+  it("(f) no token and no scope (no workflow_id, no parent): no lock row, and two creates are two tickets (unchanged)", async () => {
+    // TEAM-6091: a token-less create WITH a workflow or parent now takes a derived
+    // lock (the TEAM-6091 suite below); with neither there is nothing to scope it by.
+    const { workflow_id: _wf, parent_key: _p, ...unscoped } = ESCALATION;
+    const a = await create({ ...unscoped });
+    const b = await create({ ...unscoped });
     expect(a.key).not.toBe(b.key);
     expect(tickets()).toHaveLength(2);
     expect(locks()).toHaveLength(0);
@@ -214,4 +225,95 @@ describe("TEAM-5712 — create_ticket client_token", () => {
       expect(tickets()).toHaveLength(0);
     }
   );
+});
+
+/**
+ * TEAM-6091: a token-less create (every persona call — the fleet tool tells them to
+ * leave client_token "") used to have NO dedupe in this twin, so two personas that each
+ * check-then-create the post-merge follow-up chain filed it twice. It now takes the
+ * TEAM-5712 lock under a token derived from run-or-parent + assignee + normalized
+ * summary (gate-contract.mjs deriveCreateDedupeToken).
+ */
+describe("TEAM-6091 — token-less create dedupe (derived lock)", () => {
+  const FOLLOW_UP = {
+    summary: "CD: follow-up PR https://github.com/acme/hub/pull/941",
+    description: "deploy the follow-up PR",
+    parent_key: EPIC,
+    assignee: "agentcore_hub_release_manager",
+    workflow_id: "wf_test",
+  };
+  const setStatus = (key, status) => h.state.table.set(key, { ...h.state.table.get(key), status });
+
+  it("(a) two CONCURRENT creates of the same ticket (same parent + summary, no client_token) file ONE ticket and both return its key", async () => {
+    const [a, b] = await Promise.all([create({ ...FOLLOW_UP }), create({ ...FOLLOW_UP })]);
+    expect(a.key, JSON.stringify(a)).toMatch(/^TEAM-\d+$/);
+    expect(b.key, JSON.stringify(b)).toBe(a.key);
+    expect(tickets(), "exactly one ticket").toHaveLength(1);
+    expect([a.idempotent, b.idempotent].filter(Boolean), "the loser answers idempotently").toHaveLength(1);
+  });
+
+  it("(b) parent-only scope (no workflow_id): two concurrent creates still file ONE ticket", async () => {
+    const { workflow_id: _wf, ...parentOnly } = FOLLOW_UP;
+    const [a, b] = await Promise.all([create({ ...parentOnly }), create({ ...parentOnly })]);
+    expect(b.key).toBe(a.key);
+    expect(tickets()).toHaveLength(1);
+  });
+
+  it("(c) cosmetic summary variants (case, whitespace, trailing period) are the same ticket", async () => {
+    const [a, b] = await Promise.all([
+      create({ ...FOLLOW_UP }),
+      create({ ...FOLLOW_UP, summary: `  ${FOLLOW_UP.summary.toUpperCase().replace(/ /g, "   ")}.` }),
+    ]);
+    expect(b.key).toBe(a.key);
+    expect(tickets()).toHaveLength(1);
+  });
+
+  it("(d) a re-file after the first ticket is settled is a NEW ticket (the lock is taken over)", async () => {
+    for (const settled of ["done", "closed", "cancelled", "skipped"]) {
+      const first = await create({ ...FOLLOW_UP, summary: `${FOLLOW_UP.summary} ${settled}` });
+      setStatus(first.key, settled);
+      const [x, y] = await Promise.all([
+        create({ ...FOLLOW_UP, summary: `${FOLLOW_UP.summary} ${settled}` }),
+        create({ ...FOLLOW_UP, summary: `${FOLLOW_UP.summary} ${settled}` }),
+      ]);
+      expect(x.key, settled).not.toBe(first.key);
+      expect(y.key, `two concurrent re-filers converge (${settled})`).toBe(x.key);
+    }
+    expect(tickets()).toHaveLength(8);
+  });
+
+  it("(e) an OPEN ticket is answered with, sequentially too", async () => {
+    const first = await create({ ...FOLLOW_UP });
+    setStatus(first.key, "in_progress");
+    const again = await create({ ...FOLLOW_UP });
+    expect(again.key).toBe(first.key);
+    expect(tickets()).toHaveLength(1);
+  });
+
+  it("(f) a different assignee, workflow or parent is a different ticket", async () => {
+    await Promise.all([
+      create({ ...FOLLOW_UP }),
+      create({ ...FOLLOW_UP, assignee: "agentcore_hub_ci_agent" }),
+      create({ ...FOLLOW_UP, workflow_id: "wf_other" }),
+    ]);
+    const { workflow_id: _wf, ...parentOnly } = FOLLOW_UP;
+    await Promise.all([create({ ...parentOnly }), create({ ...parentOnly, parent_key: "TEAM-901" })]);
+    expect(tickets()).toHaveLength(5);
+  });
+
+  it("(g) an explicit client_token still wins over the derived one, and still answers a settled ticket (a retry, not a re-file)", async () => {
+    const first = await create({ ...FOLLOW_UP, client_token: TOKEN });
+    setStatus(first.key, "done");
+    const retry = await create({ ...FOLLOW_UP, client_token: TOKEN });
+    expect(retry.key).toBe(first.key);
+    expect(locks().map((l) => l.ticketId)).toEqual([`IDEMP#${TOKEN}`]);
+  });
+
+  it("(h) the derived lock is an ordinary TEAM-5712 lock row: ttl ~7 days, auto- prefix, no ticket attributes", async () => {
+    await create({ ...FOLLOW_UP });
+    const [lock] = locks();
+    expect(lock.ticketId).toMatch(/^IDEMP#auto-[0-9a-f]{40}$/);
+    expect(lock.ttl - Math.floor(Date.now() / 1000)).toBeGreaterThan(7 * 24 * 3600 - 60);
+    expect(Object.keys(lock).sort()).toEqual(["lockedAt", "reservedTicketId", "ticketId", "ttl"]);
+  });
 });

@@ -130,6 +130,7 @@
         "manual-step-lint.mjs",
         "s3-conditional.mjs",
         "ticket-probe.mjs",
+        "github-pr-ref.mjs",
         "node_modules/"
       ],
       "npm": true
@@ -143,6 +144,7 @@
         "manual-step-lint.mjs",
         "s3-conditional.mjs",
         "ticket-probe.mjs",
+        "github-pr-ref.mjs",
         "node_modules/"
       ],
       "npm": true,

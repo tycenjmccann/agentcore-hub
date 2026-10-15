@@ -44,11 +44,11 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, isIntentOnlyReservation, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, githubPrRef, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES, isIntentOnlyReservation } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
-import { ensureRepoCheck, formatRepoCheckWarning } from "./repo-check.mjs";
+import { ensureRepoCheck, formatRepoCheckWarning, parseGitHubUrl } from "./repo-check.mjs";
 import { eventIdFor, normalizeEventDedupeMode } from "./event-id.mjs";
 import { GATE_STATES, classifyRejection, normalizeGateGuardMode } from "./gate-state.mjs";
 // TEAM-4121 FR-8: the fix-ticket contract lives in a zero-import module that is
@@ -1780,11 +1780,11 @@ function resolvePrUrlForReview(workflow, gateTicket, upstream) {
  * enforceDiffScope's rename handling.
  */
 async function computeReviewChangeSet(prUrl) {
-  const m = String(prUrl || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  const m = githubPrRef(prUrl); // TEAM-6133: host-anchored, shared with the follow-up PR gate
   if (!m) return null;
-  const [, owner, repo, number] = m;
+  const { owner, repo, number } = m;
   try {
-    const files = await callGitHub("list_pr_files", { owner, repo, pull_number: Number(number) });
+    const files = await callGitHub("list_pr_files", { owner, repo, pull_number: number });
     if (!Array.isArray(files) || files.length === 0) return null;
     const paths = [];
     for (const f of files) {
@@ -3525,6 +3525,13 @@ export async function completeWorkflow(workflow) {
       return;
     }
     if (probe.merged === true) mergeProof = probe;
+    // TEAM-6032 (DL-038): after the unified merge, a fix PR to the default branch (or a ticket-stated base, TEAM-6108) still open is orphaned.
+    const open = await followUpPrGate({ workflow, agentTasks: freshWf?.agentTasks || workflow.agentTasks, tickets: children, mergeProof, readCompletionRecord, getAgentPhase: (id) => getAgentDef(id)?.phase, api: githubApi });
+    if (open.length > 0) {
+      console.error(`[orchestrator] CompletionRejectedOpenFollowUpPr ${workflow.id}: ${open.join(", ")} still open — leaving run open.`);
+      await notifyCompletionBlockedOnce(workflow, open.join(", "), "open_follow_up_pr");
+      return;
+    }
   }
 
   try {
@@ -3753,9 +3760,9 @@ async function closeWorkflowBlocked(workflow, verdict) {
  * label is created on demand by GitHub if it doesn't exist yet.
  */
 async function labelPullRequest(prUrl, label) {
-  const m = String(prUrl || "").match(/github\.com\/([^/]+)\/([^/]+)\/pull\/(\d+)/);
+  const m = githubPrRef(prUrl); // TEAM-6133: host-anchored, shared with the follow-up PR gate
   if (!m) throw new Error(`unrecognized PR url: ${prUrl}`);
-  const [, owner, repo, number] = m;
+  const { owner, repo, number } = m;
   await githubApi(`/repos/${owner}/${repo}/issues/${number}/labels`, "POST", { labels: [label] });
 }
 
@@ -4787,11 +4794,10 @@ function buildManifestContext(manifest, agentPhase, workflow, ticket) {
 
   // Canonical repo info from manifest (single source of truth)
   if (manifest.repoConfig?.repos?.length > 0) {
-    const url = manifest.repoConfig.repos[0].url || "";
-    const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
+    const match = parseGitHubUrl(manifest.repoConfig.repos[0].url);
     if (match) {
       ctx += `### Repository\n`;
-      ctx += `- owner: "${match[1]}"\n- repo: "${match[2]}"\n`;
+      ctx += `- owner: "${match.owner}"\n- repo: "${match.repo}"\n`;
       ctx += `- default_branch: "${manifest.repoConfig.repos[0].defaultBranch || "main"}"\n\n`;
     }
   }
@@ -5075,9 +5081,7 @@ async function publishEvent(ticketId, detailType, detail) {
 // ─── Utilities ─────────────────────────────────────────────────────────────────
 
 function parseRepoUrl(repoConfig) {
-  const url = repoConfig?.repos?.[0]?.url || "";
-  const match = url.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
-  return match ? { owner: match[1], repo: match[2] } : { owner: "", repo: "" };
+  return parseGitHubUrl(repoConfig?.repos?.[0]?.url) || { owner: "", repo: "" };
 }
 
 /**

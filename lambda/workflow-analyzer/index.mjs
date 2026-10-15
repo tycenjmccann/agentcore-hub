@@ -744,7 +744,7 @@ export function prNumbersFrom(workflow, extraUrls = []) {
     workflow?.delivery?.prUrl,
     ...extraUrls,
   ]) {
-    const m = /\/pull\/(\d+)/.exec(String(url || ""));
+    const m = /\/pull\/([1-9]\d*)(?![\w%-])/.exec(String(url || "")); // TEAM-6148: whole positive integer
     const n = m ? Number(m[1]) : NaN;
     if (Number.isFinite(n) && !out.includes(n)) out.push(n);
   }

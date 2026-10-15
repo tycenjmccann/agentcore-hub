@@ -105,11 +105,19 @@ describe("buildTicketsPolicyStatements — the S3 grants (TEAM-5867 P0)", () => 
     }
   });
 
-  it("the S3 actions are exactly GetObject, ListBucket and the TEAM-5941 fence PutObject - no s3:Delete*, no other write", () => {
-    for (const provider of ["dynamodb", "jira"] as const) {
-      const s3Actions = s3Statements(statements(provider)).flatMap(actionsOf).sort();
-      expect(s3Actions).toEqual(["s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
-    }
+  it("the S3 actions are exactly GetObject, ListBucket and PutObject (the TEAM-5941 fence; on jira also the TEAM-6091 create claim) - no s3:Delete*, no other write", () => {
+    expect(s3Statements(statements("dynamodb")).flatMap(actionsOf).sort()).toEqual(["s3:GetObject", "s3:ListBucket", "s3:PutObject"]);
+    expect(s3Statements(statements("jira")).flatMap(actionsOf).sort()).toEqual(["s3:GetObject", "s3:ListBucket", "s3:PutObject", "s3:PutObject"]);
+  });
+
+  // TEAM-6091: the Jira twin has no conditional create, so its token-less create dedupe
+  // is a create-only PutObject of ticket-claims/<token>.json. Jira only, prefix-scoped.
+  it("jira (only): the create-claim PutObject is one unconditioned statement scoped to ticket-claims/*", () => {
+    const claim = statements("jira").filter((s) => s.Sid === "TicketCreateClaim");
+    expect(claim).toEqual([
+      { Sid: "TicketCreateClaim", Effect: "Allow", Action: ["s3:PutObject"], Resource: `${BUCKET_ARN}/ticket-claims/*` },
+    ]);
+    expect(statements("dynamodb").some((s) => s.Sid === "TicketCreateClaim")).toBe(false);
   });
 
   // TEAM-5941: the Done-intent fence is a conditional PutObject of completions/<ticket>.json
@@ -117,7 +125,7 @@ describe("buildTicketsPolicyStatements — the S3 grants (TEAM-5867 P0)", () => 
   it.each(["dynamodb", "jira"] as const)(
     "%s: the fence PutObject is one unconditioned statement scoped to completions/* and nothing wider",
     (provider) => {
-      const list = statements(provider).filter((s) => actionsOf(s).includes("s3:PutObject"));
+      const list = statements(provider).filter((s) => actionsOf(s).includes("s3:PutObject") && s.Sid !== "TicketCreateClaim");
       expect(list).toHaveLength(1);
       const { Sid, ...rest } = list[0];
       expect(Sid).toBe("CompletionRecordFence");
@@ -177,6 +185,7 @@ describe("buildTicketsPolicyStatements — the S3 grants (TEAM-5867 P0)", () => 
       "ArtifactRead",
       "ArtifactBucketList",
       "CompletionRecordFence", // TEAM-5941
+      "TicketCreateClaim", // TEAM-6091 (jira only)
     ]);
   });
 

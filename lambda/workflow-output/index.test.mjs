@@ -631,6 +631,19 @@ describe("report_completion — merge_commit / outcome / block_reason", () => {
     expect(r.block_reason).toHaveLength(500);
     expect(h.warns.join("\n")).toMatch(/oversized merge_commit/);
   });
+
+  // TEAM-6075 — the orchestrator's follow-up PR gate reads this record's pr_url; a
+  // non-string value must never reach it. Strings are kept verbatim (legacy field).
+  it("TEAM-6075: a non-string pr_url is recorded as null; a blank string is null; a string is kept verbatim", async () => {
+    await report({ pr_url: [PR_URL] });
+    expect(record().pr_url).toBeNull();
+    h.puts.length = 0;
+    await report({ pr_url: "  " });
+    expect(record().pr_url).toBeNull();
+    h.puts.length = 0;
+    await report({ pr_url: PR_URL });
+    expect(record().pr_url).toBe(PR_URL);
+  });
 });
 
 // TEAM-4525 AC-3 — the head SHA a human approved at the Merge Approval gate is
@@ -702,6 +715,8 @@ describe("report_completion — approved_head_sha", () => {
 // evidence". Refusing costs a human gate ticket; accepting silently claims a
 // deploy that may never have happened.
 const CD_LEDGER_KEY = "workflows/wf_1/shared/cd-ledger.json";
+// TEAM-6149: the follow-up CD's own ledger (TEAM-6134), keyed by the reporting ticket.
+const CD_LEDGER_TICKET_KEY = "workflows/wf_1/shared/cd-ledger-TEAM-4200.json";
 
 describe("report_completion — ship-report contract (pipeline_execution_id / pipeline_name)", () => {
   it("(1) refuses shipped with no pipeline_execution_id, writing nothing and transitioning nothing", async () => {
@@ -3503,6 +3518,245 @@ describe("report_completion — FR-5 cd-ledger derived follow-ups (amendment A3)
   });
 });
 
+// ─── TEAM-6149: a follow-up CD's report reads ITS OWN ledger ──────────────────
+//
+// TEAM-6134 gave each `CD: follow-up PR <url>` ticket its own ledger,
+// `shared/cd-ledger-<CD ticket id>.json`, and left `shared/cd-ledger.json` to the
+// unified PR's deploy. report_completion kept reading only the unified key, so a
+// follow-up CD derived the unified deploy's stale `unmerged` / `handoff[]` as its
+// own follow-ups and never saw its own ledger. One selection rule now, shared by
+// the follow-up read and the DL-030 probe: the per-ticket key first; the unified
+// key only as a fallback, and only when its `prUrl` is this report's `pr_url` (or
+// one side has none - the unified CD path, unchanged). A mismatch is "no ledger".
+describe("report_completion — TEAM-6149: a follow-up CD reads its own ledger", () => {
+  const PR_A = PR_URL;
+  const PR_B = "https://github.com/owner/repo/pull/77";
+  const unified = (body) => h.objects.set(CD_LEDGER_KEY, JSON.stringify(body));
+  const perTicket = (body) => h.objects.set(CD_LEDGER_TICKET_KEY, JSON.stringify(body));
+  const shipReport = (extra) => report({
+    outcome: "shipped", merge_commit: MERGE_COMMIT, pipeline_execution_id: EXEC_ID, pipeline_name: PIPELINE, ...extra,
+  });
+  // Only the ledger GETs, in order - the record and manifest reads that follow are not under test.
+  const gotKeys = () => h.gets.map((g) => g.Key).filter((k) => k.includes("/shared/cd-ledger"));
+
+  it("(a) the per-ticket ledger wins: only ITS handoff is derived, the unified ledger's stale unmerged is not read", async () => {
+    h.siblings.push(CD);
+    unified({ prUrl: PR_A, execution_id: EXEC_ID, unmerged: { commits: ["a1b2c3d"], files: ["deploy/config.sh"] } });
+    perTicket({ prUrl: PR_B, handoff: ["Attach the IAM policy"] });
+    const r = result(await shipReport({ pr_url: PR_B }));
+    expect(r.status).toBe("complete");
+    const followUps = record().followUps;
+    expect(followUps).toHaveLength(1);
+    expect(followUps[0].kind).toBe("console_handoff");
+    expect(followUps.some((f) => f.kind === "fix" || f.baseBranch === "main")).toBe(false);
+    expect(h.created).toHaveLength(1);
+    expect(h.created[0].params.assignee).toBe("human:engineer");
+    expect(gotKeys()).toContain(CD_LEDGER_TICKET_KEY);
+    expect(gotKeys()).not.toContain(CD_LEDGER_KEY);
+  });
+
+  it("(b) the unified CD path is unchanged: a matching pr_url, or a report with no pr_url, derives", async () => {
+    // TEAM-6154 (R3-F3): the `[undefined, PR_B]` tuple that used to be here - a ledger
+    // with NO prUrl adopted by a report that names a PR - was the wildcard; see (h).
+    for (const [ledgerPr, reportPr] of [[PR_A, PR_A], [PR_A, undefined]]) {
+      h.puts.length = 0; h.created.length = 0; h.siblings.length = 0; h.objects.clear(); h.gets.length = 0;
+      h.siblings.push(CD);
+      unified({ ...(ledgerPr ? { prUrl: ledgerPr } : {}), handoff: ["Enable the flag in the console"] });
+      const r = result(await shipReport(reportPr ? { pr_url: reportPr } : {}));
+      expect(r.status, `${ledgerPr} / ${reportPr}`).toBe("complete");
+      expect(record().followUps, `${ledgerPr} / ${reportPr}`).toHaveLength(1);
+      expect(record().followUps[0].kind).toBe("console_handoff");
+      expect(h.created).toHaveLength(1);
+      // The per-ticket key was looked for first, and provably not there.
+      expect(gotKeys()).toEqual([CD_LEDGER_TICKET_KEY, CD_LEDGER_KEY]);
+    }
+  });
+
+  it("(c) per-ticket missing and the unified prUrl is ANOTHER PR: no ledger, nothing derived, report accepted", async () => {
+    h.siblings.push(CD);
+    unified({ prUrl: PR_A, unmerged: { commits: ["a1b2c3d"] }, handoff: ["Enable the flag"] });
+    const r = result(await shipReport({ pr_url: PR_B }));
+    expect(r.status).toBe("complete");
+    expect("followUps" in record()).toBe(false);
+    expect(h.created).toHaveLength(0);
+    expect(transitioned()).toBe(true);
+    expect(h.warns.join("\n")).toMatch(/treated as no ledger/);
+  });
+
+  it("(c2) the prUrl match is trivially normalized: trim and a trailing slash", async () => {
+    h.siblings.push(CD);
+    unified({ prUrl: `${PR_A}/`, handoff: ["Enable the flag"] });
+    const r = result(await shipReport({ pr_url: ` ${PR_A} ` }));
+    expect(r.status).toBe("complete");
+    expect(record().followUps).toHaveLength(1);
+  });
+
+  it("(d) per-ticket missing and the unified prUrl is THIS PR: falls back and derives", async () => {
+    h.siblings.push(CD);
+    unified({ prUrl: PR_A, handoff: ["Enable the flag in the console", "Re-run the smoke test"] });
+    const r = result(await shipReport({ pr_url: PR_A }));
+    expect(r.status).toBe("complete");
+    expect(record().followUps).toHaveLength(1);
+    expect(record().followUps[0].title).toBe("Post-merge console/IAM handoff (2 steps)");
+    expect(gotKeys()).toEqual([CD_LEDGER_TICKET_KEY, CD_LEDGER_KEY]);
+  });
+
+  for (const [label, seed] of [
+    ["AccessDenied", () => {
+      perTicket({ prUrl: PR_B, handoff: ["x"] });
+      const err = new Error("AccessDenied on the ledger");
+      err.name = "AccessDenied";
+      err.$metadata = { httpStatusCode: 403 };
+      h.getError = { key: CD_LEDGER_TICKET_KEY, err };
+    }],
+    ["a body that is not JSON", () => h.objects.set(CD_LEDGER_TICKET_KEY, "{ this is truncated")],
+  ]) {
+    it(`(e) an UNREADABLE per-ticket ledger (${label}) refuses, naming the per-ticket key, nothing written`, async () => {
+      unified({ prUrl: PR_A, handoff: ["Enable the flag"] });
+      seed();
+      const r = result(await shipReport({ pr_url: PR_B }));
+      expect(r.ok).toBe(false);
+      expect(r.reason).toBe("cd_ledger_unreadable");
+      expect(r.message).toContain(CD_LEDGER_TICKET_KEY);
+      expect(r.message).not.toContain(`(${CD_LEDGER_KEY})`);
+      expect(wroteRecord()).toBe(false);
+      expect(transitioned()).toBe(false);
+      expect(calls("Tickets___get_issue")).toHaveLength(0);
+      expect(h.created).toHaveLength(0);
+      // It never fell through to the unified key: unreadable is not 404.
+      expect(gotKeys()).not.toContain(CD_LEDGER_KEY);
+    });
+  }
+
+  it("(f) the DL-030 probe HEADs the per-ticket key too: a per-ticket ledger alone is NOT the legacy path", async () => {
+    perTicket({ prUrl: PR_B, executionId: EXEC_ID });
+    const r = result(await report({ outcome: "shipped", merge_commit: MERGE_COMMIT }));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("shipped_requires_execution_and_merge_commit");
+    expect(r.missing).toEqual(["pipeline_execution_id"]);
+    expect(h.heads.map((x) => x.Key)).toContain(CD_LEDGER_TICKET_KEY);
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+  });
+
+  it("(g) a ticket id with path characters never becomes a key segment", async () => {
+    h.siblings.push(CD);
+    const r = result(await shipReport({ ticket_id: "../x", pr_url: PR_A }));
+    expect(gotKeys().some((k) => k.includes("cd-ledger-"))).toBe(false);
+    expect(h.heads.map((x) => x.Key).some((k) => k.includes("cd-ledger-"))).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/not a safe key segment/);
+    // and it still reached the unified key, so nothing else about the call changed
+    expect(gotKeys()).toContain(CD_LEDGER_KEY);
+    expect(r.status).toBe("complete");
+  });
+
+  // ─── TEAM-6154 (ship review r3 of #954): F2 canonical PR identity, F3 ownership, F4 body shape ──
+
+  it("(c3) R3-F2: the unified prUrl is THIS PR under a different host/owner/repo case, a #fragment, /files or ?query - adopted", async () => {
+    for (const ledgerPr of ["https://GITHUB.COM/Owner/Repo/pull/42", `${PR_A}#discussion_r1`, `${PR_A}/files`, `${PR_A}?x=1`, "HTTPS://github.com/OWNER/REPO/pull/42/"]) {
+      h.puts.length = 0; h.created.length = 0; h.siblings.length = 0; h.objects.clear(); h.gets.length = 0; h.warns.length = 0;
+      h.siblings.push(CD);
+      unified({ prUrl: ledgerPr, handoff: ["Enable the flag in the console"] });
+      const r = result(await shipReport({ pr_url: PR_A }));
+      expect(r.status, ledgerPr).toBe("complete");
+      expect(record().followUps, ledgerPr).toHaveLength(1);
+      expect(record().followUps[0].kind).toBe("console_handoff");
+      expect(h.created, ledgerPr).toHaveLength(1);
+      expect(h.warns.join("\n"), ledgerPr).not.toMatch(/treated as no ledger/);
+    }
+  });
+
+  it("(c4) R3-F2: the identity is strict - junk after the number, an encoded slash, or a different number is ANOTHER PR", async () => {
+    const one = "https://github.com/owner/repo/pull/1";
+    for (const [ledgerPr, reportPr] of [
+      ["https://github.com/owner/repo/pull/1not-a-pr", one],
+      ["https://github.com/owner/repo/pull/1%2Fnot-a-pr", one],
+      [one, "https://github.com/owner/repo/pull/1not-a-pr"],
+      [PR_A, "https://github.com/owner/repo/pull/420"],
+      [PR_A, "https://github.com/owner/other-repo/pull/42"],
+    ]) {
+      h.puts.length = 0; h.created.length = 0; h.siblings.length = 0; h.objects.clear(); h.gets.length = 0; h.warns.length = 0;
+      h.siblings.push(CD);
+      unified({ prUrl: ledgerPr, handoff: ["Enable the flag"], unmerged: { commits: ["a1b2c3d"] } });
+      const r = result(await shipReport({ pr_url: reportPr }));
+      expect(r.status, `${ledgerPr} / ${reportPr}`).toBe("complete");
+      expect("followUps" in record(), `${ledgerPr} / ${reportPr}`).toBe(false);
+      expect(h.created).toHaveLength(0);
+      expect(h.warns.join("\n")).toMatch(/treated as no ledger/);
+    }
+  });
+
+  it("(h) R3-F3: a unified ledger with NO prUrl is not a wildcard - a follow-up CD naming a PR derives nothing from it", async () => {
+    h.siblings.push(CD);
+    unified({ unmerged: { commits: ["old-unmerged"] }, handoff: ["Stale console step"] });
+    const r = result(await shipReport({ pr_url: "https://github.com/owner/repo/pull/99" }));
+    expect(r.status).toBe("complete");
+    expect("followUps" in record()).toBe(false);
+    expect(h.created).toHaveLength(0);
+    expect(transitioned()).toBe(true);
+    expect(gotKeys()).toEqual([CD_LEDGER_TICKET_KEY, CD_LEDGER_KEY]);
+    expect(h.warns.join("\n")).toMatch(/names no prUrl/);
+  });
+
+  it("(h2) R3-F3: an anonymous unified ledger IS adopted on deploy evidence - its executionId or mergeCommit is the one reported - and only then", async () => {
+    const cases = [
+      ["executionId", { executionId: EXEC_ID }, true],
+      ["execution_id", { execution_id: EXEC_ID.toUpperCase() }, true],
+      ["mergeCommit", { mergeCommit: MERGE_COMMIT }, true],
+      ["another executionId", { executionId: "ffffffff-1234-4f56-89ab-cdef01234567" }, false],
+      ["another mergeCommit", { mergeCommit: "1111111111" }, false],
+    ];
+    for (const [label, fields, adopts] of cases) {
+      h.puts.length = 0; h.created.length = 0; h.siblings.length = 0; h.objects.clear(); h.gets.length = 0; h.warns.length = 0;
+      h.siblings.push(CD);
+      unified({ ...fields, handoff: ["Enable the flag"] });
+      const r = result(await shipReport({ pr_url: PR_B }));
+      expect(r.status, label).toBe("complete");
+      expect("followUps" in record(), label).toBe(adopts);
+      expect(h.created, label).toHaveLength(adopts ? 1 : 0);
+      if (!adopts) expect(h.warns.join("\n"), label).toMatch(/names no prUrl/);
+    }
+  });
+
+  it("(h3) R3-F3: a ledger that names ANOTHER PR is a mismatch even when its executionId is the one reported", async () => {
+    h.siblings.push(CD);
+    unified({ prUrl: PR_A, executionId: EXEC_ID, handoff: ["Enable the flag"] });
+    const r = result(await shipReport({ pr_url: PR_B }));
+    expect(r.status).toBe("complete");
+    expect("followUps" in record()).toBe(false);
+    expect(h.warns.join("\n")).toMatch(/treated as no ledger/);
+  });
+
+  for (const [label, body] of [["null", "null"], ["an array", "[]"], ["a number", "7"], ["a string", "\"x\""]]) {
+    it(`(i) R3-F4: a per-ticket ledger whose body is ${label} is UNREADABLE, not absent - refused naming that key, no fall-through`, async () => {
+      h.siblings.push(CD);
+      h.objects.set(CD_LEDGER_TICKET_KEY, body);
+      unified({ prUrl: PR_A, handoff: ["Enable the flag"] });
+      const r = result(await shipReport({ pr_url: PR_A }));
+      expect(r.ok, label).toBe(false);
+      expect(r.reason, label).toBe("cd_ledger_unreadable");
+      expect(r.message).toContain(CD_LEDGER_TICKET_KEY);
+      expect(r.message).not.toContain(`(${CD_LEDGER_KEY})`);
+      expect(gotKeys(), label).toEqual([CD_LEDGER_TICKET_KEY]);
+      expect(wroteRecord()).toBe(false);
+      expect(transitioned()).toBe(false);
+      expect(calls("Tickets___get_issue")).toHaveLength(0);
+      expect(h.created).toHaveLength(0);
+    });
+  }
+
+  it("(i2) R3-F4: a unified ledger whose body is null is UNREADABLE too", async () => {
+    h.siblings.push(CD);
+    h.objects.set(CD_LEDGER_KEY, "null");
+    const r = result(await shipReport({ pr_url: PR_A }));
+    expect(r.ok).toBe(false);
+    expect(r.reason).toBe("cd_ledger_unreadable");
+    expect(r.message).toContain(CD_LEDGER_KEY);
+    expect(wroteRecord()).toBe(false);
+    expect(transitioned()).toBe(false);
+  });
+});
+
 // ─── TEAM-4754: an UNREADABLE cd-ledger refuses the ship report ────────────────
 //
 // The same defect N2 fixes, one read earlier. `readCdLedger` returned `null` for
@@ -3536,6 +3790,8 @@ describe("report_completion — cd_ledger_unreadable (three-outcome ledger read)
       expect(r.reason).toBe("cd_ledger_unreadable");
       expect(r.missing).toEqual([]);
       expect(r.message).toMatch(/could not be read/);
+      // TEAM-6149: the message names the key that was actually unreadable.
+      expect(r.message).toContain(CD_LEDGER_KEY);
       expect(r.message).toMatch(/Nothing was recorded and the ticket was NOT transitioned\. Retry the call\./);
       expect(wroteRecord()).toBe(false);
       expect(transitioned()).toBe(false);

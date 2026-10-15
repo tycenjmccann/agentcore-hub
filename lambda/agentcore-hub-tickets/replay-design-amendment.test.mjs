@@ -101,6 +101,8 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
           }
           if (name === "GetCommand") return { Item: h.state.items[cmd.input.Key.ticketId] };
           if (name === "PutCommand") {
+            // TEAM-6091: a token-less create's derived IDEMP# lock row is not a ticket.
+            if (String(cmd.input.Item?.ticketId).startsWith("IDEMP#")) return {};
             if (!cmd.input.Item?.eventId) {
               h.state.puts.push(cmd.input.Item);
               h.state.onPut?.(cmd.input.Item);

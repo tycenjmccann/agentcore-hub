@@ -91,6 +91,8 @@ import {
   publishJourneyEvent,
   verifyGateCondition,
   terminalMoveRefusal,
+  deriveCreateDedupeToken,
+  isSettledGateStatus,
 } from "./gate-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -129,6 +131,11 @@ const COUNTER_KEY = { ticketId: "__COUNTER__" };
  * isTicketRow, exactly as they always filtered __COUNTER__. It expires via the
  * table's TTL on `ttl` (enabled by deploy/setup-tickets-lambda.mjs and
  * scripts/create-dynamodb-tables.sh).
+ *
+ * TEAM-6091: a create WITHOUT a token takes the same lock under a DERIVED token
+ * (`auto-<hash>` of run-or-parent + assignee + normalized summary, gate-contract.mjs
+ * deriveCreateDedupeToken), so concurrent check-then-create of one ticket lands one
+ * row; a derived lock whose ticket is settled is taken over (claimCreateLock).
  */
 const IDEMP_PREFIX = "IDEMP#";
 const IDEMP_TTL_S = 7 * 24 * 60 * 60;
@@ -1051,6 +1058,12 @@ const TRANSITIONS = {
     { id: "block", name: "Request Changes", to: "blocked" },
   ],
   blocked: [
+    // TEAM-6147: a self-transition so transition_ticket(blocked, blocked_by=...) can ADD a
+    // blocker to a ticket that is already blocked (a follow-up chain link missing its
+    // predecessor edge). Pure blocker union: status is unchanged, so the orchestrator's
+    // stream handler ignores the MODIFY (no cascade), and nothing else in transitionIssue
+    // keys off a blocked->blocked move.
+    { id: "block", name: "Block", to: "blocked" },
     { id: "unblock", name: "Unblock", to: "todo" },
     { id: "ready", name: "Mark Ready", to: "ready" },
     { id: "start", name: "Start Progress", to: "in_progress" },
@@ -1675,34 +1688,23 @@ async function createTicket(args) {
     });
   }
 
+  // TEAM-6091: no client_token ⇒ a token derived from the run (or parent) + assignee +
+  // normalized summary, through the SAME atomic lock — so two personas that each
+  // check-then-create one ticket converge on it instead of filing two. Scope and
+  // normalization are the Jira twin's guard's (gate-contract.mjs), so the twins dedupe
+  // the same calls; with neither a workflow nor a parent there is no token, as before.
+  const derivedToken = clientToken ? null : deriveCreateDedupeToken({ workflowId: workflow_id, parentId: parent_key, assignee, summary });
+  const lockToken = clientToken || derivedToken;
+
   let ticketId = await nextTicketId(project_key);
-  if (clientToken) {
+  if (lockToken) {
     // TEAM-5712: the lock records the id BEFORE the ticket exists, so a retry
     // after a partial failure (lock written, ticket Put lost) re-puts the ticket
     // under that same id rather than pointing at a missing one forever. A losing
     // writer's freshly minted id is simply burned — a numbering gap, nothing more.
-    const lockKey = `${IDEMP_PREFIX}${clientToken}`;
-    try {
-      await ddb.send(new PutCommand({
-        TableName: TABLE_NAME,
-        Item: {
-          ticketId: lockKey,
-          reservedTicketId: ticketId,
-          lockedAt: new Date().toISOString(),
-          ttl: Math.floor(Date.now() / 1000) + IDEMP_TTL_S,
-        },
-        ConditionExpression: "attribute_not_exists(ticketId)",
-      }));
-    } catch (err) {
-      if (err?.name !== "ConditionalCheckFailedException") throw err;
-      const lock = await ddb.send(
-        new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: lockKey }, ConsistentRead: true })
-      );
-      if (!lock.Item?.reservedTicketId) throw new Error(`client_token lock ${lockKey} holds no reserved ticket id`);
-      ticketId = lock.Item.reservedTicketId;
-      const existing = await getTicketRow(ticketId);
-      if (existing) return createdResponse(existing, { idempotent: true });
-    }
+    const claimed = await claimCreateLock(`${IDEMP_PREFIX}${lockToken}`, ticketId, { reclaimSettled: derivedToken !== null });
+    if (claimed.existing) return createdResponse(claimed.existing, { idempotent: true });
+    ticketId = claimed.ticketId;
   }
   const now = new Date().toISOString();
   const type = (issue_type || "Task").toLowerCase();
@@ -1751,7 +1753,7 @@ async function createTicket(args) {
     ...(baseBranch ? { baseBranch } : {}),
   };
 
-  if (clientToken) {
+  if (lockToken) {
     // Conditional, so two replays of one token racing to finish a create land
     // ONE row; the loser answers with the winner's.
     try {
@@ -1789,6 +1791,64 @@ async function createTicket(args) {
     // entirely when nothing was autowired, so an ordinary create is unchanged.
     ...(autowire.autowired ? { autowired: autowire.autowired } : {}),
   }, issue_type || "Task");
+}
+
+/**
+ * TEAM-5712 / TEAM-6091: claim the `IDEMP#<token>` lock for `ticketId`. Resolves to
+ * `{ ticketId }` — the id to Put under (ours, or a reserved one whose ticket Put was
+ * lost) — or `{ existing }`, the ticket another create already filed under this lock.
+ *
+ * `reclaimSettled` (derived tokens only): a lock whose ticket is settled (done /
+ * closed / skipped / cancelled) is TAKEN OVER with a conditional update on the id it
+ * holds, so a ticket legitimately re-filed after the first one closed is created, not
+ * answered with the closed one — the Jira twin's guard never matched a Done ticket
+ * either. Of two re-filers racing the takeover exactly one wins; the loser re-reads
+ * and converges on the winner's. An explicit client_token is a RETRY of one call, so
+ * it keeps answering with whatever that call filed.
+ */
+const CREATE_LOCK_ATTEMPTS = 3;
+async function claimCreateLock(lockKey, ticketId, { reclaimSettled }) {
+  const ttl = () => Math.floor(Date.now() / 1000) + IDEMP_TTL_S;
+  try {
+    await ddb.send(new PutCommand({
+      TableName: TABLE_NAME,
+      Item: {
+        ticketId: lockKey,
+        reservedTicketId: ticketId,
+        lockedAt: new Date().toISOString(),
+        ttl: ttl(),
+      },
+      ConditionExpression: "attribute_not_exists(ticketId)",
+    }));
+    return { ticketId };
+  } catch (err) {
+    if (err?.name !== "ConditionalCheckFailedException") throw err;
+  }
+  for (let attempt = 1; attempt <= CREATE_LOCK_ATTEMPTS; attempt++) {
+    const lock = await ddb.send(
+      new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: lockKey }, ConsistentRead: true })
+    );
+    const reserved = lock.Item?.reservedTicketId;
+    if (!reserved) throw new Error(`client_token lock ${lockKey} holds no reserved ticket id`);
+    const existing = await getTicketRow(reserved);
+    if (!existing) return { ticketId: reserved };
+    if (!reclaimSettled || !isSettledGateStatus(existing.status)) return { existing };
+    try {
+      await ddb.send(new UpdateCommand({
+        TableName: TABLE_NAME,
+        Key: { ticketId: lockKey },
+        UpdateExpression: "SET reservedTicketId = :new, lockedAt = :now, #ttl = :ttl",
+        ConditionExpression: "reservedTicketId = :old",
+        ExpressionAttributeNames: { "#ttl": "ttl" },
+        ExpressionAttributeValues: { ":new": ticketId, ":old": reserved, ":now": new Date().toISOString(), ":ttl": ttl() },
+      }));
+      return { ticketId };
+    } catch (err) {
+      if (err?.name !== "ConditionalCheckFailedException") throw err;
+      // Another re-filer took it over first — re-read and answer with theirs.
+    }
+  }
+  throw new Error(`create lock ${lockKey} kept moving under ${CREATE_LOCK_ATTEMPTS} takeover attempts`);
 }
 
 /** TEAM-5712: a stored ticket row by id (strongly consistent), or null. */
@@ -2273,9 +2333,13 @@ async function transitionIssue(args) {
   }
 
   // DL-024: an agent parks ITS OWN ticket behind the tickets it just filed.
-  // ADDITIVE — union with the row's existing blockers (the row is already in
-  // hand), matching the Jira Lambda where each blocked_by entry becomes one more
-  // "Blocks" link. edit_issue keeps the explicit whole-array "set" semantics.
+  // ADDITIVE — union with the row's existing blockers, matching the Jira Lambda where
+  // each blocked_by entry becomes one more "Blocks" link. edit_issue keeps the explicit
+  // whole-array "set" semantics.
+  // TEAM-6155: the union is NOT written as a whole-list SET — two concurrent additive
+  // writers (TEAM-6147 chain repairs) both passed the status fence and the later
+  // replace erased the earlier blocker. sendTransition appends only what is missing,
+  // guarded per blocker; a guard loss re-reads and retries with what is still missing.
   const blockers = args.blocked_by;
   let blockedByAdded = [];
   if (blockers) {
@@ -2283,12 +2347,7 @@ async function transitionIssue(args) {
       .map((b) => String(b).trim())
       .filter(Boolean);
     const existing = Array.isArray(current.Item.blockedBy) ? current.Item.blockedBy : [];
-    blockedByAdded = requested.filter((b) => !existing.includes(b));
-    if (blockedByAdded.length > 0) {
-      updateExpr += ", #bb = :bb";
-      exprNames["#bb"] = "blockedBy";
-      exprValues[":bb"] = [...existing, ...new Set(blockedByAdded)];
-    }
+    blockedByAdded = [...new Set(requested.filter((b) => !existing.includes(b)))];
   }
 
   // TEAM-5719: attribute a park to the claim generation that made it, in the SAME
@@ -2374,6 +2433,22 @@ async function transitionIssue(args) {
       if (labelPlan.removes) removes.push(...labelPlan.removes);
       condition = labelPlan.condition || null;
     }
+    // TEAM-6155: append only the blockers this attempt still has to add, and refuse the
+    // write if any of them landed meanwhile (a concurrent additive writer) — never a
+    // whole-list SET. `contains` on a missing attribute is false, so the guard also
+    // holds for a row that has no blockedBy yet. Same attribute, same List type.
+    if (blockedByAdded.length > 0) {
+      names["#bb"] = "blockedBy";
+      values[":empty"] = [];
+      values[":bbAdd"] = blockedByAdded;
+      expr += ", #bb = list_append(if_not_exists(#bb, :empty), :bbAdd)";
+      const guards = blockedByAdded.map((b, i) => {
+        values[`:bb${i}`] = b;
+        return `NOT contains(#bb, :bb${i})`;
+      });
+      const guard = guards.join(" AND ");
+      condition = condition ? `(${condition}) AND ${guard}` : guard;
+    }
     if (dropParkClaim) removes.push("#pc"); // TEAM-5719
     // TEAM-5707: on BOTH attempts, so the label-race retry keeps the status fence.
     if (expectedStatus) {
@@ -2403,7 +2478,10 @@ async function transitionIssue(args) {
       new GetCommand({ TableName: TABLE_NAME, Key: { ticketId: issueKey }, ConsistentRead: true })
     );
     const actual = fresh.Item ? fresh.Item.status || "todo" : "missing";
-    return { actual, moved: actual !== expectedStatus };
+    // TEAM-6155: the fresh blocker list too, so a lost blocker guard can be told apart
+    // from the status fence and retried with only what is still missing.
+    const blockedBy = Array.isArray(fresh.Item?.blockedBy) ? fresh.Item.blockedBy : [];
+    return { actual, moved: expectedStatus ? actual !== expectedStatus : false, blockedBy };
   };
   // The condition is built from exactly two sources — the gate label slot checks
   // and `#s = :expected` (no attribute_exists here) — so when the label clause
@@ -2421,32 +2499,47 @@ async function transitionIssue(args) {
     if (fence?.refusal) return fence.refusal;
   }
 
+  // TEAM-6155: a lost blocker guard is retried with what is still missing — bounded, so
+  // a pathological writer cannot spin us, and never reported as transitioned when an
+  // edge was not written. Everything before this loop (gate guard, Done-intent fence)
+  // and after it (hold check, response) runs once, around the single successful write.
+  const MAX_WRITE_ATTEMPTS = 3;
   let committed = false;
   try {
-    try {
-      await sendTransition(true);
-    } catch (err) {
-      if (err?.claimRefusal) return err.claimRefusal;
-      if (!isCondFail(err)) throw err;
-      const reread = expectedStatus ? await fenceReread() : null;
-      if (reread?.moved) return preconditionRefusal(reread.actual);
-      if (!labelPlan?.condition) {
-        if (reread) return fenceRefusal(reread);
-        throw err;
-      }
-      // A concurrent writer moved the label list under us. The label bookkeeping is
-      // cosmetic; the status and the verification are not — retry without the label
-      // clause rather than wedge a verified transition on a label race.
-      console.warn(
-        `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
-      );
+    let withLabelPlan = true;
+    for (let attempt = 1; ; attempt++) {
       try {
-        await sendTransition(false);
-      } catch (retryErr) {
-        if (retryErr?.claimRefusal) return retryErr.claimRefusal;
-        // The retry carries no label clause: with a fence it is the fence that failed.
-        if (isCondFail(retryErr) && expectedStatus) return fenceRefusal(await fenceReread());
-        throw retryErr;
+        await sendTransition(withLabelPlan);
+        break;
+      } catch (err) {
+        if (err?.claimRefusal) return err.claimRefusal;
+        if (!isCondFail(err)) throw err;
+        // The reread decides which clause failed: a moved status is the fence; a blocker
+        // that landed meanwhile is the guard; neither (with a label clause) is the race.
+        const reread = expectedStatus || blockedByAdded.length ? await fenceReread() : null;
+        if (reread?.moved) return preconditionRefusal(reread.actual);
+        if (blockedByAdded.length) {
+          const remaining = blockedByAdded.filter((b) => !reread.blockedBy.includes(b));
+          if (remaining.length !== blockedByAdded.length) {
+            blockedByAdded = remaining; // drop what landed; the status part still has to be written
+            if (attempt < MAX_WRITE_ATTEMPTS) continue;
+            return textResult(
+              `Write conflict: ${issueKey} blocked_by changed under ${MAX_WRITE_ATTEMPTS} attempts — not transitioned.`
+            );
+          }
+        }
+        if (!labelPlan?.condition || !withLabelPlan) {
+          // No label clause on this attempt: with a fence it is the fence that failed.
+          if (reread) return fenceRefusal(reread);
+          throw err;
+        }
+        // A concurrent writer moved the label list under us. The label bookkeeping is
+        // cosmetic; the status and the verification are not — retry without the label
+        // clause rather than wedge a verified transition on a label race.
+        console.warn(
+          `[agentcore-hub-tickets] ${issueKey}: gate label write lost a race, transitioning without it`
+        );
+        withLabelPlan = false;
       }
     }
     committed = true;
