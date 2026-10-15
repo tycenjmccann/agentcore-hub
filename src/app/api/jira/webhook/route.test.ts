@@ -113,6 +113,7 @@ describe("POST /api/jira/webhook (queue mode)", () => {
     process.env.WORKFLOW_COMMAND_QUEUE_URL =
       "https://sqs.us-east-1.amazonaws.com/123/agentcore-hub-workflow-commands.fifo";
     delete process.env.JIRA_WEBHOOK_SECRET;
+    delete process.env.JIRA_WEBHOOK_SECRET_PREVIOUS;
   });
 
   it("enqueues a status-change command grouped by the workflow root", async () => {
@@ -182,6 +183,7 @@ describe("POST /api/jira/webhook (legacy direct-invoke fallback)", () => {
     h.lambdaInvokes.length = 0;
     delete process.env.WORKFLOW_COMMAND_QUEUE_URL;
     delete process.env.JIRA_WEBHOOK_SECRET;
+    delete process.env.JIRA_WEBHOOK_SECRET_PREVIOUS;
   });
 
   it("invokes the orchestrator Lambda directly when no queue is configured", async () => {
@@ -215,6 +217,7 @@ describe("POST /api/jira/webhook (signature)", () => {
 
   afterEach(() => {
     delete process.env.JIRA_WEBHOOK_SECRET;
+    delete process.env.JIRA_WEBHOOK_SECRET_PREVIOUS;
   });
 
   it("accepts a validly signed request and dispatches exactly once", async () => {
@@ -319,6 +322,7 @@ describe("POST /api/jira/webhook (secret unset — passthrough + one-time warnin
     process.env.WORKFLOW_COMMAND_QUEUE_URL =
       "https://sqs.us-east-1.amazonaws.com/123/agentcore-hub-workflow-commands.fifo";
     delete process.env.JIRA_WEBHOOK_SECRET;
+    delete process.env.JIRA_WEBHOOK_SECRET_PREVIOUS;
   });
 
   it("passes through unsigned requests and warns exactly once across requests on the same module instance", async () => {
@@ -360,5 +364,89 @@ describe("POST /api/jira/webhook (secret unset — passthrough + one-time warnin
     expect(res.status).toBe(400);
     expect(h.sqsSends).toHaveLength(0);
     expect(h.lambdaInvokes).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-6352 (R3-F2): rotating an already-enabled secret had a 401 window —
+ * the route verified against JIRA_WEBHOOK_SECRET alone, so whichever side
+ * (Jira or hub) switched first broke deliveries until the other caught up.
+ * This reproduces the round-3 harness: the hub was redeployed first with
+ * current=NEW and previous=OLD while Jira still signs with OLD.
+ */
+describe("POST /api/jira/webhook (rotation, TEAM-6352 R3-F2)", () => {
+  const OLD = "old-secret";
+  const NEW = "new-secret";
+
+  beforeEach(() => {
+    h.sqsSends.length = 0;
+    h.lambdaInvokes.length = 0;
+    process.env.WORKFLOW_COMMAND_QUEUE_URL =
+      "https://sqs.us-east-1.amazonaws.com/123/agentcore-hub-workflow-commands.fifo";
+    process.env.JIRA_WEBHOOK_SECRET = NEW;
+    process.env.JIRA_WEBHOOK_SECRET_PREVIOUS = OLD;
+  });
+
+  afterEach(() => {
+    delete process.env.JIRA_WEBHOOK_SECRET;
+    delete process.env.JIRA_WEBHOOK_SECRET_PREVIOUS;
+  });
+
+  it("accepts a delivery Jira still signs with the OLD key and dispatches it", async () => {
+    const body = webhookPayload();
+    const res = await post(body, { "x-hub-signature": sign(body, OLD) });
+    expect(res.status).toBe(200);
+    expect(h.sqsSends).toHaveLength(1);
+  });
+
+  it("accepts a delivery signed with the NEW key", async () => {
+    const body = webhookPayload();
+    const res = await post(body, { "x-hub-signature": sign(body, NEW) });
+    expect(res.status).toBe(200);
+    expect(h.sqsSends).toHaveLength(1);
+  });
+
+  it("rejects an unrelated key or a missing header with 401 and dispatches nothing", async () => {
+    const body = webhookPayload();
+    const bad = await post(body, { "x-hub-signature": sign(body, "unrelated-secret") });
+    expect(bad.status).toBe(401);
+    const none = await post(body);
+    expect(none.status).toBe(401);
+    expect(h.sqsSends).toHaveLength(0);
+    expect(h.lambdaInvokes).toHaveLength(0);
+  });
+
+  it("a whitespace-only PREVIOUS is unset: an OLD-signed delivery is rejected", async () => {
+    process.env.JIRA_WEBHOOK_SECRET_PREVIOUS = "   ";
+    const body = webhookPayload();
+    const res = await post(body, { "x-hub-signature": sign(body, OLD) });
+    expect(res.status).toBe(401);
+    expect(h.sqsSends).toHaveLength(0);
+  });
+
+  it("uses the exact PREVIOUS value (untrimmed) as the HMAC key", async () => {
+    process.env.JIRA_WEBHOOK_SECRET_PREVIOUS = " old ";
+    const body = webhookPayload();
+    expect((await post(body, { "x-hub-signature": sign(body, " old ") })).status).toBe(200);
+    expect((await post(body, { "x-hub-signature": sign(body, "old") })).status).toBe(401);
+    expect(h.sqsSends).toHaveLength(1);
+  });
+
+  it("PREVIOUS set but current unset → unchanged passthrough (200 + dispatch + one warning), never enforcement", async () => {
+    delete process.env.JIRA_WEBHOOK_SECRET;
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.resetModules();
+    const { POST } = await import("./route");
+    const body = webhookPayload();
+    const send = (headers?: Record<string, string>) =>
+      POST(new NextRequest("http://localhost/api/jira/webhook", { method: "POST", body: JSON.stringify(body), headers }));
+
+    const unsigned = await send();
+    const wrong = await send({ "x-hub-signature": sign(body, "unrelated-secret") });
+    expect(unsigned.status).toBe(200);
+    expect(wrong.status).toBe(200);
+    expect(h.sqsSends).toHaveLength(2);
+    expect(warnSpy.mock.calls.filter((c) => String(c[0]).includes("JIRA_WEBHOOK_SECRET"))).toHaveLength(1);
+    warnSpy.mockRestore();
   });
 });

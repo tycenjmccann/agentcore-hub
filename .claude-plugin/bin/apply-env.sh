@@ -51,6 +51,16 @@
 # printed so the skill runs the Jira webhook step first. Never printed on a
 # first install, on plain carry-over, or when the secret is unchanged.
 #
+# TEAM-6352 (R3-F2): that marker is for FIRST enablement only (no secret on
+# disk). Replacing an already-set secret on an existing deployment is a
+# rotation, and with one key no ordering avoids a 401 window — so the old value
+# is written to JIRA_WEBHOOK_SECRET_PREVIOUS (the hub accepts either while the
+# current one is set) and a `JIRA_WEBHOOK_SECRET_ROTATING=1 …` marker is printed
+# instead: redeploy the hub first, then Jira, then drop PREVIOUS. An existing
+# PREVIOUS is carried over on a re-run mid-rotation (unless it equals the
+# current secret) and dropped with disable_webhook_signing. Values are never
+# printed.
+#
 # brand_name is a *display* string only — sets NEXT_PUBLIC_BRAND_NAME so the
 # header, sidebar, and page titles read "Bob's AI Hub" instead of "AgentCore
 # Hub". It does NOT affect any AWS resource names. Those are part of the
@@ -103,8 +113,11 @@ if [[ "$disable_webhook_signing" == "true" && -n "$jira_webhook_secret" ]]; then
 fi
 existing_secret=$(read_env_local_value JIRA_WEBHOOK_SECRET)
 existing_deployment_url=$(read_env_local_value DEPLOYMENT_URL)
+existing_previous=$(read_env_local_value JIRA_WEBHOOK_SECRET_PREVIOUS)
 
 secret_is_new=false
+secret_rotating=false
+jira_webhook_secret_previous=""
 if [[ "$disable_webhook_signing" == "true" ]]; then
   jira_webhook_secret=""
   echo "JIRA_WEBHOOK_SECRET: disabled by answers.jira.disable_webhook_signing — not carried over into .env.local. Also unset it on the live service (./deploy/ecs-express/set-env.sh --unset JIRA_WEBHOOK_SECRET, or redeploy) and remove the secret from the Jira webhook (DEPLOY.md 'Jira webhook signing')."
@@ -112,10 +125,21 @@ else
   if [[ -z "$jira_webhook_secret" ]]; then
     jira_webhook_secret="$existing_secret"
   elif [[ "$jira_webhook_secret" != "$existing_secret" && -n "$existing_deployment_url" && "$existing_deployment_url" != *placeholder* ]]; then
-    secret_is_new=true
+    if [[ -n "$existing_secret" ]]; then
+      secret_rotating=true
+      jira_webhook_secret_previous="$existing_secret"
+    else
+      secret_is_new=true
+    fi
+  fi
+  if [[ "$secret_rotating" != "true" && -n "$existing_previous" && "$existing_previous" != "$jira_webhook_secret" ]]; then
+    jira_webhook_secret_previous="$existing_previous"
   fi
   if [[ -n "$jira_webhook_secret" ]]; then
     require_jira_webhook_secret_format "$jira_webhook_secret" || exit 1
+  fi
+  if [[ -n "$jira_webhook_secret_previous" ]]; then
+    require_jira_webhook_secret_format "$jira_webhook_secret_previous" JIRA_WEBHOOK_SECRET_PREVIOUS || exit 1
   fi
 fi
 
@@ -172,10 +196,13 @@ emit() {
   echo ""
 
   # Kept regardless of module set and ticket provider (TEAM-6347, see header).
-  if [[ -n "$jira_webhook_secret" || -n "$existing_deployment_url" ]]; then
+  if [[ -n "$jira_webhook_secret" || -n "$jira_webhook_secret_previous" || -n "$existing_deployment_url" ]]; then
     echo "# --- Carried over across re-runs (DEPLOY.md 'Jira webhook signing') ---"
     if [[ -n "$jira_webhook_secret" ]]; then
       emit JIRA_WEBHOOK_SECRET "$jira_webhook_secret"
+    fi
+    if [[ -n "$jira_webhook_secret_previous" ]]; then
+      emit JIRA_WEBHOOK_SECRET_PREVIOUS "$jira_webhook_secret_previous"
     fi
     if [[ -n "$existing_deployment_url" ]]; then
       emit DEPLOYMENT_URL "$existing_deployment_url"
@@ -233,4 +260,7 @@ chmod 600 "$ENV_FILE"
 echo "Wrote $ENV_FILE (mode 600)"
 if [[ "$secret_is_new" == "true" ]]; then
   echo "JIRA_WEBHOOK_SECRET_NEW=1 — the secret differs from the one the deployed hub was set up with: run ./deploy/apprunner/setup-jira-webhook.sh BEFORE redeploying the hub (Jira first, DEPLOY.md 'Jira webhook signing')"
+fi
+if [[ "$secret_rotating" == "true" ]]; then
+  echo "JIRA_WEBHOOK_SECRET_ROTATING=1 — the secret replaces the one the deployed hub was set up with; the old one is kept as JIRA_WEBHOOK_SECRET_PREVIOUS so the hub accepts both: redeploy the hub FIRST, THEN run ./deploy/apprunner/setup-jira-webhook.sh, THEN remove JIRA_WEBHOOK_SECRET_PREVIOUS from .env.local and redeploy (or ./deploy/ecs-express/set-env.sh --unset JIRA_WEBHOOK_SECRET_PREVIOUS) (DEPLOY.md 'Rotating an enabled secret')"
 fi

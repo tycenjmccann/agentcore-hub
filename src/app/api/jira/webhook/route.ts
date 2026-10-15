@@ -31,6 +31,13 @@
  * strip a leading UTF-8 BOM and replace invalid UTF-8 first. A body-read
  * failure returns the same 400 as an invalid-JSON body, regardless of
  * whether the secret is configured.
+ *
+ * TEAM-6352: rotating an enabled secret had a 401 window — with one key, no
+ * ordering of the Jira and hub updates avoids it. While JIRA_WEBHOOK_SECRET is
+ * set, a signature matching the optional JIRA_WEBHOOK_SECRET_PREVIOUS is also
+ * accepted (DEPLOY.md "Rotating an enabled secret": hub with both keys, then
+ * Jira, then drop PREVIOUS). PREVIOUS is ignored when the current secret is
+ * unset, so it can never turn enforcement on (or keep it on after a rollback).
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -127,9 +134,18 @@ export async function POST(req: NextRequest) {
   // an operator pastes into its UI. Trimming here while the sender does not
   // meant a padded secret could never verify.
   const secret = process.env.JIRA_WEBHOOK_SECRET || "";
+  // TEAM-6352: the retiring key during a rotation (hub first with both keys,
+  // then Jira, then drop this). Same trim-only-for-opt-in rule. Consulted only
+  // while the current secret is set — on its own it enables nothing.
+  const previous = process.env.JIRA_WEBHOOK_SECRET_PREVIOUS || "";
 
   if (secret.trim()) {
-    if (!verifyHubSignature(bytes, req.headers.get("x-hub-signature"), secret)) {
+    const header = req.headers.get("x-hub-signature");
+    // Both compares run when a previous key is set, so timing does not reveal
+    // which key matched.
+    const okCurrent = verifyHubSignature(bytes, header, secret);
+    const okPrevious = previous.trim() ? verifyHubSignature(bytes, header, previous) : false;
+    if (!okCurrent && !okPrevious) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
   } else if (!warnedUnauthenticated) {

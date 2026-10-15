@@ -107,7 +107,7 @@ Map the answer to a `MODULES` set in the canonical order `core → builder → w
 
 If they pick Jira, do a follow-up `AskUserQuestion` (or accept free text via "Other") for `JIRA_SITE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY`. Treat these as secrets — do not echo them back, do not write them anywhere except `.env.local`.
 
-Do not ask for `JIRA_WEBHOOK_SECRET` (webhook signing is an operator opt-in, see DEPLOY.md "Jira webhook signing"). `apply-env.sh` carries an existing `JIRA_WEBHOOK_SECRET` line in `.env.local` over to the regenerated file on a re-run **regardless of which modules or ticket provider the re-run selects**, so enabling it is never undone by `/setup`; an optional `jira.webhook_secret` in the answers blob overrides it. The one explicit way to drop it is `"jira": { "disable_webhook_signing": true }` in the answers blob — use it only when the user asks to turn signing off (`apply-env.sh` refuses it alongside a `webhook_secret`), and remind them to also unset it on the live service and remove it from the Jira webhook (DEPLOY.md).
+Do not ask for `JIRA_WEBHOOK_SECRET` (webhook signing is an operator opt-in, see DEPLOY.md "Jira webhook signing"). `apply-env.sh` carries an existing `JIRA_WEBHOOK_SECRET` line in `.env.local` over to the regenerated file on a re-run **regardless of which modules or ticket provider the re-run selects**, so enabling it is never undone by `/setup`; an optional `jira.webhook_secret` in the answers blob overrides it (an existing `JIRA_WEBHOOK_SECRET_PREVIOUS`, the retiring key of a rotation, is carried over the same way). The one explicit way to drop it is `"jira": { "disable_webhook_signing": true }` in the answers blob — use it only when the user asks to turn signing off (`apply-env.sh` refuses it alongside a `webhook_secret`), and remind them to also unset it on the live service and remove it from the Jira webhook (DEPLOY.md).
 
 ## Q4 — Workflow runtime topology *(skip if Workflow not in MODULES)*
 
@@ -313,7 +313,9 @@ rm /tmp/agentcore-hub-answers.json
 
 `apply-env.sh` is the one place that writes `.env.local`. The skill does **not** write env vars by hand.
 
-If `apply-env.sh` prints `JIRA_WEBHOOK_SECRET_NEW=1`, note it: the answers brought a webhook secret that differs from the one the existing deployment was set up with, and the deploy-target step below must run the Jira webhook step **before** redeploying the hub (`apply-env.sh` also carries `DEPLOYMENT_URL` over from the previous `.env.local`, so that step has its target).
+If `apply-env.sh` prints `JIRA_WEBHOOK_SECRET_NEW=1`, note it: the answers turn webhook signing on for an existing deployment that had no secret, and the deploy-target step below must run the Jira webhook step **before** redeploying the hub (`apply-env.sh` also carries `DEPLOYMENT_URL` over from the previous `.env.local`, so that step has its target).
+
+If it prints `JIRA_WEBHOOK_SECRET_ROTATING=1` instead, note that too: the answers replace a secret that was already set, `apply-env.sh` kept the old one as `JIRA_WEBHOOK_SECRET_PREVIOUS` (the hub accepts both), and the deploy-target step must redeploy the hub **before** the Jira webhook step, then drop the previous key.
 
 ---
 
@@ -353,6 +355,8 @@ After Core/Builder/Workflow verify clean and **before** running Evaluations:
 - **Skip (`skip`):** skip both the deploy and the `DEPLOYMENT_URL` write. If Evaluations was selected, warn the user that prd-submitter will be deployed with a placeholder URL and they must update it manually.
 
 **Re-run with a new secret (`apply-env.sh` printed `JIRA_WEBHOOK_SECRET_NEW=1`):** run `./deploy/apprunner/setup-jira-webhook.sh` BEFORE `./deploy/apprunner/deploy.sh` (for `byo`, before rolling your own container with the new env), so Jira signs deliveries before the hub starts verifying them — DEPLOY.md "Jira webhook signing", Jira first (a), then the hub (b). The script reads the carried-over `DEPLOYMENT_URL` from `.env.local`, so it needs nothing from the deploy. A first install (nothing deployed, so no webhook to break) and a re-run with an unchanged secret keep the order on this page: deploy first, then the webhook step below (which is idempotent, so running it again after a Jira-first re-run is harmless).
+
+**Re-run rotating an enabled secret (`apply-env.sh` printed `JIRA_WEBHOOK_SECRET_ROTATING=1`):** run `./deploy/apprunner/deploy.sh` FIRST (for `byo`, roll your own container with the new env first) — the hub then holds both keys and accepts deliveries signed with either — THEN `./deploy/apprunner/setup-jira-webhook.sh`, so Jira switches to the new key. Finally tell the user to remove the `JIRA_WEBHOOK_SECRET_PREVIOUS` line from `.env.local` and redeploy (or `./deploy/ecs-express/set-env.sh --unset JIRA_WEBHOOK_SECRET_PREVIOUS`) — DEPLOY.md "Jira webhook signing", "Rotating an enabled secret". Never run the Jira step first here: that is the rejection window this order exists to avoid.
 
 ### Jira webhook setup (after deploy-target, if `TICKET_PROVIDER=jira` and `deploy_target` is NOT `local`)
 

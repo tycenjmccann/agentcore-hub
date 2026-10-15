@@ -30,6 +30,12 @@
  * .claude-plugin/bin/../.. layout so the script's REPO_ROOT is the scratch dir,
  * child env from an allow-list, no network (the script only runs jq).
  *
+ * TEAM-6352 (R3-F2): replacing an ALREADY-SET secret on an existing deployment
+ * is a rotation, not a first enable. The NEW=1 marker sent the skill down the
+ * Jira-first order, which with one hub key 401s every delivery until the hub
+ * redeploys. Now the old value is kept as JIRA_WEBHOOK_SECRET_PREVIOUS and a
+ * JIRA_WEBHOOK_SECRET_ROTATING=1 marker (hub first) is printed instead.
+ *
  * Fail-on-base demo: APPLY_ENV_SH=<path> points the suite at another copy of
  * the script (e.g. `git show <base>:.claude-plugin/bin/apply-env.sh`).
  */
@@ -45,6 +51,7 @@ const HEX = "a087bb7308b9ddb0e5281aa541d57292d3cc5a2b3a5837b4f6f10744dfdcd464";
 const OTHER = "njlkSWWO1AxrYziUR8EoQ8x2kJC8EcEpxA6ldAefw/Q=";
 const REFUSAL = /JIRA_WEBHOOK_SECRET (is empty|contains)/;
 const MARKER = /^JIRA_WEBHOOK_SECRET_NEW=1\b/m;
+const ROTATING = /^JIRA_WEBHOOK_SECRET_ROTATING=1\b/m;
 const DEPLOYED_URL = "https://abc123.us-east-1.awsapprunner.com";
 
 const scratchDirs: string[] = [];
@@ -326,22 +333,27 @@ describe("apply-env.sh carries DEPLOYMENT_URL over and flags a NEW secret on an 
     expect("DEPLOYMENT_URL" in parseEnv(r.env!)).toBe(false);
   });
 
-  it("marker: answers secret differs from the on-disk one and a deployment exists → JIRA_WEBHOOK_SECRET_NEW=1, value not echoed", () => {
+  it("rotation (TEAM-6352): answers secret replaces an already-set one on a deployment → ROTATING=1 (not NEW=1), old kept as PREVIOUS, values not echoed", () => {
     const r = runApplyEnv(jiraAnswers(OTHER), EXISTING_DEPLOYED);
     expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
-    expect(r.stdout).toMatch(MARKER);
-    expect(r.stdout.match(/JIRA_WEBHOOK_SECRET_NEW=1/g)).toHaveLength(1);
-    expect(r.stdout).toMatch(/setup-jira-webhook\.sh BEFORE redeploying/);
+    expect(r.stdout).toMatch(ROTATING);
+    expect(r.stdout.match(/JIRA_WEBHOOK_SECRET_ROTATING=1/g)).toHaveLength(1);
+    expect(r.stdout).not.toMatch(MARKER);
+    expect(r.stdout).toMatch(/redeploy the hub FIRST, THEN run \.\/deploy\/apprunner\/setup-jira-webhook\.sh/);
     expect(r.stdout).not.toContain(OTHER);
     expect(r.stdout).not.toContain(HEX);
-    expect(parseEnv(r.env!).JIRA_WEBHOOK_SECRET).toBe(OTHER);
+    const env = parseEnv(r.env!);
+    expect(env.JIRA_WEBHOOK_SECRET).toBe(OTHER);
+    expect(env.JIRA_WEBHOOK_SECRET_PREVIOUS).toBe(HEX);
   });
 
   it("marker: first-time enable on a deployed hub that had no secret (the R2-F2 case) → fires", () => {
     const r = runApplyEnv(jiraAnswers(HEX), DEPLOYED_UNSIGNED);
     expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
     expect(r.stdout).toMatch(MARKER);
+    expect(r.stdout).not.toMatch(ROTATING);
     expect(parseEnv(r.env!).DEPLOYMENT_URL).toBe(DEPLOYED_URL);
+    expect("JIRA_WEBHOOK_SECRET_PREVIOUS" in parseEnv(r.env!)).toBe(false);
   });
 
   it("no marker when the answers secret equals the on-disk one", () => {
@@ -378,5 +390,55 @@ describe("apply-env.sh carries DEPLOYMENT_URL over and flags a NEW secret on an 
     expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
     expect(r.stdout).not.toMatch(MARKER);
     expect(parseEnv(r.env!).JIRA_WEBHOOK_SECRET).toBe(HEX);
+  });
+});
+
+describe("apply-env.sh staged rotation keeps the old key as JIRA_WEBHOOK_SECRET_PREVIOUS (TEAM-6352 R3-F2)", () => {
+  it("rotation with nothing deployed → neither marker, no PREVIOUS (no hub to protect)", () => {
+    const r = runApplyEnv(jiraAnswers(OTHER), EXISTING);
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
+    expect(r.stdout).not.toMatch(MARKER);
+    expect(r.stdout).not.toMatch(ROTATING);
+    expect("JIRA_WEBHOOK_SECRET_PREVIOUS" in parseEnv(r.env!)).toBe(false);
+  });
+
+  it("a re-run mid-rotation carries PREVIOUS over (else the next full redeploy reopens the window), no marker", () => {
+    const r = runApplyEnv(jiraAnswers(), `${EXISTING_DEPLOYED.replace(HEX, OTHER)}JIRA_WEBHOOK_SECRET_PREVIOUS="${HEX}"\n`);
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
+    const env = parseEnv(r.env!);
+    expect(env.JIRA_WEBHOOK_SECRET).toBe(OTHER);
+    expect(env.JIRA_WEBHOOK_SECRET_PREVIOUS).toBe(HEX);
+    expect(r.stdout).not.toMatch(ROTATING);
+    expect(r.stdout).not.toMatch(MARKER);
+    expect(r.stdout).not.toContain(HEX);
+  });
+
+  it("carries PREVIOUS regardless of module set (same rule as the current secret)", () => {
+    const r = runApplyEnv(answers({ modules: ["core", "cloud-code"], jira: null }), `${EXISTING_DEPLOYED.replace(HEX, OTHER)}JIRA_WEBHOOK_SECRET_PREVIOUS="${HEX}"\n`);
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
+    expect(parseEnv(r.env!).JIRA_WEBHOOK_SECRET_PREVIOUS).toBe(HEX);
+  });
+
+  it("a PREVIOUS equal to the resolved current secret is not emitted", () => {
+    const r = runApplyEnv(jiraAnswers(), `${EXISTING_DEPLOYED}JIRA_WEBHOOK_SECRET_PREVIOUS="${HEX}"\n`);
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
+    expect("JIRA_WEBHOOK_SECRET_PREVIOUS" in parseEnv(r.env!)).toBe(false);
+  });
+
+  it("disable_webhook_signing drops PREVIOUS too", () => {
+    const r = runApplyEnv(jiraAnswers(undefined, "jira", ["core", "workflow"], { disable_webhook_signing: true }), `${EXISTING_DEPLOYED}JIRA_WEBHOOK_SECRET_PREVIOUS="${OTHER}"\n`);
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
+    const env = parseEnv(r.env!);
+    expect("JIRA_WEBHOOK_SECRET" in env).toBe(false);
+    expect("JIRA_WEBHOOK_SECRET_PREVIOUS" in env).toBe(false);
+  });
+
+  it("a malformed carried-over PREVIOUS is refused before the backup/overwrite, naming the variable", () => {
+    const existing = `${EXISTING_DEPLOYED}JIRA_WEBHOOK_SECRET_PREVIOUS="ab c"\n`;
+    const r = runApplyEnv(jiraAnswers(), existing);
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(1);
+    expect(r.stderr).toMatch(/JIRA_WEBHOOK_SECRET_PREVIOUS contains whitespace/);
+    expect(r.env).toBe(existing);
+    expect(r.bak).toBeNull();
   });
 });

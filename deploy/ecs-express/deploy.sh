@@ -65,6 +65,11 @@ source "$REPO_ROOT/deploy/lib/jira-webhook-secret.sh"
 if [[ -n "${JIRA_WEBHOOK_SECRET:-}" ]]; then
   require_jira_webhook_secret_format "$JIRA_WEBHOOK_SECRET" || exit 1
 fi
+# TEAM-6352: the retiring key of a staged rotation is forwarded the same way
+# (same guard), so "redeploy the hub with both keys" really holds both.
+if [[ -n "${JIRA_WEBHOOK_SECRET_PREVIOUS:-}" ]]; then
+  require_jira_webhook_secret_format "$JIRA_WEBHOOK_SECRET_PREVIOUS" JIRA_WEBHOOK_SECRET_PREVIOUS || exit 1
+fi
 
 # Eval gate (FR-7): the container bakes in agents.json/workflows.json — refuse
 # to build/push ungated config. Runs before the docker build and S3 reads.
@@ -495,7 +500,7 @@ echo "  [6/6] ECS Express Mode service: $SERVICE_NAME"
 ENV_JSON="[{\"name\":\"HOSTNAME\",\"value\":\"0.0.0.0\"},{\"name\":\"PORT\",\"value\":\"8080\"},{\"name\":\"NODE_ENV\",\"value\":\"production\"}"
 for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE \
            ARTIFACT_BUCKET TICKET_TOOLS_LAMBDA JIRA_SITE_URL JIRA_EMAIL \
-           JIRA_API_TOKEN JIRA_PROJECT_KEY JIRA_WEBHOOK_SECRET GITHUB_PAT GITHUB_OWNER GITHUB_REPO HUB_REPO_URL \
+           JIRA_API_TOKEN JIRA_PROJECT_KEY JIRA_WEBHOOK_SECRET JIRA_WEBHOOK_SECRET_PREVIOUS GITHUB_PAT GITHUB_OWNER GITHUB_REPO HUB_REPO_URL \
            MCP_SERVERS BUILDER_AGENT_ID AGENTCORE_ROLE_ARN LAMBDA_ROLE_ARN \
            NEXT_PUBLIC_BRAND_NAME EVAL_CONFIG_TABLE DEPLOY_MODE \
            WORKFLOW_RUNTIME_COUNT CODING_AGENT_RUNTIME_ARN CLOUD_CODE_TABLE \

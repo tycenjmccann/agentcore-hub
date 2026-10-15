@@ -58,7 +58,9 @@ header (`verifyHubSignature`, `src/lib/auth/hub-signature.ts`) whenever
 in this order: **Jira first (a), then the hub (b). Do not reverse it.** If the
 secret lands on the hub first while Jira still sends unsigned deliveries,
 every delivery gets `401` and its status transition is dropped — Jira does
-not redeliver it — until Jira is configured too.
+not redeliver it — until Jira is configured too. That order is for turning
+signing **on**; changing an already-enabled secret is a rotation and goes hub
+first with both keys (see "Rotating an enabled secret" below).
 
 - **(a) Jira side.** Generate the secret with `openssl rand -hex 32`. It must
   match `[A-Za-z0-9._~+/=-]+` — no spaces, newlines, quotes or `$`:
@@ -104,10 +106,32 @@ not redeliver it — until Jira is configured too.
   into the regenerated one regardless of which modules or ticket provider the
   re-run selects (TEAM-6347); `"jira": { "disable_webhook_signing": true }` in
   the answers blob is the one explicit way to drop it (then follow the rollback
-  below for the live service and the Jira webhook). When a re-run supplies a
-  secret that differs from the on-disk one on an existing deployment, it prints
+  below for the live service and the Jira webhook). When a re-run turns signing
+  on for an existing deployment (no secret on disk yet), it prints
   `JIRA_WEBHOOK_SECRET_NEW=1` and the setup skill runs `setup-jira-webhook.sh`
-  before `deploy.sh` — the same Jira-first order as (a) then (b).
+  before `deploy.sh` — the same Jira-first order as (a) then (b). When it
+  replaces a secret that was already set, it keeps the old one as
+  `JIRA_WEBHOOK_SECRET_PREVIOUS` and prints `JIRA_WEBHOOK_SECRET_ROTATING=1`
+  instead: the skill then runs `deploy.sh` before `setup-jira-webhook.sh`, the
+  rotation order below. An existing `JIRA_WEBHOOK_SECRET_PREVIOUS` is carried
+  over too, so a re-run mid-rotation does not drop it.
+- **Rotating an enabled secret (hub first, both keys — TEAM-6352).** With one
+  key no ordering avoids a `401` window: whichever side changes first rejects
+  or mis-signs until the other catches up. While `JIRA_WEBHOOK_SECRET` is set,
+  the hub also accepts a signature made with `JIRA_WEBHOOK_SECRET_PREVIOUS`
+  (same charset rule, forwarded by both full-redeploy scripts). Order:
+  1. Put the new value in `JIRA_WEBHOOK_SECRET` and the old one in
+     `JIRA_WEBHOOK_SECRET_PREVIOUS` in `.env.local`, and redeploy the hub — or
+     push both to the live service in one call:
+     `./deploy/ecs-express/set-env.sh JIRA_WEBHOOK_SECRET=<new> JIRA_WEBHOOK_SECRET_PREVIOUS=<old>`.
+     The hub now accepts deliveries signed with either key.
+  2. Switch Jira to the new key (`./deploy/apprunner/setup-jira-webhook.sh`, or
+     the Jira UI as in (a)).
+  3. Remove the `JIRA_WEBHOOK_SECRET_PREVIOUS` line from `.env.local` and
+     redeploy (or `./deploy/ecs-express/set-env.sh --unset JIRA_WEBHOOK_SECRET_PREVIOUS`).
+
+  `JIRA_WEBHOOK_SECRET_PREVIOUS` on its own enables nothing: while
+  `JIRA_WEBHOOK_SECRET` is unset the hub stays in unsigned passthrough.
 
 Between (a) and (b) the hub still accepts unsigned requests (and logs one
 `console.warn` per instance). Once (b) rolls out, an unsigned or mismatched

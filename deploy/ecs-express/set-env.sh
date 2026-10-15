@@ -52,6 +52,10 @@ while [ $# -gt 0 ]; do
     JIRA_WEBHOOK_SECRET=*)
       require_jira_webhook_secret_format "${1#JIRA_WEBHOOK_SECRET=}" || exit 1
       SETS+=("$1"); shift ;;
+    # TEAM-6352: the retiring key of a staged rotation, same rule.
+    JIRA_WEBHOOK_SECRET_PREVIOUS=*)
+      require_jira_webhook_secret_format "${1#JIRA_WEBHOOK_SECRET_PREVIOUS=}" JIRA_WEBHOOK_SECRET_PREVIOUS || exit 1
+      SETS+=("$1"); shift ;;
     *=*) SETS+=("$1"); shift ;;
     *) echo "ERROR: expected KEY=VALUE, --unset KEY or --dry-run, got '$1'" >&2; exit 2 ;;
   esac

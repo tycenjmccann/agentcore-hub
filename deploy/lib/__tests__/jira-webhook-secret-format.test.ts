@@ -237,6 +237,21 @@ describe("set-env.sh refuses JIRA_WEBHOOK_SECRET with a newline/whitespace befor
     expect(r.calls).toMatch(/^ecs list-services/m);
   });
 
+  // TEAM-6352: the retiring key of a staged rotation is an HMAC key Jira held,
+  // so set-env.sh holds it to the same rule (and names it in the error).
+  it("JIRA_WEBHOOK_SECRET_PREVIOUS with whitespace → exit 1 naming that key, no ecs call", () => {
+    const r = runSetEnv("JIRA_WEBHOOK_SECRET_PREVIOUS=ab c", "--dry-run");
+    expect(r.calls, `set-env.sh reached an ecs call before refusing:\n${r.calls}`).not.toMatch(/\becs\b/);
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(1);
+    expect(r.stderr).toMatch(/JIRA_WEBHOOK_SECRET_PREVIOUS contains whitespace or a newline/);
+  });
+
+  it("a hex JIRA_WEBHOOK_SECRET_PREVIOUS passes the guard and proceeds to the service lookup", () => {
+    const r = runSetEnv(`JIRA_WEBHOOK_SECRET=${HEX}`, `JIRA_WEBHOOK_SECRET_PREVIOUS=${HEX}`, "--dry-run");
+    expect(r.stderr).not.toMatch(/JIRA_WEBHOOK_SECRET(_PREVIOUS)? (is empty|contains)/);
+    expect(r.calls).toMatch(/^ecs list-services/m);
+  });
+
   it("--unset JIRA_WEBHOOK_SECRET (the documented rollback) is not guarded", () => {
     const r = runSetEnv("--unset", "JIRA_WEBHOOK_SECRET", "--dry-run");
     expect(r.stderr).not.toMatch(REFUSAL);

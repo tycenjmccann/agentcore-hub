@@ -29,6 +29,7 @@ const skill = readFileSync(process.env.SETUP_SKILL_MD ?? join(REPO_ROOT, "skills
 const deployMd = readFileSync(process.env.DEPLOY_MD ?? join(REPO_ROOT, "DEPLOY.md"), "utf8");
 
 const MARKER = "JIRA_WEBHOOK_SECRET_NEW=1";
+const ROTATING = "JIRA_WEBHOOK_SECRET_ROTATING=1";
 
 /** Text from the first line matching `heading` up to the next `## ` heading. */
 function section(text: string, heading: RegExp): string {
@@ -98,5 +99,57 @@ describe("skills/setup/SKILL.md runs the Jira webhook step before the hub redepl
   it("the post-deploy webhook step is still there for first installs and unchanged secrets (idempotent re-run)", () => {
     const step = section(skill, /^## Deploy target step/m);
     expect(step).toMatch(/^### Jira webhook setup/m);
+  });
+});
+
+/**
+ * TEAM-6352 (R3-F2): rotating an already-enabled secret is NOT Jira-first —
+ * with one hub key that 401s every delivery until the hub redeploys. The
+ * ROTATING=1 marker routes the skill hub-first (both keys), then Jira, then
+ * drops JIRA_WEBHOOK_SECRET_PREVIOUS; DEPLOY.md documents the same order.
+ */
+describe("staged rotation order: hub (both keys) → Jira → drop PREVIOUS (TEAM-6352)", () => {
+  const sec = section(deployMd, /^## Jira webhook signing/m);
+
+  it("DEPLOY.md has a rotation bullet: both keys on the hub, then Jira, then remove PREVIOUS", () => {
+    const at = sec.indexOf("**Rotating an enabled secret");
+    expect(at, "rotation bullet missing").toBeGreaterThan(-1);
+    const rot = sec.slice(at);
+    const bothAt = rot.search(/set-env\.sh JIRA_WEBHOOK_SECRET=<new> JIRA_WEBHOOK_SECRET_PREVIOUS=<old>/);
+    const jiraAt = rot.indexOf("setup-jira-webhook.sh");
+    const dropAt = rot.search(/--unset JIRA_WEBHOOK_SECRET_PREVIOUS/);
+    expect(bothAt).toBeGreaterThan(-1);
+    expect(jiraAt).toBeGreaterThan(bothAt);
+    expect(dropAt).toBeGreaterThan(jiraAt);
+    expect(rot).toMatch(/on its own enables nothing/);
+  });
+
+  it("DEPLOY.md's /setup bullet routes ROTATING=1 through deploy.sh before setup-jira-webhook.sh", () => {
+    const s = sentenceWith(sec, ROTATING);
+    const after = sec.slice(sec.indexOf(ROTATING));
+    const deployAt = after.indexOf("deploy.sh");
+    const webhookAt = after.indexOf("setup-jira-webhook.sh");
+    expect(s).toBeTruthy();
+    expect(deployAt).toBeGreaterThan(-1);
+    expect(webhookAt).toBeGreaterThan(deployAt);
+  });
+
+  it("SKILL.md apply step watches for the ROTATING marker", () => {
+    const apply = section(skill, /^## After confirmation: write `\.env\.local`/m);
+    expect(apply).toContain(ROTATING);
+  });
+
+  it("SKILL.md deploy-target step: ROTATING=1 runs deploy.sh FIRST, then setup-jira-webhook.sh, then drops PREVIOUS", () => {
+    const step = section(skill, /^## Deploy target step/m);
+    const at = step.indexOf(ROTATING);
+    expect(at, "ROTATING instruction missing from the deploy-target step").toBeGreaterThan(-1);
+    const after = step.slice(at);
+    const deployAt = after.indexOf("./deploy/apprunner/deploy.sh");
+    const webhookAt = after.indexOf("./deploy/apprunner/setup-jira-webhook.sh");
+    const dropAt = after.indexOf("JIRA_WEBHOOK_SECRET_PREVIOUS");
+    expect(deployAt).toBeGreaterThan(-1);
+    expect(webhookAt).toBeGreaterThan(deployAt);
+    expect(dropAt).toBeGreaterThan(webhookAt);
+    expect(after).toMatch(/DEPLOY\.md/);
   });
 });

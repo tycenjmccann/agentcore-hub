@@ -21,11 +21,13 @@
 
 JIRA_WEBHOOK_SECRET_PATTERN='^[A-Za-z0-9._~+/=-]+$'
 
-# require_jira_webhook_secret_format VALUE → 0 if VALUE is safe, else prints a
-# one-line reason to stderr (never the value) and returns 1. The caller decides
-# whether to exit.
+# require_jira_webhook_secret_format VALUE [NAME] → 0 if VALUE is safe, else
+# prints a one-line reason to stderr (never the value) and returns 1. The caller
+# decides whether to exit. NAME (default JIRA_WEBHOOK_SECRET) is the variable
+# named in the message — JIRA_WEBHOOK_SECRET_PREVIOUS, the retiring key of a
+# rotation (TEAM-6352), is held to the same rule.
 require_jira_webhook_secret_format() {
-  local value="$1"
+  local value="$1" name="${2:-JIRA_WEBHOOK_SECRET}"
   if [[ "$value" =~ $JIRA_WEBHOOK_SECRET_PATTERN ]]; then
     return 0
   fi
@@ -35,7 +37,7 @@ require_jira_webhook_secret_format() {
   elif [[ "$value" == *[[:space:]]* ]]; then
     why="contains whitespace or a newline (a trailing newline from echo / copy-paste is the usual cause)"
   fi
-  echo "ERROR: ✗ JIRA_WEBHOOK_SECRET $why. Jira and the hub would sign with different bytes (DEPLOY.md 'Jira webhook signing')." >&2
+  echo "ERROR: ✗ $name $why. Jira and the hub would sign with different bytes (DEPLOY.md 'Jira webhook signing')." >&2
   echo "       Generate one with: openssl rand -hex 32  — and use the same value in .env.local (Jira side) and ./deploy/ecs-express/set-env.sh (hub side)." >&2
   return 1
 }

@@ -240,11 +240,37 @@ describe.each(TARGETS)("deploy/%s/deploy.sh — static contract", (target) => {
     expect(text).toMatch(/for var in[^;]*\bJIRA_WEBHOOK_SECRET\b/);
   });
 
+  it("lists JIRA_WEBHOOK_SECRET_PREVIOUS in the forward allow-list (TEAM-6352)", () => {
+    expect(text).toMatch(/for var in[^;]*\bJIRA_WEBHOOK_SECRET_PREVIOUS\b/);
+  });
+
   it("sources deploy/lib/jira-webhook-secret.sh before its first aws call", () => {
     const sourceAt = text.search(/^\s*source\s+"\$REPO_ROOT\/deploy\/lib\/jira-webhook-secret\.sh"/m);
     const firstAws = text.search(/^[^#\n]*\baws\s+\w/m);
     expect(sourceAt, "guard not sourced").toBeGreaterThan(-1);
     expect(firstAws).toBeGreaterThan(-1);
     expect(sourceAt).toBeLessThan(firstAws);
+  });
+});
+
+// TEAM-6352 (R3-F2): the staged-rotation order redeploys the hub with BOTH
+// keys first; that only works if the full redeploy forwards the retiring key.
+describe.each(TARGETS)("deploy/%s/deploy.sh forwards JIRA_WEBHOOK_SECRET_PREVIOUS from .env.local (TEAM-6352)", (target) => {
+  const OLD = "njlkSWWO1AxrYziUR8EoQ8x2kJC8EcEpxA6ldAefw/Q=";
+
+  it("forwards both keys byte-for-byte during a rotation", () => {
+    const r = runDeploy(target, `JIRA_WEBHOOK_SECRET="${HEX}"\nJIRA_WEBHOOK_SECRET_PREVIOUS="${OLD}"\n`);
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
+    const env = submittedEnv(target, r);
+    expect(env.JIRA_WEBHOOK_SECRET).toBe(HEX);
+    expect(env.JIRA_WEBHOOK_SECRET_PREVIOUS).toBe(OLD);
+  });
+
+  it("a malformed PREVIOUS → exit 1 naming the variable, ZERO aws/docker calls", () => {
+    const r = runDeploy(target, `JIRA_WEBHOOK_SECRET="${HEX}"\nJIRA_WEBHOOK_SECRET_PREVIOUS="ab c"\n`);
+    expect(r.aws, "deploy.sh reached aws before refusing").toBeNull();
+    expect(r.docker, "deploy.sh reached docker before refusing").toBeNull();
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(1);
+    expect(r.stderr).toMatch(/JIRA_WEBHOOK_SECRET_PREVIOUS contains whitespace or a newline/);
   });
 });
