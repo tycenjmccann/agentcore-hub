@@ -2404,3 +2404,81 @@ describe("TEAM-6203 resolveTicketEntry / resolveTicketPrUrl — the ONE agentTas
     expect(refs.map((r) => r.number).sort((a, b) => a - b)).toEqual([9, 12]);
   });
 });
+
+// TEAM-6192 — the ONE delegation step after the ship-verdict evaluation, called by completeWorkflow's
+// re-check AND POST /api/workflow/[id]/complete (via src/lib/workflow/follow-up-pr-gate.ts). It removes
+// only verdict-less offenders verdictCarried excuses, with a proof-aware guard for the unified ticket.
+describe("TEAM-6192 dropCarriedOffenders", () => {
+  const FU = "https://github.com/o/r/pull/12", UNI = "https://github.com/o/r/pull/846";
+  const RM = "agentcore_hub_release_manager";
+  const U = { ticketId: "U", type: "task", status: "done", phase: "ship", assignee: RM, title: "Ship: unified release" };
+  const S = { ticketId: "S", type: "task", status: "done", phase: "ship", assignee: RM, title: `Ship: follow-up PR ${FU}` };
+  const C = { ticketId: "C", type: "task", status: "done", phase: "ship", assignee: RM, title: `CD: follow-up PR ${FU}` };
+  const PROOF = { merged: true, prUrl: UNI, mergeCommit: "m846" };
+  const drop = (...a) => completion.dropCarriedOffenders(...a);
+  const verdictOf = (children, tasks) => completion.evaluateShipVerdict(children, tasks, ["ship"]);
+  const SHIPPED_C = { ticketId: "C", output: "deployed", prUrl: FU, mergeCommit: "m12", outcome: "shipped" };
+
+  it("returns the SAME verdict object when shipped, not required, or nothing is dropped", () => {
+    const shipped = verdictOf([C], { C: SHIPPED_C });
+    expect(drop(shipped, { children: [C], agentTasks: { C: SHIPPED_C } })).toBe(shipped);
+    const notRequired = completion.evaluateShipVerdict([S], {}, []);
+    expect(drop(notRequired, { children: [S] })).toBe(notRequired);
+    const tasks = { S: { ticketId: "S", output: "x", prUrl: FU }, C: { ticketId: "C", output: "deployed", prUrl: FU } };
+    const v = verdictOf([S, C], tasks);
+    expect(drop(v, { children: [S, C], agentTasks: tasks, mergeProof: PROOF })).toBe(v);
+    expect(drop(null)).toBe(null);
+  });
+
+  it("drops a verdict-less chain Ship carried by its PR's shipped CD — with and without GitHub proof → shipped, handoff false", () => {
+    const tasks = { S: { ticketId: "S", output: "reviewed", prUrl: FU }, C: SHIPPED_C };
+    const v = verdictOf([S, C], tasks);
+    expect(v.offenders.map((o) => o.ticketId)).toEqual(["S"]);
+    for (const mergeProof of [PROOF, null]) {
+      expect(drop(v, { children: [S, C], agentTasks: tasks, mergeProof })).toEqual({ required: true, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [] });
+    }
+  });
+
+  it("a CD never borrows and a verdict-less CD carries nothing", () => {
+    const tasks = { S: { ticketId: "S", outcome: "shipped", prUrl: FU }, C: { ticketId: "C", output: "deployed", prUrl: FU } };
+    const v = verdictOf([S, C], tasks);
+    expect(drop(v, { children: [S, C], agentTasks: tasks, mergeProof: PROOF }).offenders.map((o) => o.ticketId)).toEqual(["C"]);
+    const t2 = { S: { ticketId: "S", output: "x", prUrl: FU }, C: { ticketId: "C", output: "deployed", prUrl: FU } };
+    expect(drop(verdictOf([S, C], t2), { children: [S, C], agentTasks: t2 }).offenders.map((o) => o.ticketId)).toEqual(["S", "C"]);
+  });
+
+  it("an own block is never excused: outcome and blockReason stand", () => {
+    const tasks = { S: { ticketId: "S", prUrl: FU, outcome: "deploy-blocked", blockReason: "gate rejected" }, C: SHIPPED_C };
+    const v = verdictOf([S, C], tasks);
+    expect(drop(v, { children: [S, C], agentTasks: tasks, mergeProof: PROOF })).toBe(v);
+    expect(v).toMatchObject({ shipped: false, outcome: "deploy-blocked", blockReason: "gate rejected" });
+  });
+
+  it("a deploy-blocked offender left beside a dropped one keeps the outcome and blockReason", () => {
+    const tasks = { U: { ticketId: "U", outcome: "deploy-blocked", blockReason: "unified gate rejected" }, S: { ticketId: "S", output: "x", prUrl: FU }, C: SHIPPED_C };
+    const out = drop(verdictOf([U, S, C], tasks), { children: [U, S, C], agentTasks: tasks, mergeProof: PROOF });
+    expect(out).toMatchObject({ shipped: false, outcome: "deploy-blocked", blockReason: "unified gate rejected", offenders: [{ ticketId: "U", phase: "ship", verdict: "deploy-blocked" }] });
+  });
+
+  it("with GitHub proof: a ticket whose own PR IS the unified PR is kept, even with a same-PR shipped CD", () => {
+    const cdU = { ...C, title: "CD: deploy the release" };
+    const tasks = { U: { ticketId: "U", output: "x", prUrl: UNI }, C: { ticketId: "C", mergeCommit: "m846", prUrl: UNI } };
+    const v = verdictOf([U, cdU], tasks);
+    expect(drop(v, { children: [U, cdU], agentTasks: tasks, mergeProof: PROOF })).toBe(v);
+  });
+
+  it("without GitHub proof: only a DL-038 chain-titled ticket is excused — a `Fix (ship-review rN)` fixer is kept", () => {
+    const fixer = { ...S, title: "Fix (ship-review r1): follow-up findings" };
+    const tasks = { S: { ticketId: "S", output: "fixed", prUrl: FU }, C: SHIPPED_C };
+    const v = verdictOf([fixer, C], tasks);
+    expect(drop(v, { children: [fixer, C], agentTasks: tasks })).toBe(v);
+    expect(drop(v, { children: [fixer, C], agentTasks: tasks, mergeProof: PROOF }).shipped).toBe(true); // proof names the unified PR
+  });
+
+  it("the recipient's PR may come from its completion record (records), as verdictCarried resolves it", () => {
+    const fixer = { ...S, title: "Fix (ship-review r1): follow-up findings" };
+    const tasks = { S: { ticketId: "S", output: "fixed" }, C: SHIPPED_C };
+    const v = verdictOf([fixer, C], tasks);
+    expect(drop(v, { children: [fixer, C], agentTasks: tasks, records: { S: { pr_url: FU } }, mergeProof: PROOF }).shipped).toBe(true);
+  });
+});

@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
 import { readFileSync } from "node:fs";
+import chain from "@/lib/workflow/__fixtures__/delivered-follow-up-chain.json";
 
 /**
  * TEAM-3619 D4a — the completion guard on POST /api/workflow/[id]/complete.
@@ -1294,5 +1295,126 @@ describe("POST complete — effective def + live roster at every gate (TEAM-6187
     const res = await post();
     expect(res.status).toBe(200);
     expect((await res.json()).status).toBe("complete");
+  });
+});
+
+/**
+ * TEAM-6192 — a DELIVERED DL-038 follow-up chain on this route. The ship verdict
+ * was evaluated over every ship ticket and never re-checked, so the follow-up
+ * `Ship:` review (no verdict of its own) closed the run static-ci-only although
+ * its `CD:` ticket carried its own merge_commit + outcome:"shipped". The route now
+ * calls the orchestrator's own dropCarriedOffenders after the follow-up gate.
+ * Fixture shared byte-for-byte with completion-gates.test.mjs (same 7 cases).
+ */
+describe("POST complete — TEAM-6192 delivered follow-up chain (shared fixture)", () => {
+  const ENV = ["GITHUB_PAT", "SHIP_MERGE_VERIFY"] as const;
+  const savedEnv: Partial<Record<(typeof ENV)[number], string | undefined>> = {};
+  const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v)) as T;
+  const workflow = (tasks: Record<string, Record<string, unknown>> = {}) => ({
+    workflowId: "wf_1",
+    phase: "ship",
+    workflowDefId: "software-delivery",
+    featureBranch: chain.featureBranch,
+    repoConfig: REPO,
+    agentTasks: { ...clone(chain.agentTasks), ...tasks },
+  });
+  /** GitHub proves the unified merge (merged PR whose head IS the branch head); /pulls/12 answers `fu`. */
+  const github = (fu: Record<string, unknown>) => {
+    const routes: Array<[string, unknown]> = [
+      ["/pulls?head=", [chain.github.unifiedMergedPr]],
+      ["/branches/", { commit: { sha: chain.github.branchHeadSha } }],
+      ["/pulls/12", fu],
+      ["/pulls/846", chain.github.unifiedMergedPr],
+    ];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL | Request) => {
+      const hit = routes.find(([m]) => String(url).includes(m));
+      return new Response(JSON.stringify(hit ? hit[1] : {}), { status: 200 });
+    }));
+  };
+  const outcomeOf = (u: Record<string, unknown>) => (u.ExpressionAttributeValues as Record<string, unknown>)?.[":outcome"];
+  const recordReads = () => h.state.s3Gets.filter((k) => /^completions\/[USC]\.json$/.test(k)).sort();
+
+  beforeEach(() => {
+    for (const k of ENV) savedEnv[k] = process.env[k];
+    process.env.GITHUB_PAT = "ghp_test";
+    delete process.env.SHIP_MERGE_VERIFY;
+    h.state.tickets = clone(chain.tickets);
+    h.state.workflow = workflow();
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    for (const k of ENV) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+  });
+
+  it("1. delivered (CD shipped with its own merge_commit, follow-up PR merged) → 200 complete", async () => {
+    github(chain.github.followUpPrMerged);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+    expect(h.state.updates.map(outcomeOf)).toEqual([undefined]); // the :complete write, not closeBlocked
+  });
+
+  it("2. (a) the CD reported no merge_commit / outcome → static-ci-only, offenders S and C", async () => {
+    h.state.workflow = workflow({ C: clone(chain.variants.cdNotShipped) });
+    github(chain.github.followUpPrMerged);
+    await load();
+    const body = await (await post()).json();
+    expect(body.status).toBe("static-ci-only");
+    expect(body.offenders.map((o: { ticketId: string }) => o.ticketId)).toEqual(["S", "C"]);
+  });
+
+  it("3. (b) the follow-up PR is still open → 409 open_follow_up_pr, no terminal write", async () => {
+    github(chain.github.followUpPrOpen);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "open_follow_up_pr", prs: [chain.followUpPrUrl] });
+    expect(h.state.updates).toEqual([]);
+  });
+
+  it("4. (c) no GitHub proof (SHIP_MERGE_VERIFY=off) → complete on the CD's own verdict; records read like the orchestrator's", async () => {
+    process.env.SHIP_MERGE_VERIFY = "off";
+    github(chain.github.followUpPrMerged);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+    // Input parity: the orchestrator's re-check reads completions/<child>.json for every child
+    // (memoized readCompletionRecord) and the verdicts from the workflow row — so does the route.
+    expect(recordReads()).toEqual(["completions/C.json", "completions/S.json", "completions/U.json"]);
+  });
+
+  it("4b. (c) parity: a CD verdict that exists ONLY in completions/C.json is not read without the gate → static-ci-only", async () => {
+    process.env.SHIP_MERGE_VERIFY = "off";
+    h.state.workflow = workflow({ C: clone(chain.variants.cdNotShipped) });
+    h.state.s3Objects["completions/C.json"] = JSON.stringify(chain.variants.cdShippedRecord);
+    await load();
+    const body = await (await post()).json();
+    expect(body.status).toBe("static-ci-only");
+    expect(recordReads()).toContain("completions/C.json");
+  });
+
+  it("5. (c′) no GitHub proof and S is not a DL-038 chain ticket → NOT excused (unified-ticket guard) → static-ci-only", async () => {
+    process.env.SHIP_MERGE_VERIFY = "off";
+    h.state.tickets = clone(chain.tickets).map((t) => (t.ticketId === "S" ? { ...t, title: chain.variants.nonChainShipTitle } : t));
+    await load();
+    const body = await (await post()).json();
+    expect(body.status).toBe("static-ci-only");
+    expect(body.offenders).toEqual([{ ticketId: "S", phase: "ship", verdict: "none" }]);
+  });
+
+  it("6. S carries its own block verdict → never excused by the shipped CD → deploy-blocked with S's reason", async () => {
+    h.state.workflow = workflow({ S: { ...clone(chain.agentTasks.S), ...chain.variants.shipOwnBlock } });
+    github(chain.github.followUpPrMerged);
+    await load();
+    const body = await (await post()).json();
+    expect(body.status).toBe("deploy-blocked");
+    expect(body.offenders).toEqual([{ ticketId: "S", phase: "ship", verdict: "deploy-blocked" }]);
+    const values = h.state.updates[0].ExpressionAttributeValues as Record<string, unknown>;
+    expect(values[":reason"]).toBe(chain.variants.shipOwnBlock.blockReason);
   });
 });

@@ -1,0 +1,28 @@
+{
+  "_comment": "TEAM-6192 — ONE delivered DL-038 follow-up chain for BOTH completion surfaces: src/app/api/workflow/[id]/complete/route.test.ts and lambda/orchestrator/completion-gates.test.mjs. U = the unified Ship ticket (carries the unified merge proof); S = 'Ship: follow-up PR <url>' (output + its own PR, no verdict); C = 'CD: follow-up PR <url>' (its own merge_commit + outcome shipped). Each harness adds only its own scaffolding (def, other phases, GitHub stub mechanics).",
+  "featureBranch": "feature/EPIC-1-fix",
+  "unifiedPrUrl": "https://github.com/o/r/pull/846",
+  "followUpPrUrl": "https://github.com/o/r/pull/12",
+  "tickets": [
+    { "ticketId": "U", "type": "task", "status": "done", "phase": "ship", "assignee": "agentcore_hub_release_manager", "title": "Ship: unified release" },
+    { "ticketId": "S", "type": "task", "status": "done", "phase": "ship", "assignee": "agentcore_hub_release_manager", "title": "Ship: follow-up PR https://github.com/o/r/pull/12" },
+    { "ticketId": "C", "type": "task", "status": "done", "phase": "ship", "assignee": "agentcore_hub_release_manager", "title": "CD: follow-up PR https://github.com/o/r/pull/12" }
+  ],
+  "agentTasks": {
+    "U": { "ticketId": "U", "agentId": "agentcore_hub_release_manager", "output": "merged the unified PR", "mergeCommit": "m846", "prUrl": "https://github.com/o/r/pull/846" },
+    "S": { "ticketId": "S", "agentId": "agentcore_hub_release_manager", "output": "follow-up PR reviewed", "prUrl": "https://github.com/o/r/pull/12" },
+    "C": { "ticketId": "C", "agentId": "agentcore_hub_release_manager", "output": "deployed", "prUrl": "https://github.com/o/r/pull/12", "mergeCommit": "m12", "outcome": "shipped" }
+  },
+  "variants": {
+    "cdNotShipped": { "ticketId": "C", "agentId": "agentcore_hub_release_manager", "output": "deployed", "prUrl": "https://github.com/o/r/pull/12" },
+    "cdShippedRecord": { "ticket_id": "C", "pr_url": "https://github.com/o/r/pull/12", "merge_commit": "m12", "outcome": "shipped", "summary": "deployed" },
+    "nonChainShipTitle": "Fix (ship-review r1): follow-up findings",
+    "shipOwnBlock": { "outcome": "deploy-blocked", "blockReason": "follow-up deploy gate rejected" }
+  },
+  "github": {
+    "branchHeadSha": "head000",
+    "unifiedMergedPr": { "number": 846, "state": "closed", "merged": true, "merged_at": "2026-09-02T10:00:00Z", "head": { "sha": "head000", "ref": "feature/EPIC-1-fix" }, "base": { "ref": "main" }, "merge_commit_sha": "m846", "html_url": "https://github.com/o/r/pull/846" },
+    "followUpPrMerged": { "number": 12, "state": "closed", "merged": true, "merged_at": "2026-09-03T10:00:00Z", "merge_commit_sha": "m12", "head": { "ref": "fix/S" }, "base": { "ref": "main" } },
+    "followUpPrOpen": { "number": 12, "state": "open", "merged": false, "merged_at": null, "head": { "ref": "fix/S" }, "base": { "ref": "main" } }
+  }
+}

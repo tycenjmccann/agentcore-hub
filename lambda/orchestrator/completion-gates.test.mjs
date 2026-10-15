@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { readFileSync } from "node:fs";
 import { deliveryRollUp } from "./completion.mjs";
 
 /**
@@ -1569,6 +1570,80 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     await completeWorkflow({ ...SHIP_WF });
     expect(h.state.storeCompletions.length).toBe(1);
     expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  // TEAM-6192 — the SAME delivered DL-038 chain (U unified Ship, S "Ship: follow-up PR", C "CD: follow-up PR")
+  // the HTTP route test loads (src/lib/workflow/__fixtures__/delivered-follow-up-chain.json), same 7 cases.
+  // Both surfaces now call completion.mjs dropCarriedOffenders after the gate; without GitHub proof
+  // (SHIP_MERGE_VERIFY=off) S is excused only by its chain title + C's OWN verdict from the row.
+  describe("TEAM-6192 — delivered follow-up chain (shared fixture)", () => {
+    const chain = JSON.parse(readFileSync(new URL("../../src/lib/workflow/__fixtures__/delivered-follow-up-chain.json", import.meta.url), "utf8"));
+    const clone = (v) => JSON.parse(JSON.stringify(v));
+    const BASE = SHIP_CHILDREN.filter((t) => t.ticketId !== "B-4");
+    const BASE_TASKS = Object.fromEntries(Object.entries(SHIP_TASKS).filter(([k]) => k !== "B-4"));
+    const recordReads = () => h.state.s3Gets.filter((k) => /^completions\/[USC]\.json$/.test(String(k))).sort();
+    const run = async ({ tasks = {}, tickets = chain.tickets, fu = chain.github.followUpPrMerged } = {}) => {
+      h.state.merges.length = 0; h.state.storeCompletions.length = 0; h.state.terminalClaims.length = 0; h.state.s3Gets.length = 0;
+      h.state.snapshots = [[...BASE, ...clone(tickets)]];
+      h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...clone(BASE_TASKS), ...clone(chain.agentTasks), ...clone(tasks) } };
+      const u = chain.github.unifiedMergedPr;
+      mockGitHub({ prs: [u], headSha: chain.github.branchHeadSha, pulls: { 846: u, 12: fu } });
+      await loadShip();
+      await completeWorkflow({ ...SHIP_WF, featureBranch: chain.featureBranch });
+    };
+    const claims = () => h.state.terminalClaims.map(({ outcome, reason }) => ({ outcome, reason }));
+
+    it("1. delivered (CD shipped with its own merge_commit, follow-up PR merged) → completes, S/C not stamped", async () => {
+      await run();
+      expect(h.state.storeCompletions.length).toBe(1);
+      expect(h.state.terminalClaims).toEqual([]);
+      expect(h.state.merges.filter((m) => m.tid === "S" || m.tid === "C")).toEqual([]);
+    });
+
+    it("2. (a) the CD reported no merge_commit / outcome → static-ci-only", async () => {
+      await run({ tasks: { C: chain.variants.cdNotShipped } });
+      expect(h.state.storeCompletions.length).toBe(0);
+      expect(claims()).toEqual([{ outcome: "static-ci-only", reason: null }]);
+    });
+
+    it("3. (b) the follow-up PR is still open → CompletionRejectedOpenFollowUpPr, no terminal write", async () => {
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      await run({ fu: chain.github.followUpPrOpen });
+      expect(h.state.storeCompletions.length).toBe(0);
+      expect(h.state.terminalClaims).toEqual([]);
+      expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedOpenFollowUpPr"))).toBe(true);
+      error.mockRestore();
+    });
+
+    it("4. (c) no GitHub proof (SHIP_MERGE_VERIFY=off) → completes on the CD's own verdict; reads completions/<child>.json like the route", async () => {
+      process.env.SHIP_MERGE_VERIFY = "off";
+      await run();
+      expect(h.state.storeCompletions.length).toBe(1);
+      expect(h.state.terminalClaims).toEqual([]);
+      expect(recordReads()).toEqual(["completions/C.json", "completions/S.json", "completions/U.json"]);
+    });
+
+    it("4b. (c) parity: a CD verdict that exists ONLY in completions/C.json is not read without the gate → static-ci-only", async () => {
+      process.env.SHIP_MERGE_VERIFY = "off";
+      h.state.s3Completions["completions/C.json"] = clone(chain.variants.cdShippedRecord);
+      await run({ tasks: { C: chain.variants.cdNotShipped } });
+      expect(h.state.storeCompletions.length).toBe(0);
+      expect(claims()).toEqual([{ outcome: "static-ci-only", reason: null }]);
+      expect(recordReads()).toContain("completions/C.json");
+    });
+
+    it("5. (c′) no GitHub proof and S is not a DL-038 chain ticket → NOT excused (unified-ticket guard) → static-ci-only", async () => {
+      process.env.SHIP_MERGE_VERIFY = "off";
+      await run({ tickets: chain.tickets.map((t) => (t.ticketId === "S" ? { ...t, title: chain.variants.nonChainShipTitle } : t)) });
+      expect(h.state.storeCompletions.length).toBe(0);
+      expect(claims()).toEqual([{ outcome: "static-ci-only", reason: null }]);
+    });
+
+    it("6. S carries its own block verdict → never excused by the shipped CD → deploy-blocked with S's reason", async () => {
+      await run({ tasks: { S: { ...chain.agentTasks.S, ...chain.variants.shipOwnBlock } } });
+      expect(h.state.storeCompletions.length).toBe(0);
+      expect(claims()).toEqual([{ outcome: "deploy-blocked", reason: chain.variants.shipOwnBlock.blockReason }]);
+    });
   });
 });
 
