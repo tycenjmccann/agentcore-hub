@@ -11,6 +11,8 @@
 #
 # Prerequisites (from .env.local):
 #   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, DEPLOYMENT_URL
+#   Optional: JIRA_WEBHOOK_SECRET — [A-Za-z0-9._~+/=-]+ only (openssl rand -hex 32);
+#   refused otherwise (TEAM-6334, deploy/lib/jira-webhook-secret.sh)
 #
 # Usage:
 #   ./deploy/apprunner/setup-jira-webhook.sh
@@ -32,6 +34,17 @@ load_env_local .env.local
 : "${JIRA_API_TOKEN:?JIRA_API_TOKEN must be set}"
 : "${JIRA_PROJECT_KEY:?JIRA_PROJECT_KEY must be set}"
 : "${DEPLOYMENT_URL:?DEPLOYMENT_URL must be set}"
+
+# TEAM-6334: refuse a secret the two writers cannot pass through byte-identical
+# (newline, whitespace, shell metachars) BEFORE touching Jira — otherwise Jira
+# would sign with these bytes and the hub (set via set-env.sh) with others,
+# and every delivery would 401. One rule, shared with set-env.sh. Resolved
+# from this script's own location so it works from any cwd.
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/jira-webhook-secret.sh"
+if [[ -n "${JIRA_WEBHOOK_SECRET:-}" ]]; then
+  require_jira_webhook_secret_format "$JIRA_WEBHOOK_SECRET" || exit 1
+fi
 
 WEBHOOK_NAME="agentcore-hub-workflow"
 WEBHOOK_URL="${DEPLOYMENT_URL}/api/jira/webhook"
@@ -107,6 +120,19 @@ WEBHOOK_PAYLOAD=$(cat <<EOF
 EOF
 )
 
+# TEAM-6324: when JIRA_WEBHOOK_SECRET is set, have Jira sign deliveries with
+# it (/rest/webhooks/1.0/webhook accepts an optional "secret" field) so the
+# hub's signature check (DEPLOY.md "Jira webhook signing") has something to
+# verify against. Unset is byte-identical to before this change.
+if [[ -n "${JIRA_WEBHOOK_SECRET:-}" ]]; then
+  WEBHOOK_PAYLOAD=$(SECRET="$JIRA_WEBHOOK_SECRET" python3 -c "
+import json, os, sys
+payload = json.loads(sys.stdin.read())
+payload['secret'] = os.environ['SECRET']
+print(json.dumps(payload))
+" <<<"$WEBHOOK_PAYLOAD")
+fi
+
 RESPONSE=$(curl -sf -X POST \
   -u "$AUTH" \
   -H "Content-Type: application/json" \
@@ -121,6 +147,7 @@ RESPONSE=$(curl -sf -X POST \
     echo "          URL:  ${WEBHOOK_URL}" >&2
     echo "          Events: Issue Created, Issue Updated" >&2
     echo "          Filter: project = ${JIRA_PROJECT_KEY}" >&2
+    echo "          Secret: \$JIRA_WEBHOOK_SECRET (set it here too, so the hub's signature check has a match — DEPLOY.md 'Jira webhook signing')" >&2
     exit 1
   }
 

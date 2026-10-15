@@ -16,6 +16,21 @@
  * Fallback: when WORKFLOW_COMMAND_QUEUE_URL is unset, invokes the
  * orchestrator Lambda directly (pre-R1 behavior) so the app keeps working
  * against an install that hasn't created the queue yet.
+ *
+ * TEAM-6324: verifies Jira's `X-Hub-Signature: sha256=<hex>` header
+ * (verifyHubSignature, src/lib/auth/hub-signature.ts) against
+ * JIRA_WEBHOOK_SECRET before any parse or dispatch, when that secret is
+ * configured. Unlike workflow/webhook's WEBHOOK_SECRET gate, an unset secret
+ * here is passthrough (not a fail-closed 503) — but it logs one console.warn
+ * per cold start so an install that never configures it is still visible in
+ * the logs. DEPLOY.md's "Jira webhook signing" section has the required
+ * rollout order (Jira first, then the hub) — reversing it drops deliveries.
+ *
+ * TEAM-6344: the body is read once as bytes (req.arrayBuffer(), inside a
+ * try) so the HMAC verifies the exact bytes Jira sent — req.text() would
+ * strip a leading UTF-8 BOM and replace invalid UTF-8 first. A body-read
+ * failure returns the same 400 as an invalid-JSON body, regardless of
+ * whether the secret is configured.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -23,6 +38,7 @@ import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { mapJiraStatusToInternal } from "@/lib/workflow/jira-client";
 import { commandGroupId, commandDedupId } from "@/lib/workflow/command-queue";
+import { verifyHubSignature } from "@/lib/auth/hub-signature";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const ORCHESTRATOR_LAMBDA = process.env.ORCHESTRATOR_LAMBDA || "agentcore-hub-orchestrator";
@@ -30,6 +46,10 @@ const COMMAND_QUEUE_URL = process.env.WORKFLOW_COMMAND_QUEUE_URL || "";
 
 const lambda = new LambdaClient({ region: REGION });
 const sqs = new SQSClient({ region: REGION });
+
+// Logged once per module instance so an install that never sets the secret
+// still gets a visible signal, without spamming on every webhook delivery.
+let warnedUnauthenticated = false;
 
 interface JiraWebhookPayload {
   webhookEvent?: string;
@@ -92,9 +112,38 @@ async function dispatchCommand(
 }
 
 export async function POST(req: NextRequest) {
+  // TEAM-6344: read the body once as bytes. A stream/read failure here is
+  // the same user-facing outcome as an invalid-JSON body on main.
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(await req.arrayBuffer());
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
+  // TEAM-6333: trim only decides opt-in (a blank/whitespace-only secret means
+  // unset). The HMAC key is the exact configured value, untrimmed — the same
+  // bytes setup-jira-webhook.sh sends Jira, and what Jira does with whatever
+  // an operator pastes into its UI. Trimming here while the sender does not
+  // meant a padded secret could never verify.
+  const secret = process.env.JIRA_WEBHOOK_SECRET || "";
+
+  if (secret.trim()) {
+    if (!verifyHubSignature(bytes, req.headers.get("x-hub-signature"), secret)) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+  } else if (!warnedUnauthenticated) {
+    warnedUnauthenticated = true;
+    console.warn(
+      "[jira-webhook] JIRA_WEBHOOK_SECRET not set — accepting UNSIGNED webhooks; see DEPLOY.md"
+    );
+  }
+
   let payload: JiraWebhookPayload;
   try {
-    payload = await req.json();
+    // TEAM-6344: TextDecoder strips a leading BOM and replaces invalid UTF-8
+    // the same way req.json() (and main's req.text()) would.
+    payload = JSON.parse(new TextDecoder().decode(bytes));
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }

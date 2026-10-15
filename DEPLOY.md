@@ -49,6 +49,75 @@ NOT rewritten by the commands below. That is deliberate:
   set — it rewrites function env vars and would blank prod Jira credentials.**
   The staging deploy below is code-only for exactly this reason.
 
+## Jira webhook signing (JIRA_WEBHOOK_SECRET)
+
+`/api/jira/webhook` verifies Jira's `X-Hub-Signature: sha256=<hex HMAC-SHA256(secret, raw body)>`
+header (`verifyHubSignature`, `src/lib/auth/hub-signature.ts`) whenever
+`JIRA_WEBHOOK_SECRET` is set. An unset secret is passthrough, not fail-closed
+(unlike `WEBHOOK_SECRET` on `/api/workflow/webhook`) — see TEAM-6324. Enable it
+in this order: **Jira first (a), then the hub (b). Do not reverse it.** If the
+secret lands on the hub first while Jira still sends unsigned deliveries,
+every delivery gets `401` and its status transition is dropped — Jira does
+not redeliver it — until Jira is configured too.
+
+- **(a) Jira side.** Generate the secret with `openssl rand -hex 32`. It must
+  match `[A-Za-z0-9._~+/=-]+` — no spaces, newlines, quotes or `$`:
+  `.env.local` is `source`d by bash and `set-env.sh` joins its arguments on
+  newlines, so anything else would reach Jira and the hub as different bytes.
+  `setup-jira-webhook.sh` refuses a non-empty value outside that charset before
+  any Jira call; an unset or empty `JIRA_WEBHOOK_SECRET` means signing stays
+  off on the Jira side (the webhook is created without a secret, exactly as
+  before). `set-env.sh` applies the same charset rule and refuses an empty
+  value too, since the hub needs a real key (both via
+  `deploy/lib/jira-webhook-secret.sh`, TEAM-6334). Set it on the webhook:
+  Jira admin → System → WebHooks → `agentcore-hub-workflow` → Secret, or
+  re-run `./deploy/apprunner/setup-jira-webhook.sh` with `JIRA_WEBHOOK_SECRET`
+  set in `.env.local`. Jira then signs every delivery.
+- **(b) Hub side.** Two steps, both required, whichever route (a) used:
+  1. Add `JIRA_WEBHOOK_SECRET=<the same value>` to `.env.local`. Nothing in (a)
+     writes it there — the Jira-UI route never touches the file, and
+     `setup-jira-webhook.sh` only reads it — and `set-env.sh` below writes only
+     to the live service. Without this line the next full redeploy drops the
+     secret (next bullet).
+  2. Push it to the running service:
+     ```bash
+     source deploy/config.sh
+     ./deploy/ecs-express/set-env.sh JIRA_WEBHOOK_SECRET=<the same value>
+     ```
+     (never the raw ECS update API — it replaces the whole container env, which
+     would blank the other live secrets on this service).
+
+  The hub uses the value byte-for-byte as the HMAC key (no trimming); the
+  charset rule above is what guarantees the bytes are identical on both sides.
+- **Full redeploys read `.env.local`, not the live service.** A full redeploy
+  (`./deploy/ecs-express/deploy.sh`, or the legacy `./deploy/apprunner/deploy.sh`)
+  rebuilds the whole container env from `.env.local` and forwards
+  `JIRA_WEBHOOK_SECRET` from there (TEAM-6336), validated with the same charset
+  rule — an invalid non-empty value aborts the deploy before any AWS call; unset
+  or empty is simply not forwarded. This is why (b) step 1 is required: if the
+  secret only lives on the running service, the next full redeploy drops it and
+  the hub silently falls back to unsigned passthrough. The pipeline's
+  roll-by-digest (`deploy/pipeline/buildspec-deploy.yml`) and
+  `deploy/pipeline/rollback.sh` reuse the live env and are unaffected.
+- **`/setup` re-runs keep it.** `.claude-plugin/bin/apply-env.sh` carries
+  `JIRA_WEBHOOK_SECRET` (and `DEPLOYMENT_URL`) from the previous `.env.local`
+  into the regenerated one regardless of which modules or ticket provider the
+  re-run selects (TEAM-6347); `"jira": { "disable_webhook_signing": true }` in
+  the answers blob is the one explicit way to drop it (then follow the rollback
+  below for the live service and the Jira webhook). When a re-run supplies a
+  secret that differs from the on-disk one on an existing deployment, it prints
+  `JIRA_WEBHOOK_SECRET_NEW=1` and the setup skill runs `setup-jira-webhook.sh`
+  before `deploy.sh` — the same Jira-first order as (a) then (b).
+
+Between (a) and (b) the hub still accepts unsigned requests (and logs one
+`console.warn` per instance). Once (b) rolls out, an unsigned or mismatched
+request gets `401`. Rollback: `./deploy/ecs-express/set-env.sh --unset JIRA_WEBHOOK_SECRET`,
+and remove the line from `.env.local` too, or the next full redeploy re-enables it.
+
+Verify: move a ticket in Jira and confirm it still dispatches; a bare
+`curl -XPOST $DEPLOYMENT_URL/api/jira/webhook -d '{}'` should return `401`
+once the secret is set on the hub.
+
 ## Config evals (optional)
 
 Prompt, blueprint, and agent/workflow config changes can be scored by the
