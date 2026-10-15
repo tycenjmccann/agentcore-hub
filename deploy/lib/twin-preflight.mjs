@@ -31,6 +31,11 @@
  *     fence writes the record (IfMatch) right before the commit and REFUSES the Done when
  *     the write is denied, so fence-carrying twin code onto a role without the grant
  *     would refuse every Done on a ticket with a record.
+ *   - TEAM-6143: dynamodb:ConditionCheckItem on the tickets table, agentcore-hub-tickets
+ *     only. A Done carrying require_done is one TransactWriteItems with a ConditionCheck
+ *     per required ticket row; without the grant every such Done AccessDenies and the
+ *     drain retries it forever. The table ARN is derived from the function's own ARN
+ *     (region + account) and its TICKETS_TABLE, defaulted exactly as the twin defaults it.
  * The twins' own fail-closed semantics are untouched; this only decides whether their
  * code may ship.
  *
@@ -48,6 +53,8 @@ export const TWIN_FUNCTIONS = ["agentcore-hub-jira", "agentcore-hub-tickets"];
 const PROVIDER_OF = { "agentcore-hub-jira": "jira", "agentcore-hub-tickets": "dynamodb" };
 const SETUP_FIX = (fn) =>
   `source deploy/config.sh && TICKET_PROVIDER=${PROVIDER_OF[fn] || "<provider>"} node deploy/setup-tickets-lambda.mjs`;
+// The dynamodb twin's table fallback (lambda/agentcore-hub-tickets/index.mjs TABLE_NAME).
+const DEFAULT_TICKETS_TABLE = "agentcore-hub-tickets";
 const ROLE_READ_FIX =
   "./deploy/pipeline/deploy.sh (grants the Deploy role iam:ListRolePolicies + iam:GetRolePolicy on the twin roles, TwinPreflightIamRead)";
 
@@ -146,7 +153,7 @@ export function policyMayDenyUnder(docs, action, prefix) {
 
 /**
  * The verdict for one twin. Pure.
- *   config:   {state:"ok", role, bucket} | {state:"absent"} | {state:"error", error}
+ *   config:   {state:"ok", role, bucket, region?, account?, table?} | {state:"absent"} | {state:"error", error}
  *   policies: {state:"ok", docs:[{name, document}]} | {state:"error", error}
  * @returns {{action:"proceed"|"skip-absent"|"block", reasons:string[]}}
  */
@@ -190,6 +197,21 @@ export function decideTwin({ fn, optional, expectedBucket, config, policies }) {
     ["s3:PutObject", `${completions}*`, "the Done-intent fence writes the completion record before the commit (TEAM-5941); a denied write refuses every Done on a ticket with a record",
       () => policyMayDenyUnder(policies.docs, "s3:PutObject", completions), () => policyGrantsUnder(policies.docs, "s3:PutObject", completions)],
   ];
+  let tableArn = "";
+  if (fn === "agentcore-hub-tickets") {
+    // TEAM-6143: the require_done Done is a TransactWriteItems whose ConditionChecks need
+    // this action on the table row; a denied check fails the Done closed (AccessDenied),
+    // which the workflow-output drain retries without end.
+    if (!config.region || !config.account) {
+      reasons.push(
+        `could not derive ${fn}'s tickets table ARN (no region/account in its function ARN), so dynamodb:ConditionCheckItem is unverifiable — refused`
+      );
+    } else {
+      tableArn = `arn:aws:dynamodb:${config.region}:${config.account}:table/${config.table || DEFAULT_TICKETS_TABLE}`;
+      need.push(["dynamodb:ConditionCheckItem", tableArn, "a Done carrying require_done is one TransactWriteItems with a ConditionCheck per required ticket (TEAM-6143); a denied check refuses that Done",
+        () => policyDenies(policies.docs, "dynamodb:ConditionCheckItem", tableArn), () => policyGrants(policies.docs, "dynamodb:ConditionCheckItem", tableArn)]);
+    }
+  }
   for (const [action, arn, why, denied, granted] of need) {
     if (denied()) {
       reasons.push(`role ${config.role} has a Deny that may cover ${action} on ${arn} (${why})`);
@@ -203,7 +225,8 @@ export function decideTwin({ fn, optional, expectedBucket, config, policies }) {
     );
     return { action: "block", reasons };
   }
-  return { action: "proceed", reasons: [`role ${config.role} grants unconditioned s3:ListBucket on ${bucketArn}, and s3:GetObject and s3:PutObject over ${completions}*, with no Deny that may apply; ARTIFACT_BUCKET is set`] };
+  const ddb = tableArn ? `, and dynamodb:ConditionCheckItem on ${tableArn}` : "";
+  return { action: "proceed", reasons: [`role ${config.role} grants unconditioned s3:ListBucket on ${bucketArn}, and s3:GetObject and s3:PutObject over ${completions}*${ddb}, with no Deny that may apply; ARTIFACT_BUCKET is set`] };
 }
 
 // ── the thin wrapper over the aws CLI ───────────────────────────────────────────
@@ -221,27 +244,34 @@ const parseJson = (s) => JSON.parse(String(s || "").trim() || "null");
 /** get-role-policy's PolicyDocument: the CLI decodes it to an object; the raw API returns it URL-encoded. */
 const policyDocument = (v) => (typeof v === "string" ? JSON.parse(decodeURIComponent(v)) : v);
 
-/** Read one twin's Role + ARTIFACT_BUCKET and its role's inline policies. Never reads other env values. */
+/**
+ * Read one twin's Role, FunctionArn, ARTIFACT_BUCKET and TICKETS_TABLE, and its role's
+ * inline policies. Never reads other env values.
+ */
 export async function inspectTwin(fn, { run = awsCli, region }) {
   const regionArgs = region ? ["--region", region] : [];
   const cfg = await run([
     "lambda", "get-function-configuration", "--function-name", fn, ...regionArgs,
-    // Only these two fields come back: the env also holds JIRA_API_TOKEN / GITHUB_PAT.
-    "--query", "{role: Role, bucket: Environment.Variables.ARTIFACT_BUCKET}", "--output", "json",
+    // Only these fields come back: the env also holds JIRA_API_TOKEN / GITHUB_PAT.
+    // FunctionArn + TICKETS_TABLE locate the dynamodb twin's table (TEAM-6143).
+    "--query", "{role: Role, bucket: Environment.Variables.ARTIFACT_BUCKET, arn: FunctionArn, table: Environment.Variables.TICKETS_TABLE}", "--output", "json",
   ]);
   if (cfg.code !== 0) {
     const code = errorCodeOf(cfg);
     return { config: code === "ResourceNotFoundException" ? { state: "absent" } : { state: "error", error: code } };
   }
-  let roleArn, bucket;
+  let roleArn, bucket, fnArn, table;
   try {
-    ({ role: roleArn, bucket } = parseJson(cfg.stdout) || {});
+    ({ role: roleArn, bucket, arn: fnArn, table } = parseJson(cfg.stdout) || {});
   } catch {
     return { config: { state: "error", error: "unparseable get-function-configuration output" } };
   }
   if (!roleArn) return { config: { state: "error", error: "no Role in the function configuration" } };
   const role = String(roleArn).split("/").pop();
-  const config = { state: "ok", role, bucket: bucket || "" };
+  // arn:aws:lambda:<region>:<account>:function:<name> — the table lives in the function's
+  // region (the twin's client uses AWS_REGION) and account.
+  const [, , , fnRegion = "", account = ""] = String(fnArn || "").split(":");
+  const config = { state: "ok", role, bucket: bucket || "", region: fnRegion, account, table: table || "" };
 
   const names = await run(["iam", "list-role-policies", "--role-name", role, "--query", "PolicyNames", "--output", "json"]);
   if (names.code !== 0) return { config, policies: { state: "error", error: `ListRolePolicies: ${errorCodeOf(names)}` } };
@@ -277,7 +307,7 @@ export async function runPreflight({ planText, bucket, region, run = awsCli, log
   if (blocked.length) {
     log(
       `ticket-twin preflight REFUSED: ${blocked.map((v) => v.fn).join(", ")} would ship code whose Done guard refuses every ` +
-        "non-ship Done (completion_record_required). Nothing was deployed. Fix the role/env with deploy/setup-tickets-lambda.mjs " +
+        "non-ship Done (completion_record_required), or whose require_done Done AccessDenies (TEAM-6143). Nothing was deployed. Fix the role/env with deploy/setup-tickets-lambda.mjs " +
         "(DEPLOY.md, TEAM-5910), then re-run the pipeline."
     );
   }

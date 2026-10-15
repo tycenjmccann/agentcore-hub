@@ -55,6 +55,8 @@ const withoutList = (doc: { Version: string; Statement: Statement[] }) => ({
   ...doc,
   Statement: doc.Statement.filter((s) => s.Sid !== "ArtifactBucketList"),
 });
+const fnArn = (fn: string) => `arn:aws:lambda:${REGION}:${ACCOUNT}:function:${fn}`;
+const TABLE_ARN = `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/agentcore-hub-tickets`;
 const docs = (document: unknown) => [{ name: "TicketsLambdaAccess", document }];
 
 // ── the fake aws CLI ────────────────────────────────────────────────────────────
@@ -78,7 +80,7 @@ function fakeAws(spec: {
     const [svc, op] = args;
     if (svc === "lambda" && op === "get-function-configuration") {
       const fn = at("--function-name") as Twin;
-      return spec.config?.[fn] ?? ok({ role: `arn:aws:iam::${ACCOUNT}:role/${ROLE[fn]}`, bucket: BUCKET });
+      return spec.config?.[fn] ?? ok({ role: `arn:aws:iam::${ACCOUNT}:role/${ROLE[fn]}`, bucket: BUCKET, arn: fnArn(fn), table: null });
     }
     if (svc === "iam" && op === "list-role-policies") {
       return spec.list?.[twinOfRole(at("--role-name"))] ?? ok(["TicketsLambdaAccess"]);
@@ -355,13 +357,92 @@ describe("TEAM-5924: GetObject proven over completions/*, not a probe key", () =
   });
 });
 
+// ── TEAM-6143: the dynamodb twin's require_done Done needs ConditionCheckItem ───────
+// A Done carrying require_done is one TransactWriteItems with a ConditionCheck per
+// required ticket row. The grant lands only via setup-tickets-lambda.mjs (a handoff), so
+// shipping that code onto a role without it would AccessDenies every such Done, which
+// the workflow-output drain retries without end. The preflight must block instead.
+describe("TEAM-6143: dynamodb:ConditionCheckItem on the tickets table", () => {
+  const preTxn = () => {
+    const doc = policyFor("dynamodb");
+    doc.Statement = doc.Statement.map((s) =>
+      Array.isArray(s.Action) && (s.Action as string[]).includes("dynamodb:UpdateItem")
+        ? { ...s, Action: (s.Action as string[]).filter((a) => a !== "dynamodb:ConditionCheckItem") }
+        : s
+    );
+    return doc;
+  };
+  const good = {
+    fn: "agentcore-hub-tickets",
+    optional: true,
+    expectedBucket: BUCKET,
+    config: { state: "ok", role: ROLE["agentcore-hub-tickets"], bucket: BUCKET, region: REGION, account: ACCOUNT, table: "" },
+    policies: { state: "ok", docs: docs(policyFor("dynamodb")) },
+  };
+
+  it("the policy tickets-lambda-config.mjs writes → proceed, naming the grant", () => {
+    const v = decideTwin(good);
+    expect(v.action).toBe("proceed");
+    expect(v.reasons.join(" ")).toContain(`dynamodb:ConditionCheckItem on ${TABLE_ARN}`);
+  });
+  it("a pre-TEAM-6143 policy (no ConditionCheckItem) → block, naming the action, the table and the setup script", () => {
+    const v = decideTwin({ ...good, policies: { state: "ok", docs: docs(preTxn()) } });
+    expect(v.action).toBe("block");
+    expect(v.reasons.join(" ")).toMatch(/no unconditioned inline dynamodb:ConditionCheckItem covering arn:aws:dynamodb:us-east-1:123456789012:table\/agentcore-hub-tickets/);
+    expect(v.reasons.join(" ")).toMatch(/TEAM-6143/);
+    expect(v.reasons.join(" ")).toContain("TICKET_PROVIDER=dynamodb node deploy/setup-tickets-lambda.mjs");
+  });
+  it("checks the table the function's TICKETS_TABLE names, not the default", () => {
+    const v = decideTwin({ ...good, config: { ...good.config, table: "custom-tickets" } });
+    expect(v.action).toBe("block");
+    expect(v.reasons.join(" ")).toMatch(/table\/custom-tickets/);
+  });
+  it("a Deny that may cover it, or a conditioned grant → block", () => {
+    const denied = { Statement: [...policyFor("dynamodb").Statement, { Effect: "Deny", Action: "dynamodb:*", Resource: "*" }] };
+    expect(decideTwin({ ...good, policies: { state: "ok", docs: docs(denied) } }).action).toBe("block");
+    const conditioned = {
+      Statement: [
+        ...preTxn().Statement,
+        { Effect: "Allow", Action: "dynamodb:ConditionCheckItem", Resource: TABLE_ARN, Condition: { Bool: { "aws:SecureTransport": "true" } } },
+      ],
+    };
+    expect(decideTwin({ ...good, policies: { state: "ok", docs: docs(conditioned) } }).action).toBe("block");
+  });
+  it("no region/account to build the table ARN → block (unverifiable)", () => {
+    const v = decideTwin({ ...good, config: { state: "ok", role: ROLE["agentcore-hub-tickets"], bucket: BUCKET } });
+    expect(v.action).toBe("block");
+    expect(v.reasons.join(" ")).toMatch(/ConditionCheckItem is unverifiable/);
+  });
+  it("the Jira twin is not asked for it (no table)", () => {
+    const jira = { ...good, fn: "agentcore-hub-jira", optional: false, config: { ...good.config, role: ROLE["agentcore-hub-jira"] }, policies: { state: "ok", docs: docs(policyFor("jira")) } };
+    const v = decideTwin(jira);
+    expect(v.action).toBe("proceed");
+    expect(v.reasons.join(" ")).not.toMatch(/ConditionCheckItem/);
+  });
+  it("runPreflight: a live tickets role without the grant refuses the deploy (exit 1)", async () => {
+    const r = await preflight(plan(JIRA_ROW, TICKETS_ROW), fakeAws({ get: { "agentcore-hub-tickets": ok(preTxn()) } }));
+    expect(r.exitCode).toBe(1);
+    expect(r.out).toMatch(/agentcore-hub-tickets: BLOCK/);
+    expect(r.out).toMatch(/dynamodb:ConditionCheckItem/);
+  });
+});
+
 // ── the wrapper over the CLI ────────────────────────────────────────────────────
 describe("inspectTwin", () => {
-  it("queries only Role + ARTIFACT_BUCKET (never the env values that hold secrets)", async () => {
+  it("queries only Role, FunctionArn, ARTIFACT_BUCKET and TICKETS_TABLE (never the env values that hold secrets)", async () => {
     const aws = fakeAws({});
     await inspectTwin("agentcore-hub-jira", { run: aws.run, region: REGION });
     const cfg = aws.calls.find((c) => c[1] === "get-function-configuration")!;
-    expect(cfg[cfg.indexOf("--query") + 1]).toBe("{role: Role, bucket: Environment.Variables.ARTIFACT_BUCKET}");
+    expect(cfg[cfg.indexOf("--query") + 1]).toBe(
+      "{role: Role, bucket: Environment.Variables.ARTIFACT_BUCKET, arn: FunctionArn, table: Environment.Variables.TICKETS_TABLE}"
+    );
+  });
+  it("TEAM-6143: derives region + account from the FunctionArn and passes TICKETS_TABLE through", async () => {
+    const aws = fakeAws({
+      config: { "agentcore-hub-tickets": ok({ role: `arn:aws:iam::${ACCOUNT}:role/${ROLE["agentcore-hub-tickets"]}`, bucket: BUCKET, arn: fnArn("agentcore-hub-tickets"), table: "custom-tickets" }) },
+    });
+    const r = await inspectTwin("agentcore-hub-tickets", { run: aws.run, region: REGION });
+    expect(r.config).toMatchObject({ state: "ok", region: REGION, account: ACCOUNT, table: "custom-tickets" });
   });
   it("strips an IAM path off the role ARN", async () => {
     const aws = fakeAws({ config: { "agentcore-hub-jira": ok({ role: `arn:aws:iam::${ACCOUNT}:role/svc/AgentCoreHubJiraLambdaRole`, bucket: BUCKET }) } });

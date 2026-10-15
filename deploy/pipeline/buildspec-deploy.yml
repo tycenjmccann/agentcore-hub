@@ -102,7 +102,10 @@ phases:
       # twin-preflight.mjs reads the function's Role + ARTIFACT_BUCKET (no other env
       # value) and the role's INLINE policies, and refuses unless an unconditioned
       # ListBucket is there. Unreadable, conditioned, managed-policy-only or Denied
-      # all refuse. A failed pre_build skips the whole build phase: nothing ships,
+      # all refuse. TEAM-6143: for agentcore-hub-tickets it also requires an
+      # unconditioned inline dynamodb:ConditionCheckItem on the tickets table (the
+      # require_done Done is a TransactWriteItems with a ConditionCheck per row).
+      # A failed pre_build skips the whole build phase: nothing ships,
       # nothing rolls back, the baseline stays put so the next run re-plans the twin.
       - |
         node deploy/lib/twin-preflight.mjs --plan /tmp/deploy-plan.tsv --bucket "${ARTIFACT_BUCKET:-}" --region "${AWS_REGION_HUB:-}" \

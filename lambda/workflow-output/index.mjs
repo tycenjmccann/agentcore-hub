@@ -1925,6 +1925,11 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       }
       // The gate: the off-gate hold the post-write gate confirm stamps, written by the
       // failed-Done rewrite below (briefPending:true ⇒ STATUS_PENDING_BRIEF, no Done).
+      // Known residual (left as is): if the twin's best-effort Done-intent clear also
+      // failed, the record still carries a fresh intent, so that rewrite's writeRecord is
+      // DEFERRED by deferHoldOnDoneIntent (a new briefPending hold) and the record keeps
+      // its finalized release. No Done lands either way; the ticket stays open and the
+      // next report re-asks the gate from scratch.
       if (releasedNow && !briefHeld) {
         report.briefPending = true;
         delete report.briefDisposition;
