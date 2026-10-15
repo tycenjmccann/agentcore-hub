@@ -4525,7 +4525,12 @@ async function skipSibling(row, { workflowId, sweeperTicketId }) {
   // sibling's own writer is active and owns the record.
   const cur = await readRecord(key);
   if (cur.error) return { ok: false, error: `completion record ${key} unreadable (${cur.error}) - not skipped` };
-  const held = cur.record?.briefPending === true ? "briefPending:true" : cur.record?.followUpsPending === true ? "followUpsPending:true" : null;
+  // TEAM-6217 (R3-01 sibling sweep): and a QUEUED record whose merge brief nothing has recorded on the
+  // gate is the same hold without the stamp (queuedBriefOwed, the one predicate report_completion
+  // uses) - the skip marker would erase the brief obligation and the skip's Done would make the gate
+  // Ready brief-less.
+  const held = cur.record?.briefPending === true ? "briefPending:true" : cur.record?.followUpsPending === true ? "followUpsPending:true"
+    : queuedBriefOwed(cur.record) ? `ticketWrites:"queued" with its merge brief ${queuedBriefOwed(cur.record)} not yet recorded on the gate` : null;
   if (held) {
     console.warn(`[report_completion] ${ticketId}: empty_sweep will NOT skip it - its completion record has ${held}; the hold is lifted by report_completion or a human, never by the sweep`);
     return { ok: false, error: `completion record ${key} has ${held} - not skipped; the hold is lifted by report_completion or a human, never by the sweep` };
