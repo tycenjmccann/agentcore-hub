@@ -136,7 +136,7 @@ beforeEach(() => {
   h.state.updateError = null;
   h.state.workflowAfterFail = null;
   h.state.def = { completionRequiresAgentPhases: ["ship"] };
-  h.state.s3Objects = {};
+  h.state.s3Objects = { [CD_REGISTRY_KEY]: REGISTERED_O_R };
   h.state.s3Gets.length = 0;
   h.state.s3Error = null;
   for (const k of SAVED) saved[k] = process.env[k];
@@ -172,6 +172,17 @@ const refusedPhases = (update: Record<string, unknown>): string[] => {
 /** All five phases a run can already be closed on (sorted, for comparison). */
 const ALL_TERMINAL_PHASES = ["cancelled", "complete", "deploy-blocked", "error", "static-ci-only"];
 
+/**
+ * TEAM-6187 — the route now follows the EFFECTIVE def (CD-registry ship strip,
+ * as the orchestrator's getEffectiveWorkflowDef), so a fixture that expects a
+ * ship phase to be REQUIRED needs a repo that is registered for CD. Every fixture
+ * carries this repoConfig and the top-level beforeEach registers it; the tests
+ * that want a handoff run empty the registry explicitly.
+ */
+const REPO = { repos: [{ url: "https://github.com/o/r", defaultBranch: "main" }] };
+const CD_REGISTRY_KEY = "config/cd-registry.json";
+const REGISTERED_O_R = JSON.stringify({ version: 1, repos: [{ repo: "o/r" }] });
+
 function post(id = "wf_1") {
   return POST(new NextRequest(`http://localhost/api/workflow/${id}/complete`, { method: "POST", body: "{}" }), {
     params: { id },
@@ -180,7 +191,7 @@ function post(id = "wf_1") {
 
 describe("POST complete — cancellation guard (D4a)", () => {
   it("refuses a cancelled run with 409 workflow_cancelled before loading tickets", async () => {
-    h.state.workflow = { workflowId: "wf_1", phase: "ship", cancelledAt: "2026-08-30T00:00:00Z" };
+    h.state.workflow = { workflowId: "wf_1", repoConfig: REPO, phase: "ship", cancelledAt: "2026-08-30T00:00:00Z" };
     h.state.tickets = [];
     await load();
     const res = await post();
@@ -203,7 +214,7 @@ describe("POST complete — cancel/complete race CAS guard (TEAM-3686 F1)", () =
     { ticketId: "T-4", type: "task", status: "done", phase: "ship", assignee: "rm" },
   ];
   const CLEAN_WF = {
-    workflowId: "wf_1",
+    workflowId: "wf_1", repoConfig: REPO,
     phase: "ship",
     agentTasks: { "T-4": { ticketId: "T-4", output: "merged the release PR", mergeCommit: "9f1c2ab" } },
   };
@@ -265,7 +276,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
   it("a done HUMAN gate stamped phase:<required> with no agentTask is NOT missing evidence (hub-materialized Merge Approval)", async () => {
     process.env.COMPLETION_EVIDENCE_REQUIRED = "true";
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "ship",
       workflowDefId: "software-delivery",
       agentTasks: { "T-4": { ticketId: "T-4", output: "merged #578" } },
@@ -284,7 +295,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
   it("409 missing_evidence when the flag is ON and a done ship ticket has an empty task", async () => {
     process.env.COMPLETION_EVIDENCE_REQUIRED = "true";
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "ship",
       workflowDefId: "software-delivery",
       agentTasks: { "T-4": { ticketId: "T-4", output: "" } },
@@ -304,7 +315,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
     // completion record must be REFUSED, not shadow-logged. Env var deleted in
     // beforeEach → the true default → enforce.
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "ship",
       workflowDefId: "software-delivery",
       agentTasks: { "T-4": { ticketId: "T-4", output: "" } },
@@ -322,7 +333,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
   it("fail-closed: an unrecognized flag value (\"banana\") still enforces — 409, no write", async () => {
     process.env.COMPLETION_EVIDENCE_REQUIRED = "banana";
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "ship",
       workflowDefId: "software-delivery",
       agentTasks: { "T-4": { ticketId: "T-4", output: "" } },
@@ -341,7 +352,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
     process.env.COMPLETION_EVIDENCE_REQUIRED = "off";
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "ship",
       workflowDefId: "software-delivery",
       agentTasks: { "T-4": { ticketId: "T-4", output: "" } },
@@ -363,7 +374,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
   it("completes when evidence is present (task output), flag ON", async () => {
     process.env.COMPLETION_EVIDENCE_REQUIRED = "1";
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "ship",
       workflowDefId: "software-delivery",
       agentTasks: { "T-4": { ticketId: "T-4", output: "opened PR #12; head sha abc", mergeCommit: "abc1234" } },
@@ -379,7 +390,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
   it("accepts an artifactKey as evidence in place of output, flag ON", async () => {
     process.env.COMPLETION_EVIDENCE_REQUIRED = "on";
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "ship",
       workflowDefId: "software-delivery",
       agentTasks: {
@@ -399,7 +410,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
     // Its empty task must NOT block completion even with the flag on.
     process.env.COMPLETION_EVIDENCE_REQUIRED = "true";
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "ship",
       workflowDefId: "software-delivery",
       // One cancelled ship ticket (no evidence) + one done ship ticket WITH
@@ -433,7 +444,7 @@ describe("POST complete — deliverable-evidence gate (D4a)", () => {
 describe("POST complete — ship/CD merge-verdict gate (TEAM-3747 D2)", () => {
   const doneShipTicket = { ticketId: "T-4", type: "task", status: "done", phase: "ship", assignee: "rm" };
   const shipWorkflow = (ship: Record<string, unknown>) => ({
-    workflowId: "wf_1",
+    workflowId: "wf_1", repoConfig: REPO,
     phase: "ship",
     workflowDefId: "software-delivery",
     agentTasks: { "T-4": { ticketId: "T-4", output: "release summary written", ...ship } },
@@ -526,7 +537,7 @@ describe("POST complete — ship/CD merge-verdict gate (TEAM-3747 D2)", () => {
   it("AC-D2.5: a legacy def with no ship phase is untouched — plain complete", async () => {
     h.state.def = { completionRequiresAgentPhases: ["development", "verification"] };
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "review",
       workflowDefId: "software-delivery",
       // Old-shape entry: no mergeCommit/outcome/blockReason keys at all.
@@ -624,7 +635,7 @@ describe("POST complete — ship/CD merge-verdict gate (TEAM-3747 D2)", () => {
 describe("POST complete — required-phase gate (TEAM-3755 F4)", () => {
   it("a cancelled-only required ship phase is refused — 409, no write, no fake blocked close", async () => {
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "ship",
       workflowDefId: "software-delivery",
       agentTasks: { "T-4": { ticketId: "T-4", output: "" } },
@@ -642,7 +653,7 @@ describe("POST complete — required-phase gate (TEAM-3755 F4)", () => {
   it("a required phase with NO ticket at all is refused, naming every unrun phase", async () => {
     h.state.def = { completionRequiresAgentPhases: ["development", "verification", "ship"] };
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "development",
       workflowDefId: "software-delivery",
       agentTasks: { "T-1": { ticketId: "T-1", output: "implemented" } },
@@ -657,7 +668,7 @@ describe("POST complete — required-phase gate (TEAM-3755 F4)", () => {
 
   it("a HUMAN gate ticket cannot satisfy a required agent phase (twin's isHuman rule)", async () => {
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "ship",
       workflowDefId: "software-delivery",
       agentTasks: { "T-9": { ticketId: "T-9", output: "approved" } },
@@ -673,7 +684,7 @@ describe("POST complete — required-phase gate (TEAM-3755 F4)", () => {
 
   it("enforced even with the evidence opt-out ON — it is a structural refusal, not a heuristic", async () => {
     process.env.COMPLETION_EVIDENCE_REQUIRED = "off";
-    h.state.workflow = { workflowId: "wf_1", phase: "ship", agentTasks: {} };
+    h.state.workflow = { workflowId: "wf_1", repoConfig: REPO, phase: "ship", agentTasks: {} };
     h.state.tickets = [{ ticketId: "T-4", type: "task", status: "cancelled", phase: "ship", assignee: "rm" }];
     await load();
     const res = await post();
@@ -684,7 +695,7 @@ describe("POST complete — required-phase gate (TEAM-3755 F4)", () => {
 
   it("a legacy def with no required phases is untouched (nothing to prove)", async () => {
     h.state.def = {};
-    h.state.workflow = { workflowId: "wf_1", phase: "review", agentTasks: {} };
+    h.state.workflow = { workflowId: "wf_1", repoConfig: REPO, phase: "review", agentTasks: {} };
     h.state.tickets = [{ ticketId: "T-1", type: "task", status: "cancelled", phase: "development", assignee: "dev" }];
     await load();
     const res = await post();
@@ -702,7 +713,7 @@ describe("POST complete — required-phase gate (TEAM-3755 F4)", () => {
 describe("POST complete — terminal-claim CAS parity (TEAM-3755 F2)", () => {
   it("the green complete write CASes off all five terminal phases", async () => {
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "ship",
       agentTasks: { "T-4": { ticketId: "T-4", output: "merged", mergeCommit: "9f1c2ab" } },
     };
@@ -745,7 +756,7 @@ describe("POST complete — completions-record fallback (TEAM-3976)", () => {
   beforeEach(() => {
     h.state.def = { completionRequiresAgentPhases: ["development"] };
     h.state.workflow = {
-      workflowId: "wf_1",
+      workflowId: "wf_1", repoConfig: REPO,
       phase: "development",
       workflowDefId: "software-delivery",
       // mark_done landed first: complete, but no output/artifactKey.
@@ -834,8 +845,13 @@ describe("POST complete — completions-record fallback (TEAM-3976)", () => {
  * follow-up PR still open into main after the unified merge; this route did not,
  * so the Workflow Manager's `complete` closed it green. Same gate (the
  * orchestrator's followUpPrGate), same exclusions, same fail-open.
+ *
+ * TEAM-6187 — the gate's INPUTS are the orchestrator's too (completeWorkflow,
+ * lambda/orchestrator/index.mjs): GitHub merge proof from the same landing
+ * probe, the fresh-record overlay before it, the effective def (framework overlay
+ * + CD-registry strip), the live roster, and the epic's children only.
  */
-describe("POST complete — open follow-up PR gate (TEAM-6136)", () => {
+describe("POST complete — open follow-up PR gate (TEAM-6136 / TEAM-6187)", () => {
   const PR = "https://github.com/o/r/pull/77";
   const ENV = ["GITHUB_PAT", "SHIP_MERGE_VERIFY"] as const;
   const savedEnv: Partial<Record<(typeof ENV)[number], string | undefined>> = {};
@@ -848,7 +864,7 @@ describe("POST complete — open follow-up PR gate (TEAM-6136)", () => {
     phase: "ship",
     workflowDefId: "software-delivery",
     featureBranch: "feature/x",
-    repoConfig: { repos: [{ url: "https://github.com/o/r", defaultBranch: "main" }] },
+    repoConfig: REPO,
     agentTasks: {
       "T-4": { ticketId: "T-4", agentId: "agentcore_hub_release_manager", output: "merged the release PR", ...ship },
       "T-9": { ticketId: "T-9", agentId: "agentcore_hub_bug_fixer", output: "fixed on main" },
@@ -859,11 +875,27 @@ describe("POST complete — open follow-up PR gate (TEAM-6136)", () => {
     return v?.[":outcome"] ?? v?.[":complete"];
   };
   let fetchMock: ReturnType<typeof vi.fn>;
-  const githubReturns = (status: number, pr: Record<string, unknown> | null) => {
-    fetchMock = vi.fn(async () => new Response(JSON.stringify(pr), { status }));
+  /** GitHub stub routed by URL substring (first match wins); anything else is `200 {}`,
+   *  which leaves the landing probe inconclusive (no PR list, no compare status). */
+  type GhRoute = [match: string, status: number, body: unknown];
+  const githubRoutes = (routes: GhRoute[]) => {
+    fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const u = String(url);
+      const hit = routes.find(([m]) => u.includes(m));
+      const [, status, body] = hit ?? ["", 200, {}];
+      return new Response(JSON.stringify(body), { status });
+    });
     vi.stubGlobal("fetch", fetchMock);
   };
+  /** Every single-PR read (`/pulls/<n>`) answers `status`/`pr`; the probe stays inconclusive. */
+  const githubReturns = (status: number, pr: Record<string, unknown> | null) => githubRoutes([["/pulls/", status, pr]]);
+  const calledUrls = () => fetchMock.mock.calls.map((c) => String(c[0]));
   const openPr = { state: "open", base: { ref: "main" }, head: { ref: "fix/y" } };
+  /** GitHub proves feature/x merged into main: merged PR #70 whose head IS the branch head. */
+  const MERGED_ROUTES: GhRoute[] = [
+    ["/pulls?head=", 200, [{ number: 70, state: "closed", merged_at: "2026-10-01T00:00:00Z", head: { sha: "h1" }, base: { ref: "main" }, merge_commit_sha: "m70", html_url: "https://github.com/o/r/pull/70" }]],
+    ["/branches/", 200, { commit: { sha: "h1" } }],
+  ];
 
   beforeEach(() => {
     for (const k of ENV) savedEnv[k] = process.env[k];
@@ -871,7 +903,7 @@ describe("POST complete — open follow-up PR gate (TEAM-6136)", () => {
     delete process.env.SHIP_MERGE_VERIFY;
     h.state.tickets = tickets;
     h.state.workflow = workflow();
-    h.state.s3Objects = { "completions/T-9.json": JSON.stringify({ ticket_id: "T-9", pr_url: PR }) };
+    h.state.s3Objects = { [CD_REGISTRY_KEY]: REGISTERED_O_R, "completions/T-9.json": JSON.stringify({ ticket_id: "T-9", pr_url: PR }) };
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -890,8 +922,7 @@ describe("POST complete — open follow-up PR gate (TEAM-6136)", () => {
     expect(body.error).toBe("open_follow_up_pr");
     expect(body.prs).toEqual([PR]);
     expect(h.state.updates).toEqual([]); // neither the :complete write nor closeBlocked
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(String(fetchMock.mock.calls[0][0])).toBe("https://api.github.com/repos/o/r/pulls/77");
+    expect(calledUrls()).toContain("https://api.github.com/repos/o/r/pulls/77");
   });
 
   it("(a′) a deploy-blocked ship verdict over a merged unified PR is refused too — closeBlocked is gated", async () => {
@@ -920,7 +951,7 @@ describe("POST complete — open follow-up PR gate (TEAM-6136)", () => {
     const res = await post();
     expect(res.status).toBe(200);
     expect((await res.json()).status).toBe("complete");
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(calledUrls()).toContain("https://api.github.com/repos/o/r/pulls/77");
   });
 
   it("(d) no GITHUB_PAT → 200 complete and GitHub is never called", async () => {
@@ -960,7 +991,7 @@ describe("POST complete — open follow-up PR gate (TEAM-6136)", () => {
   });
 
   it("an intent-only reservation record is no record → falls back to the cached prUrl", async () => {
-    h.state.s3Objects = { "completions/T-9.json": JSON.stringify({ reservation: "done-intent", ticketId: "T-9" }) };
+    h.state.s3Objects["completions/T-9.json"] = JSON.stringify({ reservation: "done-intent", ticketId: "T-9" });
     const wf = workflow();
     (wf.agentTasks["T-9"] as Record<string, unknown>).prUrl = "https://github.com/o/r/pull/78";
     h.state.workflow = wf;
@@ -969,5 +1000,202 @@ describe("POST complete — open follow-up PR gate (TEAM-6136)", () => {
     const res = await post();
     expect(res.status).toBe(409);
     expect((await res.json()).prs).toEqual(["https://github.com/o/r/pull/78"]);
+  });
+
+  // ── TEAM-6187 F1: GitHub merge proof (index.mjs featureBranchMergeProbe → mergeProof) ──
+  it("F1: GitHub proves the unified merge → the gate engages although no task carries a mergeCommit", async () => {
+    // route.ts shipVerdictOf accepts outcome:"shipped" with no mergeCommit, so the
+    // verdict passes; resolvePrBase alone would never see a merge → the gate skipped.
+    h.state.workflow = workflow({ outcome: "shipped" });
+    githubRoutes([...MERGED_ROUTES, ["/pulls/77", 200, openPr]]);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("open_follow_up_pr");
+    expect(body.prs).toEqual([PR]);
+    expect(h.state.updates).toEqual([]);
+  });
+
+  it("F1 (operator def): the ship ticket's persona is rostered under development — GitHub proof still engages the gate", async () => {
+    h.state.workflow = {
+      ...workflow(),
+      workflowDefId: "operator",
+      agentTasks: {
+        "T-4": { ticketId: "T-4", agentId: "agentcore_hub_operator", output: "merged + deployed", mergeCommit: "9f1c2ab" },
+        "T-9": { ticketId: "T-9", agentId: "agentcore_hub_operator", output: "built" },
+      },
+    };
+    h.state.tickets = [
+      { ticketId: "T-9", type: "task", status: "done", title: "Build: the thing", assignee: "agentcore_hub_operator" },
+      { ticketId: "T-4", type: "task", status: "done", title: "Ship: the thing", labels: ["wf:wf_1", "phase:ship"], assignee: "agentcore_hub_operator" },
+    ];
+    githubRoutes([...MERGED_ROUTES, ["/pulls/77", 200, openPr]]);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("open_follow_up_pr");
+  });
+
+  // ── TEAM-6187 §1c: the fresh-record overlay the orchestrator runs before its probe ──
+  it("F1-c: a ship record that landed AFTER the Done stamp supplies the mergeCommit the gate keys on", async () => {
+    h.state.workflow = workflow({ startedAt: "2026-10-01T00:00:00Z", completedAt: "2026-10-01T00:05:00Z" });
+    h.state.s3Objects["completions/T-4.json"] = JSON.stringify({
+      ticket_id: "T-4", completed_at: "2026-10-01T00:06:00Z", merge_commit: "9f1c2ab", summary: "merged the release PR",
+    });
+    githubReturns(200, openPr);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("open_follow_up_pr");
+    expect(h.state.updates).toEqual([]); // not the static-ci-only close either
+  });
+
+  it("F1-c: a record OLDER than the Done stamp is not fresh → ignored (static-ci-only close, PR never read)", async () => {
+    h.state.workflow = workflow({ startedAt: "2026-10-01T00:00:00Z", completedAt: "2026-10-01T00:05:00Z" });
+    h.state.s3Objects["completions/T-4.json"] = JSON.stringify({
+      ticket_id: "T-4", completed_at: "2026-10-01T00:04:00Z", merge_commit: "9f1c2ab", summary: "merged the release PR",
+    });
+    githubReturns(200, openPr);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("static-ci-only");
+    expect(calledUrls()).not.toContain("https://api.github.com/repos/o/r/pulls/77");
+  });
+
+  // ── TEAM-6187 §1d: the probe's own refusal (index.mjs CompletionRejectedUnmergedBranch) ──
+  it("F1-d: GitHub proves the feature branch is NOT merged → 409 unmerged_branch, no write, gate never reached", async () => {
+    githubRoutes([
+      ["/pulls?head=", 200, []],
+      ["/compare/", 200, { status: "ahead", ahead_by: 3 }],
+      ["/pulls/77", 200, openPr],
+    ]);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("unmerged_branch");
+    expect(body.featureBranch).toBe("feature/x");
+    expect(body.reason).toContain("3 commit(s) ahead");
+    expect(h.state.updates).toEqual([]);
+    expect(calledUrls()).not.toContain("https://api.github.com/repos/o/r/pulls/77");
+  });
+
+  // ── TEAM-6187 F2: effective def (framework overlay + CD-registry strip), as completeWorkflow ──
+  it("F2: repo removed from the CD registry → ship phase stripped → gate does not run, 200 complete", async () => {
+    h.state.s3Objects[CD_REGISTRY_KEY] = JSON.stringify({ version: 1, repos: [] });
+    githubReturns(200, openPr);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(h.state.updates.length).toBe(1);
+  });
+
+  // ── TEAM-6187 F3: live roster (S3 config/agents.json), bundled agents.json only as fallback ──
+  it("F3: the live roster classifies a ship agent the bundled roster does not know", async () => {
+    h.state.s3Objects["config/agents.json"] = JSON.stringify({ agents: [{ agentId: "agentcore_hub_release_captain", phase: "ship" }] });
+    const wf = workflow();
+    wf.agentTasks["T-4"].agentId = "agentcore_hub_release_captain";
+    h.state.workflow = wf;
+    h.state.tickets = [{ ...tickets[0], assignee: "agentcore_hub_release_captain" }, tickets[1]];
+    githubReturns(200, openPr); // probe inconclusive, so only the roster can engage the gate
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("open_follow_up_pr");
+  });
+
+  // ── TEAM-6187 F4: the epic's children only (index.mjs getChildTickets), never the epic ──
+  it("F4: an epic description's base_branch: is not a stated base → a PR into that branch is skipped", async () => {
+    h.state.tickets = [
+      { ticketId: "E-1", type: "epic", status: "done", description: "base_branch: release/legacy" },
+      ...tickets,
+    ];
+    githubReturns(200, { ...openPr, base: { ref: "release/legacy" } });
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+  });
+});
+
+/**
+ * TEAM-6187 sibling sweep — the same two defect classes (raw def, bundled roster)
+ * at the route's OTHER gates, where the orchestrator also reads the effective
+ * def (getEffectiveWorkflowDef) and the live roster (getAgentDef).
+ */
+describe("POST complete — effective def + live roster at every gate (TEAM-6187)", () => {
+  it("Sweep #3: handoff run (unregistered repo, def with ship, no ship ticket) is NOT 409 required_phase_incomplete", async () => {
+    h.state.s3Objects[CD_REGISTRY_KEY] = JSON.stringify({ version: 1, repos: [] });
+    h.state.def = { completionRequiresAgentPhases: ["development", "ship"] };
+    h.state.workflow = {
+      workflowId: "wf_1",
+      phase: "review",
+      workflowDefId: "software-delivery",
+      featureBranch: "feature/x",
+      repoConfig: REPO,
+      agentTasks: { "T-1": { ticketId: "T-1", agentId: "agentcore_hub_backend_dev", output: "implemented" } },
+    };
+    h.state.tickets = [{ ticketId: "T-1", type: "task", status: "done", phase: "development", assignee: "agentcore_hub_backend_dev" }];
+    await load();
+    const res = await post();
+    const body = await res.json();
+    expect(body.error).not.toBe("required_phase_incomplete");
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("complete");
+  });
+
+  it("Sweep #3: the SAME run on a registered repo still owes its ship phase — 409 [ship] (assertion kept)", async () => {
+    h.state.def = { completionRequiresAgentPhases: ["development", "ship"] };
+    h.state.workflow = {
+      workflowId: "wf_1",
+      phase: "review",
+      workflowDefId: "software-delivery",
+      featureBranch: "feature/x",
+      repoConfig: REPO,
+      agentTasks: { "T-1": { ticketId: "T-1", agentId: "agentcore_hub_backend_dev", output: "implemented" } },
+    };
+    h.state.tickets = [{ ticketId: "T-1", type: "task", status: "done", phase: "development", assignee: "agentcore_hub_backend_dev" }];
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect((await res.json()).phases).toEqual(["ship"]);
+  });
+
+  it("Sweep #4: a ticket with no phase stamp resolves its phase from the LIVE roster (bundled roster does not know the agent)", async () => {
+    h.state.s3Objects["config/agents.json"] = JSON.stringify({ agents: [{ agentId: "agentcore_hub_release_captain", phase: "ship" }] });
+    h.state.workflow = {
+      workflowId: "wf_1",
+      phase: "ship",
+      workflowDefId: "software-delivery",
+      repoConfig: REPO,
+      agentTasks: { "T-4": { ticketId: "T-4", agentId: "agentcore_hub_release_captain", output: "merged", mergeCommit: "9f1c2ab" } },
+    };
+    h.state.tickets = [{ ticketId: "T-4", type: "task", status: "done", assignee: "agentcore_hub_release_captain" }];
+    await load();
+    const res = await post();
+    const body = await res.json();
+    expect(body.error).not.toBe("required_phase_incomplete");
+    expect(res.status).toBe(200);
+    expect(body.status).toBe("complete");
+    expect(h.state.s3Gets.filter((k) => k === "config/agents.json").length).toBe(1); // loaded once per request
+  });
+
+  it("Sweep #4: roster unreadable → bundled agents.json fallback still classifies the release manager", async () => {
+    h.state.workflow = {
+      workflowId: "wf_1",
+      phase: "ship",
+      workflowDefId: "software-delivery",
+      repoConfig: REPO,
+      agentTasks: { "T-4": { ticketId: "T-4", agentId: "agentcore_hub_release_manager", output: "merged", mergeCommit: "9f1c2ab" } },
+    };
+    h.state.tickets = [{ ticketId: "T-4", type: "task", status: "done", assignee: "agentcore_hub_release_manager" }];
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
   });
 });

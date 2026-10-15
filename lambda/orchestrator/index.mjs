@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, githubPrRef, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES, isIntentOnlyReservation } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, freshRecordFields, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, githubPrRef, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES, isIntentOnlyReservation } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -1290,31 +1290,9 @@ async function harvestCompletionEvidence(workflow, ticketId, transitioned = fals
       console.warn(`[orchestrator] evidence harvest skipped for ${ticketId}: no readable completions/${ticketId}.json`);
       return;
     }
-    const fields = {}, fresh = record.completed_at >= entry?.startedAt && (transitioned || record.completed_at > entry?.completedAt), take = (k) => fresh || !entry?.[k];
+    // TEAM-6187: field rule = completion.mjs freshRecordFields (shared with the /complete route's pre-probe overlay).
+    const { fresh, fields } = freshRecordFields(entry, record, { transitioned, hasEvidence });
     if (skip && !fresh) return;
-    // Deliverable evidence — fill when absent, overwrite when `fresh` (TEAM-5900).
-    if (!hasEvidence || fresh) {
-      const summary = typeof record.summary === "string" ? record.summary.trim() : "";
-      if (summary) fields.output = summary.slice(0, 10000);
-      if (record.branch) fields.branch = record.branch;
-    }
-    // Ship/CD verdict signals — harvested regardless of deliverable evidence, each
-    // only when the record carries it and take() admits it (legacy records lack these
-    // keys). commit_sha/pr_url kept here so the ship gate + final PR label find them.
-    if (record.commit_sha && take("commitSha")) fields.commitSha = record.commit_sha;
-    if (record.pr_url && take("prUrl")) fields.prUrl = record.pr_url;
-    if (record.merge_commit && take("mergeCommit")) fields.mergeCommit = record.merge_commit;
-    if (take("outcome")) {
-      // The admitted set lives beside shipVerdictOf (TEAM-4763 P1-A) because what
-      // may be harvested and what it MEANS are one decision: they had drifted, and
-      // `handoff` — writable by report_completion since TEAM-4740 — was dropped
-      // here, so an honest handoff closed the run on the static-ci-only phase.
-      const oc = harvestableShipOutcome(record.outcome);
-      if (oc) fields.outcome = oc;
-    }
-    if (record.block_reason && take("blockReason")) {
-      fields.blockReason = String(record.block_reason).slice(0, 500);
-    }
     if (Object.keys(fields).length === 0) return;
     await store.mergeTaskMetadata(workflow.id, ticketId, fields);
     if (entry) Object.assign(entry, fields);

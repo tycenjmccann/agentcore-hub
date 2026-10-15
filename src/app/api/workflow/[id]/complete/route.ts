@@ -15,7 +15,11 @@
  *      unrecorded work is resolved by closing the child ticket, not bypassing.
  *   2b. Refuses (409 open_follow_up_pr) once the unified PR merged while a
  *      follow-up PR this run opened into the default branch is still open — the
- *      orchestrator's own followUpPrGate (TEAM-6032 DL-038, TEAM-6136).
+ *      orchestrator's own followUpPrGate (TEAM-6032 DL-038, TEAM-6136) — and
+ *      (409 unmerged_branch) when GitHub proves the feature branch never landed
+ *      (TEAM-6187, the orchestrator's merge-verify refusal). TEAM-6187: every
+ *      gate here reads the EFFECTIVE def (framework overlay + CD-registry ship
+ *      strip) and the LIVE roster, exactly as completeWorkflow does.
  *   3. Transitions the epic ticket to Done (Jira) so the board rolls up.
  *   4. Conditional write: phase → "complete", completedAt, managerWatch=false,
  *      and compacts runaway escalation noise in the same write.
@@ -39,6 +43,10 @@ import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
+import { applyFramework, resolveFramework, type WorkflowDef } from "@/lib/workflow/workflow-defs";
+import { effectiveDefFor } from "@/lib/workflow/intake-materialize";
+import { loadRoster } from "@/lib/workflow/roster-loader";
+import { deliveryModeFor, loadCdRegistry } from "@/lib/cd-registry";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
 import { resolveMissingEvidenceFromRecords } from "@/lib/workflow/completion-evidence";
 import { followUpPrGateConfigured, openFollowUpPrsAtCompletion } from "@/lib/workflow/follow-up-pr-gate";
@@ -69,13 +77,61 @@ const COMPLETION_EVIDENCE_REQUIRED = !/^(off|false|0)$/i.test(
   (process.env.COMPLETION_EVIDENCE_REQUIRED || "").trim()
 );
 
-// agentId → agent phase, from the bundled roster (same doc the pipeline reads).
+// agentId → agent phase, from the BUNDLED roster. TEAM-6187: this is the
+// FALLBACK only — the orchestrator reads the live S3 config/agents.json
+// (loadAgentRoster, FALLBACK_ROSTER on failure), so does this route (livePhaseMap).
 // Used to route a child ticket to its agent phase when the ticket carries no
 // explicit `phase` stamp (TEAM-3619 D4c stamps spawned fixes; agent tickets are
 // derived from their assignee, exactly as the orchestrator does).
 const AGENT_PHASE_BY_ID: Record<string, string> = Object.fromEntries(
   (agentsConfig.agents as Array<{ agentId: string; phase: string }>).map((a) => [a.agentId, a.phase])
 );
+type PhaseById = Record<string, string>;
+
+/**
+ * TEAM-6187 — the live roster's agentId → phase map, read ONCE per request and
+ * only when a gate actually needs it (lazy, so the TEAM-3976 zero-S3-reads happy
+ * path holds). Mirror of the orchestrator's getAgentDef(id)?.phase: the S3 doc
+ * REPLACES the bundled map when it loads; an unreadable/empty roster falls back
+ * to the bundled agents.json (the orchestrator's FALLBACK_ROSTER). Never throws.
+ */
+function livePhaseMap(): () => Promise<PhaseById> {
+  let loading: Promise<PhaseById> | null = null;
+  return () => {
+    if (!loading) {
+      loading = loadRoster()
+        .then((roster) => {
+          const live = roster.filter((a) => a?.agentId && typeof a.phase === "string" && a.phase);
+          return live.length ? Object.fromEntries(live.map((a) => [a.agentId, a.phase as string])) : AGENT_PHASE_BY_ID;
+        })
+        .catch(() => AGENT_PHASE_BY_ID);
+    }
+    return loading;
+  };
+}
+
+/**
+ * TEAM-6187 — mirror of the orchestrator's getEffectiveWorkflowDef (index.mjs):
+ * the configured def with the run's SDLC framework overlay applied, then the
+ * CD-registry handoff strip (effectiveDefFor ≡ cd-registry.mjs stripShipPhases).
+ * Every gate/verdict decision reads THIS, never the raw def. The registry is read
+ * only when the def has a ship phase/gate to strip — stripping is a no-op
+ * otherwise, and the TEAM-3976 happy path contractually makes zero S3 reads.
+ * Null when the def id is unknown (callers treat that as "nothing required").
+ */
+async function resolveEffectiveWorkflowDef(workflow: Record<string, unknown>): Promise<WorkflowDef | null> {
+  const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
+  if (!def) return null;
+  const input = workflow.input as { sdlcFramework?: unknown } | undefined;
+  const framed = applyFramework(def, resolveFramework(def, workflow.sdlcFramework ?? input?.sdlcFramework));
+  const touchesShip =
+    (framed.completionRequiresAgentPhases || []).some((p) => SHIP_PHASES.has(p)) ||
+    (framed.reviewGates || []).some((g) => SHIP_PHASES.has(g?.afterPhase));
+  if (!touchesShip) return framed;
+  const repoUrl = (workflow.repoConfig as { repos?: Array<{ url?: string }> } | undefined)?.repos?.[0]?.url;
+  const cdRegistered = deliveryModeFor(await loadCdRegistry(), repoUrl) === "cd";
+  return effectiveDefFor(framed, { cdRegistered });
+}
 
 // TEAM-3747 D2: the lifecycle-integrity ship outcomes are ALSO terminal — a run
 // closed deploy-blocked / static-ci-only cannot be re-"completed" out from under
@@ -147,21 +203,43 @@ function openChildren(tickets: Ticket[]): Ticket[] {
   });
 }
 
-/** The agent phase a child ticket belongs to: an explicit `phase` stamp wins
- *  (TEAM-3619 D4c routes spawned fixes to their originating upstream phase),
- *  else derive it from the assignee's roster phase. Undefined for humans/unknowns. */
-function phaseOfTicket(t: Ticket): string | undefined {
+/** The phase a child ticket states on its own (no roster): an explicit `phase`
+ *  stamp (TEAM-3619 D4c routes spawned fixes to their originating upstream phase),
+ *  the `phase:<p>` label Jira mode keeps (the hub stamps it on every skeleton
+ *  ticket), or a `Ship:`/`CD:` title — single-agent defs (operator) ship from a
+ *  persona rostered under development, so the roster alone misses their Ship ticket. */
+function statedTicketPhase(t: Ticket): string | undefined {
   if (typeof t.phase === "string" && t.phase) return t.phase;
-  // Jira mode drops `phase` but keeps the `phase:<p>` label the hub stamps on
-  // every skeleton ticket; single-agent defs (operator) ship from a persona
-  // rostered under development, so the roster alone misses their Ship ticket.
   const labelled = (Array.isArray(t.labels) ? t.labels : [])
     .map((l) => (typeof l === "string" && l.startsWith("phase:") ? l.slice("phase:".length) : ""))
     .find(Boolean);
   if (labelled) return labelled;
   if (/^(Ship|CD):/i.test(String(t.title || ""))) return "ship";
+  return undefined;
+}
+
+/** The agent phase a child ticket belongs to: its stated phase wins, else the
+ *  assignee's roster phase (TEAM-6187: the LIVE roster map, bundled as fallback,
+ *  exactly as the orchestrator's getAgentDef). Undefined for humans/unknowns. */
+function phaseOfTicket(t: Ticket, phaseById: PhaseById): string | undefined {
+  const stated = statedTicketPhase(t);
+  if (stated) return stated;
   const assignee = typeof t.assignee === "string" ? t.assignee : "";
-  return AGENT_PHASE_BY_ID[assignee];
+  return phaseById[assignee];
+}
+
+/** Does resolving these tickets' phases need the roster at all? Only a non-epic,
+ *  non-human ticket with no stated phase does — so the TEAM-3976 happy path
+ *  (every ticket phase-stamped) never pays the S3 read. */
+function ticketsNeedRoster(tickets: Ticket[]): boolean {
+  return tickets.some(
+    (t) =>
+      t.type !== "epic" &&
+      !statedTicketPhase(t) &&
+      typeof t.assignee === "string" &&
+      t.assignee.length > 0 &&
+      !t.assignee.startsWith("human:")
+  );
 }
 
 interface AgentTaskLike {
@@ -182,7 +260,8 @@ interface AgentTaskLike {
 function missingEvidenceTickets(
   tickets: Ticket[],
   agentTasks: Record<string, AgentTaskLike>,
-  requiredPhases: string[]
+  requiredPhases: string[],
+  phaseById: PhaseById
 ): Array<{ ticketId: string; phase: string }> {
   if (!requiredPhases.length) return [];
   const required = new Set(requiredPhases);
@@ -199,7 +278,7 @@ function missingEvidenceTickets(
     // isHumanGateTicket): hub-materialized gates carry `phase:<afterPhase>`, so
     // phaseOfTicket resolves them into a required phase with no agentTask evidence.
     if (isHumanGateTicket(t)) continue;
-    const phase = phaseOfTicket(t);
+    const phase = phaseOfTicket(t, phaseById);
     if (!phase || !required.has(phase)) continue;
     const ticketId = String(t.ticketId || "");
     const entry = tasks[ticketId] || byTicketId.get(ticketId);
@@ -237,7 +316,7 @@ function isHumanGateTicket(t: Ticket): boolean {
  * reviewGates + gate-ticket resolution and is a separate finding — this helper
  * closes only the cancelled/empty-phase hole.
  */
-function requiredPhasesMissingDoneAgent(tickets: Ticket[], requiredPhases: string[]): string[] {
+function requiredPhasesMissingDoneAgent(tickets: Ticket[], requiredPhases: string[], phaseById: PhaseById): string[] {
   if (!requiredPhases.length) return [];
   const isHuman = (a: unknown) => typeof a === "string" && a.startsWith("human:");
   return requiredPhases.filter(
@@ -246,7 +325,7 @@ function requiredPhasesMissingDoneAgent(tickets: Ticket[], requiredPhases: strin
         (t) =>
           t.type !== "epic" &&
           !isHuman(t.assignee) &&
-          phaseOfTicket(t) === phase &&
+          phaseOfTicket(t, phaseById) === phase &&
           String(t.status || "").toLowerCase() === "done"
       )
   );
@@ -318,7 +397,8 @@ const SHIP_SATISFIED_VERDICTS: readonly string[] = ["shipped", "handoff"];
 function evaluateShipVerdict(
   tickets: Ticket[],
   agentTasks: Record<string, ShipTaskLike>,
-  requiredPhases: string[]
+  requiredPhases: string[],
+  phaseById: PhaseById
 ): ShipVerdict {
   const inert: ShipVerdict = { required: false, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [] };
   const shipPhases = requiredPhases.filter((p) => SHIP_PHASES.has(p));
@@ -335,7 +415,7 @@ function evaluateShipVerdict(
       t.type !== "epic" &&
       String(t.status || "").toLowerCase() === "done" &&
       !isHuman(t.assignee) &&
-      phases.has(phaseOfTicket(t) as string)
+      phases.has(phaseOfTicket(t, phaseById) as string)
   );
   // No done ship AGENT ticket to inspect: keep the twin's "cannot prove a
   // phantom" stance (completion.mjs evaluateShipVerdict does the same) rather
@@ -358,7 +438,7 @@ function evaluateShipVerdict(
       if (verdict === "handoff") handoffs++;
       continue;
     }
-    offenders.push({ ticketId, phase: phaseOfTicket(t) as string, verdict: verdict || "none" });
+    offenders.push({ ticketId, phase: phaseOfTicket(t, phaseById) as string, verdict: verdict || "none" });
     if (verdict === "deploy-blocked") {
       blocked = "deploy-blocked";
       if (!blockReason && entry && typeof entry.blockReason === "string") blockReason = entry.blockReason;
@@ -587,6 +667,21 @@ export async function POST(
       );
     }
 
+    // TEAM-6187: ONE effective def and ONE roster map feed every gate below (2b,
+    // 2b′, 2c) — the orchestrator's getEffectiveWorkflowDef + getAgentDef. A def
+    // that will not resolve must not turn a legitimate completion into a 500 (the
+    // gates' long-standing discipline): it is logged once and nothing is required.
+    let effectiveDef: WorkflowDef | null = null;
+    try {
+      effectiveDef = await resolveEffectiveWorkflowDef(workflow);
+    } catch (err) {
+      console.warn(`[complete] workflow def unresolved — phase gates skipped: ${(err as Error).message}`);
+    }
+    const requiredPhases: string[] = effectiveDef?.completionRequiresAgentPhases || [];
+    const livePhases = livePhaseMap();
+    const phaseById: PhaseById =
+      requiredPhases.length > 0 && ticketsNeedRoster(tickets) ? await livePhases() : AGENT_PHASE_BY_ID;
+
     // 2b. TEAM-3619 D4a: deliverable-evidence gate. Every done ticket in a
     //     completion-required phase must have real work behind it (task output or
     //     an artifact). Enforced by default (TEAM-3690): missing evidence → 409.
@@ -594,10 +689,8 @@ export async function POST(
     //     back to shadow-log-and-continue. No bypass parameter: the same reason
     //     the open-children gate has none.
     try {
-      const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
-      const requiredPhases = def?.completionRequiresAgentPhases || [];
       const agentTasks = (workflow.agentTasks as Record<string, AgentTaskLike>) || {};
-      let missing = missingEvidenceTickets(tickets, agentTasks, requiredPhases);
+      let missing = missingEvidenceTickets(tickets, agentTasks, requiredPhases, phaseById);
       // TEAM-3976: a ticket closed out-of-band (mark_done) BEFORE its
       // report_completion landed has an evidence-less agentTasks entry — the
       // orchestrator's one-shot harvest found no record, and the later done→done
@@ -675,9 +768,7 @@ export async function POST(
     //      "the work never ran" refusal, the same class as the open-children
     //      gate, not an evidence heuristic.
     try {
-      const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
-      const requiredPhases = def?.completionRequiresAgentPhases || [];
-      const unrun = requiredPhasesMissingDoneAgent(tickets, requiredPhases);
+      const unrun = requiredPhasesMissingDoneAgent(tickets, requiredPhases, phaseById);
       if (unrun.length > 0) {
         return NextResponse.json(
           {
@@ -705,25 +796,30 @@ export async function POST(
     //     event (see closeBlocked). Same COMPLETION_EVIDENCE_REQUIRED gate — enforce
     //     by default; the explicit opt-out only shadow-logs and completes.
     try {
-      const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
-      const requiredPhases = def?.completionRequiresAgentPhases || [];
       const verdict = evaluateShipVerdict(
         tickets,
         (workflow.agentTasks as Record<string, ShipTaskLike>) || {},
-        requiredPhases
+        requiredPhases,
+        phaseById
       );
       // 2c-0. TEAM-6136 — the TEAM-6032 (DL-038) follow-up PR gate, BEFORE the
       //       blocked close so both terminal writes are gated (the orchestrator's
       //       order). Same function as the orchestrator, same guard: no
-      //       SHIP_MERGE_VERIFY opt-out, a ship phase, featureBranch, repoConfig,
-      //       GITHUB_PAT, not a pure handoff. Fail-open: never throws.
+      //       SHIP_MERGE_VERIFY opt-out, a ship phase (EFFECTIVE def), featureBranch,
+      //       repoConfig, GITHUB_PAT, not a pure handoff. Fail-open: never throws.
+      //       TEAM-6187 — and the orchestrator's INPUTS: the fresh-record overlay and
+      //       the GitHub landing probe run first inside openFollowUpPrsAtCompletion
+      //       (a PROVEN-unmerged branch refuses here, as completeWorkflow's
+      //       CompletionRejectedUnmergedBranch does), the live roster classifies the
+      //       ship agent, and only the epic's CHILDREN state `base_branch:` bases.
       if (
         followUpPrGateConfigured(workflow, requiredPhases.some((p: string) => SHIP_PHASES.has(p))) &&
         !verdict.handoff
       ) {
-        const prs = await openFollowUpPrsAtCompletion({
+        const phases = await livePhases();
+        const outcome = await openFollowUpPrsAtCompletion({
           workflow,
-          tickets,
+          tickets: tickets.filter((t) => t.type !== "epic"), // parity: children = getChildTickets(epicId)
           readCompletionRecord: async (ticketId) => {
             if (!ARTIFACT_BUCKET) return null;
             try {
@@ -733,15 +829,33 @@ export async function POST(
               throw err; // the gate falls back to the cached prUrl
             }
           },
-          getAgentPhase: (agentId) => AGENT_PHASE_BY_ID[agentId],
+          getAgentPhase: (agentId) => phases[agentId],
           token: process.env.GITHUB_PAT,
         });
-        if (prs.length > 0) {
-          console.error(`[complete] CompletionRejectedOpenFollowUpPr ${workflowId}: ${prs.join(", ")} still open`);
+        if ("unmerged" in outcome) {
+          console.error(
+            `[complete] CompletionRejectedUnmergedBranch ${workflowId}: feature branch ${workflow.featureBranch} ` +
+              `is not merged into the base (${outcome.unmerged.reason}). CD did not land the merge — refusing.`
+          );
+          return NextResponse.json(
+            {
+              error: "unmerged_branch",
+              featureBranch: workflow.featureBranch,
+              reason: outcome.unmerged.reason,
+              hint:
+                "CD did not land the merge. Open (or merge) the PR from the feature branch to the default " +
+                "branch, or have the release manager open a fresh unified PR through Merge Approval, then retry — " +
+                "completion has no bypass.",
+            },
+            { status: 409 }
+          );
+        }
+        if (outcome.prs.length > 0) {
+          console.error(`[complete] CompletionRejectedOpenFollowUpPr ${workflowId}: ${outcome.prs.join(", ")} still open`);
           return NextResponse.json(
             {
               error: "open_follow_up_pr",
-              prs,
+              prs: outcome.prs,
               hint: "Merge or close these follow-up PRs first — completion has no bypass.",
             },
             { status: 409 }
