@@ -18,11 +18,13 @@
  * stubbed `aws` on PATH, from a scratch copy so the script's hard-coded
  * `$SCRIPT_DIR/../.env.local` can never pick up a developer's real file.
  *
- * Hermetic env (TEAM-6185): the child env deletes TICKET_PROVIDER and
- * TICKET_TOOLS_LAMBDA from a copy of process.env before applying each case's
- * overrides, so a developer's/CI's exported value can never leak into an
- * "unset" case (repro: `TICKET_PROVIDER=dynamodb npx vitest run ...` used to
- * fail 2 of these; `TICKET_TOOLS_LAMBDA=<anything>` used to fail 4).
+ * Hermetic env (TEAM-6185, tightened in TEAM-6200 F5): the child env is built
+ * from an allow-list (hermeticEnv below), never from a copy of process.env, so
+ * a developer's/CI's exported TICKET_PROVIDER, TICKET_TOOLS_LAMBDA,
+ * EXISTING_LAMBDAS (read by the aws stub), AWS_REGION/AWS_PROFILE or any of
+ * the script's other ${VAR:-default} inputs can never leak into an "unset"
+ * case (repro: `TICKET_PROVIDER=dynamodb npx vitest run ...` used to fail 2 of
+ * these; `TICKET_TOOLS_LAMBDA=<anything>` used to fail 4).
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync, chmodSync, mkdirSync, readFileSync, cpSync, rmSync } from "node:fs";
@@ -61,6 +63,22 @@ sys.stderr.write("\nAn error occurred (AccessDenied) when calling the %s operati
 sys.exit(255)
 `;
 
+/**
+ * Child env for the spawned script, built from an allow-list rather than a copy
+ * of process.env (TEAM-6200 F5; same helper as trace-workflow-ticket-lambda.
+ * test.ts). Only what bash, python3 (the stub) and the script need to run is
+ * passed through; every input that can change the outcome is set explicitly by
+ * the caller.
+ */
+const hermeticEnv = (binDir: string, pinned: Record<string, string>): NodeJS.ProcessEnv => {
+  const base: Record<string, string> = { PATH: `${binDir}:${process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}` };
+  for (const k of ["HOME", "TMPDIR", "LANG", "LC_ALL"] as const) {
+    if (process.env[k] !== undefined) base[k] = process.env[k] as string;
+  }
+  // Same cast as envOf: ProcessEnv's augmented required NODE_ENV is irrelevant to a bash child.
+  return { ...base, ...pinned } as NodeJS.ProcessEnv;
+};
+
 // Scratch dirs created by runVerifyInfra, removed in afterEach (TEAM-6185 —
 // mkdtempSync fixtures were never cleaned up).
 const scratchDirs: string[] = [];
@@ -95,22 +113,13 @@ const runVerifyInfra = (env: Record<string, string> = {}) => {
   const callLog = join(dir, "aws-calls.jsonl");
   writeFileSync(callLog, "");
 
-  // Delete the two vars this test is pinning before applying `env`'s
-  // overrides — an inherited TICKET_PROVIDER/TICKET_TOOLS_LAMBDA from the
-  // developer's/CI's shell must never decide an "unset" case (TEAM-6185).
-  const baseEnv = { ...process.env };
-  delete baseEnv.TICKET_PROVIDER;
-  delete baseEnv.TICKET_TOOLS_LAMBDA;
-
   const res = spawnSync("bash", [join(dir, "scripts", "verify-infra.sh")], {
-    env: {
-      ...baseEnv,
-      PATH: `${binDir}:${process.env.PATH}`,
+    env: hermeticEnv(binDir, {
       AWS_CALL_LOG: callLog,
       AWS_ACCOUNT_ID: "123456789012",
       ARTIFACT_BUCKET: "", // skip the IAM-grant sections entirely
       ...env,
-    },
+    }),
   });
   const calls: string[][] = readFileSync(callLog, "utf8")
     .trim()

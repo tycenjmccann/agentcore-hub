@@ -20,9 +20,15 @@
  *
  * Same hermetic end-to-end pattern as verify-infra-ticket-lambda.test.ts: a
  * scratch copy of scripts/trace-workflow.sh + deploy/lib/runtime-env-
- * defaults.sh, a stubbed `aws` on PATH, process.env copied with
- * TICKET_PROVIDER/TICKET_TOOLS_LAMBDA deleted before each case's overrides,
- * and scratch dirs removed in afterEach.
+ * defaults.sh, a stubbed `aws` on PATH, a child env built from an ALLOW-LIST
+ * (hermeticEnv below — never a copy of process.env, so no inherited
+ * TICKET_PROVIDER / TICKET_TOOLS_LAMBDA / MOCK_* / AWS_* can decide a case;
+ * TEAM-6200 F5), and scratch dirs removed in afterEach.
+ *
+ * TEAM-6200 F4: the script runs under `set -euo pipefail` and sources
+ * .env.local; a line like GITHUB_TOKEN="$OPTIONAL_REVIEW_TOKEN" with that var
+ * unset must not kill it with "unbound variable" (verify-infra.sh, which has
+ * no nounset, tolerates the same file). The last case below pins that.
  */
 import { afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, writeFileSync, chmodSync, mkdirSync, readFileSync, cpSync, rmSync } from "node:fs";
@@ -76,6 +82,25 @@ sys.stderr.write("\nAn error occurred (AccessDenied) when calling an unmocked op
 sys.exit(255)
 `;
 
+/**
+ * Child env for the spawned script, built from an allow-list rather than a copy
+ * of process.env (TEAM-6200 F5). The previous inherit-then-delete idiom only
+ * removed TICKET_PROVIDER/TICKET_TOOLS_LAMBDA, so an exported
+ * MOCK_TICKET_PROVIDER (read by the aws stub) still leaked:
+ * `MOCK_TICKET_PROVIDER=dynamodb npx vitest run …` failed the jira-default
+ * case and `=jira` failed the .env.local-only dynamodb case. Only what bash,
+ * python3 (the stub) and the script need to run is passed through; every
+ * input that can change the outcome is set explicitly by the caller.
+ */
+const hermeticEnv = (binDir: string, pinned: Record<string, string>): NodeJS.ProcessEnv => {
+  const base: Record<string, string> = { PATH: `${binDir}:${process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}` };
+  for (const k of ["HOME", "TMPDIR", "LANG", "LC_ALL"] as const) {
+    if (process.env[k] !== undefined) base[k] = process.env[k] as string;
+  }
+  // Same cast as envOf: ProcessEnv's augmented required NODE_ENV is irrelevant to a bash child.
+  return { ...base, ...pinned } as NodeJS.ProcessEnv;
+};
+
 const scratchDirs: string[] = [];
 afterEach(() => {
   for (const dir of scratchDirs.splice(0)) {
@@ -111,22 +136,13 @@ const runTraceWorkflow = (env: Record<string, string> = {}, envLocal?: string) =
   writeFileSync(callLog, "");
   const outDir = join(dir, "out");
 
-  // Hermetic env (same idiom as verify-infra-ticket-lambda.test.ts): delete
-  // the two vars this test pins before applying each case's overrides, so an
-  // inherited value from the developer's/CI's shell can never leak in.
-  const baseEnv = { ...process.env };
-  delete baseEnv.TICKET_PROVIDER;
-  delete baseEnv.TICKET_TOOLS_LAMBDA;
-
   const res = spawnSync("bash", [join(dir, "scripts", "trace-workflow.sh"), "wf_test", "--output", outDir], {
-    env: {
-      ...baseEnv,
-      PATH: `${binDir}:${process.env.PATH}`,
+    env: hermeticEnv(binDir, {
       AWS_PROFILE: "stub-profile",
       AWS_REGION: "us-east-1",
       AWS_CALL_LOG: callLog,
       ...env,
-    },
+    }),
   });
   const calls: string[][] = readFileSync(callLog, "utf8")
     .trim()
@@ -192,6 +208,23 @@ describe("trace-workflow.sh — ticket-tools log group follows TICKET_PROVIDER (
     const groups = logGroupsQueried(calls);
     expect(groups).toContain("/aws/lambda/custom-ticket-fn");
     expect(groups).not.toContain("/aws/lambda/agentcore-hub-tickets");
+    expect(groups).not.toContain("/aws/lambda/agentcore-hub-jira");
+  });
+
+  // TEAM-6200 F4: .env.local may reference a variable that is unset in the
+  // shell (e.g. an optional token). Sourcing it under the script's `set -u`
+  // used to abort before any aws call. Exit status is deliberately not
+  // asserted (see the note above the describe); "proceeds" is proven by the
+  // Step 3b ticket-tools log pull actually happening with the provider the
+  // same .env.local set, and by stderr carrying no "unbound variable".
+  it("survives a .env.local that references an unset variable and still honours its TICKET_PROVIDER", () => {
+    const { stderr, calls } = runTraceWorkflow(
+      {},
+      'TICKET_PROVIDER=dynamodb\nGITHUB_TOKEN="$OPTIONAL_REVIEW_TOKEN"\n'
+    );
+    expect(stderr).not.toMatch(/unbound variable/);
+    const groups = logGroupsQueried(calls);
+    expect(groups).toContain("/aws/lambda/agentcore-hub-tickets");
     expect(groups).not.toContain("/aws/lambda/agentcore-hub-jira");
   });
 });

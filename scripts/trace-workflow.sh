@@ -32,10 +32,18 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/../.env.local"
 
 # Same loader as scripts/verify-infra.sh — picks up TICKET_PROVIDER (and an
-# explicit TICKET_TOOLS_LAMBDA override) from .env.local when the shell
-# itself doesn't export them.
+# explicit TICKET_TOOLS_LAMBDA override) from .env.local. NOTE: like any
+# sourced file, a value set in .env.local OVERWRITES a shell export of the same
+# name (verify-infra.sh behaves identically); the file is not a fallback.
+# nounset is suspended only while sourcing (TEAM-6200 F4): .env.local may
+# legitimately reference a variable that is unset in this shell (e.g.
+# GITHUB_TOKEN="$OPTIONAL_REVIEW_TOKEN"), which verify-infra.sh (no set -u)
+# tolerates but `set -euo pipefail` above turned into an "unbound variable"
+# abort before any AWS call. Restored unconditionally: set -u is always on here.
 if [ -f "$ENV_FILE" ]; then
+  set +u
   set -a; source "$ENV_FILE"; set +a
+  set -u
 fi
 
 export AWS_PROFILE="${AWS_PROFILE:?ERROR: Set AWS_PROFILE}"
