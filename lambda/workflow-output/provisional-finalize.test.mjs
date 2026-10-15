@@ -447,12 +447,18 @@ const NONCE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$
  * TEAM-6164: a real message always carries its own report's follow-ups, so a drain now treats a record whose unfiled follow-ups the message
  * does not carry as a NEWER report's hold and is superseded by it; this fabricated shape keeps the record consistent with itself (the
  * outage report's follow-up hold comes off), so these tests stay about the admission.
+ * TEAM-6224: likewise the brief - a record whose queued merge brief nothing recorded on the gate still owes it
+ * (briefObligation), and the twins' Done guard now refuses that record; so the brief this shape omits is recorded
+ * on its gate, as the earlier replay that carried it would have.
  */
 const residualOnly = () => {
   if (fake.objects.has(B_KEY) && record(B_KEY).followUpsPending === true) {
     const cur = record(B_KEY);
     delete cur.followUpsMaterialized;
     setRecord(B_KEY, { ...cur, followUpsPending: false, status: "complete" });
+  }
+  if (fake.objects.has(B_KEY) && output.briefObligation(record(B_KEY))) {
+    setRecord(B_KEY, output.clearBriefHoldOnGate({ ...record(B_KEY), briefDelivered: "gate", briefTargets: [GATE] }));
   }
   return { ...JSON.parse(fake.queue[0].Body), followUps: [], brief: undefined };
 };
