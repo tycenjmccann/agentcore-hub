@@ -83,7 +83,7 @@ function makeFixture(): string {
   mkdirSync(join(dir, "src", "config"), { recursive: true });
 
   copyFileSync(join(REPO, "deploy", "config.sh"), join(dir, "deploy", "config.sh"));
-  for (const lib of ["check-eval-gate.sh", "parse-force-args.sh", "runtime-env-defaults.sh"]) {
+  for (const lib of ["check-eval-gate.sh", "parse-force-args.sh", "runtime-env-defaults.sh", "load-env-local.sh"]) {
     const src = join(REPO, "deploy", "lib", lib);
     // runtime-env-defaults.sh is new in TEAM-6069; copying it only when present
     // lets this same test run (and fail) against the pre-fix tree.

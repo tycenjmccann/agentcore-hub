@@ -91,8 +91,9 @@ afterEach(() => {
 /**
  * Run the real verify-infra.sh from a scratch copy of the repo's scripts/ and
  * deploy/lib/ dirs (so the fix's `source "$SCRIPT_DIR/../deploy/lib/
- * runtime-env-defaults.sh"` resolves), with no .env.local, against the aws
- * stub. Returns stdout and the decoded call log.
+ * runtime-env-defaults.sh"` and (TEAM-6202) `.../deploy/lib/load-env-local.sh`
+ * resolve), with no .env.local, against the aws stub. Returns stdout and the
+ * decoded call log.
  */
 const runVerifyInfra = (env: Record<string, string> = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "verify-infra-ticket-lambda-"));
@@ -104,6 +105,7 @@ const runVerifyInfra = (env: Record<string, string> = {}) => {
     join(REPO_ROOT, "deploy", "lib", "runtime-env-defaults.sh"),
     join(dir, "deploy", "lib", "runtime-env-defaults.sh")
   );
+  cpSync(join(REPO_ROOT, "deploy", "lib", "load-env-local.sh"), join(dir, "deploy", "lib", "load-env-local.sh"));
   // No .env.local in this scratch dir — the script must not fail trying to
   // source a file that doesn't exist (it guards with `[ -f "$ENV_FILE" ]`).
   const binDir = join(dir, "bin");

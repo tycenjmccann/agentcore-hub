@@ -12,9 +12,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/../.env.local"
 
-if [ -f "$ENV_FILE" ]; then
-  set -a; source "$ENV_FILE"; set +a
-fi
+# Loaded via the shared helper (TEAM-6202) so this stays consistent with
+# every other .env.local source site, even though this script has no set -u.
+source "$SCRIPT_DIR/../deploy/lib/load-env-local.sh"
+load_env_local "$ENV_FILE"
 
 REGION="${AWS_REGION:-us-east-1}"
 WORKFLOWS_TABLE="${WORKFLOWS_TABLE:-agentcore-hub-workflows}"

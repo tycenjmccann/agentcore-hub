@@ -505,3 +505,38 @@ describe("POST /api/workflow/webhook — a Done Jira already has (TEAM-6165)", (
     expect(h.sends.length).toBe(0);
   });
 });
+
+describe("POST /api/workflow/webhook — status mapping is the shared jiraStatusToInternal mirror (TEAM-6146)", () => {
+  const nonDoneUpdate = () => h.sends.find((s) => s.name === "UpdateCommand");
+
+  it.each([
+    ["Won't Do", "cancelled"],
+    ["Cancelled", "cancelled"],
+    ["WONT DO", "cancelled"],
+    ["Ready", "ready"],
+    ["  In Progress ", "in_progress"],
+    ["Waiting for review", "waiting_for_review"],
+  ])('a jira_transition to %j writes status %j (not the previous private mapJiraStatus, which only knew to do/in progress/done/blocked/in review)', async (toString, expected) => {
+    const res = await post({
+      event_type: "jira_transition",
+      issue_key: "TEAM-7",
+      changelog: { items: [{ field: "status", toString }] },
+    });
+    expect(res.status).toBe(200);
+    const update = nonDoneUpdate();
+    expect(update).toBeTruthy();
+    expect((update!.input.ExpressionAttributeValues as Record<string, unknown>)[":s"]).toBe(expected);
+    expect(h.invokes.length).toBe(0); // only `done` goes through the tickets Lambda
+  });
+
+  it("a status item with no toString is ignored, writes nothing", async () => {
+    const res = await post({
+      event_type: "jira_transition",
+      issue_key: "TEAM-7",
+      changelog: { items: [{ field: "status", toString: undefined as unknown as string }] },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ received: true, ignored: true });
+    expect(h.sends.length).toBe(0);
+  });
+});

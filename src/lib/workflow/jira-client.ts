@@ -6,27 +6,23 @@
  */
 
 import { JQL_SEARCH_CAP, JiraSearchTruncatedError, searchJqlAll } from "./jira-search-paginate";
+import { jiraStatusToInternal } from "./jira-status-map";
 
 // ─── Status Mapping ────────────────────────────────────────────────────────────
 
-/** Maps Jira status display names (case-insensitive) to internal status values */
-export const JIRA_STATUS_TO_INTERNAL: Record<string, string> = {
-  "to do": "todo",
-  "todo": "todo",
-  "ready": "ready",
-  "open": "todo",
-  "in progress": "in_progress",
-  "in review": "in_review",
-  "done": "done",
-  "closed": "done",
-  "resolved": "done",
-  "blocked": "blocked",
-  // TEAM-5421 — a cancelled run's tickets land in Won't Do; read it as the
-  // terminal `cancelled`, never as an open "won't do" status.
-  "won't do": "cancelled",
-  "wont do": "cancelled",
-  "cancelled": "cancelled",
-  "canceled": "cancelled",
+/**
+ * TEAM-6146 — board-only aliases the shared Lambda mirror does not have (the Lambda
+ * reads "Closed"/"Resolved" as their own lowercased names, not as `done`; this file's
+ * callers — the real Jira webhook, nudge, retry, cancel — read a board more loosely
+ * than the Lambda does). Checked FIRST, before the shared mapStatusToInternal mirror.
+ * Left exactly as this file had it; aligning Closed/Resolved with the Lambda is a
+ * separate decision, out of scope for TEAM-6146. Pinned by jira-status-map-parity.test.ts.
+ */
+export const BOARD_ALIASES: Record<string, string> = {
+  todo: "todo",
+  open: "todo",
+  closed: "done",
+  resolved: "done",
 };
 
 /** Maps internal status values to Jira transition names */
@@ -40,12 +36,13 @@ export const INTERNAL_STATUS_TO_JIRA: Record<string, string> = {
 };
 
 /**
- * Normalize a Jira status name to an internal status string.
- * Falls back to the lowercased input if no mapping found.
+ * Normalize a Jira status name to an internal status string: BOARD_ALIASES first,
+ * else the shared mirror of the jira Lambda's mapStatusToInternal (jira-status-map.ts).
+ * Null-safe — unlike the Lambda, this file's callers sometimes pass an unchecked field.
  */
-export function mapJiraStatusToInternal(jiraStatus: string): string {
-  const normalized = jiraStatus.toLowerCase().trim();
-  return JIRA_STATUS_TO_INTERNAL[normalized] || normalized;
+export function mapJiraStatusToInternal(jiraStatus: unknown): string {
+  const normalized = typeof jiraStatus === "string" ? jiraStatus.toLowerCase().trim() : "";
+  return BOARD_ALIASES[normalized] ?? jiraStatusToInternal(normalized);
 }
 
 /**

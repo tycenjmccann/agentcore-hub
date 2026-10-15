@@ -17,18 +17,19 @@
 
 set -e
 
-# Source project env vars (GITHUB_PAT, etc.) so agents get MCP access
-ENV_FILE="$(cd "$(dirname "$0")/../.." && pwd)/.env.local"
+# Source project env vars (GITHUB_PAT, etc.) so agents get MCP access, via the
+# shared loader (TEAM-6202) so this stays consistent with every other
+# .env.local source site.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../lib/load-env-local.sh"
+ENV_FILE="$(cd "$SCRIPT_DIR/../.." && pwd)/.env.local"
 if [ -f "$ENV_FILE" ]; then
-  set -a
-  # shellcheck disable=SC1090 # user-local env file, resolved at runtime
-  source "$ENV_FILE"
-  set +a
+  load_env_local "$ENV_FILE"
   echo "Loaded env from $ENV_FILE"
 fi
 
 REGION="${AWS_REGION:-us-east-1}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BASE_DIR="$SCRIPT_DIR"
 DEPLOY_MODE="${DEPLOY_MODE:-lightweight}"
 
