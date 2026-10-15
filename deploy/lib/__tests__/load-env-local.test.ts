@@ -25,7 +25,7 @@
  * a copy of process.env), scratch dirs removed in afterEach.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync, cpSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, cpSync, rmSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -162,13 +162,21 @@ describe("deploy/config.sh sources .env.local without aborting under set -u", ()
    * scratch .env.local, run under the exact `set -euo pipefail` ~13 real
    * deploy scripts source config.sh from. AWS_ACCOUNT_ID/AWS_REGION are
    * pinned so config.sh never calls `aws sts get-caller-identity`.
+   *
+   * load-env-local.sh is copied only if present (same idiom as TEAM-6069's
+   * runtime-env-forwarding.test.ts for runtime-env-defaults.sh): this test
+   * must also run — and FAIL with the real "unbound variable" symptom, not
+   * an unrelated ENOENT — against the pre-fix tree, where config.sh has no
+   * reference to the helper at all and sources .env.local inline.
    */
   const runConfigSh = (envLocal: string) => {
     const dir = mkdtempSync(join(tmpdir(), "config-sh-"));
     scratchDirs.push(dir);
     mkdirSync(join(dir, "deploy", "lib"), { recursive: true });
     cpSync(join(REPO_ROOT, "deploy", "config.sh"), join(dir, "deploy", "config.sh"));
-    cpSync(join(REPO_ROOT, "deploy", "lib", "load-env-local.sh"), join(dir, "deploy", "lib", "load-env-local.sh"));
+    if (existsSync(HELPER)) {
+      cpSync(HELPER, join(dir, "deploy", "lib", "load-env-local.sh"));
+    }
     cpSync(
       join(REPO_ROOT, "deploy", "lib", "runtime-env-defaults.sh"),
       join(dir, "deploy", "lib", "runtime-env-defaults.sh")
