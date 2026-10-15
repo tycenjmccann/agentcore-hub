@@ -17,9 +17,15 @@
  * the role_policy_* harness in setup-pipeline-tools-lambda.test.mjs) with a
  * stubbed `aws` on PATH, from a scratch copy so the script's hard-coded
  * `$SCRIPT_DIR/../.env.local` can never pick up a developer's real file.
+ *
+ * Hermetic env (TEAM-6185): the child env deletes TICKET_PROVIDER and
+ * TICKET_TOOLS_LAMBDA from a copy of process.env before applying each case's
+ * overrides, so a developer's/CI's exported value can never leak into an
+ * "unset" case (repro: `TICKET_PROVIDER=dynamodb npx vitest run ...` used to
+ * fail 2 of these; `TICKET_TOOLS_LAMBDA=<anything>` used to fail 4).
  */
-import { describe, expect, it } from "vitest";
-import { mkdtempSync, writeFileSync, chmodSync, mkdirSync, readFileSync, cpSync } from "node:fs";
+import { afterEach, describe, expect, it } from "vitest";
+import { mkdtempSync, writeFileSync, chmodSync, mkdirSync, readFileSync, cpSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -55,6 +61,15 @@ sys.stderr.write("\nAn error occurred (AccessDenied) when calling the %s operati
 sys.exit(255)
 `;
 
+// Scratch dirs created by runVerifyInfra, removed in afterEach (TEAM-6185 —
+// mkdtempSync fixtures were never cleaned up).
+const scratchDirs: string[] = [];
+afterEach(() => {
+  for (const dir of scratchDirs.splice(0)) {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 /**
  * Run the real verify-infra.sh from a scratch copy of the repo's scripts/ and
  * deploy/lib/ dirs (so the fix's `source "$SCRIPT_DIR/../deploy/lib/
@@ -63,6 +78,7 @@ sys.exit(255)
  */
 const runVerifyInfra = (env: Record<string, string> = {}) => {
   const dir = mkdtempSync(join(tmpdir(), "verify-infra-ticket-lambda-"));
+  scratchDirs.push(dir);
   mkdirSync(join(dir, "scripts"));
   mkdirSync(join(dir, "deploy", "lib"), { recursive: true });
   cpSync(join(REPO_ROOT, "scripts", "verify-infra.sh"), join(dir, "scripts", "verify-infra.sh"));
@@ -79,9 +95,16 @@ const runVerifyInfra = (env: Record<string, string> = {}) => {
   const callLog = join(dir, "aws-calls.jsonl");
   writeFileSync(callLog, "");
 
+  // Delete the two vars this test is pinning before applying `env`'s
+  // overrides — an inherited TICKET_PROVIDER/TICKET_TOOLS_LAMBDA from the
+  // developer's/CI's shell must never decide an "unset" case (TEAM-6185).
+  const baseEnv = { ...process.env };
+  delete baseEnv.TICKET_PROVIDER;
+  delete baseEnv.TICKET_TOOLS_LAMBDA;
+
   const res = spawnSync("bash", [join(dir, "scripts", "verify-infra.sh")], {
     env: {
-      ...process.env,
+      ...baseEnv,
       PATH: `${binDir}:${process.env.PATH}`,
       AWS_CALL_LOG: callLog,
       AWS_ACCOUNT_ID: "123456789012",

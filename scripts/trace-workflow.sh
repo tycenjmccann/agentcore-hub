@@ -28,18 +28,30 @@ set -euo pipefail
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_FILE="$SCRIPT_DIR/../.env.local"
+
+# Same loader as scripts/verify-infra.sh — picks up TICKET_PROVIDER (and an
+# explicit TICKET_TOOLS_LAMBDA override) from .env.local when the shell
+# itself doesn't export them.
+if [ -f "$ENV_FILE" ]; then
+  set -a; source "$ENV_FILE"; set +a
+fi
+
 export AWS_PROFILE="${AWS_PROFILE:?ERROR: Set AWS_PROFILE}"
 REGION="${AWS_REGION:-us-east-1}"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Ticket-tools Lambda name per TICKET_PROVIDER (TEAM-6161): same derivation as
-# scripts/verify-infra.sh — an explicit TICKET_TOOLS_LAMBDA still wins.
+# scripts/verify-infra.sh — an explicit TICKET_TOOLS_LAMBDA still wins. Only
+# sourced here; NOT resolved yet — the traced workflow's own ticketProvider
+# (Step 1, from DDB) can override .env.local/the shell, so the actual
+# resolve_runtime_lambda_names call (and LOG_TICKET_TOOLS) happens after Step
+# 1 reads it (TEAM-6185 — resolving this early always picked agentcore-hub-jira
+# for a dynamodb install configured only via .env.local or workflow metadata).
 source "$SCRIPT_DIR/../deploy/lib/runtime-env-defaults.sh"
-resolve_runtime_lambda_names
 
 # Log groups
 LOG_ORCHESTRATOR="/aws/lambda/agentcore-hub-orchestrator"
-LOG_TICKET_TOOLS="/aws/lambda/${TICKET_TOOLS_LAMBDA}"
 LOG_WORKFLOW_OUTPUT="/aws/lambda/agentcore-hub-workflow-output"
 LOG_AGENT_INVOKER="/aws/lambda/agentcore-hub-agent-invoker"
 
@@ -109,11 +121,21 @@ if echo "$WORKFLOW_META" | jq -e '.Item' > /dev/null 2>&1; then
   EPIC_ID=$(echo "$WORKFLOW_META" | jq -r '.Item.epicId.S // "N/A"')
   STARTED_AT=$(echo "$WORKFLOW_META" | jq -r '.Item.startedAt.S // .Item.startedAt.N // "N/A"')
   STATUS=$(echo "$WORKFLOW_META" | jq -r '.Item.phase.S // .Item.status.S // "N/A"')
-  TICKET_PROVIDER=$(echo "$WORKFLOW_META" | jq -r '.Item.ticketProvider.S // "N/A"')
+  # This workflow's own ticketProvider, read separately from the display
+  # value (TEAM-6185): it only overrides TICKET_PROVIDER (from the shell or
+  # .env.local) when the record actually has one — a missing attribute reads
+  # as the literal "N/A" below, which must never be treated as a provider
+  # name (resolve_runtime_lambda_names would then pick agentcore-hub-tickets,
+  # the opposite of the jira default).
+  META_TICKET_PROVIDER=$(echo "$WORKFLOW_META" | jq -r '.Item.ticketProvider.S // "N/A"')
   echo "  Epic: $EPIC_ID"
   echo "  Started: $STARTED_AT"
   echo "  Phase: $STATUS"
-  echo "  Ticket Provider: $TICKET_PROVIDER"
+  echo "  Ticket Provider: $META_TICKET_PROVIDER"
+
+  if [ "$META_TICKET_PROVIDER" = "jira" ] || [ "$META_TICKET_PROVIDER" = "dynamodb" ]; then
+    TICKET_PROVIDER="$META_TICKET_PROVIDER"
+  fi
 
   # If we have startedAt as ISO string, convert to epoch ms
   if [ "$STARTED_AT" != "N/A" ]; then
@@ -131,6 +153,14 @@ else
   echo "  WARNING: Workflow not found in DDB. Using full time window."
   EPIC_ID=""
 fi
+
+# Resolve the ticket-tools Lambda name now that TICKET_PROVIDER is final (the
+# shell/.env.local value, possibly overridden above by this workflow's own
+# record). A single call: an explicit TICKET_TOOLS_LAMBDA (shell or
+# .env.local) still wins, and since this is the only resolve call, there's no
+# earlier computed value that could stick (TEAM-6185).
+resolve_runtime_lambda_names
+LOG_TICKET_TOOLS="/aws/lambda/${TICKET_TOOLS_LAMBDA}"
 
 echo ""
 
