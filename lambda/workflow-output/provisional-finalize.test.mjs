@@ -442,8 +442,20 @@ describe("TEAM-6151 — the ONE conditional finalize", () => {
 
 // ─── TEAM-6152 (review round 5) ───
 const NONCE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-/** The queued message with only its residual findings (no follow-ups, no brief): the shape whose step-6 write is byte-identical across drains. */
-const residualOnly = () => ({ ...JSON.parse(fake.queue[0].Body), followUps: [], brief: undefined });
+/**
+ * The queued message with only its residual findings (no follow-ups, no brief): the shape whose step-6 write is byte-identical across drains.
+ * TEAM-6164: a real message always carries its own report's follow-ups, so a drain now treats a record whose unfiled follow-ups the message
+ * does not carry as a NEWER report's hold and is superseded by it; this fabricated shape keeps the record consistent with itself (the
+ * outage report's follow-up hold comes off), so these tests stay about the admission.
+ */
+const residualOnly = () => {
+  if (fake.objects.has(B_KEY) && record(B_KEY).followUpsPending === true) {
+    const cur = record(B_KEY);
+    delete cur.followUpsMaterialized;
+    setRecord(B_KEY, { ...cur, followUpsPending: false, status: "complete" });
+  }
+  return { ...JSON.parse(fake.queue[0].Body), followUps: [], brief: undefined };
+};
 
 describe("TEAM-6152 F1 — a byte-identical re-establishment keeps the ETag (MD5), so the finalize needs a per-write nonce", () => {
   /**
@@ -910,5 +922,66 @@ describe("TEAM-6164 F1 — the older message in the FIFO group never Dones over 
     expect((await drainMsg(1)).outcome).toBe("applied");
     expect(fake.tickets.get(REVIEW).status).toBe("Done");
     twinsAdmitAdmission(R_KEY);
+  });
+});
+
+// ─── TEAM-6164 F1 sibling: step 6 cleared followUpsPending off the MESSAGE's entries ───
+/**
+ * An older queued message with no follow-ups (a report whose Done 503'd) drained after a newer
+ * report_completion stamped followUpsPending:true (its follow-up refused with a retryable, non-outage
+ * 429, so it was NOT queued and the agent was told to retry) wrote followUpsPending:false and Doned
+ * the ticket with the follow-up unfiled. The record's unfiled set (followUpsMaterialized.failed) is
+ * now what every drain write honours: a message that does not carry it is superseded (TEAM-6158
+ * shape), and on a ticket already Done the hold stays true.
+ */
+describe("TEAM-6164 sibling — a stale message never clears a followUpsPending hold a newer report stamped", () => {
+  const PASS = { summary: "Verdict: PASS. Design reviewed against main and the feature branch, read-only; no blocking findings.\n\nNo tool failures." };
+  const followUpTickets = () => [...fake.tickets.values()].filter((t) => t.parentKey === EPIC_R && /\[fu:[0-9a-f]{8}\]\s*$/.test(t.title));
+  const twinsRefuseRecord = (key) => { for (const twin of TWIN_GUARDS) expect(twin.judgeCompletionRecord(key, fake.objects.get(key), { securityReview: true })).toMatchObject({ proven: false }); };
+  /** PASS queued with no follow-ups; then a re-report whose follow-up 429s (retryable, not queued) stamps the hold. */
+  const staleThenHeld = async () => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503 };
+    expect(await reportReview(PASS)).toMatchObject({ status: "complete", ticketWrites: "queued" });
+    expect(fake.queue).toHaveLength(1);
+    expect(JSON.parse(fake.queue[0].Body).followUps).toEqual([]);
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503, Tickets___create_ticket: "Jira API 429: rate limited" };
+    const held = await reportReview({ ...PASS, follow_ups: call0.arguments.follow_ups });
+    expect(held).toMatchObject({ status: "complete_pending_follow_ups" });
+    expect(fake.queue, "a retryable non-outage refusal is the agent's retry, not a queued message").toHaveLength(1);
+    expect(record(R_KEY)).toMatchObject({ status: "complete_pending_follow_ups", followUpsPending: true, followUpsMaterialized: { failed: [expect.objectContaining({ hash: expect.any(String), retryable: true })] } });
+    expect(followUpTickets()).toHaveLength(0);
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+  };
+
+  it("S1 the older message drains over the newer hold ⇒ superseded (no notice, no stamp), no Done, followUpsPending stays true, twins refuse; the agent's retry files the follow-up and Dones", async () => {
+    await staleThenHeld();
+    const from = fake.calls.length;
+    const out = await drainQueued();
+    expect(out, out.reason).toMatchObject({ outcome: "dropped", superseded: true });
+    expect(out.permanent).toBeUndefined();
+    expect(out.reason).toMatch(/followUpsPending:true for 1 follow-up\(s\) this message does not carry/);
+    expect(transitionsOf(REVIEW, from)).toHaveLength(0);
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    expect(record(R_KEY)).toMatchObject({ followUpsPending: true, status: "complete_pending_follow_ups" });
+    expect(record(R_KEY).ticketWrites).not.toBe("applied");
+    expect(record(R_KEY).replayDropped).toBeUndefined();
+    expect(fake.calls.slice(from).filter((c) => c.tool === "Tickets___add_comment" && /replay-dropped/.test(String(c.params.comment)))).toHaveLength(0);
+    expect(followUpTickets(), "the drain filed nothing it could not name").toHaveLength(0);
+    twinsRefuseRecord(R_KEY);
+    // The hold's own report_completion retry files the follow-up and closes the ticket.
+    expect(await reportReview({ ...PASS, follow_ups: call0.arguments.follow_ups })).toMatchObject({ status: "complete" });
+    expect(followUpTickets()).toHaveLength(1);
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    expect(record(R_KEY)).toMatchObject({ followUpsPending: false, status: "complete" });
+  });
+
+  it("S2 the ticket is already Done when the older message drains ⇒ applied, but the newer hold stays followUpsPending:true for the human who files it", async () => {
+    await staleThenHeld();
+    fake.tickets.get(REVIEW).status = "Done";
+    const out = await drainQueued();
+    expect(out, out.reason).toMatchObject({ outcome: "applied" });
+    expect(record(R_KEY)).toMatchObject({ ticketWrites: "applied", followUpsPending: true, status: "complete_pending_follow_ups" });
+    expect(followUpTickets()).toHaveLength(0);
   });
 });

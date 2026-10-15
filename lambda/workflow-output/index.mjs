@@ -851,6 +851,29 @@ export function reMarkableAdmission(record, amendment = null) {
  *
  *   { source: "record" | "message", verdict, amendmentTicketId }   or null
  */
+/**
+ * TEAM-6164 (F1 sibling, same message-vs-record class): the follow-ups the RECORD says are
+ * still unfiled (`followUpsMaterialized.failed`, stamped by the newest report_completion or
+ * drain write) that THIS message neither carries nor resolved. Step 6 wrote
+ * `followUpsPending:false` off the message's own entries alone, so an OLDER queued message
+ * with no follow-ups (a report whose Done 503'd) drained after a NEWER report stamped
+ * `followUpsPending:true` cleared that hold and Doned the ticket with the follow-up unfiled -
+ * the record cannot re-file them for it (its outcome rows carry no hash, owner or detail),
+ * so the message does not own the hold: it is superseded, and whoever stamped the hold (the
+ * agent's retry, or that report's own queued message) files them and closes the ticket.
+ * A record holding `followUpsPending:true` with no per-entry breakdown (nothing writes one
+ * today) is unresolved too - fail closed on a hold nobody can name. `[]` when the record
+ * states no hold.
+ */
+export function unresolvedRecordFollowUps(record, materialized, entries = []) {
+  if (record?.followUpsPending !== true) return [];
+  const failed = record.followUpsMaterialized?.failed;
+  if (!Array.isArray(failed)) return [{ hash: null, reason: "followUpsPending:true with no followUpsMaterialized breakdown" }];
+  const own = new Set(entries.map((e) => e?.hash).filter(Boolean));
+  const resolved = new Set([...(materialized?.created || []), ...(materialized?.skipped || []), ...(materialized?.rerouted || [])].map((r) => r?.hash).filter(Boolean));
+  return failed.filter((f) => f && typeof f.hash === "string" && !own.has(f.hash) && !resolved.has(f.hash));
+}
+
 export function drainAdmission(record, msg) {
   const sr = record?.securityReview;
   const own = sr && typeof sr === "object" && asText(sr.verdict) && String(sr.verdict).toUpperCase() !== "PASS" ? sr : null;
@@ -2592,6 +2615,10 @@ export async function drainCompletion(msg) {
       await postUnfiledNotices({ failed: materialized.failed, entries, ticketId, epicKey, sourcePayload: read.payload, priorPosted: prior.posted });
     }
   }
+  // TEAM-6164 (F1 sibling): the record's unfiled follow-ups this message does not carry. They
+  // keep `followUpsPending:true` on every write below, and a message with no hold of its own
+  // is superseded before step 6 (it cannot file them and must not Done over them).
+  const unresolved = unresolvedRecordFollowUps(rec.record, materialized, entries);
   // What holds the ticket open (the Done is withheld and the message is a surfaced
   // drop), decided after steps 4-5 so the brief and residual findings still land.
   const holds = [];
@@ -2693,7 +2720,8 @@ export async function drainCompletion(msg) {
     // Round 5 P2: the hold stamps what the follow-ups really are now, so a brief-only
     // hold (every follow-up filed) does not leave the twins' Done guard refusing the
     // human who places the brief and closes the ticket.
-    const stillUnfiled = materialized.failed.length > 0;
+    // TEAM-6164: or what the record says is unfiled and this message did not resolve.
+    const stillUnfiled = materialized.failed.length > 0 || unresolved.length > 0;
     return drop(holds.map((h) => h.step).join("+"), holds.map((h) => h.error).join("; "), {
       epicKey,
       record: {
@@ -2721,11 +2749,25 @@ export async function drainCompletion(msg) {
   const admission = drainAdmission(rec.record, msg);
   const residualAmendment = admission?.amendmentTicketId ?? null;
 
+  // TEAM-6164 (F1 sibling): a record whose NEWER report stamped follow-ups this message does
+  // not carry is not this message's to Done - the TEAM-6158 superseded shape: no notice, no
+  // drop stamp, no alarm (the probe deletes a `dropped` message); the brief and residual
+  // posts above are marker-deduped. The hold's own report_completion retry, or its queued
+  // message behind this one in the FIFO group, files them and closes the ticket.
+  if (unresolved.length > 0 && !alreadyDone) {
+    const reason = `superseded: ${reportKey} holds followUpsPending:true for ${unresolved.length} follow-up(s) this message does not carry (${unresolved.map((f) => f.hash || f.reason).join(", ")}) - stamped by a newer report_completion; nothing written, no Done; that report's retry or its own queued message files them and closes ${ticketId}`;
+    console.warn(`[ticket-replay] ${ticketId}: SUPERSEDED - ${reason}`);
+    return { outcome: "dropped", superseded: true, reason };
+  }
+
   // 6. The record, BEFORE the Done: every retryable follow-up is filed now, and the
   //    twins' Done guard refuses a record that still says followUpsPending:true.
+  //    TEAM-6164: on a ticket already Done, a hold a newer report stamped for follow-ups
+  //    this message does not carry stays true (a human, or that report's retry, files them).
   let record = rec.record;
   if (record) {
-    Object.assign(record, { status: "complete", followUpsPending: false, ticketWrites: "queued" });
+    const stillPending = unresolved.length > 0;
+    Object.assign(record, { status: stillPending ? STATUS_PENDING_FOLLOW_UPS : "complete", followUpsPending: stillPending, ticketWrites: "queued" });
     if (entries.length > 0) record.followUpsMaterialized = materialized;
     // TEAM-6124: merged onto the record's own list, as drop() does.
     const merged = mergeUndelivered(record.undelivered, undelivered, delivered);
