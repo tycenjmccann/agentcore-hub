@@ -39,6 +39,7 @@ import type { DeferredPhase, TicketPlan, TicketPlanItem } from "@/lib/workflow/i
 import { loadRoster } from "@/lib/workflow/roster-loader";
 import { deliveryModeFor, loadCdRegistry } from "@/lib/cd-registry";
 import { clientTokenParam } from "@/lib/workflow/client-token";
+import { provesTransitioned } from "@/lib/workflow/ticket-transition-refusal";
 import { loadModelsRegistry } from "@/lib/models-registry";
 import { validateModelOverride } from "@/lib/models/validate-model-override";
 
@@ -934,14 +935,15 @@ async function startWithDynamoDB(body: WorkflowInput, def: WorkflowDef, presetWo
         ticket_id: epicId,
         transition_id: "done",
       });
-      // Success shape is { status: "transitioned", ... }; failures come back as
-      // { error } or a textResult { content: [{ text: "Invalid transition ..." }] }.
-      if (cancelResult.status !== "transitioned") {
-        const detail =
-          cancelResult.error ||
-          (cancelResult.content as Array<{ text?: string }> | undefined)?.[0]?.text ||
-          JSON.stringify(cancelResult);
-        throw new Error(String(detail));
+      // TEAM-6138: the tickets twin's success is { key, status: "transitioned", to };
+      // the Jira twin's is { ticketId, status: <landed status>, requested,
+      // matchedTransition } — its `status` is never the literal "transitioned", so a
+      // bare `!== "transitioned"` check misreads a real Jira success as a failure.
+      // provesTransitioned recognizes both shapes; failures come back as { error } or
+      // a textResult { content: [{ text: "Invalid transition ..." }] }.
+      if (!provesTransitioned(cancelResult, "done", epicId)) {
+        const detail = toolFailureDetail(cancelResult);
+        throw new Error(detail);
       }
       console.log(`[start] orphan epic ${epicId} cancelled via terminal transition (dedup fence loss cleanup)`);
     } catch (cleanupErr) {
@@ -1199,8 +1201,12 @@ function toolFailureDetail(res: Record<string, unknown>): string {
  *      trigger. It must come second because `transition_ticket`'s own blocked_by
  *      is additive, so it can never clear the list.
  * `transition_ticket` reports an invalid transition as a textResult, not
- * `{error}`, so both results are checked on their success `status` — otherwise a
- * failed unblock would leave item 0 blocked forever with nothing in the log.
+ * `{error}`, so both results are checked on success — `edit_issue` on its
+ * `status`, and `unblock` with provesTransitioned against its landed status
+ * ("todo") — TEAM-6138: the Jira twin's unblock success is `{ticketId,
+ * status:"todo", requested, matchedTransition}`, never the literal
+ * "transitioned", so a bare equality check misreads it as a failure — otherwise
+ * a failed unblock would leave item 0 blocked forever with nothing in the log.
  */
 async function releaseSentinelBlocker(ticketId: string, workflowId: string): Promise<void> {
   const cleared = await invokeTicketLambda("Tickets___edit_issue", {
@@ -1214,7 +1220,7 @@ async function releaseSentinelBlocker(ticketId: string, workflowId: string): Pro
     ticket_id: ticketId,
     transition_id: "unblock",
   });
-  if (moved.status !== "transitioned") {
+  if (!provesTransitioned(moved, "todo", ticketId)) {
     throw new Error(`Failed to unblock ${ticketId} after clearing the sentinel: ${toolFailureDetail(moved)}`);
   }
   console.log(`[start] ${workflowId}: sentinel released on ${ticketId} — blockers cleared, unblocked → todo.`);

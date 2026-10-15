@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { ticketsSuccess } from "@/lib/workflow/__fixtures__/ticket-transition-success";
 
 /**
  * TEAM-4453 D1 — the start route executing a hub-materialized ticket plan.
@@ -93,12 +94,19 @@ vi.mock("@aws-sdk/client-lambda", () => {
         return { Payload: new TextEncoder().encode(JSON.stringify(override)) };
       }
       // Default success shapes, mirroring the tickets Lambda's own contracts.
+      // TEAM-6138: the transition default is the REAL tickets-twin success shape
+      // ({key, status:"transitioned", to}), not the bare {status:"transitioned"}
+      // this used to answer — a shape neither Lambda returns, and not proof under
+      // provesTransitioned.
       const result =
         payload.tool_name === "Tickets___create_ticket"
           ? { key: `TEAM-${h.state.nextKey++}`, status: "created" }
           : payload.tool_name === "Tickets___edit_issue"
             ? { key: payload.parameters.ticket_id, status: "updated" }
-            : { status: "transitioned" };
+            : ticketsSuccess(
+                payload.parameters.ticket_id as string,
+                payload.parameters.transition_id === "unblock" ? "todo" : (payload.parameters.transition_id as string)
+              );
       return { Payload: new TextEncoder().encode(JSON.stringify(result)) };
     }
   }
@@ -362,6 +370,38 @@ describe("DynamoDB: the operator skeleton is written in plan order and released 
     expect((await res.json()).error).toContain(
       "Failed to clear the sentinel blocker on TEAM-101: ticket not found"
     );
+    error.mockRestore();
+  });
+
+  it("TEAM-6138: TICKET_TOOLS_LAMBDA pointed at the Jira Lambda — a Jira-shaped unblock success releases the sentinel (200)", async () => {
+    h.state.invokeImpl = (p) =>
+      p.tool_name === "Tickets___transition_ticket" && p.parameters.transition_id === "unblock"
+        ? {
+            // lambda/agentcore-hub-jira/index.mjs:2495 success shape — landed status
+            // "todo" is never the literal "transitioned".
+            ticketId: p.parameters.ticket_id,
+            status: "todo",
+            message: "Transitioned to todo",
+            requested: "todo",
+            matchedTransition: { id: "11", name: "Unblock", to: "To Do" },
+          }
+        : undefined;
+    await load("dynamodb");
+    const res = await post(OPERATOR_BODY);
+    expect(res.status).toBe(200);
+    expect((await res.json()).materialized).toEqual(["TEAM-101", "TEAM-102", "TEAM-103"]);
+  });
+
+  it("a bare {status:'transitioned'} unblock answer (a shape neither Lambda returns) is still a failure", async () => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    h.state.invokeImpl = (p) =>
+      p.tool_name === "Tickets___transition_ticket" && p.parameters.transition_id === "unblock"
+        ? { status: "transitioned" }
+        : undefined;
+    await load("dynamodb");
+    const res = await post(OPERATOR_BODY);
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toContain("Failed to unblock TEAM-101 after clearing the sentinel");
     error.mockRestore();
   });
 });

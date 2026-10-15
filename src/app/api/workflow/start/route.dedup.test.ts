@@ -56,6 +56,11 @@ const h = vi.hoisted(() => {
     epicSeq: 0,
     jiraDeleted: [] as string[],
     failJiraDeleteOnce: false,
+    // TEAM-6138: when set, a successful "done"/"unblock" transition answers in the
+    // Jira Lambda's success shape ({ticketId, status:<landed>, requested,
+    // matchedTransition}) instead of the tickets twin's ({key, status:"transitioned",
+    // to}) — models TICKET_TOOLS_LAMBDA pointed at the Jira Lambda.
+    jiraShapedTransitionSuccess: false,
   };
 });
 
@@ -175,7 +180,22 @@ vi.mock("@aws-sdk/client-lambda", () => {
         } else {
           const row = h.tickets.get(p.ticket_id);
           if (row) row.status = p.transition_id;
-          result = { key: p.ticket_id, status: "transitioned", to: p.transition_id };
+          if (h.jiraShapedTransitionSuccess) {
+            // TEAM-6138: the Jira twin's real success shape — `status` is the
+            // landed internal status, never the literal "transitioned".
+            const landed = p.transition_id === "unblock" ? "todo" : p.transition_id;
+            const jiraName = p.transition_id === "unblock" ? "Unblock" : "Done";
+            const jiraTo = p.transition_id === "unblock" ? "To Do" : "Done";
+            result = {
+              ticketId: p.ticket_id,
+              status: landed,
+              message: `Transitioned to ${landed}`,
+              requested: landed,
+              matchedTransition: { id: "31", name: jiraName, to: jiraTo },
+            };
+          } else {
+            result = { key: p.ticket_id, status: "transitioned", to: p.transition_id };
+          }
         }
       } else if (call.tool_name === "Tickets___add_comment") {
         if (h.failAddCommentOnce) {
@@ -274,6 +294,7 @@ beforeEach(async () => {
   h.epicSeq = 0;
   h.jiraDeleted.length = 0;
   h.failJiraDeleteOnce = false;
+  h.jiraShapedTransitionSuccess = false;
   process.env.TICKET_PROVIDER = "dynamodb";
   vi.resetModules();
   ({ POST } = await import("./route"));
@@ -687,6 +708,27 @@ describe("POST /api/workflow/start — orphan-epic cleanup on fence loss (TEAM-3
     const loserEpic = epicKeys().find((k) => k !== bBody.epicId)!;
     expect(h.tickets.get(loserEpic)?.status).not.toBe("done");
     errSpy.mockRestore();
+  });
+
+  it("TEAM-6138: TICKET_TOOLS_LAMBDA pointed at the Jira Lambda — a Jira-shaped done success is recognized, not logged as a cleanup failure", async () => {
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    h.jiraShapedTransitionSuccess = true;
+    const { aRes, aBody, bBody } = await raceOverlap(post);
+
+    expect(aRes.status).toBe(200);
+    expect(aBody).toMatchObject({ workflowId: bBody.workflowId, deduplicated: true });
+
+    const loserEpic = epicKeys().find((k) => k !== bBody.epicId)!;
+    expect(h.tickets.get(loserEpic)?.status).toBe("done");
+    expect(liveEpicKeys()).toEqual([bBody.epicId]);
+
+    // The real success was recognized — no manual-cleanup error — and the
+    // "cancelled" success log fired.
+    expect(errSpy).not.toHaveBeenCalledWith(expect.stringContaining("FAILED to cancel orphan epic"));
+    expect(logSpy).toHaveBeenCalledWith(expect.stringContaining("cancelled via terminal transition"));
+    errSpy.mockRestore();
+    logSpy.mockRestore();
   });
 
   describe("jira backend", () => {
