@@ -137,6 +137,6 @@ describe("skills/setup/SKILL.md keys the Jira-first order off the persisted .env
     const step = section(skill, /^## Deploy target step/m);
     const flagAt = step.indexOf(FLAG);
     const after = step.slice(flagAt);
-    expect(after).toMatch(/setup-jira-webhook\.sh.*fails.*stop/is);
+    expect(after).toMatch(/setup-jira-webhook\.sh[\s\S]*fails[\s\S]*stop/i);
   });
 });
