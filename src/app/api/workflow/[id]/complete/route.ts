@@ -43,13 +43,17 @@ import { getTicketsForWorkflowFromDynamo } from "@/lib/workflow/dynamo-read";
 import { getTicketsForWorkflowFromJira } from "@/lib/workflow/jira-read";
 import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
-import { applyFramework, resolveFramework, type WorkflowDef } from "@/lib/workflow/workflow-defs";
+import { applyFramework, type WorkflowDef } from "@/lib/workflow/workflow-defs";
 import { effectiveDefFor } from "@/lib/workflow/intake-materialize";
 import { loadRoster } from "@/lib/workflow/roster-loader";
 import { deliveryModeFor, loadCdRegistry } from "@/lib/cd-registry";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
 import { resolveMissingEvidenceFromRecords } from "@/lib/workflow/completion-evidence";
 import { followUpPrGateConfigured, openFollowUpPrsAtCompletion } from "@/lib/workflow/follow-up-pr-gate";
+// TEAM-6136 F6: the orchestrator's OWN framework selector (pure, no imports) —
+// imported directly, as follow-up-pr-gate.ts imports completion.mjs, so there is
+// one implementation of "which SDLC framework does this run follow".
+import { frameworkOfWorkflow } from "../../../../../../lambda/orchestrator/artifact-chain.mjs";
 import agentsConfig from "@/config/agents.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -118,12 +122,18 @@ function livePhaseMap(): () => Promise<PhaseById> {
  * only when the def has a ship phase/gate to strip — stripping is a no-op
  * otherwise, and the TEAM-3976 happy path contractually makes zero S3 reads.
  * Null when the def id is unknown (callers treat that as "nothing required").
+ *
+ * TEAM-6136 F6 — the framework itself is chosen by the orchestrator's exported
+ * frameworkOfWorkflow (artifact-chain.mjs: `row.sdlcFramework || input.sdlcFramework`,
+ * then resolveFramework), NOT a hand-mirror: the mirror used `??`, so an
+ * empty-string row stamp was rejected by resolveFramework here while the
+ * orchestrator fell through to the request's overlay — two verdicts for one run.
+ * The row's `input` is the same plain object on both sides (Document client).
  */
 async function resolveEffectiveWorkflowDef(workflow: Record<string, unknown>): Promise<WorkflowDef | null> {
   const def = await resolveWorkflowDef(String(workflow.workflowDefId || ""));
   if (!def) return null;
-  const input = workflow.input as { sdlcFramework?: unknown } | undefined;
-  const framed = applyFramework(def, resolveFramework(def, workflow.sdlcFramework ?? input?.sdlcFramework));
+  const framed = applyFramework(def, frameworkOfWorkflow(def, workflow));
   const touchesShip =
     (framed.completionRequiresAgentPhases || []).some((p) => SHIP_PHASES.has(p)) ||
     (framed.reviewGates || []).some((g) => SHIP_PHASES.has(g?.afterPhase));

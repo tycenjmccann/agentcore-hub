@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { readFileSync } from "node:fs";
 
 /**
  * TEAM-3619 D4a — the completion guard on POST /api/workflow/[id]/complete.
@@ -1119,6 +1120,102 @@ describe("POST complete — open follow-up PR gate (TEAM-6136 / TEAM-6187)", () 
     const res = await post();
     expect(res.status).toBe(200);
     expect((await res.json()).status).toBe("complete");
+  });
+
+  /**
+   * TEAM-6136 F6 — the route picks the run's SDLC framework with the
+   * orchestrator's OWN selector (artifact-chain.mjs frameworkOfWorkflow:
+   * `row.sdlcFramework || input.sdlcFramework`, then resolveFramework), not a
+   * hand-mirror. The hand-mirror used `??`, so an EMPTY-STRING row stamp was fed
+   * to resolveFramework (rejected → the def's own framework) where the
+   * orchestrator falls through to the request's overlay. With an overlay that
+   * drops the ship requirement, the orchestrator saw no ship phase and completed
+   * while this route kept ship, ran the gate, proved the branch unmerged and
+   * answered 409 unmerged_branch — two verdicts for one run.
+   */
+  describe("framework selection is the orchestrator's frameworkOfWorkflow (TEAM-6136 F6)", () => {
+    /** Base def owes ship; the "playbook" overlay (selected by input.sdlcFramework) owes development only. */
+    const DEF_WITH_OVERLAY = {
+      completionRequiresAgentPhases: ["ship"],
+      frameworks: { playbook: { label: "Playbook", completionRequiresAgentPhases: ["development"] } },
+    };
+    /** GitHub proves feature/x is NOT merged — the F1-d routes — so a ship-owing def refuses. */
+    const UNMERGED_ROUTES: GhRoute[] = [
+      ["/pulls?head=", 200, []],
+      ["/compare/", 200, { status: "ahead", ahead_by: 3 }],
+      ["/pulls/77", 200, openPr],
+    ];
+    const rowWith = (stamp: unknown, input: Record<string, unknown> | undefined = { sdlcFramework: "playbook" }) => {
+      const wf = workflow() as Record<string, unknown>;
+      if (stamp === undefined) delete wf.sdlcFramework;
+      else wf.sdlcFramework = stamp;
+      if (input) wf.input = input;
+      return wf;
+    };
+
+    beforeEach(() => {
+      h.state.def = DEF_WITH_OVERLAY;
+      githubRoutes(UNMERGED_ROUTES);
+    });
+
+    const expectOverlayApplied = async () => {
+      const res = await post();
+      expect(res.status).toBe(200);
+      expect((await res.json()).status).toBe("complete");
+      expect(fetchMock).not.toHaveBeenCalled(); // no ship phase → the gate never runs
+      expect(h.state.updates.length).toBe(1);
+    };
+
+    it("codex repro: EMPTY-STRING stamp + input playbook → overlay applies (orchestrator's `||`) → 200 complete, not 409 unmerged_branch", async () => {
+      // On the pre-fix route (`??`) the "" stamp reached resolveFramework, which
+      // rejected it → def's own "standard" → ship owed → gate → 409 unmerged_branch.
+      h.state.workflow = rowWith("");
+      await load();
+      const res = await post();
+      const body = await res.json();
+      expect({ status: res.status, error: body.error }).toEqual({ status: 200, error: undefined });
+      expect(body.status).toBe("complete");
+      expect(fetchMock).not.toHaveBeenCalled(); // no ship phase → the gate never runs
+      expect(h.state.updates.length).toBe(1);
+    });
+
+    it("ABSENT stamp + input playbook → overlay applies → 200 complete", async () => {
+      h.state.workflow = rowWith(undefined);
+      await load();
+      await expectOverlayApplied();
+    });
+
+    it("NULL stamp + input playbook → overlay applies → 200 complete", async () => {
+      h.state.workflow = rowWith(null);
+      await load();
+      await expectOverlayApplied();
+    });
+
+    it("NON-EMPTY stamp wins over input: \"standard\" + input playbook → ship owed → 409 unmerged_branch, no write", async () => {
+      h.state.workflow = rowWith("standard");
+      await load();
+      const res = await post();
+      expect(res.status).toBe(409);
+      const body = await res.json();
+      expect(body.error).toBe("unmerged_branch");
+      expect(body.featureBranch).toBe("feature/x");
+      expect(h.state.updates).toEqual([]);
+    });
+
+    it("NON-EMPTY stamp alone selects the overlay: \"playbook\" with no input → 200 complete", async () => {
+      h.state.workflow = rowWith("playbook", undefined);
+      await load();
+      await expectOverlayApplied();
+    });
+
+    // Parity pin (same discipline as SdlcBadge.presence / terminal-outcome-surfaces):
+    // the selection is the orchestrator's export, never re-inlined. The selector's
+    // own truth table lives in lambda/orchestrator/artifact-chain.test.mjs.
+    it("route.ts calls the orchestrator's frameworkOfWorkflow and no longer inlines `sdlcFramework ??`", () => {
+      const src = readFileSync(new URL("./route.ts", import.meta.url), "utf8");
+      expect(src).toContain("frameworkOfWorkflow(def, workflow)");
+      expect(src).not.toContain("sdlcFramework ??");
+    });
   });
 });
 
