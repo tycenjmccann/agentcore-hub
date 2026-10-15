@@ -625,7 +625,10 @@ describe("TEAM-6152 sibling — a stale residual replay acts only on the admissi
   const roundTwo = async () => {
     await withResidual();
     seedTicket({ ticketId: AMEND_B2, title: "Amend design: db9sx9 (round 2)", status: "Done", assignee: "agentcore_hub_backend_designer", parentKey: EPIC });
-    patchRecord(B_KEY, { securityReview: { verdict: "FAIL", amendmentTicketId: AMEND_B2 } });
+    // TEAM-6217 (R3-03): a pre-`residual` record under a FAIL stamp must be able to state its findings
+    // (legacyResidualOf: its summary's verdict line is the stamp's) or step 5 holds the Done as a surfaced
+    // drop before the admission logic these tests exercise. The operator fixture's summary names no verdict.
+    patchRecord(B_KEY, { securityReview: { verdict: "FAIL", amendmentTicketId: AMEND_B2 }, summary: "Verdict: FAIL (changes needed). R1: rotate the probe role key.\n\nNo tool failures." });
   };
 
   it("T15 the record's (newer) amendment reopened while the message's is Done ⇒ the replay confirms the RECORD's amendment, drops, and marks that stamp provisional; no Done", async () => {
@@ -998,18 +1001,74 @@ describe("TEAM-6164 F1 — the older message in the FIFO group never Dones over 
     twinsAdmitAdmission(R_KEY);
   });
 
-  it("TEAM-6205 R2-03e a record written before `residual` existed (no text) under its FAIL admission ⇒ the older PASS message still Dones, posts nothing stale, and records the dev lanes as undelivered residual_findings", async () => {
+  it("TEAM-6205 R2-03e / TEAM-6217 R3-03: a record written before `residual` existed under its FAIL admission ⇒ the older PASS message delivers the findings REBUILT from the record's own summary to both dev lanes before the Done; nothing is recorded undelivered", async () => {
     await queueTwoFindingsUnposted(["PASS", "FAIL"]);
     const cur = record(R_KEY);
     delete cur.residual;
     setRecord(R_KEY, cur);
+    let atDone = null;
+    fake.onTransition = (t) => { if (t.ticketId === REVIEW) atDone = [residualComments(DEV1).length, residualComments(DEV2).length]; };
     const out = await drainMsg(0);
     expect(out, out.reason).toMatchObject({ outcome: "applied" });
     expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    expect(atDone, "the rebuilt findings were on both dev lanes when the Done was made").toEqual([1, 1]);
+    expect(residualComments(DEV1)[0]).toContain("verdict FAIL");
+    expect(residualComments(DEV1)[0]).toContain(reviewCompletion.summary.split("\n")[0]);
+    expect((record(R_KEY).undelivered || []).filter((u) => u.part === "residual_findings"), "nothing recorded undelivered").toEqual([]);
+    expect(record(R_KEY).residual, "the drain never writes `residual`").toBeUndefined();
+    twinsAdmitAdmission(R_KEY);
+  });
+
+  // ─── TEAM-6217 R3-03 (ship review round 3 on #970) - red on f4ef506: R2-03e asserted the wrong behaviour ───
+  // For a current FAIL admission on a pre-`residual` record, currentResidual returns missingText;
+  // the drain records the dev lanes undelivered and Dones, then the FAIL message behind it is dropped
+  // "already applied" - the findings never reach DEV1/DEV2 although the record still holds the
+  // original summary and artifacts (report.summary / report.artifacts) they can be rebuilt from
+  // (legacyResidualOf, valid when the summary's verdict line is the stamp's). When they cannot be,
+  // an open ticket is a surfaced drop at step 5 - never a Done with zero findings (R3-03b).
+  it("TEAM-6217 R3-03 a pre-`residual` record under its FAIL admission: by the time the review is Done, the FAIL findings are on both dev lanes (rebuilt from the record, or delivered by the FAIL message) - never Done with zero findings", async () => {
+    await queueTwoFindingsUnposted(["PASS", "FAIL"]);
+    const cur = record(R_KEY);
+    delete cur.residual;
+    setRecord(R_KEY, cur);
+    expect(record(R_KEY)).toMatchObject({ summary: reviewCompletion.summary, securityReview: { verdict: "FAIL", amendmentTicketId: AMEND } });
+    let atDone = null;
+    fake.onTransition = (t) => { if (t.ticketId === REVIEW) atDone = [residualComments(DEV1).length, residualComments(DEV2).length]; };
+    const first = await drainMsg(0);
+    const second = await drainMsg(1);
+    expect(first, first.reason).toMatchObject({ outcome: "applied" });
+    expect(second).toMatchObject({ outcome: "dropped", reason: "already applied" });
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    expect(atDone, "the findings were on both dev lanes when the Done was made").toEqual([1, 1]);
+    expect(residualComments(DEV1)).toHaveLength(1);
+    expect(residualComments(DEV2)).toHaveLength(1);
+    expect(residualComments(DEV1)[0]).toContain("verdict FAIL");
+    twinsAdmitAdmission(R_KEY);
+  });
+
+  it("TEAM-6217 R3-03b a pre-`residual` record whose summary does NOT state its FAIL verdict (a same-session resubmit kept the PASS text) ⇒ the older PASS message is a surfaced drop at step 5 (no Done, nothing posted); the FAIL's own message delivers and Dones", async () => {
+    await queueTwoFindingsUnposted(["PASS", "FAIL"]);
+    const cur = record(R_KEY);
+    delete cur.residual;
+    cur.summary = PASS.summary;
+    setRecord(R_KEY, cur);
+    const from = fake.calls.length;
+    const first = await drainMsg(0);
+    expect(first, first.reason).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(first.reason).toMatch(/^residual_findings: .*carries no residual text for its FAIL admission on TEAM-5399/);
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    expect(transitionsOf(REVIEW, from)).toHaveLength(0);
     expect(residualComments(DEV1)).toHaveLength(0);
-    const undelivered = (record(R_KEY).undelivered || []).filter((u) => u.part === "residual_findings");
-    expect(undelivered.map((u) => u.ticketId).sort()).toEqual([DEV1, DEV2]);
-    for (const u of undelivered) expect(u.reason).toMatch(/no residual text/);
+    expect(record(R_KEY)).toMatchObject({ ticketWrites: "dropped", replayDropped: { step: "residual_findings" } });
+    expect(fake.tickets.get(REVIEW).comments.some((c) => c.startsWith(`[replay-dropped:${REVIEW}:residual_findings]`)), "the drop is said on the ticket").toBe(true);
+    let atDone = null;
+    fake.onTransition = (t) => { if (t.ticketId === REVIEW) atDone = [residualComments(DEV1).length, residualComments(DEV2).length]; };
+    const second = await drainMsg(1);
+    expect(second, second.reason).toMatchObject({ outcome: "applied" });
+    expect(atDone, "the FAIL message's own findings were on both dev lanes when the Done was made").toEqual([1, 1]);
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    expect(record(R_KEY)).toMatchObject({ ticketWrites: "applied", securityReview: { verdict: "FAIL", amendmentTicketId: AMEND } });
+    twinsAdmitAdmission(R_KEY);
   });
 });
 
@@ -1157,5 +1216,68 @@ describe("TEAM-6205 R2-01 / R2-05 — a drain write carries the record's unresol
     expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
     expect(record(R_KEY)).toMatchObject({ followUpsPending: true, followUpsMaterialized: { failed: [] } });
     twinsRefuseRecord(R_KEY);
+  });
+
+  // ─── TEAM-6217 R3-02 (ship review round 3 on #970) - red on f4ef506: a malformed breakdown row vanished from the persisted breakdown ───
+  // unresolvedRecordFollowUps makes a sentinel for a row with no hash (R2-05), but mergeRecordFollowUps
+  // keeps only record rows with a non-empty string hash, so the malformed obligation is dropped from
+  // the breakdown drop()/step 6 persist. Once the only well-formed row (A) is filed on redelivery the
+  // record says failed:[] / [A-created] and the hold clears. Now a hash-less failed row is persisted as a durable
+  // unresolved marker ({ hash:null, unresolved:true, retryable:false, reason, raw }) - its lifecycle, one test per
+  // row: WRITER (a), READER (b), DELETE (c: only a report_completion re-run rewrites the breakdown), ORDERING (d).
+  /** failed=[null, A] on the record (a malformed row beside A); the queued message carries A; A's create is a permanent 400 ⇒ drop(). */
+  const dropWithMalformedRow = async () => {
+    await olderQueuedNewerHeld();
+    const cur = record(R_KEY);
+    const rowA = cur.followUpsMaterialized.failed.find((f) => f.hash === hashOf(FU_A));
+    patchRecord(R_KEY, { followUpsMaterialized: { ...cur.followUpsMaterialized, failed: [null, rowA] } });
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY), Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    const dropped = await drainQueued();
+    expect(dropped, dropped.reason).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(record(R_KEY).followUpsPending).toBe(true);
+  };
+  const markers = () => (record(R_KEY).followUpsMaterialized?.failed || []).filter((f) => f?.unresolved === true);
+
+  it("TEAM-6217 R3-02a (WRITER) failed=[null, A] ⇒ drop() persists the malformed obligation as a durable unresolved marker beside A, never failed=[A] alone", async () => {
+    await dropWithMalformedRow();
+    const failed = record(R_KEY).followUpsMaterialized.failed;
+    expect(failed.length, "the malformed row survives the drop stamp as a marker").toBe(2);
+    expect(failedHashes()).toContain(hashOf(FU_A));
+    expect(markers()).toEqual([{ hash: null, unresolved: true, retryable: false, reason: expect.stringMatching(/^followUpsMaterialized\.failed\[0\] has no hash/), raw: "null" }]);
+  });
+
+  it("TEAM-6217 R3-02b (READER) after that drop, redelivery files A ⇒ the unknown obligation still holds: no applied, no Done, followUpsPending:true, twins refuse", async () => {
+    await dropWithMalformedRow();
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+    const out = await drainQueued();
+    expect(followUpTickets(), "A was filed").toHaveLength(1);
+    expect(record(R_KEY).followUpsPending, "the unknown obligation still holds the ticket").toBe(true);
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    expect(out).toMatchObject({ outcome: "dropped", superseded: true });
+    expect(out.reason).toMatch(/has no hash - an obligation nobody can name/);
+    expect(markers(), "the marker rides through the redelivery").toHaveLength(1);
+    twinsRefuseRecord(R_KEY);
+  });
+
+  it("TEAM-6217 R3-02c (DELETE) only the record's author clears a marker: a report_completion re-run with the full follow_ups list rewrites the breakdown, files A and B, and Dones; nothing throws on the marker", async () => {
+    await dropWithMalformedRow();
+    expect(markers()).toHaveLength(1);
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+    expect(await reportReview({ ...PASS, follow_ups: JSON.stringify([FU_A, FU_B]) })).toMatchObject({ status: "complete" });
+    expect(followUpTickets()).toHaveLength(2);
+    expect(markers(), "the re-run's own materialization replaced the breakdown").toEqual([]);
+    expect(record(R_KEY)).toMatchObject({ followUpsPending: false, status: "complete" });
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    for (const twin of TWIN_GUARDS) expect(twin.judgeCompletionRecord(R_KEY, fake.objects.get(R_KEY), { securityReview: true })).toMatchObject({ proven: true });
+  });
+
+  it("TEAM-6217 R3-02d (ORDERING) a marker rides verbatim through every later drain write: a second drop over the same record leaves exactly one marker", async () => {
+    await dropWithMalformedRow();
+    const before = markers();
+    const again = await drainQueued();
+    expect(again, again.reason).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(markers(), "no growth, no re-wrapping").toEqual(before);
+    expect(record(R_KEY).followUpsMaterialized.failed).toHaveLength(2);
+    expect(record(R_KEY).followUpsPending).toBe(true);
   });
 });

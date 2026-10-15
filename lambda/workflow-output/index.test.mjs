@@ -4280,6 +4280,32 @@ describe("report_completion — FR-10 empty_sweep", () => {
     }
   });
 
+  it("TEAM-6217 (R3-01 sibling sweep): a sibling whose QUEUED record still owes its merge brief (evidence_keys names it, no outcome recorded) is NOT skipped - same hold without the stamp (queuedBriefOwed); a queued record naming no brief, or one whose brief was delivered, still skips", async () => {
+    const QUEUED = "completions/TEAM-4645.json";
+    const owed = JSON.stringify({ ticket_id: "TEAM-4645", status: "complete", ticketWrites: "queued", evidence_keys: "workflows/wf_1/shared/plan.md,workflows/wf_1/shared/merge-brief.md" });
+    h.objects.set(QUEUED, owed);
+    h.etags.set(QUEUED, '"queued-4645"');
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    expect(h.puts.filter((p) => p.Key === QUEUED)).toHaveLength(0);
+    expect(calls("Tickets___transition_ticket").map((p) => p.ticket_id)).not.toContain("TEAM-4645");
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4644", "TEAM-4643"]);
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4645", reason: expect.stringContaining('ticketWrites:"queued" with its merge brief workflows/wf_1/shared/merge-brief.md') }]);
+    expect(h.objects.get(QUEUED)).toBe(owed);
+    // No false positive: a queued record with no merge brief among its keys, and one whose brief is recorded delivered, skip as before.
+    for (const rec of [
+      { ticket_id: "TEAM-4645", status: "complete", ticketWrites: "queued", evidence_keys: "workflows/wf_1/shared/plan.md" },
+      { ticket_id: "TEAM-4645", status: "complete", ticketWrites: "queued", evidence_keys: "workflows/wf_1/shared/merge-brief.md", briefDelivered: "gate", briefPending: false },
+    ]) {
+      h.puts.length = 0;
+      h.objects.set(QUEUED, JSON.stringify(rec));
+      h.etags.set(QUEUED, `"q-${Math.random()}"`);
+      const again = result(await sweep());
+      expect(again.emptySweepFailed ?? []).toEqual([]);
+      expect(again.emptySweepSkipped).toContain("TEAM-4645");
+    }
+  });
+
   it("TEAM-5941: a sibling whose record carries a FRESH doneIntent (a twin is committing its Done) is NOT skipped - no overwrite, no transition, reported in emptySweepFailed; a STALE one is skipped as before", async () => {
     const FENCED = "completions/TEAM-4645.json";
     const fenced = JSON.stringify({ ticket_id: "TEAM-4645", status: "complete", doneIntent: { at: new Date().toISOString(), provider: "dynamodb", nonce: "n1" } });

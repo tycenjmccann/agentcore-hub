@@ -823,6 +823,14 @@ describe("TEAM-5830 — briefPending survives concurrent writers", () => {
   });
 
   it("2. a hold stamped between the re-run's read and its record write withholds Done", async () => {
+    // TEAM-6217 (R3-01): the re-run now derives the brief obligation from the queued record itself
+    // (queuedBriefOwed) and delivers the brief before its record write. With the gate identifiable it
+    // would put the brief ON the gate (deliveredNow), and TEAM-5830's own rule then says this call's
+    // delivery stands over a hold another writer stamps mid-write - which is correct, but not what this
+    // test is about. Make the gate unidentifiable so the re-run cannot deliver (off_gate), and the hold
+    // stamped between its read and its write is adopted exactly as before. Every assertion below is the
+    // original one.
+    gateUnidentifiable();
     onFirstRecordPut(() => stamp(HOLD));
     const res = await rerun();
     expect(tools("Tickets___transition_ticket")).toHaveLength(0);
@@ -2168,7 +2176,11 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     const body = JSON.parse(fake.queue[0].Body);
     delete body.residual.amendmentTicketId;
     fake.queue[0].Body = JSON.stringify(body);
-    setRecord({ securityReview: { verdict: "FAIL", amendmentTicketId: AMEND } });
+    // TEAM-6217 (R3-03): a pre-`residual` record under a FAIL stamp must be able to state its findings
+    // (legacyResidualOf: its summary's verdict line is the stamp's), or step 5 holds the Done as a
+    // surfaced drop before the amendment re-read this test exercises. The operator fixture's summary
+    // names no verdict, so the stamped record gets a review summary beside its stamp.
+    setRecord({ securityReview: { verdict: "FAIL", amendmentTicketId: AMEND }, summary: "Verdict: FAIL (changes needed). R1: rotate the probe role key.\n\nNo tool failures." });
     fake.tickets.get(AMEND).status = "In Progress";
     expect((await tick()).out.drained).toMatchObject({ applied: 0, dropped: 1 });
     expect(fake.tickets.get(BUILD).status).not.toBe("Done");
@@ -2693,20 +2705,101 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     expect(fake.tickets.get(BUILD).status).not.toBe("Done");
   });
 
+
+  // ─── TEAM-6217 R3-01 (ship review round 3 on #970) - red on f4ef506 ──────────────────────
+  // reholdBeforeRetry's hold PUT is best-effort: when it fails (S3 503) or loses its CAS, the
+  // record still says ticketWrites:"queued" with no briefPending, and the agent's immediate
+  // report_completion retry (gate handling only on briefPending:true, :1615) Dones the build
+  // with the gate To Do and no brief body on it. Report-side safety must not depend on a
+  // compensating write: a retry of a queued brief-bearing completion needs positive delivery /
+  // release evidence even when briefPending is absent: report_completion derives it from the queued record
+  // itself (queuedBriefOwed) and treats it as briefPending:true, so the retry delivers or holds before any Done.
+  /** The build may go Done only with the brief BODY on the (reopened, open) gate. */
+  const doneOnlyWithBriefOnGate = () => {
+    if (fake.tickets.get(BUILD).status === "Done") {
+      expect(briefComments(GATE), "the build went Done with no brief body on the open gate").toHaveLength(1);
+      expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE] });
+    } else {
+      expect(record().briefPending, "withheld Done ⇒ the obligation is stated").toBe(true);
+    }
+  };
+  /** The PUT reholdBriefOffGate makes (briefPending:true + "not on the gate" reason, no release) - by shape, so the predicate stays honest about which write it fails. */
+  const isReholdPut = (input) => {
+    if (input.Key !== KEY) return false;
+    const b = bodyOf(input);
+    return b.briefPending === true && String(b.briefFallbackReason || "").startsWith("not on the gate") && !b.briefDisposition && b.ticketWrites === "queued";
+  };
+
+  it("TEAM-6217 R3-01a step 5: the stale-gate re-hold PUT fails (S3 503) ⇒ retry is answered but the record has no briefPending; the immediate report_completion retry must not Done brief-less", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    const flipped = reopenGateOnEpicAudit();
+    let failedHold = 0;
+    fake.putError = (input) => (isReholdPut(input) ? (failedHold++, awsError("ServiceUnavailable", 503, "Please reduce your request rate.")) : null);
+    const t1 = await tick();
+    expect(flipped()).toBe(1);
+    expect(failedHold, "the hold write was attempted and refused").toBe(1);
+    expect(t1.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expect(record().briefPending, "the obligation did NOT land on the record").toBeUndefined();
+    expect(record().ticketWrites).toBe("queued");
+    expect(fake.tickets.get(GATE).status).toBe("To Do");
+    fake.putError = null;
+    fake.beforeTool = null;
+    const res = await rerun();
+    doneOnlyWithBriefOnGate();
+    expect(res.status).toMatch(/^complete/);
+  });
+
+  it("TEAM-6217 R3-01b step 5: a competing writer lands between step 0 and the re-hold PUT (genuine 412) ⇒ same hole; the immediate retry must not Done brief-less", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    reopenGateOnEpicAudit();
+    let lost = 0;
+    fake.beforePut = (input) => {
+      if (isReholdPut(input) && lost === 0) {
+        lost = 1;
+        // Another writer (a twin's Done-intent fence that then expired, a re-run) re-puts the same body: new ETag, no hold.
+        fake.objects.set(KEY, JSON.stringify({ ...record(), touchedBy: "competing-writer" }));
+        fake.etags.set(KEY, `"e${++fake.etagSeq}"`);
+      }
+    };
+    const t1 = await tick();
+    expect(lost, "the hold write met a newer record").toBe(1);
+    expect(t1.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expect(record().briefPending).toBeUndefined();
+    expect(fake.tickets.get(GATE).status).toBe("To Do");
+    fake.beforePut = null;
+    fake.beforeTool = null;
+    await rerun();
+    doneOnlyWithBriefOnGate();
+  });
+
+  it("TEAM-6217 R3-01c no drain tick at all: an outage retry of a queued brief-bearing completion must not Done the build before the brief is on the gate (A1 was evidence; R3 makes it a defect)", async () => {
+    // State after beforeEach: the operator's report queued its writes (brief included); the record says
+    // ticketWrites:"queued" with no briefPending/briefDelivered/briefDisposition. The gate is To Do.
+    expect(record()).toMatchObject({ ticketWrites: "queued" });
+    expect(record().briefPending).toBeUndefined();
+    expect(record().briefDelivered).toBeUndefined();
+    const res = await rerun();
+    doneOnlyWithBriefOnGate();
+    expect([res.status, fake.tickets.get(BUILD).status, fake.tickets.get(GATE).description || "", record().briefPending ?? null]).not.toEqual(["complete", "Done", "", null]);
+  });
+
   // ─── TEAM-6205 A: the two brief siblings of R2-02 ───────────────────────────────────────
-  // A1 (:1519, evidence): an outage retry with NO drain tick in between. The record carries no
-  // hold, so the retry Dones first and the gate is Ready brief-less until the queued message's own
-  // tick puts the brief body on it. The brief is NOT lost (the message is still queued, step 4 runs
-  // on a ticket already Done); the residual ordering gap is recorded in the PR body, not fixed here.
-  it("TEAM-6205 A1 (evidence): an outage retry with no drain tick Dones first; the queued brief lands on the gate (body) on the next tick, after the Done", async () => {
+  // A1 (:1519, then evidence; TEAM-6217 R3-01 closes it): an outage retry with NO drain tick in between.
+  // TEAM-6205 recorded the gap - the record carried no hold, so the retry Doned first and the gate was
+  // Ready brief-less until the queued message's own tick. Now the retry derives the brief obligation
+  // from the queued record itself (queuedBriefOwed) and puts the brief ON the gate before the Done; the
+  // queued message's tick then finds it there (marker-deduped) and applies.
+  it("TEAM-6205 A1 / TEAM-6217 R3-01: an outage retry with no drain tick puts the brief ON the gate before the Done; the queued message's tick finds it there (deduped) and applies", async () => {
     expect((await rerun()).status).toBe("complete");
+    expect(briefComments(GATE), "the brief BODY is on the gate before the Done").toHaveLength(1);
+    expect(fake.tickets.get(GATE).description).toBe(fixture.mergeBrief.body.trim());
     expect(fake.tickets.get(BUILD).status).toBe("Done");
-    expect(briefComments(GATE), "ordering gap: the gate is Ready brief-less until the next tick").toHaveLength(0);
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE] });
     expect(fake.queue, "the queued message still carries the brief").toHaveLength(1);
     expect((await tick()).out.drained).toMatchObject({ applied: 1, dropped: 0 });
-    expect(briefComments(GATE), "the brief BODY reached the gate").toHaveLength(1);
-    expect(fake.tickets.get(GATE).description).toBe(fixture.mergeBrief.body.trim());
+    expect(briefComments(GATE), "deduped: still one copy").toHaveLength(1);
     expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE], ticketWrites: "applied" });
+    await twinsAdmit();
   });
 
   // A2 (step 0): a message that ALONE carries the brief, behind a brief-less message that Doned.

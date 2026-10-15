@@ -910,8 +910,11 @@ export function unresolvedRecordFollowUps(record, materialized, entries = []) {
   const settled = (hash) => own.has(hash) || resolved.has(hash);
   // TEAM-6205 (R2-05): a row without identity cannot be matched against anything this message
   // filed or carries, so it is UNRESOLVED - the old filter dropped it and the hold cleared.
+  // TEAM-6217 (R3-02): a durable marker mergeRecordFollowUps persisted for such a row carries its own reason.
   const out = failed
-    .map((f, i) => (f && typeof f === "object" && typeof f.hash === "string" && f.hash ? f : { hash: null, reason: `followUpsMaterialized.failed[${i}] has no hash` }))
+    .map((f, i) => (f && typeof f === "object" && typeof f.hash === "string" && f.hash ? f
+      : f?.unresolved === true && asText(f.reason) ? { hash: null, reason: f.reason }
+        : { hash: null, reason: `followUpsMaterialized.failed[${i}] has no hash` }))
     .filter((f) => f.hash === null || !settled(f.hash));
   if (out.length > 0 || failed.length > 0) return out;
   // TEAM-6205 (R2-05): a HOLLOW breakdown (`failed:[]` under `followUpsPending:true`) names no
@@ -929,8 +932,14 @@ export function unresolvedRecordFollowUps(record, materialized, entries = []) {
  * the hold cleared and the ticket Doned over it. This message's rows win per hash; every record
  * row for a hash this message does not have rides verbatim in its own bucket (a failed row with
  * its reason, retryable and commentedOn), so the record never forgets an obligation or a filed
- * ticket id. A sentinel (no hash) only holds the flag and is never fabricated into the breakdown.
- * ONE helper for every drain write (drop(), step 6).
+ * ticket id. TEAM-6217 (R3-02): a record row with NO hash is an obligation nobody can name - it
+ * used to be filtered out of the persisted breakdown, so after one drop the record said failed:[A]
+ * alone and the redelivery that filed A cleared the hold. A hash-less `failed` row is now persisted
+ * as a durable unresolved marker (`{ hash: null, unresolved: true, retryable: false, reason, raw }`;
+ * an existing marker rides verbatim, so there is no growth); hash-less rows in the other buckets
+ * ride verbatim (they claim a filed ticket, not an unfiled one). Only a report_completion re-run,
+ * which rewrites the breakdown from its own materialization, clears a marker - a drain cannot name
+ * the row. ONE helper for every drain write (drop(), step 6).
  *
  *   { unresolved, breakdown, stillUnfiled }
  */
@@ -941,11 +950,25 @@ export function mergeRecordFollowUps(record, materialized, entries = []) {
   const mine = new Set(buckets.flatMap((b) => breakdown[b].map((r) => r?.hash)).filter(Boolean));
   const prior = record?.followUpsMaterialized;
   for (const b of buckets) {
-    for (const row of Array.isArray(prior?.[b]) ? prior[b] : []) {
-      if (row && typeof row === "object" && typeof row.hash === "string" && row.hash && !mine.has(row.hash)) { breakdown[b].push(row); mine.add(row.hash); }
-    }
+    (Array.isArray(prior?.[b]) ? prior[b] : []).forEach((row, i) => {
+      const hash = row && typeof row === "object" && typeof row.hash === "string" && row.hash ? row.hash : null;
+      if (hash) { if (!mine.has(hash)) { breakdown[b].push(row); mine.add(hash); } return; }
+      if (b !== "failed") { breakdown[b].push(row); return; }
+      breakdown.failed.push(row && typeof row === "object" && row.unresolved === true ? row : unresolvedFollowUpMarker(row, i));
+    });
   }
   return { unresolved, breakdown, stillUnfiled: breakdown.failed.length > 0 || unresolved.length > 0 };
+}
+
+/** TEAM-6217 (R3-02): the durable marker a hash-less `followUpsMaterialized.failed[i]` row is persisted as. */
+export function unresolvedFollowUpMarker(row, i) {
+  let raw;
+  try { raw = JSON.stringify(row); } catch { raw = undefined; }
+  return {
+    hash: null, unresolved: true, retryable: false,
+    reason: `followUpsMaterialized.failed[${i}] has no hash - an obligation nobody can name; a WorkflowOutput___report_completion re-run with the full follow_ups list restates it`,
+    raw: clampLine(raw ?? String(row), 500),
+  };
 }
 
 export function drainAdmission(record, msg) {
@@ -970,6 +993,21 @@ export function residualOf(review, summary, artifacts) {
 }
 
 /**
+ * TEAM-6217 (R3-03): the residual a record written BEFORE `residual` existed still holds - its
+ * non-PASS stamp beside the report's own `summary` and `artifacts` (:1066), the exact inputs
+ * residualOf builds the field from. Valid only when the summary's own verdict line is the stamp's
+ * verdict (parseReviewVerdict): a same-session resubmit keeps the FIRST summary under a later
+ * stamp, so a mismatch is not this admission's text. null ⇒ nothing trustworthy to rebuild.
+ */
+export function legacyResidualOf(record) {
+  const sr = record?.securityReview;
+  const verdict = String(sr?.verdict || "").toUpperCase();
+  if (!verdict || verdict === "PASS" || !asText(record?.summary).trim()) return null;
+  if (parseReviewVerdict(record.summary) !== verdict) return null;
+  return residualOf({ residual: true, verdict, amendmentTicketId: asText(sr.amendmentTicketId) || null }, record.summary, record.artifacts);
+}
+
+/**
  * TEAM-6205 (R2-03): the residual findings a ticket-replay drain DELIVERS before its Done, keyed on
  * the SAME admission drainAdmission re-marks, confirms and finalizes. Step 5 posted `msg.residual`
  * and the sibling scan was gated on it, so an older residual-less PASS message drained over the
@@ -984,9 +1022,11 @@ export function residualOf(review, summary, artifacts) {
  *                record's trusted PASS admission (TEAM-6158's rule, decided before step 6 and
  *                before any amendment read, not in step 7 after one).
  *   missingText  the record's stamp is the admission but it carries no `residual` (written before
- *                the field existed) and the message's findings are another admission: nothing to
- *                post; the caller records the dev lanes as undelivered and the Done proceeds on
- *                the admission the twins trust.
+ *                the field existed), its own summary cannot stand in for it (legacyResidualOf), and
+ *                the message's findings are another admission: nothing to post. TEAM-6217 (R3-03):
+ *                on an open ticket the caller HOLDS the Done (a surfaced drop) - the findings are
+ *                owed before the dev lanes are released; on a ticket already Done it records the
+ *                dev lanes as undelivered.
  */
 export function currentResidual(record, msg, reportKey = "the completion record") {
   const admission = drainAdmission(record, msg);
@@ -999,8 +1039,11 @@ export function currentResidual(record, msg, reportKey = "the completion record"
     // amendment: the stamp's amendment, or a stamp naming none (the verdict wording is the stamp's).
     const stampAmendment = asText(record.securityReview?.amendmentTicketId);
     if (msg?.residual && (!stampAmendment || asText(msg.residual.amendmentTicketId) === stampAmendment)) return { ...none, residual: msg.residual };
+    // TEAM-6217 (R3-03): a pre-field record's own summary/artifacts, when they state this verdict.
+    const legacy = legacyResidualOf(record);
+    if (legacy) return { ...none, residual: legacy };
     const theirs = msg?.residual ? ` and the queued ${String(msg.residual.verdict || "").toUpperCase() || "non-PASS"} findings${asText(msg.residual.amendmentTicketId) ? ` on ${asText(msg.residual.amendmentTicketId)}` : ""} are another admission` : "";
-    return { ...none, missingText: `${reportKey} carries no residual text for its ${admission.verdict} admission${admission.amendmentTicketId ? ` on ${admission.amendmentTicketId}` : ""} (a record written before it carried one)${theirs} - no findings from this replay; a WorkflowOutput___report_completion re-run posts them` };
+    return { ...none, missingText: `${reportKey} carries no residual text for its ${admission.verdict} admission${admission.amendmentTicketId ? ` on ${admission.amendmentTicketId}` : ""} (a record written before it carried one, and its summary does not state that verdict)${theirs} - no findings from this replay; a WorkflowOutput___report_completion re-run (or that admission's own queued message) delivers them` };
   }
   const sr = record?.securityReview;
   if (sr && typeof sr === "object" && String(sr.verdict || "").toUpperCase() === "PASS") {
@@ -1612,9 +1655,20 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   let releasedNow = null;
   if (!isSynthetic) {
     const held = earlyPrior.record;
-    if (held?.briefPending === true) {
+    // TEAM-6217 (R3-01): or the record's own facts say the brief is still owed (its writes were
+    // queued with the brief among them and nothing recorded an outcome - queuedBriefOwed), whether
+    // or not a drain's best-effort re-hold stamp landed. Report-side safety must not depend on a
+    // compensating write: the obligation is treated exactly as briefPending:true, so the rest of
+    // this block delivers the brief to the gate (or holds, writing briefPending:true on THIS call's
+    // own record write) before any Done. reholdBeforeRetry's stamp stays as belt-and-braces.
+    const owedKey = held?.briefPending === true ? null : queuedBriefOwed(held);
+    if (held?.briefPending === true || owedKey) {
+      if (owedKey) {
+        report.briefPending = true;
+        console.warn(`[report_completion] ${ticket_id}: ${key} queued the merge brief ${owedKey} and nothing has recorded it on the gate - treated as briefPending:true`);
+      }
       for (const f of BRIEF_HOLD_FIELDS) if (held[f] !== undefined && report[f] === undefined) report[f] = held[f];
-      const briefKey = mergeBriefKey(keys)
+      const briefKey = mergeBriefKey(keys) || owedKey
         || (Array.isArray(held.undelivered) ? held.undelivered.find((u) => u?.part === "brief" && asText(u.s3Key))?.s3Key : null);
       let brief = null;
       if (briefKey) {
@@ -2100,6 +2154,35 @@ export function mergeBriefKey(keys) {
     if (/^workflows\/[^/]+\/shared\/merge-brief\.md$/.test(k)) return k;
   }
   return null;
+}
+
+/**
+ * TEAM-6205 (A2, drain step 0) / TEAM-6217 (R3-01): the brief `briefKey` is still OWED by
+ * `record` - no drain or report has recorded an outcome for it (`briefDelivered` unset, no
+ * release). A recorded outcome (gate, off_gate with its hold, undelivered, a release) is an
+ * answer already. The ONE predicate both the drain and report_completion ask.
+ */
+export function briefOwed(record, briefKey) {
+  return !!asText(briefKey) && record?.briefDelivered === undefined && !record?.briefDisposition?.release;
+}
+
+/**
+ * TEAM-6217 (R3-01): the merge brief a QUEUED record still owes, or null. report_completion
+ * entered its gate handling only on `briefPending === true` - a hold stamp the drain's stale-gate
+ * re-hold (reholdBeforeRetry) writes best-effort - so a 503'd or out-CAS'd stamp (or no drain
+ * tick at all) left a record saying ticketWrites:"queued" with no hold, and the agent's retry
+ * Doned the build with the gate To Do and no brief on it. The obligation is the record's own
+ * facts, read here without any stamp: its writes were queued (`ticketWrites:"queued"`), the
+ * brief was among them (its `evidence_keys` names the merge brief by the SAME rule the queue used,
+ * mergeBriefKey - or a part:"brief" undelivered entry names it), and nothing has recorded an
+ * outcome for it (briefOwed). A healthy run (no `ticketWrites`), a completion that names no
+ * merge brief, or a brief already delivered/released ⇒ null.
+ */
+export function queuedBriefOwed(record) {
+  if (record?.ticketWrites !== "queued") return null;
+  const key = mergeBriefKey(record.evidence_keys)
+    || (Array.isArray(record.undelivered) ? asText(record.undelivered.find((u) => u?.part === "brief" && asText(u.s3Key))?.s3Key) : null);
+  return briefOwed(record, key) ? key : null;
 }
 
 /**
@@ -2736,7 +2819,11 @@ export async function drainCompletion(msg) {
   // report_completion retry re-chooses the gate instead of Doning brief-less. Behind the same
   // Done-intent fence drop() and the record write defer on (`deferred`: the caller already did).
   // Returns the retry reason to log; a lost CAS or a refused PUT changes nothing a reader trusts
-  // (the message comes back and the next tick re-stamps), so it is only said.
+  // (the message comes back and the next tick re-stamps), so it is only said. TEAM-6217 (R3-01):
+  // this stamp is belt-and-braces, not load-bearing - report_completion derives the obligation
+  // from the queued record itself (queuedBriefOwed), so its retry delivers or holds whether or
+  // not this PUT landed. A failed PUT still answers retry: that is the only answer that keeps
+  // the message (and the brief) for the drain.
   const reholdBeforeRetry = async (reason, { s3Key, targets = [], fields = {}, deferred = false } = {}) => {
     if (!rec.record || !asText(s3Key)) return reason;
     if (!deferred) {
@@ -2764,8 +2851,9 @@ export async function drainCompletion(msg) {
   // its message here lost it: steps 1-6 deliver it on a ticket already Done exactly as a
   // redelivery does. A recorded outcome (gate, off_gate with its hold, undelivered, a release)
   // is a drain's or a re-run's answer already; a redelivery of that message stays a no-op.
-  const briefOwed = !!asText(msg.brief?.s3Key) && rec.record?.briefDelivered === undefined && !rec.record?.briefDisposition?.release;
-  if (rec.record?.ticketWrites === "applied" && !briefOwed) return { outcome: "dropped", reason: "already applied" };
+  // TEAM-6217 (R3-01): through the one predicate report_completion's queuedBriefOwed shares.
+  const owed = briefOwed(rec.record, msg.brief?.s3Key);
+  if (rec.record?.ticketWrites === "applied" && !owed) return { outcome: "dropped", reason: "already applied" };
 
   // 1. The ticket.
   const read = await ticketTool("Tickets___get_issue", { ticket_id: ticketId });
@@ -2887,6 +2975,12 @@ export async function drainCompletion(msg) {
     if (out.failed.some((f) => !isPermanentTicketRefusal(f.error))) return retry(`residual findings not posted on ${out.failed.map((f) => f.ticketId).join(", ")}`);
     for (const f of out.failed) undelivered.push({ part: "residual_findings", ticketId: f.ticketId, reason: f.error });
     for (const id of [...out.posted, ...out.skipped]) delivered.push(undeliveredKey({ part: "residual_findings", ticketId: id }));
+  } else if (current.missingText && !alreadyDone) {
+    // TEAM-6217 (R3-03): the findings are owed BEFORE the Done releases the dev lanes, and nothing
+    // here can produce them - a surfaced drop (notice, stamp, ticket left open), never a Done with
+    // zero findings. The admission's own queued message behind this one (its residual is the same
+    // admission), or a report_completion re-run (which writes `residual` now), delivers and Dones.
+    return drop("residual_findings", current.missingText, { epicKey });
   } else if (current.missingText) {
     console.error(`[ticket-replay] ${ticketId}: residual findings NOT posted - ${current.missingText}`);
     for (const t of scan.siblings) {
@@ -4431,7 +4525,12 @@ async function skipSibling(row, { workflowId, sweeperTicketId }) {
   // sibling's own writer is active and owns the record.
   const cur = await readRecord(key);
   if (cur.error) return { ok: false, error: `completion record ${key} unreadable (${cur.error}) - not skipped` };
-  const held = cur.record?.briefPending === true ? "briefPending:true" : cur.record?.followUpsPending === true ? "followUpsPending:true" : null;
+  // TEAM-6217 (R3-01 sibling sweep): and a QUEUED record whose merge brief nothing has recorded on the
+  // gate is the same hold without the stamp (queuedBriefOwed, the one predicate report_completion
+  // uses) - the skip marker would erase the brief obligation and the skip's Done would make the gate
+  // Ready brief-less.
+  const held = cur.record?.briefPending === true ? "briefPending:true" : cur.record?.followUpsPending === true ? "followUpsPending:true"
+    : queuedBriefOwed(cur.record) ? `ticketWrites:"queued" with its merge brief ${queuedBriefOwed(cur.record)} not yet recorded on the gate` : null;
   if (held) {
     console.warn(`[report_completion] ${ticketId}: empty_sweep will NOT skip it - its completion record has ${held}; the hold is lifted by report_completion or a human, never by the sweep`);
     return { ok: false, error: `completion record ${key} has ${held} - not skipped; the hold is lifted by report_completion or a human, never by the sweep` };
