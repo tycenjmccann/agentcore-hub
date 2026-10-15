@@ -52,6 +52,10 @@ function normalizeStatus(value: unknown): string {
  *   lambda/agentcore-hub-tickets/index.mjs:2461  { key, status: "transitioned", from, to, … }
  *   lambda/agentcore-hub-jira/index.mjs:2495      { ticketId, status: <landed>, message,
  *                                                   requested, matchedTransition: {id,name,to}, … }
+ *   TEAM-6165 — the jira twin's already-Done acknowledgement (a literal `done` on an issue
+ *   Jira already reads Done, after the Done guard admitted it): { ticketId, status: "done",
+ *   requested: "done", alreadyDone: true, noop: true, message }. It is proof by the plain
+ *   `landed === target` rule below — no rule here is loosened for it.
  *
  * TEAM-6131 — proof is about THE ticket and THE status the caller asked for:
  *   - the payload must name the requested ticket (`key` / `ticketId`; the tickets twin

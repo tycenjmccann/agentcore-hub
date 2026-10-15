@@ -2458,6 +2458,32 @@ async function transitionTicket(params) {
     );
   }
 
+  // TEAM-6165: a Done the issue ALREADY has (the Jira webhook announcing a board move
+  // that happened) is acknowledged, not re-attempted — Jira offers no Done transition
+  // from Done, so it used to refuse with "No transition to Done" after commenting. Only
+  // a literal `done` request with no blockers, on the very issue asked for (Jira returns
+  // a moved issue's CURRENT key), and only after the guard above admitted it exactly as
+  // for a real Done. No comment, no transition, no Done-intent fence: the fence guards
+  // THIS request's commit window and a no-op has none (an intent written here would be
+  // stale and defer a real hold). `skip` and every other target keep the path below.
+  if (
+    targetStatus === "done" &&
+    blockers.length === 0 &&
+    mapStatusToInternal(current?.fields?.status?.name) === "done" &&
+    String(current?.key ?? "").trim().toUpperCase() === String(ticket_id).trim().toUpperCase()
+  ) {
+    console.log(`[jira-tools] ${ticket_id} is already Done — acknowledged, no transition performed`);
+    return {
+      ticketId: current.key,
+      status: "done",
+      message: "Already Done - no transition performed",
+      requested: "done",
+      alreadyDone: true,
+      noop: true,
+      ...(gateVerification ? { gateVerification } : {}),
+    };
+  }
+
   // Add the reason as a comment BEFORE the transition. The transition fires the
   // status webhook → orchestrator rejection handler reads the latest comment;
   // commenting first avoids a race where rework starts before the feedback lands.

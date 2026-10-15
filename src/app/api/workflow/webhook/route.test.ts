@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
-import { ticketsSuccess, JIRA_NAME_MATCH_CLOSED } from "@/lib/workflow/__fixtures__/ticket-transition-success";
+import { ticketsSuccess, JIRA_NAME_MATCH_CLOSED, JIRA_ALREADY_DONE } from "@/lib/workflow/__fixtures__/ticket-transition-success";
 
 /**
  * TEAM-5781 — the webhook's `request_fix` branch minted a ticket id with its own
@@ -473,5 +473,35 @@ describe("POST /api/workflow/webhook — the Jira pair must account for the move
     const res = await post(JIRA_DONE);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+  });
+});
+
+/**
+ * TEAM-6165 (ship review F4) — the webhook announces a Done that already happened in Jira.
+ * The jira Lambda now acknowledges it (JIRA_ALREADY_DONE, pinned against the real handler in
+ * ticket-transition-refusal.jira-e2e.test.ts) instead of refusing "No transition to Done";
+ * its Done guard still refuses a held / unproven ticket, and that refusal stays a 409.
+ */
+describe("POST /api/workflow/webhook — a Done Jira already has (TEAM-6165)", () => {
+  it("the jira Lambda's already-Done acknowledgement → 200 via the tickets Lambda, no direct write", async () => {
+    lambdaAnswers(JIRA_ALREADY_DONE);
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+    expect(directDoneWrites()).toHaveLength(0);
+    expect(h.invokes).toHaveLength(1);
+  });
+
+  it("the Done guard's structured refusal on an already-Done ticket → 409, no direct write", async () => {
+    lambdaAnswers({
+      ok: false,
+      reason: "completion_record_required",
+      hint: "call WorkflowOutput___report_completion(ticket_id=…) — it writes the record and transitions the ticket for you",
+      error: "Cannot move TEAM-7 to Done: a ship-phase ticket needs its completion record first — (ARTIFACT_BUCKET is unset, so completions/TEAM-7.json cannot be read)",
+    });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "Ticket transition rejected", ticketId: "TEAM-7" });
+    expect(h.sends.length).toBe(0);
   });
 });
