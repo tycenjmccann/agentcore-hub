@@ -30,10 +30,16 @@ set -euo pipefail
 
 export AWS_PROFILE="${AWS_PROFILE:?ERROR: Set AWS_PROFILE}"
 REGION="${AWS_REGION:-us-east-1}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Ticket-tools Lambda name per TICKET_PROVIDER (TEAM-6161): same derivation as
+# scripts/verify-infra.sh — an explicit TICKET_TOOLS_LAMBDA still wins.
+source "$SCRIPT_DIR/../deploy/lib/runtime-env-defaults.sh"
+resolve_runtime_lambda_names
 
 # Log groups
 LOG_ORCHESTRATOR="/aws/lambda/agentcore-hub-orchestrator"
-LOG_TICKET_TOOLS="/aws/lambda/${TICKET_TOOLS_LAMBDA:-agentcore-hub-tickets}"
+LOG_TICKET_TOOLS="/aws/lambda/${TICKET_TOOLS_LAMBDA}"
 LOG_WORKFLOW_OUTPUT="/aws/lambda/agentcore-hub-workflow-output"
 LOG_AGENT_INVOKER="/aws/lambda/agentcore-hub-agent-invoker"
 
