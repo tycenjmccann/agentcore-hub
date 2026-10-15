@@ -73,25 +73,32 @@ not redeliver it — until Jira is configured too.
   Jira admin → System → WebHooks → `agentcore-hub-workflow` → Secret, or
   re-run `./deploy/apprunner/setup-jira-webhook.sh` with `JIRA_WEBHOOK_SECRET`
   set in `.env.local`. Jira then signs every delivery.
-- **(b) Hub side.**
-  ```bash
-  source deploy/config.sh
-  ./deploy/ecs-express/set-env.sh JIRA_WEBHOOK_SECRET=<the same value>
-  ```
-  (never the raw ECS update API — it replaces the whole container env, which
-  would blank the other live secrets on this service). The hub uses the value
-  byte-for-byte as the HMAC key (no trimming); the charset rule above is what
-  guarantees the bytes are identical on both sides.
+- **(b) Hub side.** Two steps, both required, whichever route (a) used:
+  1. Add `JIRA_WEBHOOK_SECRET=<the same value>` to `.env.local`. Nothing in (a)
+     writes it there — the Jira-UI route never touches the file, and
+     `setup-jira-webhook.sh` only reads it — and `set-env.sh` below writes only
+     to the live service. Without this line the next full redeploy drops the
+     secret (next bullet).
+  2. Push it to the running service:
+     ```bash
+     source deploy/config.sh
+     ./deploy/ecs-express/set-env.sh JIRA_WEBHOOK_SECRET=<the same value>
+     ```
+     (never the raw ECS update API — it replaces the whole container env, which
+     would blank the other live secrets on this service).
+
+  The hub uses the value byte-for-byte as the HMAC key (no trimming); the
+  charset rule above is what guarantees the bytes are identical on both sides.
 - **Full redeploys read `.env.local`, not the live service.** A full redeploy
   (`./deploy/ecs-express/deploy.sh`, or the legacy `./deploy/apprunner/deploy.sh`)
   rebuilds the whole container env from `.env.local` and forwards
   `JIRA_WEBHOOK_SECRET` from there (TEAM-6336), validated with the same charset
   rule — an invalid non-empty value aborts the deploy before any AWS call; unset
-  or empty is simply not forwarded. Keep the secret in `.env.local` (step (a)
-  already puts it there): if it only lives on the running service, the next
-  full redeploy drops it and the hub silently falls back to unsigned
-  passthrough. The pipeline's roll-by-digest (`deploy/pipeline/buildspec-deploy.yml`)
-  and `deploy/pipeline/rollback.sh` reuse the live env and are unaffected.
+  or empty is simply not forwarded. This is why (b) step 1 is required: if the
+  secret only lives on the running service, the next full redeploy drops it and
+  the hub silently falls back to unsigned passthrough. The pipeline's
+  roll-by-digest (`deploy/pipeline/buildspec-deploy.yml`) and
+  `deploy/pipeline/rollback.sh` reuse the live env and are unaffected.
 
 Between (a) and (b) the hub still accepts unsigned requests (and logs one
 `console.warn` per instance). Once (b) rolls out, an unsigned or mismatched
