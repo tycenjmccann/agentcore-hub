@@ -37,3 +37,17 @@ export const JIRA_NAME_MATCH_CLOSED = {
   requested: "done",
   matchedTransition: { id: "31", name: "Done", to: "Closed" },
 };
+
+/**
+ * TEAM-6165 — a literal `done` on an issue Jira ALREADY reads Done (the webhook announcing
+ * a board move): the Lambda runs the Done guard, then acknowledges without commenting or
+ * POSTing a transition. `ticketId` is the key Jira returned, verified equal to the request.
+ */
+export const JIRA_ALREADY_DONE = {
+  ticketId: "TEAM-7",
+  status: "done",
+  message: "Already Done - no transition performed",
+  requested: "done",
+  alreadyDone: true,
+  noop: true,
+};

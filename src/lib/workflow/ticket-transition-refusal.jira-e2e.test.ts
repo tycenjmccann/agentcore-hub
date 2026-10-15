@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { provesTransitioned, rejectedDetails, jiraStatusToInternal, jiraDisplayNameOf, HUB_STATUSES } from "./ticket-transition-refusal";
-import { JIRA_DONE_SUCCESS, JIRA_NAME_MATCH_CLOSED } from "./__fixtures__/ticket-transition-success";
+import { JIRA_DONE_SUCCESS, JIRA_NAME_MATCH_CLOSED, JIRA_ALREADY_DONE } from "./__fixtures__/ticket-transition-success";
 
 /**
  * TEAM-6131 Finding 4 — the cross-codebase contract between the REAL jira ticket-tools
@@ -45,15 +45,26 @@ const ISSUE = `https://${SITE}/rest/api/3/issue/${TICKET}`;
 const ENV_KEYS = ["JIRA_SITE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_PROJECT_KEY", "ARTIFACT_BUCKET", "WORKFLOWS_TABLE", "EVENTS_TABLE", "PIPELINE_TOOLS_LAMBDA"] as const;
 const saved: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
 
-/** A fake Jira Cloud whose transition list is `transitions`; records every transition POST body. */
-function installFakeJira(transitions: Array<{ id: string; name: string; to: { name: string } }>) {
+/**
+ * A fake Jira Cloud whose transition list is `transitions`; records every transition POST body.
+ * TEAM-6165: `status` / `key` / `labels` are what the issue reads as (default: an In Progress
+ * TEAM-7 with no labels), and every comment POST is recorded into `comments`.
+ */
+function installFakeJira(
+  transitions: Array<{ id: string; name: string; to: { name: string } }>,
+  { status = "In Progress", key = TICKET, labels = [] as string[], comments = [] as unknown[] } = {}
+) {
   const posts: unknown[] = [];
   const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status });
   vi.stubGlobal("fetch", async (url: string | URL, init: RequestInit = {}) => {
     const u = String(url);
     const method = (init.method || "GET").toUpperCase();
-    if (method === "GET" && u === `${ISSUE}?fields=status`) return json({ key: TICKET, fields: { status: { name: "In Progress" } } });
-    if (method === "GET" && u === `${ISSUE}?fields=labels,description`) return json({ key: TICKET, fields: { labels: [], description: null } });
+    if (method === "GET" && u === `${ISSUE}?fields=status`) return json({ key, fields: { status: { name: status } } });
+    if (method === "GET" && u === `${ISSUE}?fields=labels,description`) return json({ key, fields: { labels, description: null } });
+    if (method === "POST" && u === `${ISSUE}/comment`) {
+      comments.push(JSON.parse(String(init.body)));
+      return json({ id: "c1" }, 201);
+    }
     if (method === "GET" && u === `${ISSUE}/transitions`) return json({ transitions });
     if (method === "POST" && u === `${ISSUE}/transitions`) {
       posts.push(JSON.parse(String(init.body)));
@@ -75,8 +86,8 @@ async function loadHandler(): Promise<Handler> {
   return (await loadJira()).handler;
 }
 
-const transitionDone = (handler: Handler) =>
-  handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: TICKET, transition_id: "done" } });
+const transitionDone = (handler: Handler, extra: Record<string, unknown> = {}) =>
+  handler({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: TICKET, transition_id: "done", ...extra } });
 
 beforeEach(() => {
   for (const k of ENV_KEYS) saved[k] = process.env[k];
@@ -205,5 +216,63 @@ describe("the TS status-map mirror × the REAL jira Lambda's mapStatusToInternal
         TICKET
       )
     ).toBe(false);
+  });
+});
+
+/**
+ * TEAM-6165 (ship review F4) — the Jira webhook announces a Done that ALREADY happened in
+ * Jira and the hub route asks this Lambda for transition_ticket(done). An issue that reads
+ * Done offers only Reopen, so the Lambda answered `No transition to "Done" found` — after
+ * posting the webhook's reason comment — and the route 409'd every legitimate Done webhook.
+ * A literal `done` on an already-Done issue is now acknowledged once the Done guard admits
+ * it: no comment, no transition POST. `skip`, a guard refusal and a key mismatch are not.
+ */
+describe("the REAL jira Lambda on an issue that is ALREADY Done (TEAM-6165)", () => {
+  const REOPEN_ONLY = [{ id: "11", name: "Reopen", to: { name: "To Do" } }];
+
+  it("(1) a literal done WITH a reason is acknowledged: no comment, no transition, and it is proof of done", async () => {
+    const comments: unknown[] = [];
+    const posts = installFakeJira(REOPEN_ONLY, { status: "Done", comments });
+    const res = await transitionDone(await loadHandler(), { reason: "Jira webhook transition to Done" });
+
+    expect(res).toEqual(JIRA_ALREADY_DONE);
+    expect(posts).toEqual([]);
+    expect(comments).toEqual([]);
+    expect(rejectedDetails(res, "done")).toBeNull();
+    expect(provesTransitioned(res, "done", TICKET)).toBe(true);
+  });
+
+  it("(2) the Done guard still runs first: a ship-phase issue with no provable completion record is refused — no comment, no transition", async () => {
+    const comments: unknown[] = [];
+    // ARTIFACT_BUCKET is unset (beforeEach), so completionRecordProven refuses without I/O.
+    const posts = installFakeJira(REOPEN_ONLY, { status: "Done", labels: ["phase:ship"], comments });
+    const res = await transitionDone(await loadHandler(), { reason: "Jira webhook transition to Done" });
+
+    expect(res.reason).toBe("completion_record_required");
+    expect(res.alreadyDone).toBeUndefined();
+    expect(rejectedDetails(res, "done")).toMatch(/needs its completion record first/);
+    expect(provesTransitioned(res, "done", TICKET)).toBe(false);
+    expect(posts).toEqual([]);
+    expect(comments).toEqual([]);
+  });
+
+  it("(3) Jira answers with a DIFFERENT key (moved issue): not acknowledged", async () => {
+    const posts = installFakeJira(REOPEN_ONLY, { status: "Done", key: "TEAM-99" });
+    const res = await transitionDone(await loadHandler());
+
+    expect(res.alreadyDone).toBeUndefined();
+    expect(res.error).toMatch(/No transition to "Done" found/);
+    expect(provesTransitioned(res, "done", TICKET)).toBe(false);
+    expect(posts).toEqual([]);
+  });
+
+  it("(4) a skip on an already-Done issue keeps today's behaviour: not acknowledged", async () => {
+    const posts = installFakeJira(REOPEN_ONLY, { status: "Done" });
+    const res = await (await loadHandler())({ tool_name: "Tickets___transition_ticket", parameters: { ticket_id: TICKET, transition_id: "skip" } });
+
+    expect(res.alreadyDone).toBeUndefined();
+    expect(res.error).toMatch(/No transition to "Done" found/);
+    expect(provesTransitioned(res, "done", TICKET)).toBe(false);
+    expect(posts).toEqual([]);
   });
 });
