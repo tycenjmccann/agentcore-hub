@@ -99,6 +99,15 @@ not redeliver it — until Jira is configured too.
   the hub silently falls back to unsigned passthrough. The pipeline's
   roll-by-digest (`deploy/pipeline/buildspec-deploy.yml`) and
   `deploy/pipeline/rollback.sh` reuse the live env and are unaffected.
+- **`/setup` re-runs keep it.** `.claude-plugin/bin/apply-env.sh` carries
+  `JIRA_WEBHOOK_SECRET` (and `DEPLOYMENT_URL`) from the previous `.env.local`
+  into the regenerated one regardless of which modules or ticket provider the
+  re-run selects (TEAM-6347); `"jira": { "disable_webhook_signing": true }` in
+  the answers blob is the one explicit way to drop it (then follow the rollback
+  below for the live service and the Jira webhook). When a re-run supplies a
+  secret that differs from the on-disk one on an existing deployment, it prints
+  `JIRA_WEBHOOK_SECRET_NEW=1` and the setup skill runs `setup-jira-webhook.sh`
+  before `deploy.sh` — the same Jira-first order as (a) then (b).
 
 Between (a) and (b) the hub still accepts unsigned requests (and logs one
 `console.warn` per instance). Once (b) rolls out, an unsigned or mismatched

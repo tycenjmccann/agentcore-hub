@@ -107,7 +107,7 @@ Map the answer to a `MODULES` set in the canonical order `core → builder → w
 
 If they pick Jira, do a follow-up `AskUserQuestion` (or accept free text via "Other") for `JIRA_SITE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY`. Treat these as secrets — do not echo them back, do not write them anywhere except `.env.local`.
 
-Do not ask for `JIRA_WEBHOOK_SECRET` (webhook signing is an operator opt-in, see DEPLOY.md "Jira webhook signing"). `apply-env.sh` carries an existing `JIRA_WEBHOOK_SECRET` line in `.env.local` over to the regenerated file on a re-run, so enabling it is never undone by `/setup`; an optional `jira.webhook_secret` in the answers blob overrides it.
+Do not ask for `JIRA_WEBHOOK_SECRET` (webhook signing is an operator opt-in, see DEPLOY.md "Jira webhook signing"). `apply-env.sh` carries an existing `JIRA_WEBHOOK_SECRET` line in `.env.local` over to the regenerated file on a re-run **regardless of which modules or ticket provider the re-run selects**, so enabling it is never undone by `/setup`; an optional `jira.webhook_secret` in the answers blob overrides it. The one explicit way to drop it is `"jira": { "disable_webhook_signing": true }` in the answers blob — use it only when the user asks to turn signing off (`apply-env.sh` refuses it alongside a `webhook_secret`), and remind them to also unset it on the live service and remove it from the Jira webhook (DEPLOY.md).
 
 ## Q4 — Workflow runtime topology *(skip if Workflow not in MODULES)*
 
@@ -313,6 +313,8 @@ rm /tmp/agentcore-hub-answers.json
 
 `apply-env.sh` is the one place that writes `.env.local`. The skill does **not** write env vars by hand.
 
+If `apply-env.sh` prints `JIRA_WEBHOOK_SECRET_NEW=1`, note it: the answers brought a webhook secret that differs from the one the existing deployment was set up with, and the deploy-target step below must run the Jira webhook step **before** redeploying the hub (`apply-env.sh` also carries `DEPLOYMENT_URL` over from the previous `.env.local`, so that step has its target).
+
 ---
 
 ## Run modules in order
@@ -349,6 +351,8 @@ After Core/Builder/Workflow verify clean and **before** running Evaluations:
 - **App Runner (`apprunner`):** run `./deploy/apprunner/deploy.sh`. This script idempotently creates the ECR repository, the `AppRunnerECRAccessRole` and `agentcore-hub-apprunner-instance` IAM roles, builds and pushes the Docker image, and creates (or updates) the App Runner service. It sets `HOSTNAME=0.0.0.0` and `PORT=8080` as runtime env vars to prevent the health-check bind issue (see Dockerfile comment). Once the service is RUNNING, the script captures the App Runner URL and persists it as `DEPLOYMENT_URL` in `.env.local` (same sed-or-append pattern as `BUILDER_AGENT_ID`). Requires Docker running locally.
 - **Bring-your-own (`byo`):** don't build or push anything. Write `DEPLOYMENT_URL=https://placeholder.example` to `.env.local` and tell the user: "Update `DEPLOYMENT_URL` in `.env.local` once your service is live so prd-submitter and Jira webhooks know where to reach the app." If Evaluations was selected, surface this warning prominently — prd-submitter is being deployed with a placeholder URL.
 - **Skip (`skip`):** skip both the deploy and the `DEPLOYMENT_URL` write. If Evaluations was selected, warn the user that prd-submitter will be deployed with a placeholder URL and they must update it manually.
+
+**Re-run with a new secret (`apply-env.sh` printed `JIRA_WEBHOOK_SECRET_NEW=1`):** run `./deploy/apprunner/setup-jira-webhook.sh` BEFORE `./deploy/apprunner/deploy.sh` (for `byo`, before rolling your own container with the new env), so Jira signs deliveries before the hub starts verifying them — DEPLOY.md "Jira webhook signing", Jira first (a), then the hub (b). The script reads the carried-over `DEPLOYMENT_URL` from `.env.local`, so it needs nothing from the deploy. A first install (nothing deployed, so no webhook to break) and a re-run with an unchanged secret keep the order on this page: deploy first, then the webhook step below (which is idempotent, so running it again after a Jira-first re-run is harmless).
 
 ### Jira webhook setup (after deploy-target, if `TICKET_PROVIDER=jira` and `deploy_target` is NOT `local`)
 
