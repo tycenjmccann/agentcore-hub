@@ -450,22 +450,82 @@ describe("TEAM-6224 — the merge-brief obligation survives a partial write", ()
       twinsRefuse();
     });
 
-    it("ORDER: the pre-send write fails ⇒ nothing is sent, the answer is retry; the retry with the provider back is a healthy report", async () => {
+    it("FIRST WRITE: the provider already refused this call ⇒ the brief key rides the call's FIRST record write; every later write failing cannot lose it", async () => {
       fake.down = true;
-      fake.putError = (input) => (input.Key === KEY && briefEntry(bodyOf(input)) && bodyOf(input).ticketWrites === undefined ? s3Fail() : null);
+      let recordPuts = 0;
+      const firstBodies = [];
+      // S3 takes the call's first record write, then refuses every one after it.
+      fake.putError = (input) => {
+        if (input.Key !== KEY) return null;
+        if (++recordPuts === 1) { firstBodies.push(bodyOf(input)); return null; }
+        return s3Fail();
+      };
       const res = result(await report());
+      expect(res.next_action).toBe("retry_report_completion");
+      expect(briefEntry(firstBodies[0]), "the obligation is in the FIRST write").toMatchObject({ part: "brief", s3Key: BRIEF });
+      expect(briefEntry(record())).toMatchObject({ part: "brief", s3Key: BRIEF });
+      expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+      twinsRefuse();
+
+      // The healthy retry finds the obligation (briefObligation) and puts the brief on the gate, then Dones.
+      fake.putError = null;
+      fake.down = false;
+      expectDeliveredThenDone(result(await report()));
+    });
+
+    it("FIRST WRITE: with the outage already seen, no separate pre-send write is made (one record PUT before the send)", async () => {
+      fake.down = true;
+      // Each record PUT, as the number of sends made before it.
+      const sendsAtPut = [];
+      fake.putError = (input) => { if (input.Key === KEY) sendsAtPut.push(fake.sends.length); return null; };
+      expect(result(await report())).toMatchObject(fixture.expectedResponse);
+      expect(fake.sends).toHaveLength(1);
+      expect(sendsAtPut, "the first write, then the post-send ticketWrites:'queued' stamp - nothing else").toEqual([0, 1]);
+      expect(briefEntry(record())).toMatchObject({ s3Key: BRIEF });
+    });
+
+    it("FIRST WRITE: the provider answers again by the Done ⇒ the twin refuses it on the recorded brief; the retry delivers, then Dones", async () => {
+      // get_issue / list_tickets 503 (outage seen before the first write); the Done reaches a
+      // healthy twin, which judges the record through its real Done guard (the fake does not).
+      fake.failTool = {
+        Tickets___get_issue: PROVIDER_503,
+        Tickets___list_tickets: PROVIDER_503,
+        Tickets___transition_ticket: () => TWIN_GUARDS[0].judgeBriefHold(KEY, fake.objects.get(KEY))?.why || null,
+      };
+      const res = result(await report(noFollowUps));
+      expect(res.status).toBe("complete_pending_brief");
+      expect(res.next_action).toBe("retry_report_completion");
+      expect(fake.tickets.get(BUILD).status).toBe("In Progress");
+      expect(record()).toMatchObject({ briefPending: true });
+      expect(briefEntry(record())).toMatchObject({ s3Key: BRIEF });
+
+      fake.failTool = null;
+      fake.calls.length = 0; // the order check below is about the retry's own Done, not the refused one
+      expectDeliveredThenDone(result(await report(noFollowUps)));
+    });
+
+    it("HEALTHY: a report naming the brief with the provider up posts NO brief and writes NO undelivered brief entry", async () => {
+      const res = result(await report(noFollowUps));
+      expect(res.status).toBe("complete");
+      expect(fake.tickets.get(BUILD).status).toBe("Done");
+      expect(briefPosts(GATE), "report_completion posts the brief only when the record owes it").toHaveLength(0);
+      expect(fake.calls.filter((c) => c.tool === "Tickets___add_comment" && c.params.ticket_id === GATE)).toHaveLength(0);
+      expect(fake.calls.filter((c) => c.tool === "Tickets___update_ticket" && c.params.ticket_id === GATE)).toHaveLength(0);
+      expect(briefEntry(record())).toBeUndefined();
+      expect(mod.briefObligation(record())).toBeNull();
+      expect(fake.sends).toHaveLength(0);
+    });
+
+    it("ORDER: the outage starts at the Done and the pre-send write fails ⇒ nothing is sent, the answer is retry", async () => {
+      // get_issue answered, so the first write could not know; the pre-send write is the first
+      // write that carries the key, and when it fails nothing is queued the record does not state.
+      fake.failTool = { Tickets___transition_ticket: PROVIDER_503 };
+      fake.putError = (input) => (input.Key === KEY && briefEntry(bodyOf(input)) && bodyOf(input).ticketWrites === undefined ? s3Fail() : null);
+      const res = result(await report(noFollowUps));
       expect(res.next_action).toBe("retry_report_completion");
       expect(res.ticketWrites).toBeUndefined();
       expect(fake.sends, "a message the record does not state").toHaveLength(0);
       expect(briefEntry(record())).toBeUndefined();
-
-      // Nothing was queued, so nothing is owed: the retry is the report a healthy run makes.
-      fake.putError = null;
-      fake.down = false;
-      expect(result(await report()).status).toBe("complete");
-      expect(fake.tickets.get(BUILD).status).toBe("Done");
-      expect(fake.sends).toHaveLength(0);
-      expect(mod.briefObligation(record())).toBeNull();
     });
 
     it("ORDER: the pre-send write lands, the send fails ⇒ the record owes the brief; the retry delivers", async () => {

@@ -1761,6 +1761,17 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       return designAmendmentRefusal({ ticketId: ticket_id, verdict: review.verdict, open: { ticketId: review.amendmentTicketId }, note: `confirmed done, then ${amendmentReread(confirm)} before the record was written`, findings: countFindings(summary) });
     }
   }
+  // TEAM-6224: the provider already refused this call (get_issue / list_tickets), so the
+  // operator's own gate post (blueprints/operator.md B7 step 3) ran against it moments ago and
+  // may not have landed, and the Done below will most likely be queued. The brief's key rides
+  // the FIRST record write: the obligation is durable before any later write can fail, and the
+  // healthy retry finds it (briefObligation) and posts the brief before its Done. Whether the
+  // call queues is only known after the Done attempt (shouldQueueTicketWrites needs it), which
+  // must follow this write, so an outage that starts at the Done still takes the pre-send
+  // write in the queue block.
+  const outageSeen = canQueueTicketWrites(isSynthetic) ? [issueError, scan.error].find((e) => e && isProviderUnavailable(e)) : null;
+  const earlyBrief = outageSeen ? mergeBriefKey(keys) : null;
+  if (earlyBrief && briefOwed(report, earlyBrief)) noteBriefOwed(report, earlyBrief, `the ticket provider is unavailable (${outageSeen}) - the merge brief may not be on the gate`);
   // TEAM-5830: the hold is whatever the WRITTEN record says, so a hold the drain stamped
   // after the read above withholds this Done, and a clear it made releases it.
   const firstWrite = await writeRecord(() => {
@@ -2163,6 +2174,11 @@ function failureCause(row, { issueError, scanError }) {
   return row.reason;
 }
 
+/** The replay queue exists for this call: jira provider, a queue URL, a real ticket. */
+export function canQueueTicketWrites(isSynthetic) {
+  return TICKET_PROVIDER === "jira" && !!TICKET_REPLAY_QUEUE_URL && !isSynthetic;
+}
+
 /**
  * Queue the ticket-side writes? The provider's error when yes, `null` when no.
  * Only on the jira provider with a queue configured, only for a real ticket, and
@@ -2173,7 +2189,7 @@ function failureCause(row, { issueError, scanError }) {
  * answer, because the agent's retry or its own judgement is what resolves those.
  */
 export function shouldQueueTicketWrites({ isSynthetic, mayTransition, failed = [], transition, issueError = null, scanError = null }) {
-  if (TICKET_PROVIDER !== "jira" || !TICKET_REPLAY_QUEUE_URL || isSynthetic) return null;
+  if (!canQueueTicketWrites(isSynthetic)) return null;
   const causes = failed.map((r) => failureCause(r, { issueError, scanError }));
   if (!causes.every(isProviderUnavailable)) return null;
   if (!mayTransition) return causes.length > 0 ? causes[0] : null;
