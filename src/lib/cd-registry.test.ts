@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { normalizeRepoKey, parseCdRegistry, findCdEntry, deliveryModeFor, upsertCdEntry, removeCdEntry, pipelineProjectsFor, resolveRegistryTtlMs, validateCdEntryInput } from "./cd-registry";
 
 /** App-side mirror of lambda/orchestrator/cd-registry.mjs — same matching rules. */
@@ -350,5 +350,112 @@ describe("validateCdEntryInput", () => {
         notes: "onboarded by ops",
       })
     ).toBeNull();
+  });
+});
+
+/**
+ * TEAM-6209 — loadCdRegistry() passed the raw S3 body straight to the tolerant
+ * parseCdRegistry, which swallows a JSON.parse failure and returns an EMPTY
+ * registry; that EMPTY registry then got cached as the last-good copy for the
+ * rest of the TTL, so one truncated S3 read silently un-registered every repo
+ * for up to 60s (and whatever read /api/workflow/[id]/complete it strips the
+ * ship phase from). Parity fix with the orchestrator's TEAM-4378 fix
+ * (lambda/orchestrator/index.mjs:252) and the tools Lambda's TEAM-4358 fix:
+ * JSON.parse strictly, THEN hand the parsed doc to parseCdRegistry, so a
+ * SyntaxError reaches the existing "read error -> keep last good" catch
+ * instead of being absorbed into an empty registry.
+ */
+const h2 = vi.hoisted(() => ({
+  state: {
+    body: undefined as string | undefined,
+    getCount: 0,
+  },
+}));
+
+vi.mock("@aws-sdk/client-s3", () => ({
+  S3Client: class {
+    async send(cmd: { constructor: { name: string } }) {
+      const name = cmd.constructor.name;
+      if (name === "GetObjectCommand") {
+        h2.state.getCount++;
+        if (h2.state.body === undefined) {
+          const e = new Error("The specified key does not exist.");
+          e.name = "NoSuchKey";
+          throw e;
+        }
+        return { Body: { transformToString: async () => h2.state.body } };
+      }
+      throw new Error(`unexpected S3 command ${name}`);
+    }
+  },
+  GetObjectCommand: class {
+    constructor(public input: Record<string, unknown>) {}
+  },
+  PutObjectCommand: class {
+    constructor(public input: Record<string, unknown>) {}
+  },
+}));
+
+describe("loadCdRegistry — warm-cache malformed body (TEAM-6209)", () => {
+  const SAVED_BUCKET = process.env.ARTIFACT_BUCKET;
+  let mod: typeof import("./cd-registry");
+
+  beforeEach(async () => {
+    h2.state.body = undefined;
+    h2.state.getCount = 0;
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.resetModules();
+    mod = await import("./cd-registry");
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    if (SAVED_BUCKET === undefined) delete process.env.ARTIFACT_BUCKET;
+    else process.env.ARTIFACT_BUCKET = SAVED_BUCKET;
+  });
+
+  it("primed with a valid registry containing o/r, past the TTL a truncated read must still return o/r", async () => {
+    const t0 = Date.now();
+    h2.state.body = JSON.stringify({ version: 1, repos: [{ repo: "o/r" }] });
+    const first = await mod.loadCdRegistry();
+    expect(first.repos.map((e) => e.repo)).toEqual(["o/r"]);
+    expect(h2.state.getCount).toBe(1);
+
+    // Past the 60s TTL, the next read hits S3 again and gets a truncated body.
+    vi.setSystemTime(t0 + 61_000);
+    h2.state.body = '{"version":1,"repos":[{"repo":"o/';
+    const second = await mod.loadCdRegistry();
+
+    // The GET really ran (TTL expired) and still didn't lose o/r.
+    expect(h2.state.getCount).toBe(2);
+    expect(second.repos.map((e) => e.repo)).toEqual(["o/r"]);
+    expect(mod.deliveryModeFor(second, "o/r")).toBe("cd");
+  });
+
+  it("a cold cache (no last-good yet) with malformed JSON falls back to the bundled seed, matching the orchestrator's fail-safe EMPTY", async () => {
+    h2.state.body = '{"version":1,"repos":[{"repo":"o/';
+    const reg = await mod.loadCdRegistry();
+    expect(reg.repos).toEqual([]); // bundled src/config/cd-registry.json ships repos: []
+  });
+
+  it("a later valid read still replaces a stale cache", async () => {
+    const t0 = Date.now();
+    h2.state.body = JSON.stringify({ version: 1, repos: [{ repo: "o/r" }] });
+    await mod.loadCdRegistry();
+
+    vi.setSystemTime(t0 + 61_000);
+    h2.state.body = JSON.stringify({ version: 1, repos: [{ repo: "o/r2" }] });
+    const reg = await mod.loadCdRegistry();
+    expect(reg.repos.map((e) => e.repo)).toEqual(["o/r2"]);
+  });
+
+  it("a missing key is EMPTY and cached as such (unaffected by the fix)", async () => {
+    h2.state.body = undefined;
+    const reg = await mod.loadCdRegistry();
+    expect(reg.repos).toEqual([]);
+    expect(h2.state.getCount).toBe(1);
+    const second = await mod.loadCdRegistry();
+    expect(h2.state.getCount).toBe(1); // served from cache, no second GET
   });
 });

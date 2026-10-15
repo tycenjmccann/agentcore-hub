@@ -330,7 +330,8 @@ const BUNDLED: CdRegistry = parseCdRegistry(bundled);
  *
  *   missing key  → EMPTY registry, cached as such (a fresh install has registered
  *                  nothing; that IS the registry, not an outage).
- *   read error   → the LAST GOOD cached copy.
+ *   read error or
+ *   malformed body → the LAST GOOD cached copy.
  *   bundled seed → only on a cold start with no cache (no ARTIFACT_BUCKET, or the
  *                  process's first read failed).
  */
@@ -342,7 +343,14 @@ export async function loadCdRegistry(opts: { force?: boolean } = {}): Promise<Cd
     const { S3Client, GetObjectCommand } = await import("@aws-sdk/client-s3");
     const s3 = new S3Client({ region: REGION });
     const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: CD_REGISTRY_KEY }));
-    const registry = parseCdRegistry(await obj.Body!.transformToString());
+    // JSON.parse HERE, not inside parseCdRegistry (TEAM-6209, parity with the
+    // orchestrator's TEAM-4378 fix and the tools Lambda's TEAM-4358 fix):
+    // parseCdRegistry is tolerant by design, so a truncated body would become
+    // an EMPTY registry and get cached below, DISCARDING the last good copy for
+    // the whole TTL. Parsing first turns a malformed body into a SyntaxError
+    // the catch below already treats as a read failure.
+    const doc: unknown = JSON.parse(await obj.Body!.transformToString());
+    const registry = parseCdRegistry(doc);
     _cache = { registry, at: now };
     return registry;
   } catch (err) {
