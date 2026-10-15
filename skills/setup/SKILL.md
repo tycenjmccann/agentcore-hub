@@ -313,7 +313,7 @@ rm /tmp/agentcore-hub-answers.json
 
 `apply-env.sh` is the one place that writes `.env.local`. The skill does **not** write env vars by hand.
 
-If `apply-env.sh` prints `JIRA_WEBHOOK_SECRET_NEW=1`, note it: the answers brought a webhook secret that differs from the one the existing deployment was set up with, and the deploy-target step below must run the Jira webhook step **before** redeploying the hub (`apply-env.sh` also carries `DEPLOYMENT_URL` over from the previous `.env.local`, so that step has its target).
+If `apply-env.sh` prints `JIRA_WEBHOOK_SECRET_NEW=1`, note it: the answers brought a webhook secret that differs from the one the existing deployment was set up with. But treat that stdout line only as a hint, not the source of truth — `apply-env.sh` also persists `JIRA_WEBHOOK_SIGNING_PENDING="1"` in `.env.local` for the same condition and never clears it itself, so if this `/setup` run (or an earlier one) stops before the Jira webhook step runs, a later re-run with an unchanged secret prints no marker but the flag is still there. The deploy-target step below reads the persisted flag from `.env.local`, not this stdout line, to decide whether the Jira webhook step must run **before** redeploying the hub (`apply-env.sh` also carries `DEPLOYMENT_URL` over from the previous `.env.local`, so that step has its target).
 
 ---
 
@@ -352,7 +352,7 @@ After Core/Builder/Workflow verify clean and **before** running Evaluations:
 - **Bring-your-own (`byo`):** don't build or push anything. Write `DEPLOYMENT_URL=https://placeholder.example` to `.env.local` and tell the user: "Update `DEPLOYMENT_URL` in `.env.local` once your service is live so prd-submitter and Jira webhooks know where to reach the app." If Evaluations was selected, surface this warning prominently — prd-submitter is being deployed with a placeholder URL.
 - **Skip (`skip`):** skip both the deploy and the `DEPLOYMENT_URL` write. If Evaluations was selected, warn the user that prd-submitter will be deployed with a placeholder URL and they must update it manually.
 
-**Re-run with a new secret (`apply-env.sh` printed `JIRA_WEBHOOK_SECRET_NEW=1`):** run `./deploy/apprunner/setup-jira-webhook.sh` BEFORE `./deploy/apprunner/deploy.sh` (for `byo`, before rolling your own container with the new env), so Jira signs deliveries before the hub starts verifying them — DEPLOY.md "Jira webhook signing", Jira first (a), then the hub (b). The script reads the carried-over `DEPLOYMENT_URL` from `.env.local`, so it needs nothing from the deploy. A first install (nothing deployed, so no webhook to break) and a re-run with an unchanged secret keep the order on this page: deploy first, then the webhook step below (which is idempotent, so running it again after a Jira-first re-run is harmless).
+**Re-run with a pending signing flag:** check `.env.local` for `JIRA_WEBHOOK_SIGNING_PENDING="1"` before this step — not just whether `apply-env.sh` printed `JIRA_WEBHOOK_SECRET_NEW=1` a moment ago, since that stdout marker won't repeat if a previous `/setup` run stopped before the webhook step ran, but the persisted flag does. When the flag is set, run `./deploy/apprunner/setup-jira-webhook.sh` BEFORE `./deploy/apprunner/deploy.sh` (for `byo`, before rolling your own container with the new env), so Jira signs deliveries before the hub starts verifying them — DEPLOY.md "Jira webhook signing", Jira first (a), then the hub (b). If `setup-jira-webhook.sh` fails, **stop** — do not deploy the hub while Jira is still unsigned; it clears the flag itself only on success, so a retry of this step is safe. The script reads the carried-over `DEPLOYMENT_URL` from `.env.local`, so it needs nothing from the deploy. A first install (nothing deployed, so no webhook to break) and a re-run with the flag absent keep the order on this page: deploy first, then the webhook step below (which is idempotent, so running it again after a Jira-first re-run is harmless).
 
 ### Jira webhook setup (after deploy-target, if `TICKET_PROVIDER=jira` and `deploy_target` is NOT `local`)
 
@@ -364,7 +364,7 @@ When the ticket provider is Jira and the app is deployed to a publicly reachable
 
 This script uses the Jira legacy admin endpoint (`/rest/webhooks/1.0/webhook`) which accepts PAT-based basic auth. It idempotently deletes any stale `agentcore-hub-workflow` webhooks and creates a new one pointing at `DEPLOYMENT_URL/api/jira/webhook` filtered to `JIRA_PROJECT_KEY`. All credentials are read from `.env.local`.
 
-For `deploy_target=local`, skip the automated webhook and remind the user: "Jira webhooks need a public URL. Once you expose localhost via ngrok/Cloudflare Tunnel, update `DEPLOYMENT_URL` in `.env.local` and run `./deploy/apprunner/setup-jira-webhook.sh`."
+For `deploy_target=local`, skip the automated webhook and remind the user: "Jira webhooks need a public URL. Once you expose localhost via ngrok/Cloudflare Tunnel, update `DEPLOYMENT_URL` in `.env.local` and run `./deploy/apprunner/setup-jira-webhook.sh`." If `JIRA_WEBHOOK_SIGNING_PENDING="1"` is in `.env.local`, it stays set until they do — `apply-env.sh` never clears it, so it is still there to drive the Jira-first order on the next `/setup` re-run.
 
 After this step, run Evaluations (if selected) so it picks up the freshly written `DEPLOYMENT_URL`.
 

@@ -107,7 +107,13 @@ not redeliver it — until Jira is configured too.
   below for the live service and the Jira webhook). When a re-run supplies a
   secret that differs from the on-disk one on an existing deployment, it prints
   `JIRA_WEBHOOK_SECRET_NEW=1` and the setup skill runs `setup-jira-webhook.sh`
-  before `deploy.sh` — the same Jira-first order as (a) then (b).
+  before `deploy.sh` — the same Jira-first order as (a) then (b). That stdout
+  marker is one-shot, so `apply-env.sh` also persists `JIRA_WEBHOOK_SIGNING_PENDING="1"`
+  in `.env.local` for the same condition (TEAM-6351) — it never clears the flag
+  itself, so a `/setup` run that stops before `setup-jira-webhook.sh` runs (e.g.
+  a failed module verification) still has it set on the next re-run, even
+  though the secret is now unchanged and the marker would no longer print.
+  Only a successful `setup-jira-webhook.sh` clears it.
 
 Between (a) and (b) the hub still accepts unsigned requests (and logs one
 `console.warn` per instance). Once (b) rolls out, an unsigned or mismatched

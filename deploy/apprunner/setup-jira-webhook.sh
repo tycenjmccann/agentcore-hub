@@ -14,6 +14,11 @@
 #   Optional: JIRA_WEBHOOK_SECRET — [A-Za-z0-9._~+/=-]+ only (openssl rand -hex 32);
 #   refused otherwise (TEAM-6334, deploy/lib/jira-webhook-secret.sh)
 #
+# On success, clears JIRA_WEBHOOK_SIGNING_PENDING from .env.local if present
+# (TEAM-6351 R3-F1) — apply-env.sh sets that flag when a new/changed webhook
+# secret needs Jira configured before the hub redeploys, and only this script
+# clears it, so an interrupted /setup re-run still knows to run Jira-first.
+#
 # Usage:
 #   ./deploy/apprunner/setup-jira-webhook.sh
 
@@ -153,6 +158,19 @@ RESPONSE=$(curl -sf -X POST \
 
 echo "        Webhook created successfully"
 echo ""
+
+# TEAM-6351 (R3-F1): only clear the pending flag once Jira has actually
+# accepted the webhook — every exit above (missing env, bad secret, failed
+# curl) leaves it set, so an interrupted /setup re-run still deploys the hub
+# Jira-first. Same tmp-file + mv + chmod 600 pattern as DEPLOYMENT_URL in
+# deploy/apprunner/deploy.sh and deploy/ecs-express/deploy.sh.
+if grep -q '^JIRA_WEBHOOK_SIGNING_PENDING=' .env.local 2>/dev/null; then
+  grep -v '^JIRA_WEBHOOK_SIGNING_PENDING=' .env.local > .env.local.tmp && mv .env.local.tmp .env.local
+  chmod 600 .env.local
+  echo "        Cleared JIRA_WEBHOOK_SIGNING_PENDING from .env.local"
+  echo ""
+fi
+
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Jira webhook configured"
 echo "  ${WEBHOOK_NAME} → ${WEBHOOK_URL}"

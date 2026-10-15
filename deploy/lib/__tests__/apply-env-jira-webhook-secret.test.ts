@@ -380,3 +380,92 @@ describe("apply-env.sh carries DEPLOYMENT_URL over and flags a NEW secret on an 
     expect(parseEnv(r.env!).JIRA_WEBHOOK_SECRET).toBe(HEX);
   });
 });
+
+/**
+ * TEAM-6351 (R3-F1 on TEAM-6347 / PR #1001) — the JIRA_WEBHOOK_SECRET_NEW=1
+ * marker above is stdout-only and one-shot: it is computed by diffing the
+ * answers against the secret already on disk, but this script's own write
+ * is what makes that diff disappear on the very next run. If /setup stops
+ * between this script and setup-jira-webhook.sh (e.g. a failed module
+ * verification), the next re-run with the SAME answers sees no change and
+ * prints no marker, so skills/setup/SKILL.md falls through to the deploy-
+ * first branch — the hub starts verifying signatures while Jira is still
+ * unsigned, and every delivery 401s with no redelivery.
+ *
+ * Fix: apply-env.sh now persists JIRA_WEBHOOK_SIGNING_PENDING="1" in
+ * .env.local for the same condition, carries it forward on every re-run
+ * (never clearing it itself, including on the disable_webhook_signing path),
+ * and only deploy/apprunner/setup-jira-webhook.sh clears it, once it actually
+ * succeeds. See jira-webhook-signing-pending.test.ts for that half.
+ */
+describe("apply-env.sh persists JIRA_WEBHOOK_SIGNING_PENDING across an interrupted /setup re-run (TEAM-6351 R3-F1)", () => {
+  const PENDING = /^JIRA_WEBHOOK_SIGNING_PENDING="1"$/m;
+
+  it("run 1 (new secret, deployed hub) sets the flag alongside the marker", () => {
+    const r = runApplyEnv(jiraAnswers(HEX), DEPLOYED_UNSIGNED);
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
+    expect(r.stdout).toMatch(MARKER);
+    expect(r.env).toMatch(PENDING);
+  });
+
+  // The reproduction: run apply-env.sh twice with IDENTICAL answers and no
+  // setup-jira-webhook.sh in between. On main, run 2's diff against the
+  // secret run 1 itself just wrote comes up empty, so no marker prints and
+  // (main has no flag at all) nothing persists the pending state — this test
+  // fails on main (see jira-webhook-signing-pending.test.ts header for the
+  // APPLY_ENV_SH / `git show <base>:...` fail-on-base demo).
+  it("run 2 with identical answers and no webhook step in between still has the flag set, and the marker keeps printing because of it", () => {
+    const run1 = runApplyEnv(jiraAnswers(HEX), DEPLOYED_UNSIGNED);
+    expect(run1.status, `${run1.stdout}\n${run1.stderr}`).toBe(0);
+    expect(run1.stdout).toMatch(MARKER);
+    expect(run1.env).toMatch(PENDING);
+
+    const run2 = runApplyEnv(jiraAnswers(HEX), run1.env!);
+    expect(run2.status, `${run2.stdout}\n${run2.stderr}`).toBe(0);
+    // Before the fix this stdout marker was one-shot — diffing identical
+    // answers against the secret apply-env.sh itself had just written made it
+    // disappear on run 2, which is exactly what let SKILL.md fall through to
+    // deploying the hub first. The persisted flag fixes the thing that
+    // actually matters (SKILL.md now reads the flag, not stdout); re-deriving
+    // the marker from the flag too means it keeps printing as a bonus.
+    expect(run2.stdout).toMatch(MARKER);
+    expect(run2.env).toMatch(PENDING);
+
+    const run3 = runApplyEnv(jiraAnswers(HEX), run2.env!);
+    expect(run3.env).toMatch(PENDING);
+  });
+
+  it("a module/provider-switching re-run still keeps the flag (same carry-over rule as the secret itself, TEAM-6347 R2-F1)", () => {
+    const run1 = runApplyEnv(jiraAnswers(HEX), DEPLOYED_UNSIGNED);
+    const run2 = runApplyEnv(answers({ modules: ["core", "cloud-code"], ticketProvider: "dynamodb", jira: null }), run1.env!);
+    expect(run2.status, `${run2.stdout}\n${run2.stderr}`).toBe(0);
+    expect(run2.env).toMatch(PENDING);
+    expect(parseEnv(run2.env!).JIRA_WEBHOOK_SECRET).toBe(HEX);
+  });
+
+  it("jira.disable_webhook_signing does not clear the flag — only setup-jira-webhook.sh does", () => {
+    const run1 = runApplyEnv(jiraAnswers(HEX), DEPLOYED_UNSIGNED);
+    const run2 = runApplyEnv(
+      jiraAnswers(undefined, "jira", ["core", "workflow"], { disable_webhook_signing: true }),
+      run1.env!
+    );
+    expect(run2.status, `${run2.stdout}\n${run2.stderr}`).toBe(0);
+    expect("JIRA_WEBHOOK_SECRET" in parseEnv(run2.env!)).toBe(false);
+    expect(run2.env).toMatch(PENDING);
+  });
+
+  it("no flag written on the existing no-marker paths: unchanged secret, first install, placeholder URL, plain carry-over", () => {
+    expect(runApplyEnv(jiraAnswers(HEX), EXISTING_DEPLOYED).env).not.toMatch(PENDING);
+    expect(runApplyEnv(jiraAnswers(HEX)).env).not.toMatch(PENDING);
+    expect(runApplyEnv(jiraAnswers(OTHER), `${EXISTING}DEPLOYMENT_URL="https://placeholder.example"\n`).env).not.toMatch(
+      PENDING
+    );
+    expect(runApplyEnv(jiraAnswers(), EXISTING_DEPLOYED).env).not.toMatch(PENDING);
+  });
+
+  it("no flag on a first-ever run with no Jira secret at all (signing off, as before)", () => {
+    const r = runApplyEnv(answers({ modules: ["core"], jira: null }));
+    expect(r.status, `${r.stdout}\n${r.stderr}`).toBe(0);
+    expect(r.env).not.toMatch(PENDING);
+  });
+});

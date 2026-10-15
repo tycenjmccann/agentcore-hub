@@ -51,6 +51,20 @@
 # printed so the skill runs the Jira webhook step first. Never printed on a
 # first install, on plain carry-over, or when the secret is unchanged.
 #
+# JIRA_WEBHOOK_SIGNING_PENDING (TEAM-6351 R3-F1): the marker above is a
+# stdout-only, one-shot signal — if /setup stops before
+# deploy/apprunner/setup-jira-webhook.sh runs (e.g. a module verification
+# failure), the NEXT re-run diffs the answers against the secret THIS run just
+# wrote, sees no change, and prints no marker, so the skill falls through to
+# deploying the hub first after all. This script now persists the same
+# condition as JIRA_WEBHOOK_SIGNING_PENDING="1" in .env.local itself: set
+# whenever secret_is_new is true OR the flag was already "1" on disk (so it
+# survives every re-run, including a module/provider switch and the disable
+# path), and cleared only by setup-jira-webhook.sh after it actually succeeds.
+# This script never clears it. The stdout marker is still printed whenever the
+# flag is pending (not just when it is newly set this run) — SKILL.md and
+# DEPLOY.md's existing readers of the stdout marker keep working unchanged.
+#
 # brand_name is a *display* string only — sets NEXT_PUBLIC_BRAND_NAME so the
 # header, sidebar, and page titles read "Bob's AI Hub" instead of "AgentCore
 # Hub". It does NOT affect any AWS resource names. Those are part of the
@@ -103,6 +117,7 @@ if [[ "$disable_webhook_signing" == "true" && -n "$jira_webhook_secret" ]]; then
 fi
 existing_secret=$(read_env_local_value JIRA_WEBHOOK_SECRET)
 existing_deployment_url=$(read_env_local_value DEPLOYMENT_URL)
+existing_signing_pending=$(read_env_local_value JIRA_WEBHOOK_SIGNING_PENDING)
 
 secret_is_new=false
 if [[ "$disable_webhook_signing" == "true" ]]; then
@@ -117,6 +132,14 @@ else
   if [[ -n "$jira_webhook_secret" ]]; then
     require_jira_webhook_secret_format "$jira_webhook_secret" || exit 1
   fi
+fi
+
+# Pending once, stays pending until setup-jira-webhook.sh clears it itself
+# (TEAM-6351 R3-F1) — this script never clears it, including on the disable
+# path above, so an interrupted /setup re-run still knows Jira isn't signed yet.
+signing_pending=false
+if [[ "$secret_is_new" == "true" || "$existing_signing_pending" == "1" ]]; then
+  signing_pending=true
 fi
 
 if [[ -f "$ENV_FILE" ]]; then
@@ -172,13 +195,16 @@ emit() {
   echo ""
 
   # Kept regardless of module set and ticket provider (TEAM-6347, see header).
-  if [[ -n "$jira_webhook_secret" || -n "$existing_deployment_url" ]]; then
+  if [[ -n "$jira_webhook_secret" || -n "$existing_deployment_url" || "$signing_pending" == "true" ]]; then
     echo "# --- Carried over across re-runs (DEPLOY.md 'Jira webhook signing') ---"
     if [[ -n "$jira_webhook_secret" ]]; then
       emit JIRA_WEBHOOK_SECRET "$jira_webhook_secret"
     fi
     if [[ -n "$existing_deployment_url" ]]; then
       emit DEPLOYMENT_URL "$existing_deployment_url"
+    fi
+    if [[ "$signing_pending" == "true" ]]; then
+      emit JIRA_WEBHOOK_SIGNING_PENDING "1"
     fi
     echo ""
   fi
@@ -231,6 +257,6 @@ emit() {
 
 chmod 600 "$ENV_FILE"
 echo "Wrote $ENV_FILE (mode 600)"
-if [[ "$secret_is_new" == "true" ]]; then
+if [[ "$signing_pending" == "true" ]]; then
   echo "JIRA_WEBHOOK_SECRET_NEW=1 — the secret differs from the one the deployed hub was set up with: run ./deploy/apprunner/setup-jira-webhook.sh BEFORE redeploying the hub (Jira first, DEPLOY.md 'Jira webhook signing')"
 fi

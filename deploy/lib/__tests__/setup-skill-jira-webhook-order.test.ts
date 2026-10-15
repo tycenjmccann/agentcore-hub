@@ -100,3 +100,43 @@ describe("skills/setup/SKILL.md runs the Jira webhook step before the hub redepl
     expect(step).toMatch(/^### Jira webhook setup/m);
   });
 });
+
+/**
+ * TEAM-6351 (R3-F1) — the stdout marker above is one-shot: if /setup stops
+ * before setup-jira-webhook.sh runs, a re-run with the SAME (now-unchanged)
+ * secret prints no marker, so a skill that only watched stdout would deploy
+ * the hub first after all. SKILL.md must instead key the Jira-first decision
+ * off the persisted .env.local flag apply-env.sh now writes.
+ */
+describe("skills/setup/SKILL.md keys the Jira-first order off the persisted .env.local flag, not just the stdout marker (TEAM-6351 R3-F1)", () => {
+  const FLAG = "JIRA_WEBHOOK_SIGNING_PENDING";
+
+  it("the apply step names the persisted flag as the thing the deploy-target step actually reads", () => {
+    const apply = section(skill, /^## After confirmation: write `\.env\.local`/m);
+    expect(apply).toContain(FLAG);
+    expect(apply).toMatch(/never clears it itself/);
+  });
+
+  it("the deploy-target step's new-secret instruction reads the flag from .env.local before deciding the order", () => {
+    const step = section(skill, /^## Deploy target step/m);
+    const flagAt = step.indexOf(FLAG);
+    expect(flagAt, "flag instruction missing from the deploy-target step").toBeGreaterThan(-1);
+    const after = step.slice(flagAt);
+    const webhookAt = after.indexOf("./deploy/apprunner/setup-jira-webhook.sh");
+    const deployAt = after.indexOf("./deploy/apprunner/deploy.sh");
+    expect(webhookAt).toBeGreaterThan(-1);
+    expect(deployAt).toBeGreaterThan(-1);
+    expect(webhookAt).toBeLessThan(deployAt);
+    // Still true after the fix: the marker remains a documented hint, and the
+    // instruction still orders the webhook script before deploy.sh with BEFORE.
+    expect(after).toContain(MARKER);
+    expect(sentenceWith(after, "./deploy/apprunner/setup-jira-webhook.sh")).toMatch(/BEFORE/);
+  });
+
+  it("a failed setup-jira-webhook.sh must stop the skill, not fall through to deploying the hub", () => {
+    const step = section(skill, /^## Deploy target step/m);
+    const flagAt = step.indexOf(FLAG);
+    const after = step.slice(flagAt);
+    expect(after).toMatch(/setup-jira-webhook\.sh.*fails.*stop/is);
+  });
+});
