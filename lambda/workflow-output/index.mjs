@@ -694,6 +694,7 @@ export const RECORD_CAS_ATTEMPTS = 3;
  *     fields (entry pruned) left a hold no re-run could find the brief for.
  */
 export function adoptHold(report, current, { deliveredNow = false, forceHold = false } = {}) {
+  const ownBrief = briefEntryKey(report);
   const adopt = !deliveredNow || (forceHold && current?.briefPending === true);
   if (adopt && current && typeof current === "object" && current.briefPending !== undefined) {
     for (const f of BRIEF_HOLD_FIELDS) {
@@ -701,11 +702,25 @@ export function adoptHold(report, current, { deliveredNow = false, forceHold = f
       else delete report[f];
     }
   }
+  // TEAM-6224 (R4-02): the current record may owe the brief WITHOUT the stamp (a newer report
+  // queued its writes with the brief, or wrote the brief's key ahead of its send) - a write
+  // that read an older record must not erase that. Re-asked on every attempt (writeRecord
+  // calls this after each re-read), and held exactly as a stamp: the key and the queued
+  // marker carried, so the next re-run finds the brief to deliver.
+  const owed = !deliveredNow && current?.briefPending !== true ? briefObligation(current) : null;
+  if (owed && !briefObligation(report)) {
+    holdBriefOwed(report, owed.key, "owed by the record this write conditioned on - not yet on the gate");
+    report.briefHoldReason = `${owed.key ? `the merge brief ${owed.key}` : "the merge brief"} is owed by a record written after this call read it - not yet on the gate`;
+    if (current.ticketWrites === "queued" && report.ticketWrites === undefined) report.ticketWrites = "queued";
+  }
   // TEAM-5995: a release (no gate needs the brief, briefDisposition) is proof too.
   const deliveredSince = current?.briefPending === false
     && (current?.briefDelivered === "gate" || current?.briefDisposition?.release === true);
   // A forced hold is never a released one (TEAM-5995: disposition ⇒ briefPending false).
   if (forceHold && !deliveredSince) { report.briefPending = true; delete report.briefDisposition; }
+  // TEAM-6224: a hold never drops the brief it holds (a pruned entry under a delivery reads
+  // briefPending:false, so nothing delivered is resurrected).
+  if (report.briefPending === true && ownBrief) noteBriefOwed(report, ownBrief, "the merge brief this report holds - not yet on the gate");
   // TEAM-5941: the twins' Done-intent fence (gate-contract.mjs) is CARRIED verbatim,
   // whatever else this write decides — it is not a hold field, and a write that dropped
   // it would re-open the window the fence closes (the drain would stamp a hold the
@@ -1476,13 +1491,17 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
         const cur = `${String(curStamp.verdict || "").toUpperCase() || "no verdict"}${asText(curStamp.amendmentTicketId) ? ` on amendment ${asText(curStamp.amendmentTicketId)}` : ""}`;
         return { ok: false, error: `${key} carries a PROVISIONAL securityReview admission (${cur}) newer than this call's - the record write never finalizes or overwrites it; a finalize goes through finalizeProvisionalRecord, and the newer admission's own caller decides` };
       }
+      // TEAM-6224: or a brief obligation (briefObligation, which the twins' guard mirrors) the
+      // record conditioned on does not carry - the brief key written ahead of the queue's send.
       const holdWritten = (report.followUpsPending === true && recordBase.record?.followUpsPending !== true)
-        || (report.briefPending === true && recordBase.record?.briefPending !== true);
+        || (report.briefPending === true && recordBase.record?.briefPending !== true)
+        || (!!briefObligation(report) && !briefObligation(recordBase.record));
       // TEAM-5994: on EVERY attempt, against the record this attempt conditions on — never
       // the get_issue above, which predates every re-read below.
       const deferred = await deferHoldOnDoneIntent({ current: recordBase.record, holdWritten, ticketId: ticket_id });
       if (deferred) {
-        const hold = report.followUpsPending === true && recordBase.record?.followUpsPending !== true ? "followUpsPending:true" : "briefPending:true";
+        const hold = report.followUpsPending === true && recordBase.record?.followUpsPending !== true ? "followUpsPending:true"
+          : report.briefPending === true ? "briefPending:true" : `the owed merge brief ${briefObligation(report)?.key}`;
         console.warn(`[report_completion] ${ticket_id}: ${key} carries a fresh Done-intent (${deferred.at}) and ${ticket_id} ${deferred.fresh.ok ? "does not read Done yet" : `could not be re-read (${deferred.fresh.error})`} - a Done is in flight, so this write (${hold}) is DEFERRED; nothing written`);
         return { ok: false, deferred: true, reason: "completion_record_done_in_flight", error: `a Done on ${ticket_id} is being committed by the ticket provider (Done-intent ${deferred.at}) and this write would put ${hold} on ${key}, a hold the committing provider can no longer see` };
       }
@@ -1661,15 +1680,16 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // compensating write: the obligation is treated exactly as briefPending:true, so the rest of
     // this block delivers the brief to the gate (or holds, writing briefPending:true on THIS call's
     // own record write) before any Done. reholdBeforeRetry's stamp stays as belt-and-braces.
-    const owedKey = held?.briefPending === true ? null : queuedBriefOwed(held);
-    if (held?.briefPending === true || owedKey) {
-      if (owedKey) {
+    // TEAM-6224: through briefObligation - also a brief key written ahead of the queue's send
+    // (R4-01), when no stamp ever landed.
+    const owed = briefObligation(held);
+    if (owed) {
+      if (held.briefPending !== true) {
         report.briefPending = true;
-        console.warn(`[report_completion] ${ticket_id}: ${key} queued the merge brief ${owedKey} and nothing has recorded it on the gate - treated as briefPending:true`);
+        console.warn(`[report_completion] ${ticket_id}: ${key} owes the merge brief ${owed.key} (queued, or its key written ahead of the queue) and nothing has recorded it on the gate - treated as briefPending:true`);
       }
       for (const f of BRIEF_HOLD_FIELDS) if (held[f] !== undefined && report[f] === undefined) report[f] = held[f];
-      const briefKey = mergeBriefKey(keys) || owedKey
-        || (Array.isArray(held.undelivered) ? held.undelivered.find((u) => u?.part === "brief" && asText(u.s3Key))?.s3Key : null);
+      const briefKey = mergeBriefKey(keys) || owed.key;
       let brief = null;
       if (briefKey) {
         const sib = needsSiblings && scan.ok ? scan : await loadSiblings(epicKey);
@@ -1721,6 +1741,10 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
         report.briefHoldReason = !briefKey ? "the report names no merge brief (evidence_keys has no shared/merge-brief.md) and the record lists none"
           : !brief.ok ? brief.error
             : `${brief.outcome}: ${brief.reason}`;
+        // TEAM-6224 (R4-05): the hold names the brief it holds, and keeps the record's queued
+        // marker - a retry that omits evidence_keys must still find the brief to deliver.
+        if (briefKey) noteBriefOwed(report, briefKey, report.briefHoldReason);
+        if (held.ticketWrites === "queued" && report.ticketWrites === undefined) report.ticketWrites = "queued";
         console.warn(`[report_completion] ${ticket_id}: merge brief still NOT on the gate (${report.briefHoldReason}) - briefPending kept`);
       }
     }
@@ -2005,6 +2029,17 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   let queued = null;
   if (queueable) {
     try {
+      // TEAM-6224 (R4-01): the brief this message carries is written onto the record BEFORE
+      // the send, as the part:"brief" undelivered entry every reader asks (briefObligation).
+      // The ticketWrites:"queued" stamp after the send can fail; the obligation must not rest
+      // on it. A write that fails sends nothing: today's retry answer, and the record states
+      // everything that is queued.
+      const queuedBrief = mergeBriefKey(keys);
+      if (queuedBrief && briefOwed(report, queuedBrief) && !briefEntryKey(report)) {
+        noteBriefOwed(report, queuedBrief, `queued for the ticket-provider replay (${queueable})`);
+        const noted = await writeRecord(() => report.status);
+        if (!noted.ok) throw Object.assign(new Error(noted.error), { name: "RecordWriteContended" });
+      }
       queued = await enqueueTicketWrites({
         ticketId: ticket_id, workflowId: workflow_id, agentId: agent_id, epicKey, entries: toMaterialize,
         // TEAM-6142: amendmentTicketId, so the drain re-confirms the amendment before its Done.
@@ -2014,7 +2049,8 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       });
       console.warn(`[report_completion] ${ticket_id}: ticket provider UNAVAILABLE (${queueable}) - ticket-side writes QUEUED (${queued.messageId || "no message id"}) for the probe to replay`);
     } catch (err) {
-      console.error(`[report_completion] ${ticket_id}: ticket provider unavailable (${queueable}) but the replay queue REFUSED the writes (${err.name}: ${err.message}) - answering retry`);
+      const refused = err.name === "RecordWriteContended" ? "the record could not take the merge brief's key ahead of the send, so nothing was queued" : "the replay queue REFUSED the writes";
+      console.error(`[report_completion] ${ticket_id}: ticket provider unavailable (${queueable}) but ${refused} (${err.name}: ${err.message}) - answering retry`);
     }
   }
   // The answer is "queued" only once the RECORD says so too. A stamp that fails falls
@@ -2183,6 +2219,43 @@ export function queuedBriefOwed(record) {
   const key = mergeBriefKey(record.evidence_keys)
     || (Array.isArray(record.undelivered) ? asText(record.undelivered.find((u) => u?.part === "brief" && asText(u.s3Key))?.s3Key) : null);
   return briefOwed(record, key) ? key : null;
+}
+
+/** TEAM-6224: the brief a record's `part:"brief"` undelivered entry names, or null. */
+export function briefEntryKey(record) {
+  return Array.isArray(record?.undelivered) ? asText(record.undelivered.find((u) => u?.part === "brief" && asText(u.s3Key))?.s3Key) || null : null;
+}
+
+/**
+ * TEAM-6224: THE answer to "does this record owe the merge brief, and with which key" -
+ * `{ key }` (key null when a stamped hold names none) or null. Owed when the record stamps
+ * the hold (`briefPending:true`), when a `part:"brief"` undelivered entry names a brief with
+ * no recorded outcome (briefOwed), or when its writes were queued with the brief among them
+ * (queuedBriefOwed, the pre-6224 record shape). The held-brief block, adoptHold on every CAS
+ * re-read, the Done-intent `holdWritten` check and the empty sweep all ask it, and the twins'
+ * briefHoldRefusal (gate-contract.mjs) mirrors it, so no partial write can leave a record
+ * that owes the brief to one reader and not to another.
+ */
+export function briefObligation(record) {
+  if (!record || typeof record !== "object") return null;
+  const entry = briefEntryKey(record);
+  if (record.briefPending === true) return { key: entry || mergeBriefKey(record.evidence_keys) };
+  if (entry && briefOwed(record, entry)) return { key: entry };
+  const queued = queuedBriefOwed(record);
+  return queued ? { key: queued } : null;
+}
+
+/** TEAM-6224: write the owed brief's key onto `record` (once; no hold). Mutates and returns it. */
+export function noteBriefOwed(record, s3Key, reason) {
+  if (asText(s3Key) && !briefEntryKey(record)) record.undelivered = mergeUndelivered(record.undelivered, [{ part: "brief", s3Key, reason }], []);
+  return record;
+}
+
+/** TEAM-6224: hold the brief AND name it, so no later reader is left a hold it cannot deliver. */
+export function holdBriefOwed(record, s3Key, reason) {
+  record.briefPending = true;
+  delete record.briefDisposition;
+  return noteBriefOwed(record, s3Key, reason);
 }
 
 /**
@@ -4526,11 +4599,12 @@ async function skipSibling(row, { workflowId, sweeperTicketId }) {
   const cur = await readRecord(key);
   if (cur.error) return { ok: false, error: `completion record ${key} unreadable (${cur.error}) - not skipped` };
   // TEAM-6217 (R3-01 sibling sweep): and a QUEUED record whose merge brief nothing has recorded on the
-  // gate is the same hold without the stamp (queuedBriefOwed, the one predicate report_completion
-  // uses) - the skip marker would erase the brief obligation and the skip's Done would make the gate
+  // gate is the same hold without the stamp (TEAM-6224: briefObligation, the one predicate
+  // report_completion uses) - the skip marker would erase the brief obligation and the skip's Done would make the gate
   // Ready brief-less.
   const held = cur.record?.briefPending === true ? "briefPending:true" : cur.record?.followUpsPending === true ? "followUpsPending:true"
-    : queuedBriefOwed(cur.record) ? `ticketWrites:"queued" with its merge brief ${queuedBriefOwed(cur.record)} not yet recorded on the gate` : null;
+    : queuedBriefOwed(cur.record) ? `ticketWrites:"queued" with its merge brief ${queuedBriefOwed(cur.record)} not yet recorded on the gate`
+      : briefObligation(cur.record) ? `the merge brief ${briefObligation(cur.record).key} owed (its key written ahead of the replay queue) and not yet recorded on the gate` : null;
   if (held) {
     console.warn(`[report_completion] ${ticketId}: empty_sweep will NOT skip it - its completion record has ${held}; the hold is lifted by report_completion or a human, never by the sweep`);
     return { ok: false, error: `completion record ${key} has ${held} - not skipped; the hold is lifted by report_completion or a human, never by the sweep` };

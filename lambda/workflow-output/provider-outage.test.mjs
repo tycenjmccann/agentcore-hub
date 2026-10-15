@@ -450,7 +450,7 @@ describe("TEAM-6224 — the merge-brief obligation survives a partial write", ()
       twinsRefuse();
     });
 
-    it("ORDER: the pre-send write fails ⇒ nothing is sent, the answer is retry; the retry with the provider back delivers", async () => {
+    it("ORDER: the pre-send write fails ⇒ nothing is sent, the answer is retry; the retry with the provider back is a healthy report", async () => {
       fake.down = true;
       fake.putError = (input) => (input.Key === KEY && briefEntry(bodyOf(input)) && bodyOf(input).ticketWrites === undefined ? s3Fail() : null);
       const res = result(await report());
@@ -459,9 +459,13 @@ describe("TEAM-6224 — the merge-brief obligation survives a partial write", ()
       expect(fake.sends, "a message the record does not state").toHaveLength(0);
       expect(briefEntry(record())).toBeUndefined();
 
+      // Nothing was queued, so nothing is owed: the retry is the report a healthy run makes.
       fake.putError = null;
       fake.down = false;
-      expectDeliveredThenDone(result(await report()));
+      expect(result(await report()).status).toBe("complete");
+      expect(fake.tickets.get(BUILD).status).toBe("Done");
+      expect(fake.sends).toHaveLength(0);
+      expect(mod.briefObligation(record())).toBeNull();
     });
 
     it("ORDER: the pre-send write lands, the send fails ⇒ the record owes the brief; the retry delivers", async () => {

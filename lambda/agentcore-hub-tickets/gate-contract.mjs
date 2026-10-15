@@ -950,11 +950,35 @@ export function descriptionCarriesConsoleLink(description, { pipeline, region } 
 // only a provable 404 (and an unset bucket, which is deploy config — see the
 // twins' briefHoldOf) admits.
 
+// TEAM-6224: the merge-brief key rule of workflow-output's mergeBriefKey (bare key or s3:// URI).
+const MERGE_BRIEF_KEY_RE = /^workflows\/[^/]+\/shared\/merge-brief\.md$/;
+function namesMergeBrief(keys) {
+  return typeof keys === "string" && keys.split(",").some((raw) => MERGE_BRIEF_KEY_RE.test(raw.trim().replace(/^s3:\/\/[^/]+\//, "")));
+}
+
+/**
+ * TEAM-6224: the brief a record owes WITHOUT the stamp, or null — workflow-output's
+ * briefObligation, mirrored: a `part:"brief"` undelivered entry, or writes queued with the
+ * brief among them (`ticketWrites:"queued"` + evidence_keys naming it), and no recorded
+ * outcome (`briefDelivered` unset, no release). A partial write (the post-send queued stamp
+ * failing, a hold written with no brief key) leaves exactly this shape.
+ */
+function briefOwedUnstamped(record) {
+  if (record.briefDelivered !== undefined || record.briefDisposition?.release) return null;
+  const entry = Array.isArray(record.undelivered)
+    ? record.undelivered.find((u) => u?.part === "brief" && typeof u.s3Key === "string" && u.s3Key)
+    : undefined;
+  if (entry) return entry.s3Key;
+  return record.ticketWrites === "queued" && namesMergeBrief(record.evidence_keys) ? "named in evidence_keys" : null;
+}
+
 /** The brief-hold refusal text, or null — shared by both judges below. */
 function briefHoldRefusal(k, record) {
-  if (record.briefPending !== true) return null;
-  const delivered =
-    typeof record.briefDelivered === "string" && record.briefDelivered.trim()
+  const owed = record.briefPending === true ? null : briefOwedUnstamped(record);
+  if (record.briefPending !== true && !owed) return null;
+  const delivered = owed
+    ? `owed: ${owed}, not yet on the gate`
+    : typeof record.briefDelivered === "string" && record.briefDelivered.trim()
       ? record.briefDelivered.trim()
       : "unstated";
   return (
