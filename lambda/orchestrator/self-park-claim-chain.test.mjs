@@ -373,7 +373,7 @@ async function deliver(fake) {
   while (fake.webhooks.length) {
     const payload = fake.webhooks.shift();
     const before = h.state.lambdaInvokes.length;
-    const res = await webhookPOST({ json: async () => payload });
+    const res = await webhookPOST({ text: async () => JSON.stringify(payload), headers: new Headers() });
     const route = await res.json();
     const cmds = h.state.lambdaInvokes.slice(before).filter((i) => i.FunctionName === "agentcore-hub-orchestrator").map((i) => i.payload);
     out.push({ changelogId: payload.changelog.id, fields: payload.changelog.items.map((i) => i.field), route, cmds });
@@ -467,11 +467,15 @@ describe("TEAM-5777: self-park claim release — real Jira Lambda → fake Jira 
     const fake = await boot();
     fake.issues["TEAM-24"].fields.status.name = "Ready";
     h.state.workflow.agentTasks["TEAM-24"] = { id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "pending" };
-    const res = await webhookPOST({ json: async () => ({
-      webhookEvent: "jira:issue_updated", timestamp: Date.now(),
-      issue: { key: "TEAM-24", fields: structuredClone(fake.issues["TEAM-24"].fields) },
-      changelog: { id: "9999", items: [{ field: "status", fieldtype: "jira", fromString: "To Do", toString: "Ready" }] },
-    }) });
+    const res = await webhookPOST({
+      text: async () =>
+        JSON.stringify({
+          webhookEvent: "jira:issue_updated", timestamp: Date.now(),
+          issue: { key: "TEAM-24", fields: structuredClone(fake.issues["TEAM-24"].fields) },
+          changelog: { id: "9999", items: [{ field: "status", fieldtype: "jira", fromString: "To Do", toString: "Ready" }] },
+        }),
+      headers: new Headers(),
+    });
     expect((await res.json()).ignored).not.toBe(true);
     for (const c of h.state.lambdaInvokes.filter((i) => i.FunctionName === "agentcore-hub-orchestrator").map((i) => i.payload)) await handler(c);
 

@@ -107,6 +107,19 @@ WEBHOOK_PAYLOAD=$(cat <<EOF
 EOF
 )
 
+# TEAM-6324: when JIRA_WEBHOOK_SECRET is set, have Jira sign deliveries with
+# it (/rest/webhooks/1.0/webhook accepts an optional "secret" field) so the
+# hub's signature check (DEPLOY.md "Jira webhook signing") has something to
+# verify against. Unset is byte-identical to before this change.
+if [[ -n "${JIRA_WEBHOOK_SECRET:-}" ]]; then
+  WEBHOOK_PAYLOAD=$(SECRET="$JIRA_WEBHOOK_SECRET" python3 -c "
+import json, os, sys
+payload = json.loads(sys.stdin.read())
+payload['secret'] = os.environ['SECRET']
+print(json.dumps(payload))
+" <<<"$WEBHOOK_PAYLOAD")
+fi
+
 RESPONSE=$(curl -sf -X POST \
   -u "$AUTH" \
   -H "Content-Type: application/json" \
@@ -121,6 +134,7 @@ RESPONSE=$(curl -sf -X POST \
     echo "          URL:  ${WEBHOOK_URL}" >&2
     echo "          Events: Issue Created, Issue Updated" >&2
     echo "          Filter: project = ${JIRA_PROJECT_KEY}" >&2
+    echo "          Secret: \$JIRA_WEBHOOK_SECRET (set it here too, so the hub's signature check has a match — DEPLOY.md 'Jira webhook signing')" >&2
     exit 1
   }
 
