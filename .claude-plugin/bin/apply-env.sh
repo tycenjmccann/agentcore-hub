@@ -16,8 +16,19 @@
 #   "aws_profile": "default",
 #   "deploy_target": "local" | "apprunner" | "byo" | "skip",
 #   "github": { "mode": "pat" | "mcp" | "skip", "pat": "...", "mcp_servers": "...", "owner": "octocat", "repo": "my-project" },
-#   "jira": { "site_url": "...", "email": "...", "api_token": "...", "project_key": "..." } | null
+#   "jira": { "site_url": "...", "email": "...", "api_token": "...", "project_key": "...",
+#             "webhook_secret": "..." (optional) } | null
 # }
+#
+# JIRA_WEBHOOK_SECRET (TEAM-6336): the /setup skill never asks for it — DEPLOY.md
+# ("Jira webhook signing") has the operator add it to .env.local by hand — so a
+# re-run regenerating this file from the answers used to drop the line, and the
+# next full redeploy (deploy/*/deploy.sh forward it from .env.local) then
+# silently returned the hub to unsigned passthrough. Now: answers.jira.webhook_secret
+# wins when non-empty; otherwise the value already in .env.local is carried
+# over; otherwise the key stays absent (signing off, as before). A non-empty
+# value is checked against the shared charset rule BEFORE the backup/overwrite,
+# so a refused run leaves .env.local untouched.
 #
 # brand_name is a *display* string only — sets NEXT_PUBLIC_BRAND_NAME so the
 # header, sidebar, and page titles read "Bob's AI Hub" instead of "AgentCore
@@ -45,6 +56,25 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ENV_FILE="$REPO_ROOT/.env.local"
+
+# Resolve JIRA_WEBHOOK_SECRET before anything is written (see the header). The
+# existing value is read in a subshell through the same loader every consumer
+# uses, with the caller's own shell value cleared first so only the file counts.
+# shellcheck disable=SC1091
+source "$REPO_ROOT/deploy/lib/jira-webhook-secret.sh"
+jira_webhook_secret=$(jq -r '.jira.webhook_secret // ""' "$ANSWERS")
+if [[ -z "$jira_webhook_secret" && -f "$ENV_FILE" ]]; then
+  jira_webhook_secret=$(
+    unset JIRA_WEBHOOK_SECRET
+    # shellcheck disable=SC1091
+    source "$REPO_ROOT/deploy/lib/load-env-local.sh"
+    load_env_local "$ENV_FILE"
+    printf '%s' "${JIRA_WEBHOOK_SECRET:-}"
+  )
+fi
+if [[ -n "$jira_webhook_secret" ]]; then
+  require_jira_webhook_secret_format "$jira_webhook_secret" || exit 1
+fi
 
 if [[ -f "$ENV_FILE" ]]; then
   cp "$ENV_FILE" "$ENV_FILE.bak"
@@ -118,6 +148,9 @@ emit() {
       emit JIRA_EMAIL "$jira_email"
       emit JIRA_API_TOKEN "$jira_token"
       emit JIRA_PROJECT_KEY "$jira_project"
+      if [[ -n "$jira_webhook_secret" ]]; then
+        emit JIRA_WEBHOOK_SECRET "$jira_webhook_secret"
+      fi
       emit TICKET_TOOLS_LAMBDA "agentcore-hub-jira"
     fi
 

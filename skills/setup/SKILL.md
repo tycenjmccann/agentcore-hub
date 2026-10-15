@@ -107,6 +107,8 @@ Map the answer to a `MODULES` set in the canonical order `core → builder → w
 
 If they pick Jira, do a follow-up `AskUserQuestion` (or accept free text via "Other") for `JIRA_SITE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN`, `JIRA_PROJECT_KEY`. Treat these as secrets — do not echo them back, do not write them anywhere except `.env.local`.
 
+Do not ask for `JIRA_WEBHOOK_SECRET` (webhook signing is an operator opt-in, see DEPLOY.md "Jira webhook signing"). `apply-env.sh` carries an existing `JIRA_WEBHOOK_SECRET` line in `.env.local` over to the regenerated file on a re-run, so enabling it is never undone by `/setup`; an optional `jira.webhook_secret` in the answers blob overrides it.
+
 ## Q4 — Workflow runtime topology *(skip if Workflow not in MODULES)*
 
 Before asking, print this framing so the user understands what's happening and where it can go:
