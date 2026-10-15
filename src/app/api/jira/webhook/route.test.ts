@@ -243,6 +243,23 @@ describe("POST /api/jira/webhook (signature)", () => {
     expect(res.status).toBe(400);
     expect(h.sqsSends).toHaveLength(0);
   });
+
+  // TEAM-6333: route.ts used to .trim() the configured secret before using it
+  // as the HMAC key, but setup-jira-webhook.sh sends Jira the untrimmed value
+  // — a padded secret could never verify. The key must be the exact
+  // configured value; only the opt-in check (secret vs. no secret) trims.
+  it("uses the exact configured secret (untrimmed) as the HMAC key", async () => {
+    process.env.JIRA_WEBHOOK_SECRET = " s3cret ";
+    const body = webhookPayload();
+
+    const ok = await post(body, { "x-hub-signature": sign(body, " s3cret ") });
+    expect(ok.status).toBe(200);
+    expect(h.sqsSends).toHaveLength(1);
+
+    const bad = await post(body, { "x-hub-signature": sign(body, "s3cret") });
+    expect(bad.status).toBe(401);
+    expect(h.sqsSends).toHaveLength(1);
+  });
 });
 
 describe("POST /api/jira/webhook (secret unset — passthrough + one-time warning)", () => {
@@ -275,5 +292,14 @@ describe("POST /api/jira/webhook (secret unset — passthrough + one-time warnin
     const warnCalls = warnSpy.mock.calls.filter((c) => String(c[0]).includes("JIRA_WEBHOOK_SECRET"));
     expect(warnCalls).toHaveLength(1);
     warnSpy.mockRestore();
+  });
+
+  // TEAM-6333: a whitespace-only secret must still count as unset (passthrough),
+  // not as a configured-but-empty HMAC key.
+  it("treats a whitespace-only secret as unset and passes the request through", async () => {
+    process.env.JIRA_WEBHOOK_SECRET = "   ";
+    const res = await post(webhookPayload());
+    expect(res.status).toBe(200);
+    expect(h.sqsSends).toHaveLength(1);
   });
 });

@@ -21,10 +21,10 @@
  * (verifyHubSignature, src/lib/auth/hub-signature.ts) against
  * JIRA_WEBHOOK_SECRET before any parse or dispatch, when that secret is
  * configured. Unlike workflow/webhook's WEBHOOK_SECRET gate, an unset secret
- * here is passthrough (not a fail-closed 503) — see DEPLOY.md's "Jira webhook
- * signing" section for why that two-sided rollout order is safe — but it logs
- * one console.warn per cold start so an install that never configures it is
- * still visible in the logs.
+ * here is passthrough (not a fail-closed 503) — but it logs one console.warn
+ * per cold start so an install that never configures it is still visible in
+ * the logs. DEPLOY.md's "Jira webhook signing" section has the required
+ * rollout order (Jira first, then the hub) — reversing it drops deliveries.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -107,9 +107,14 @@ async function dispatchCommand(
 
 export async function POST(req: NextRequest) {
   const raw = await req.text();
-  const secret = (process.env.JIRA_WEBHOOK_SECRET || "").trim();
+  // TEAM-6333: trim only decides opt-in (a blank/whitespace-only secret means
+  // unset). The HMAC key is the exact configured value, untrimmed — the same
+  // bytes setup-jira-webhook.sh sends Jira, and what Jira does with whatever
+  // an operator pastes into its UI. Trimming here while the sender does not
+  // meant a padded secret could never verify.
+  const secret = process.env.JIRA_WEBHOOK_SECRET || "";
 
-  if (secret) {
+  if (secret.trim()) {
     if (!verifyHubSignature(raw, req.headers.get("x-hub-signature"), secret)) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
