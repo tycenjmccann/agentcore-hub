@@ -23,6 +23,14 @@ Re-run any time — it rebuilds the image and updates the existing service in pl
 (found by name in the `default` cluster), then writes the public URL back to
 `.env.local` as `DEPLOYMENT_URL`.
 
+A re-run **replaces** the whole container env with what `.env.local` forwards, so
+before touching anything it compares the live env keys with the new ones
+(`deploy/lib/env-drift-guard.sh`, TEAM-6337). If the live service has keys the new
+env lacks (typically applied with `set-env.sh`), it stops and lists their names
+(never values). Add them to `.env.local`, re-apply them with `set-env.sh` after the
+deploy, or re-run with `ALLOW_ENV_KEY_DROP=1` to drop them on purpose. The CD
+pipeline never runs this script (it rolls the image by digest and keeps the live env).
+
 ## What it creates
 
 | Resource | Purpose |

@@ -99,10 +99,14 @@ case "$1 $2" in
   "s3 cp") exit 1 ;;
   "ecs list-services")
     echo '{"serviceArns":["arn:aws:ecs:us-east-1:123456789012:service/default/agentcore-hub"]}' ;;
+  # TEAM-6337: the live env carries only keys every case here forwards, so the
+  # drift guard (deploy/lib/env-drift-guard.sh) passes and the update is reached.
   "ecs describe-express-gateway-service")
-    echo '{"service":{"status":{"statusCode":"ACTIVE"},"activeConfigurations":[{"ingressPaths":[{"endpoint":"hub.example.on.aws"}]}]}}' ;;
+    echo '{"service":{"status":{"statusCode":"ACTIVE"},"activeConfigurations":[{"ingressPaths":[{"endpoint":"hub.example.on.aws"}],"primaryContainer":{"image":"old","containerPort":8080,"environment":[{"name":"HOSTNAME","value":"0.0.0.0"},{"name":"PORT","value":"8080"},{"name":"NODE_ENV","value":"production"},{"name":"AWS_REGION","value":"us-east-1"}]}}]}}' ;;
   "apprunner list-services")
     echo '{"ServiceSummaryList":[{"ServiceName":"agentcore-hub","ServiceArn":"arn:aws:apprunner:us-east-1:123456789012:service/agentcore-hub/abc","Status":"RUNNING","ServiceUrl":"hub.example.awsapprunner.com"}]}' ;;
+  "apprunner describe-service")
+    echo '{"Service":{"SourceConfiguration":{"ImageRepository":{"ImageConfiguration":{"Port":"8080","RuntimeEnvironmentVariables":{"HOSTNAME":"0.0.0.0","PORT":"8080","NODE_ENV":"production","AWS_REGION":"us-east-1"}}}}}}' ;;
   *) : ;;
 esac
 exit 0

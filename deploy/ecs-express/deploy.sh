@@ -65,6 +65,9 @@ source "$REPO_ROOT/deploy/lib/jira-webhook-secret.sh"
 if [[ -n "${JIRA_WEBHOOK_SECRET:-}" ]]; then
   require_jira_webhook_secret_format "$JIRA_WEBHOOK_SECRET" || exit 1
 fi
+# TEAM-6337: live env-key drift guard (run below, once the service is found).
+# shellcheck disable=SC1091
+source "$REPO_ROOT/deploy/lib/env-drift-guard.sh"
 
 # Eval gate (FR-7): the container bakes in agents.json/workflows.json — refuse
 # to build/push ungated config. Runs before the docker build and S3 reads.
@@ -111,6 +114,72 @@ fi
 if ! docker info >/dev/null 2>&1; then
   echo "ERROR: Docker is not running. Start Docker Desktop or Colima first." >&2
   exit 1
+fi
+
+# ─── Pre-flight: live env-key drift (TEAM-6337) ──────────────────────────────
+# The env below REPLACES the live container env on update. Build it (it does
+# not depend on the image) and find the service up front, so a deploy that would
+# drop keys applied live with set-env.sh is refused before any IAM/ECR/docker step.
+
+ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${AWS_REGION}}"
+
+# Build the container env array. HOSTNAME=0.0.0.0 + PORT=8080 mirror the App
+# Runner fix: Next.js standalone binds to whatever HOSTNAME resolves to, so pin
+# it to all-interfaces or the ALB target health check on :8080 fails.
+ENV_JSON="[{\"name\":\"HOSTNAME\",\"value\":\"0.0.0.0\"},{\"name\":\"PORT\",\"value\":\"8080\"},{\"name\":\"NODE_ENV\",\"value\":\"production\"}"
+for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE \
+           ARTIFACT_BUCKET TICKET_TOOLS_LAMBDA JIRA_SITE_URL JIRA_EMAIL \
+           JIRA_API_TOKEN JIRA_PROJECT_KEY JIRA_WEBHOOK_SECRET GITHUB_PAT GITHUB_OWNER GITHUB_REPO HUB_REPO_URL \
+           MCP_SERVERS BUILDER_AGENT_ID AGENTCORE_ROLE_ARN LAMBDA_ROLE_ARN \
+           NEXT_PUBLIC_BRAND_NAME EVAL_CONFIG_TABLE DEPLOY_MODE \
+           WORKFLOW_RUNTIME_COUNT CODING_AGENT_RUNTIME_ARN CLOUD_CODE_TABLE \
+           WORKFLOW_MANAGER_ARN ROUTINE_BUILDER_ARN ROUTINES_TABLE \
+           ROUTINES_RUNNER_ARN ROUTINES_SCHEDULER_ROLE_ARN ROUTINES_SCHEDULE_GROUP \
+           ROUTINES_DLQ_ARN ANOMALY_INTAKE_SECRET \
+           WM_MAX_OPEN_AUTO_BUGS WM_BUG_MUTE_DAYS \
+           WORKFLOW_COMMAND_QUEUE_URL WORKFLOW_LEASE_TTL_MINUTES COST_REPORT_FUNCTION \
+           SOURCE_VALIDATION_MODE EVENT_BUS; do
+  val="${!var:-}"
+  if [[ -n "$val" ]]; then
+    escaped="${val//\\/\\\\}"; escaped="${escaped//\"/\\\"}"
+    ENV_JSON+=",{\"name\":\"${var}\",\"value\":\"${escaped}\"}"
+  fi
+done
+ENV_JSON+="]"
+
+# Idempotency: find OUR service in the target cluster so a re-run updates in
+# place instead of creating a duplicate. Match the service-name segment EXACTLY
+# — a prefix match would also hit e.g. agentcore-hub-frontend/-worker and, since
+# serviceArns ordering isn't guaranteed, could update the wrong service.
+# NOTE: a `VAR=val cmd | python3` prefix only exports VAR to `cmd`, NOT to the
+# `python3` on the far side of the pipe — so export it for the whole subshell,
+# else the lookup KeyErrors (swallowed by 2>/dev/null), returns empty, and a
+# re-run wrongly takes the CREATE path and collides with the live service.
+export SERVICE_NAME
+EXISTING_ARN=$(aws ecs list-services --cluster "$CLUSTER" --region "$AWS_REGION" --output json 2>/dev/null \
+  | python3 -c "
+import json, os, sys
+want = os.environ['SERVICE_NAME']
+data = json.load(sys.stdin)
+for arn in data.get('serviceArns', []):
+    if arn.rsplit('/', 1)[-1] == want:
+        print(arn); break
+" 2>/dev/null || true)
+
+if [[ -n "$EXISTING_ARN" ]]; then
+  if ! LIVE_ENV_KEYS="$(aws ecs describe-express-gateway-service --service-arn "$EXISTING_ARN" \
+         --region "$AWS_REGION" --output json | live_env_keys ecs)"; then
+    if [[ "${ALLOW_ENV_KEY_DROP:-}" == "1" ]]; then
+      echo "WARNING: could not read the live ECS env (ALLOW_ENV_KEY_DROP=1) — not checking for dropped keys" >&2
+      LIVE_ENV_KEYS=""
+    else
+      echo "ERROR: ✗ could not read the live ECS env of $EXISTING_ARN — refusing to replace it blind." >&2
+      echo "       Retry, or re-run with ALLOW_ENV_KEY_DROP=1 to deploy without the check." >&2
+      exit 1
+    fi
+  fi
+  NEW_ENV_KEYS="$(printf '%s' "$ENV_JSON" | python3 -c 'import json,sys; print("\n".join(e["name"] for e in json.load(sys.stdin)))')"
+  require_no_env_key_drop ECS "$LIVE_ENV_KEYS" "$NEW_ENV_KEYS" || exit 1
 fi
 
 # ─── Step 1: ECR repository ──────────────────────────────────────────────────
@@ -210,8 +279,6 @@ else
     --output text >/dev/null
   echo "        Created"
 fi
-
-ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${AWS_REGION}}"
 
 # ─── Model registry grants (TEAM-4995, DL-033) ───────────────────────────────
 # Two statements are appended to the policy below for the one-model-registry work.
@@ -489,30 +556,6 @@ echo ""
 
 echo "  [6/6] ECS Express Mode service: $SERVICE_NAME"
 
-# Build the container env array. HOSTNAME=0.0.0.0 + PORT=8080 mirror the App
-# Runner fix: Next.js standalone binds to whatever HOSTNAME resolves to, so pin
-# it to all-interfaces or the ALB target health check on :8080 fails.
-ENV_JSON="[{\"name\":\"HOSTNAME\",\"value\":\"0.0.0.0\"},{\"name\":\"PORT\",\"value\":\"8080\"},{\"name\":\"NODE_ENV\",\"value\":\"production\"}"
-for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE \
-           ARTIFACT_BUCKET TICKET_TOOLS_LAMBDA JIRA_SITE_URL JIRA_EMAIL \
-           JIRA_API_TOKEN JIRA_PROJECT_KEY JIRA_WEBHOOK_SECRET GITHUB_PAT GITHUB_OWNER GITHUB_REPO HUB_REPO_URL \
-           MCP_SERVERS BUILDER_AGENT_ID AGENTCORE_ROLE_ARN LAMBDA_ROLE_ARN \
-           NEXT_PUBLIC_BRAND_NAME EVAL_CONFIG_TABLE DEPLOY_MODE \
-           WORKFLOW_RUNTIME_COUNT CODING_AGENT_RUNTIME_ARN CLOUD_CODE_TABLE \
-           WORKFLOW_MANAGER_ARN ROUTINE_BUILDER_ARN ROUTINES_TABLE \
-           ROUTINES_RUNNER_ARN ROUTINES_SCHEDULER_ROLE_ARN ROUTINES_SCHEDULE_GROUP \
-           ROUTINES_DLQ_ARN ANOMALY_INTAKE_SECRET \
-           WM_MAX_OPEN_AUTO_BUGS WM_BUG_MUTE_DAYS \
-           WORKFLOW_COMMAND_QUEUE_URL WORKFLOW_LEASE_TTL_MINUTES COST_REPORT_FUNCTION \
-           SOURCE_VALIDATION_MODE EVENT_BUS; do
-  val="${!var:-}"
-  if [[ -n "$val" ]]; then
-    escaped="${val//\\/\\\\}"; escaped="${escaped//\"/\\\"}"
-    ENV_JSON+=",{\"name\":\"${var}\",\"value\":\"${escaped}\"}"
-  fi
-done
-ENV_JSON+="]"
-
 PRIMARY_CONTAINER="{\"image\":\"${FULL_TAG}\",\"containerPort\":8080,\"environment\":${ENV_JSON}}"
 
 # Optional explicit networking (only when there's no usable default VPC).
@@ -527,25 +570,6 @@ if [[ -n "${EXPRESS_SUBNETS:-}" ]]; then
   fi
   NET_ARG=(--network-configuration "{\"subnets\":${SUBNETS_JSON},\"securityGroups\":${SG_JSON}}")
 fi
-
-# Idempotency: find OUR service in the target cluster so a re-run updates in
-# place instead of creating a duplicate. Match the service-name segment EXACTLY
-# — a prefix match would also hit e.g. agentcore-hub-frontend/-worker and, since
-# serviceArns ordering isn't guaranteed, could update the wrong service.
-# NOTE: a `VAR=val cmd | python3` prefix only exports VAR to `cmd`, NOT to the
-# `python3` on the far side of the pipe — so export it for the whole subshell,
-# else the lookup KeyErrors (swallowed by 2>/dev/null), returns empty, and a
-# re-run wrongly takes the CREATE path and collides with the live service.
-export SERVICE_NAME
-EXISTING_ARN=$(aws ecs list-services --cluster "$CLUSTER" --region "$AWS_REGION" --output json 2>/dev/null \
-  | python3 -c "
-import json, os, sys
-want = os.environ['SERVICE_NAME']
-data = json.load(sys.stdin)
-for arn in data.get('serviceArns', []):
-    if arn.rsplit('/', 1)[-1] == want:
-        print(arn); break
-" 2>/dev/null || true)
 
 if [[ -n "$EXISTING_ARN" ]]; then
   echo "        Service exists ($EXISTING_ARN) — updating in place..."

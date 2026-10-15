@@ -58,6 +58,9 @@ source "$REPO_ROOT/deploy/lib/jira-webhook-secret.sh"
 if [[ -n "${JIRA_WEBHOOK_SECRET:-}" ]]; then
   require_jira_webhook_secret_format "$JIRA_WEBHOOK_SECRET" || exit 1
 fi
+# TEAM-6337: live env-key drift guard (run below, once the service is found).
+# shellcheck disable=SC1091
+source "$REPO_ROOT/deploy/lib/env-drift-guard.sh"
 
 # Eval gate (FR-7): the container bakes in agents.json/workflows.json — refuse
 # to build/push ungated config. Runs before the docker build and S3 reads.
@@ -93,6 +96,67 @@ echo ""
 if ! docker info >/dev/null 2>&1; then
   echo "ERROR: Docker is not running. Start Docker Desktop or Colima first." >&2
   exit 1
+fi
+
+# ─── Pre-flight: live env-key drift (TEAM-6337) ──────────────────────────────
+# The env below REPLACES the live RuntimeEnvironmentVariables on update. Build it
+# (it does not depend on the image) and find the service up front, so a deploy
+# that would drop live-only keys is refused before any IAM/ECR/docker step.
+
+ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${AWS_REGION}}"
+
+# Collect runtime env vars to inject into the container.
+# Bug 3 fix: always set HOSTNAME=0.0.0.0 and PORT=8080 so Next.js standalone
+# binds to all interfaces. App Runner injects its own HOSTNAME at launch
+# which would otherwise override the Dockerfile ENV and break the health check.
+ENV_VARS='{
+  "HOSTNAME": "0.0.0.0",
+  "PORT": "8080",
+  "NODE_ENV": "production"'
+
+# Forward .env.local values that the app needs at runtime
+for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE \
+           ARTIFACT_BUCKET TICKET_TOOLS_LAMBDA JIRA_SITE_URL JIRA_EMAIL \
+           JIRA_API_TOKEN JIRA_PROJECT_KEY JIRA_WEBHOOK_SECRET GITHUB_PAT GITHUB_OWNER GITHUB_REPO HUB_REPO_URL \
+           MCP_SERVERS BUILDER_AGENT_ID AGENTCORE_ROLE_ARN LAMBDA_ROLE_ARN \
+           NEXT_PUBLIC_BRAND_NAME EVAL_CONFIG_TABLE DEPLOY_MODE \
+           WORKFLOW_RUNTIME_COUNT CODING_AGENT_RUNTIME_ARN CLOUD_CODE_TABLE \
+           ANOMALY_INTAKE_SECRET \
+           WM_MAX_OPEN_AUTO_BUGS WM_BUG_MUTE_DAYS EVENT_BUS; do
+  val="${!var:-}"
+  if [[ -n "$val" ]]; then
+    # Escape quotes in the value for JSON safety
+    escaped="${val//\"/\\\"}"
+    ENV_VARS+=", \"${var}\": \"${escaped}\""
+  fi
+done
+ENV_VARS+='}'
+
+# Check if service already exists
+EXISTING_ARN=$(aws apprunner list-services --region "$AWS_REGION" --output json 2>/dev/null \
+  | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for svc in data.get('ServiceSummaryList', []):
+    if svc.get('ServiceName') == '${SERVICE_NAME}':
+        print(svc['ServiceArn'])
+        break
+" 2>/dev/null || true)
+
+if [[ -n "$EXISTING_ARN" ]]; then
+  if ! LIVE_ENV_KEYS="$(aws apprunner describe-service --service-arn "$EXISTING_ARN" \
+         --region "$AWS_REGION" --output json | live_env_keys apprunner)"; then
+    if [[ "${ALLOW_ENV_KEY_DROP:-}" == "1" ]]; then
+      echo "WARNING: could not read the live App Runner env (ALLOW_ENV_KEY_DROP=1) — not checking for dropped keys" >&2
+      LIVE_ENV_KEYS=""
+    else
+      echo "ERROR: ✗ could not read the live App Runner env of $EXISTING_ARN — refusing to replace it blind." >&2
+      echo "       Retry, or re-run with ALLOW_ENV_KEY_DROP=1 to deploy without the check." >&2
+      exit 1
+    fi
+  fi
+  NEW_ENV_KEYS="$(printf '%s' "$ENV_VARS" | python3 -c 'import json,sys; print("\n".join(json.load(sys.stdin)))')"
+  require_no_env_key_drop "App Runner" "$LIVE_ENV_KEYS" "$NEW_ENV_KEYS" || exit 1
 fi
 
 # ─── Step 1: ECR repository ──────────────────────────────────────────────────
@@ -169,7 +233,6 @@ else
   echo "        Created"
 fi
 
-ARTIFACT_BUCKET="${ARTIFACT_BUCKET:-agentcore-hub-artifacts-${ACCOUNT_ID}-${AWS_REGION}}"
 aws iam put-role-policy \
   --role-name "$INSTANCE_ROLE" \
   --policy-name "AgentCoreHubAppRunnerPerms" \
@@ -321,44 +384,6 @@ echo ""
 # ─── Step 5: App Runner service ──────────────────────────────────────────────
 
 echo "  [5/5] App Runner service: $SERVICE_NAME"
-
-# Collect runtime env vars to inject into the container.
-# Bug 3 fix: always set HOSTNAME=0.0.0.0 and PORT=8080 so Next.js standalone
-# binds to all interfaces. App Runner injects its own HOSTNAME at launch
-# which would otherwise override the Dockerfile ENV and break the health check.
-ENV_VARS='{
-  "HOSTNAME": "0.0.0.0",
-  "PORT": "8080",
-  "NODE_ENV": "production"'
-
-# Forward .env.local values that the app needs at runtime
-for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE \
-           ARTIFACT_BUCKET TICKET_TOOLS_LAMBDA JIRA_SITE_URL JIRA_EMAIL \
-           JIRA_API_TOKEN JIRA_PROJECT_KEY JIRA_WEBHOOK_SECRET GITHUB_PAT GITHUB_OWNER GITHUB_REPO HUB_REPO_URL \
-           MCP_SERVERS BUILDER_AGENT_ID AGENTCORE_ROLE_ARN LAMBDA_ROLE_ARN \
-           NEXT_PUBLIC_BRAND_NAME EVAL_CONFIG_TABLE DEPLOY_MODE \
-           WORKFLOW_RUNTIME_COUNT CODING_AGENT_RUNTIME_ARN CLOUD_CODE_TABLE \
-           ANOMALY_INTAKE_SECRET \
-           WM_MAX_OPEN_AUTO_BUGS WM_BUG_MUTE_DAYS EVENT_BUS; do
-  val="${!var:-}"
-  if [[ -n "$val" ]]; then
-    # Escape quotes in the value for JSON safety
-    escaped="${val//\"/\\\"}"
-    ENV_VARS+=", \"${var}\": \"${escaped}\""
-  fi
-done
-ENV_VARS+='}'
-
-# Check if service already exists
-EXISTING_ARN=$(aws apprunner list-services --region "$AWS_REGION" --output json 2>/dev/null \
-  | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-for svc in data.get('ServiceSummaryList', []):
-    if svc.get('ServiceName') == '${SERVICE_NAME}':
-        print(svc['ServiceArn'])
-        break
-" 2>/dev/null || true)
 
 if [[ -n "$EXISTING_ARN" ]]; then
   echo "        Service exists ($EXISTING_ARN) — updating..."
