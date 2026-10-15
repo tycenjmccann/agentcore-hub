@@ -791,7 +791,7 @@ export async function featureBranchLanding({ owner, repo, base, head, api, recor
   if (mergedPr && headSha && mergedHead === headSha) return proof();
   const cmp = await api(`/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`);
   if (cmp?.status === "identical" || cmp?.status === "behind") {
-    return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: "" };
+    return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: mergedPr?.html_url || "" }; // TEAM-6190: identity ≠ landing proof
   }
   if (!mergedPr) {
     if (cmp?.status === "ahead" || cmp?.status === "diverged") {
@@ -817,7 +817,7 @@ export async function featureBranchLanding({ owner, repo, base, head, api, recor
   const tipSha = cmp?.base_commit?.sha || null;
   const treeOf = async (sha) => (sha ? (await api(`/repos/${owner}/${repo}/git/commits/${enc(sha)}`).catch(() => null))?.tree?.sha || null : null);
   const tipTree = await treeOf(tipSha), headTree = await treeOf(headSha);
-  if (tipTree && tipTree === headTree) return { merged: true, mergeCommit: tipSha, prUrl: "" };
+  if (tipTree && tipTree === headTree) return { merged: true, mergeCommit: tipSha, prUrl: mergedPr.html_url || "" };
   // TEAM-5935: trees that DIFFER prove nothing (an unrelated commit on base differs them).
   // Prove per file over the post-merge feature changes instead.
   const files = Array.isArray(after.files) ? after.files : [];
@@ -833,7 +833,7 @@ export async function featureBranchLanding({ owner, repo, base, head, api, recor
       `; ${base} still holds the pre-merge content of: ${v.absent.join(", ")}`
     );
   }
-  if (v.landed) return { merged: true, mergeCommit: tipSha, prUrl: "" };
+  if (v.landed) return { merged: true, mergeCommit: tipSha, prUrl: mergedPr.html_url || "" };
   return inconclusive(v.why);
 }
 
@@ -866,36 +866,50 @@ export function githubPrRef(text) {
   return null;
 }
 
+/** TEAM-6190 — the ONE parse of a DL-038 chain title's "follow-up PR <url>" (null when the marker is absent). */
+export const followUpTitleRef = (title) => (/\bfollow-up PR\s/i.test(String(title ?? "")) ? githubPrRef(title) : null);
+const samePr = (a, b) => Boolean(a && b) && a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase() && a.number === b.number;
+
 /**
  * TEAM-6054 — does a ship ticket belong to a PR other than the unified one? Its own PR is the DL-038
  * chain title's "follow-up PR <url>", else its completion record pr_url (fresher, TEAM-6062), else its
- * cached prUrl. With no unified PR url (a compare-based proof) only the chain title decides. Pure.
+ * cached prUrl. TEAM-6190: with no unified PR url (no PR from the branch merged) any own PR is another. Pure.
  */
 export function isOtherPrTicket({ entry, record, title, unifiedPrUrl }) {
   const ref = (u) => (typeof u === "string" ? githubPrRef(u) : null); // TEAM-6075: a non-string pr_url is ignored
-  const fu = /\bfollow-up PR\s/i.test(String(title ?? "")) ? githubPrRef(title) : null;
+  const own = followUpTitleRef(title) || ref(record?.pr_url) || ref(entry?.prUrl);
   const unified = ref(unifiedPrUrl);
-  if (!unified) return Boolean(fu);
-  const own = fu || ref(record?.pr_url) || ref(entry?.prUrl);
-  const lc = (s) => String(s).toLowerCase();
-  return Boolean(own) && !(lc(own.owner) === lc(unified.owner) && lc(own.repo) === lc(unified.repo) && own.number === unified.number);
+  return Boolean(own) && !samePr(own, unified);
+}
+
+/**
+ * TEAM-6190 — a chain ticket ("Ship: follow-up PR X") owes no verdict of its own when ANOTHER Done agent
+ * ticket naming the same PR in its title ("CD: follow-up PR X") carries a shipped/handoff verdict. Pure.
+ */
+export function verdictCarried(t, children, agentTasks) {
+  const own = followUpTitleRef(t?.title);
+  if (!own) return false;
+  const tasks = Object.values(agentTasks || {});
+  return [].concat(children || []).some((c) => String(c.ticketId) !== String(t.ticketId) && String(c.status || "").toLowerCase() === "done" && !isHuman(c.assignee) && samePr(followUpTitleRef(c.title), own) &&
+    SHIP_SATISFIED_VERDICTS.includes(shipVerdictOf(agentTasks?.[c.ticketId] || tasks.find((e) => e?.ticketId === String(c.ticketId)))));
 }
 
 /**
  * TEAM-6032 (DL-038) — the run's PRs in its configured repos, one per repo+number.
  * TEAM-6062: `prUrl` is fill-once, so a re-dispatched ticket's completion record
- * (`records[ticketId].pr_url`) is read too. Pure; foreign repos and non-PR urls are dropped.
+ * (`records[ticketId].pr_url`) is read too, and (TEAM-6190) every ticket title's "follow-up PR <url>".
+ * Pure; foreign repos and non-PR urls are dropped.
  */
-export function followUpPrRefs(agentTasks, repos, records = {}) {
+export function followUpPrRefs(agentTasks, repos, records = {}, tickets = []) {
   const refs = new Map();
-  for (const [tid, e] of Object.entries(agentTasks || {})) {
-    for (const url of [records?.[tid]?.pr_url, e?.prUrl]) {
-      if (typeof url !== "string") continue; // TEAM-6075: a non-string record pr_url must not disable the gate
-      const m = githubPrRef(url);
-      const r = m && [].concat(repos).find((x) => m.owner.toLowerCase() === String(x?.owner).toLowerCase() && m.repo.toLowerCase() === String(x?.repo).toLowerCase());
-      const key = r && `${r.owner}/${r.repo}#${m.number}`.toLowerCase();
-      if (r && !refs.has(key)) refs.set(key, { owner: r.owner, repo: r.repo, defaultBranch: r.defaultBranch, number: m.number, url: url.trim() });
-    }
+  const urls = Object.entries(agentTasks || {}).flatMap(([tid, e]) => [records?.[tid]?.pr_url, e?.prUrl]);
+  for (const t of [].concat(tickets || [])) { const m = followUpTitleRef(t?.title); if (m) urls.push(`https://github.com/${m.owner}/${m.repo}/pull/${m.number}`); } // TEAM-6190: title-only
+  for (const url of urls) {
+    if (typeof url !== "string") continue; // TEAM-6075: a non-string record pr_url must not disable the gate
+    const m = githubPrRef(url);
+    const r = m && [].concat(repos).find((x) => m.owner.toLowerCase() === String(x?.owner).toLowerCase() && m.repo.toLowerCase() === String(x?.repo).toLowerCase());
+    const key = r && `${r.owner}/${r.repo}#${m.number}`.toLowerCase();
+    if (r && !refs.has(key)) refs.set(key, { owner: r.owner, repo: r.repo, defaultBranch: r.defaultBranch, number: m.number, url: url.trim() });
   }
   return [...refs.values()];
 }
@@ -946,7 +960,7 @@ export async function followUpPrGate({ workflow, agentTasks, tickets = [], merge
     const recs = await Promise.all(ids.map((tid) => Promise.resolve().then(() => readCompletionRecord(tid)).catch(() => null)));
     const records = Object.fromEntries(ids.map((tid, i) => [tid, recs[i]]));
     const statedBases = [...new Set([].concat(tickets || []).map((t) => BASE_BRANCH_LINE_RE.exec(String(t?.description || ""))?.[1]).filter((b) => b && b !== workflow.featureBranch))];
-    const r = await openFollowUpPrs({ refs: followUpPrRefs(agentTasks, repos, records), featureBranch: workflow.featureBranch, defaultBranch, statedBases, api });
+    const r = await openFollowUpPrs({ refs: followUpPrRefs(agentTasks, repos, records, tickets), featureBranch: workflow.featureBranch, defaultBranch, statedBases, api });
     if (r.unknown.length > 0) warn(`[orchestrator] follow-up PR state unknown for ${workflow.id}: ${r.unknown.join(", ")}`);
     return [...r.open].sort();
   } catch (err) {

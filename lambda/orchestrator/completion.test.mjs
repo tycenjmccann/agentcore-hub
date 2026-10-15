@@ -1440,7 +1440,7 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
 
   it("later commits already on main (compare behind) → merged", async () => {
     const r = await land([["/pulls?", [merged]], ["/branches/", { commit: { sha: "new222" } }], ["/compare/main...", { status: "behind", base_commit: { sha: "b1" } }]]);
-    expect(r).toEqual({ merged: true, mergeCommit: "b1", prUrl: "" });
+    expect(r).toEqual({ merged: true, mergeCommit: "b1", prUrl: merged.html_url });
   });
 
   it("TEAM-5853 #1: sync-after-squash (merge of main, empty merge-base..head diff) → merged", async () => {
@@ -1670,7 +1670,7 @@ describe("featureBranchLanding — TEAM-5913 (404 binds every recorded head; fal
       ["/compare/old111abc...F", { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "f.js" }] }],
       ["/git/commits/T", { tree: { sha: "tree1" } }], ["/git/commits/F", { tree: { sha: "tree1" } }],
     ]);
-    expect(r).toEqual({ merged: true, mergeCommit: "T", prUrl: "" }); // base: merged:false
+    expect(r).toEqual({ merged: true, mergeCommit: "T", prUrl: merged.html_url }); // base: merged:false
   });
 
   it("TEAM-5913 (4): compares without `files` reaching the fallback → merged:null, never a proven strand", async () => {
@@ -1743,7 +1743,7 @@ describe("featureBranchLanding — TEAM-5935 (per-file proof; tree inequality is
 
   it("regression: F's change landed via T, U adds an unrelated file → trees differ but f.js identical on main → merged:true", async () => {
     const r = await land([...SHAPE(), ...T({ "f.js": "f1", "unrelated.js": "u1" }, { "f.js": "f0" }, { "f.js": "f1" })]);
-    expect(r).toEqual({ merged: true, mergeCommit: "U", prUrl: "" }); // base: merged:false
+    expect(r).toEqual({ merged: true, mergeCommit: "U", prUrl: merged.html_url }); // base: merged:false
   });
 
   it("T lands F's change, then U edits f.js further → third state on main → merged:null, never false", async () => {
@@ -1790,7 +1790,7 @@ describe("featureBranchLanding — TEAM-5935 (per-file proof; tree inequality is
 
   it("renamed: new path identical on main AND old path absent on main → true; old path still on main → null", async () => {
     const ren = SHAPE([{ filename: "b.js", status: "renamed", previous_filename: "a.js" }]);
-    expect(await land([...ren, ...T({ "b.js": "b1" }, { "a.js": "a0" }, { "b.js": "b1" })])).toEqual({ merged: true, mergeCommit: "U", prUrl: "" });
+    expect(await land([...ren, ...T({ "b.js": "b1" }, { "a.js": "a0" }, { "b.js": "b1" })])).toEqual({ merged: true, mergeCommit: "U", prUrl: merged.html_url });
     expect((await land([...ren, ...T({ "b.js": "b1", "a.js": "a0" }, { "a.js": "a0" }, { "b.js": "b1" })])).merged).toBe(null);
   });
 
@@ -1817,7 +1817,7 @@ describe("featureBranchLanding — TEAM-5935 (per-file proof; tree inequality is
   it("TEAM-5943: reads exactly ONE recursive tree per ref (matched by verbatim path) and never the Contents API", async () => {
     const calls = [];
     const r = await land([...SHAPE([{ filename: "src/a b/c#.js" }]), ...T({ "src/a b/c#.js": "same" }, { "src/a b/c#.js": "s0" }, { "src/a b/c#.js": "same" })], {}, calls);
-    expect(r).toEqual({ merged: true, mergeCommit: "U", prUrl: "" });
+    expect(r).toEqual({ merged: true, mergeCommit: "U", prUrl: merged.html_url });
     for (const t of ["treeU", "treeH", "treeF"]) expect(calls.filter((c) => c === `/repos/o/r/git/trees/${t}?recursive=1`)).toHaveLength(1);
     expect(calls.some((c) => c.includes("/contents/"))).toBe(false);
   });
@@ -1872,7 +1872,7 @@ describe("featureBranchLanding — TEAM-5943 (tree-entry identity: mode + sha, n
 
   it("(c) mode change landed on main (identical mode + sha on main's tip) → merged:true; content landed without the mode → null, never false", async () => {
     const landed = await land([...SHAPE("bin/run.sh"), ...T({ "bin/run.sh": EXEC }, { "bin/run.sh": REG }, { "bin/run.sh": EXEC }), LEGACY_CONTENTS]);
-    expect(landed).toEqual({ merged: true, mergeCommit: "U", prUrl: "" });
+    expect(landed).toEqual({ merged: true, mergeCommit: "U", prUrl: merged.html_url });
     // main took F's new content but kept 100644 → third state (neither pre-merge nor tip) → null
     const partial = await land([...SHAPE("bin/run.sh"), ...T({ "bin/run.sh": ["X1", "100644"] }, { "bin/run.sh": ["X0", "100644"] }, { "bin/run.sh": ["X1", "100755"] }), LEGACY_CONTENTS]);
     expect(partial.merged).toBe(null);
@@ -2270,10 +2270,40 @@ describe("TEAM-6054 isOtherPrTicket", () => {
     expect(other({ entry: {}, unifiedPrUrl: U9 })).toBe(false);
     expect(other({ record: { pr_url: [F12] }, unifiedPrUrl: U9 })).toBe(false);
   });
-  it("compare-based proof (no unified url): only the chain title decides", () => {
+  it("TEAM-6190 F2: no unified url (compare proof) → ANY own PR ref is another PR; none → false", () => {
     expect(other({ title: `CD: follow-up PR ${F12}`, unifiedPrUrl: "" })).toBe(true);
-    expect(other({ entry: { prUrl: F12 }, record: { pr_url: F12 }, unifiedPrUrl: "" })).toBe(false);
+    expect(other({ entry: { prUrl: F12 }, record: { pr_url: F12 }, unifiedPrUrl: "" })).toBe(true);
+    expect(other({ record: { pr_url: U9 }, unifiedPrUrl: "" })).toBe(true);
+    expect(other({ entry: {}, unifiedPrUrl: "" })).toBe(false);
   });
   it("look-alike host in the title → false", () =>
     expect(other({ title: "Ship: follow-up PR https://notgithub.com/o/r/pull/12", unifiedPrUrl: "" })).toBe(false));
+});
+
+describe("TEAM-6190 verdictCarried / title-only follow-up refs", () => {
+  const F12 = "https://github.com/o/r/pull/12", F13 = "https://github.com/o/r/pull/13";
+  const ship = { ticketId: "S", assignee: "agentcore_hub_release_manager", status: "done", title: `Ship: follow-up PR ${F12}` };
+  const cd = (title = `CD: follow-up PR ${F12}`, over = {}) => ({ ticketId: "C", assignee: "agentcore_hub_release_manager", status: "done", title, ...over });
+  const carried = (t, kids, tasks) => completionMod.verdictCarried(t, kids, tasks);
+  it("Ship: follow-up PR X is carried by a Done CD: follow-up PR X with a shipped verdict (owner/repo case-insensitive)", () => {
+    expect(carried(ship, [ship, cd()], { C: { ticketId: "C", mergeCommit: "m12" } })).toBe(true);
+    expect(carried(ship, [ship, cd("CD: follow-up PR https://github.com/O/R/pull/12")], { x: { ticketId: "C", outcome: "handoff" } })).toBe(true);
+  });
+  it("not carried: CD has no verdict, CD not Done, CD is human, a different PR, or a non-chain title", () => {
+    expect(carried(ship, [ship, cd()], { C: { ticketId: "C", output: "deployed" } })).toBe(false);
+    expect(carried(ship, [ship, cd(undefined, { status: "in_progress" })], { C: { ticketId: "C", mergeCommit: "m" } })).toBe(false);
+    expect(carried(ship, [ship, cd(undefined, { assignee: "human:x" })], { C: { ticketId: "C", mergeCommit: "m" } })).toBe(false);
+    expect(carried(ship, [ship, cd(`CD: follow-up PR ${F13}`)], { C: { ticketId: "C", mergeCommit: "m" } })).toBe(false);
+    expect(carried({ ...ship, title: "Ship unified" }, [ship, cd()], { C: { ticketId: "C", mergeCommit: "m" } })).toBe(false);
+  });
+  it("a CD ticket never carries its own verdict", () => {
+    const c = cd();
+    expect(carried(c, [c], { C: { ticketId: "C", output: "deployed" } })).toBe(false);
+  });
+  it("followUpPrRefs also collects a PR named only by a chain ticket title (deduped against task urls)", () => {
+    const repos = [{ owner: "o", repo: "r", defaultBranch: "main" }];
+    const refs = completionMod.followUpPrRefs({ A: { prUrl: F13 } }, repos, {}, [ship, cd(), { ticketId: "Z", title: "no marker https://github.com/o/r/pull/99" }]);
+    expect(refs.map((r) => r.number).sort()).toEqual([12, 13]);
+    expect(refs.find((r) => r.number === 12)).toMatchObject({ owner: "o", repo: "r", defaultBranch: "main", url: F12 });
+  });
 });
