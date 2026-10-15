@@ -5250,3 +5250,58 @@ describe("TEAM-6097 — clearBriefHoldOnRelease / clearBriefHoldOnGate", () => {
     expect(clearUndeliveredBriefTargets(rec).briefDisposition).toBeUndefined();
   });
 });
+
+// ─── TEAM-6205 R2-01 / R2-05 (ship review round 2 on #970): the follow-ups hold helpers ───
+describe("TEAM-6205 R2-05 — unresolvedRecordFollowUps fails closed on a malformed or hollow breakdown", () => {
+  const none = { created: [], skipped: [], failed: [], rerouted: [] };
+
+  it("R2-05a rows without identity, and an empty failed[] under followUpsPending:true, are unresolved (a hold nobody can name)", async () => {
+    const { unresolvedRecordFollowUps } = await import("./index.mjs");
+    for (const failed of [[], [null], [{ reason: "x" }], [{ hash: null }], [{ hash: "" }], ["abc"]]) {
+      const out = unresolvedRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed } }, none, []);
+      expect(out.length, JSON.stringify(failed)).toBeGreaterThan(0);
+      expect(out.every((f) => f.hash === null && typeof f.reason === "string" && f.reason.length > 0), JSON.stringify(out)).toBe(true);
+    }
+    // valid rows: resolved by this message (created/skipped/rerouted) or carried by it ⇒ [] (unchanged)
+    expect(unresolvedRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1" }] } }, { ...none, created: [{ hash: "a1" }] }, [])).toEqual([]);
+    expect(unresolvedRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1" }] } }, none, [{ hash: "a1" }])).toEqual([]);
+    expect(unresolvedRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1" }, { hash: "b2" }] } }, none, [{ hash: "a1" }])).toEqual([{ hash: "b2" }]);
+    // a malformed row beside a valid one: the valid one resolves, the malformed one still holds
+    expect(unresolvedRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1" }, { reason: "no hash" }] } }, none, [{ hash: "a1" }])).toHaveLength(1);
+    // no hold stated ⇒ nothing, whatever the breakdown
+    expect(unresolvedRecordFollowUps({ followUpsPending: false, followUpsMaterialized: { failed: [null] } }, none, [])).toEqual([]);
+    expect(unresolvedRecordFollowUps(null, none, [])).toEqual([]);
+    // no breakdown at all ⇒ the sentinel (unchanged)
+    expect(unresolvedRecordFollowUps({ followUpsPending: true }, none, [])).toHaveLength(1);
+  });
+
+  it("R2-05b a hollow failed[] is resolved only when every follow-up the record names is filed by, or carried by, this message", async () => {
+    const { unresolvedRecordFollowUps } = await import("./index.mjs");
+    const rec = { followUpsPending: true, followUps: [{ hash: "a1" }, { hash: "b2" }], followUpsMaterialized: { failed: [] } };
+    expect(unresolvedRecordFollowUps(rec, { ...none, created: [{ hash: "a1" }], skipped: [{ hash: "b2" }] }, [])).toEqual([]);
+    expect(unresolvedRecordFollowUps(rec, { ...none, created: [{ hash: "a1" }] }, [{ hash: "b2" }])).toEqual([]);
+    expect(unresolvedRecordFollowUps(rec, { ...none, created: [{ hash: "a1" }] }, []).length, "b2 is named and unfiled").toBeGreaterThan(0);
+    expect(unresolvedRecordFollowUps({ ...rec, followUps: [] }, none, []).length, "nothing named: fail closed").toBeGreaterThan(0);
+    expect(unresolvedRecordFollowUps({ ...rec, followUps: undefined }, none, []).length).toBeGreaterThan(0);
+  });
+
+  it("R2-01 mergeRecordFollowUps: the record's unresolved rows ride verbatim in the persisted breakdown; sentinels only hold the flag", async () => {
+    const { mergeRecordFollowUps } = await import("./index.mjs");
+    const b = { hash: "b2", reason: "Jira API 429: rate limited", retryable: true, commentedOn: ["TEAM-1"] };
+    const m = mergeRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1", reason: "x" }, b] } }, { ...none, created: [{ hash: "a1", ticketId: "TEAM-9" }] }, [{ hash: "a1" }]);
+    expect(m.unresolved).toEqual([b]);
+    expect(m.breakdown).toEqual({ created: [{ hash: "a1", ticketId: "TEAM-9" }], skipped: [], failed: [b], rerouted: [] });
+    expect(m.stillUnfiled).toBe(true);
+    // this message's own failed row and the record's copy of it are one row
+    const own = { hash: "a1", reason: "Jira API 400: bad", retryable: false, commentedOn: [] };
+    const dup = mergeRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1", reason: "older" }, b] } }, { ...none, failed: [own] }, [{ hash: "a1" }]);
+    expect(dup.breakdown.failed).toEqual([own, b]);
+    // hollow: the flag holds, nothing fabricated into failed[]
+    const hollow = mergeRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [] } }, none, []);
+    expect(hollow.stillUnfiled).toBe(true);
+    expect(hollow.breakdown.failed).toEqual([]);
+    // no hold on the record: this message's rows alone decide
+    expect(mergeRecordFollowUps({ followUpsPending: false }, none, [])).toMatchObject({ unresolved: [], stillUnfiled: false });
+    expect(mergeRecordFollowUps(null, { ...none, failed: [own] }, [{ hash: "a1" }])).toMatchObject({ unresolved: [], stillUnfiled: true });
+  });
+});

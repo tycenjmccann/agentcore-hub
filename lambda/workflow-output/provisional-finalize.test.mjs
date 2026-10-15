@@ -909,19 +909,107 @@ describe("TEAM-6164 F1 — the older message in the FIFO group never Dones over 
     twinsAdmitAdmission(R_KEY);
   });
 
-  it("T28 FAIL queued, then PASS queued; AMEND unreadable ⇒ the older FAIL retries (no Done); readable + reopened ⇒ superseded; the PASS message Dones", async () => {
+  it("T28 (TEAM-6205 R2-03c) FAIL queued, then PASS queued; AMEND unreadable ⇒ the older FAIL is SUPERSEDED at once by the record's trusted PASS (no amendment read, no retry, nothing posted); the PASS message Dones", async () => {
     await queueTwo(["FAIL", "PASS"]);
     amendmentUnreadable();
-    const held = await drainMsg(0);
-    expect(held, held.reason).toMatchObject({ outcome: "retry" });
+    const from = fake.calls.length;
+    const stale = await drainMsg(0);
+    expect(stale, stale.reason).toMatchObject({ outcome: "dropped", superseded: true });
+    expect(stale.permanent).toBeUndefined();
+    expect(callsSince(from, "Tickets___get_issue", (p) => p.ticket_id === AMEND), "a superseded message reads no amendment").toHaveLength(0);
     expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
     expect(record(R_KEY).securityReview, "a trusted PASS is never re-marked").toEqual({ verdict: "PASS" });
+    expect(record(R_KEY).replayDropped).toBeUndefined();
     amendmentReadable();
-    fake.tickets.get(AMEND).status = "To Do";
-    expect(await drainMsg(0)).toMatchObject({ outcome: "dropped", superseded: true });
     expect((await drainMsg(1)).outcome).toBe("applied");
     expect(fake.tickets.get(REVIEW).status).toBe("Done");
     twinsAdmitAdmission(R_KEY);
+  });
+
+  // ─── TEAM-6205 R2-03 (ship review round 2 on #970): residual delivery follows the CURRENT admission ───
+  // Admission re-mark/confirm/finalize used drainAdmission (the record's stamp first), but step 5 still
+  // posted msg.residual and the sibling scan was gated on it: the older PASS message (residual null) over
+  // the record's newer FAIL Doned the review with NO residual findings on the dev lanes, and the FAIL
+  // message behind it died on step 0's "already applied". The reverse posted a stale FAIL's findings over
+  // a trusted PASS and retried on an unreadable amendment it no longer owned (T28, above). The record
+  // now carries `residual` beside its stamp (same PUT), and currentResidual() delivers the record's
+  // findings / supersedes a contradicted message before step 6.
+  const residualComments = (id) => fake.tickets.get(id).comments.filter((c) => c.includes(output.residualMarker(REVIEW)));
+  /** queueTwo, but the FAIL report's own residual posts 503'd (so the queued message is what owes them). */
+  const queueTwoFindingsUnposted = async (order) => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503, Tickets___add_comment: (p) => ([DEV1, DEV2].includes(p.ticket_id) ? PROVIDER_503 : null) };
+    for (const which of order) expect(which === "PASS" ? await reportReview(PASS) : await reportReview()).toMatchObject({ status: "complete", ticketWrites: "queued" });
+    expect(fake.queue).toHaveLength(2);
+    expect(residualComments(DEV1)).toHaveLength(0);
+    expect(residualComments(DEV2)).toHaveLength(0);
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+  };
+
+  it("TEAM-6205 R2-03a PASS queued, then FAIL queued (record: FAIL); the older PASS message Dones on the record's FAIL ⇒ the FAIL's residual findings are on DEV1 and DEV2 BEFORE the Done; the FAIL message behind is 'already applied' and posts nothing new", async () => {
+    await queueTwoFindingsUnposted(["PASS", "FAIL"]);
+    let atDone = null;
+    fake.onTransition = (t) => { if (t.ticketId === REVIEW) atDone = [residualComments(DEV1).length, residualComments(DEV2).length]; };
+    const out = await drainMsg(0);
+    expect(out, out.reason).toMatchObject({ outcome: "applied" });
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    expect(atDone, "the findings were on both dev lanes when the Done was made").toEqual([1, 1]);
+    expect(residualComments(DEV1)[0]).toContain("verdict FAIL");
+    expect(residualComments(DEV1)[0]).toContain(reviewCompletion.summary.split("\n")[0]);
+    expect(record(R_KEY).securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND });
+    const second = await drainMsg(1);
+    expect(second).toMatchObject({ outcome: "dropped", reason: "already applied" });
+    expect(residualComments(DEV1)).toHaveLength(1);
+    expect(residualComments(DEV2)).toHaveLength(1);
+    twinsAdmitAdmission(R_KEY);
+  });
+
+  it("TEAM-6205 R2-03b FAIL queued, then PASS queued (record: trusted PASS); the stale FAIL message posts NO residual findings on the dev lanes and is superseded", async () => {
+    await queueTwoFindingsUnposted(["FAIL", "PASS"]);
+    fake.tickets.get(AMEND).status = "To Do";
+    const stale = await drainMsg(0);
+    expect(stale, stale.reason).toMatchObject({ outcome: "dropped", superseded: true });
+    expect(residualComments(DEV1), "a superseded admission's findings are not posted").toHaveLength(0);
+    expect(residualComments(DEV2)).toHaveLength(0);
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    expect((await drainMsg(1)).outcome).toBe("applied");
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    expect(residualComments(DEV1)).toHaveLength(0);
+  });
+
+  it("TEAM-6205 R2-03d the record carries `residual` beside the stamp in the same PUT, identical to the queued message's; a PASS re-report replaces it", async () => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503 };
+    const putsBefore = keyPuts(R_KEY).length;
+    expect(await reportReview()).toMatchObject({ ticketWrites: "queued" });
+    const queued = JSON.parse(fake.queue[0].Body).residual;
+    expect(queued).toMatchObject({ verdict: "FAIL", amendmentTicketId: AMEND, summary: expect.any(String) });
+    expect(record(R_KEY).residual).toEqual(queued);
+    const bodies = keyPuts(R_KEY).slice(putsBefore).map(bodyOf);
+    expect(bodies.length).toBeGreaterThan(1);
+    for (const body of bodies) {
+      expect(body.residual, "every PUT of the report carries the residual beside its stamp").toEqual(queued);
+      expect(`${body.residual.verdict}|${body.residual.amendmentTicketId}`).toBe(`${body.securityReview.verdict}|${body.securityReview.amendmentTicketId}`);
+    }
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+    expect(await reportReview(PASS)).toMatchObject({ status: "complete" });
+    expect(record(R_KEY).residual).toBeUndefined();
+    expect(record(R_KEY).securityReview).toEqual({ verdict: "PASS" });
+    twinsAdmitAdmission(R_KEY);
+  });
+
+  it("TEAM-6205 R2-03e a record written before `residual` existed (no text) under its FAIL admission ⇒ the older PASS message still Dones, posts nothing stale, and records the dev lanes as undelivered residual_findings", async () => {
+    await queueTwoFindingsUnposted(["PASS", "FAIL"]);
+    const cur = record(R_KEY);
+    delete cur.residual;
+    setRecord(R_KEY, cur);
+    const out = await drainMsg(0);
+    expect(out, out.reason).toMatchObject({ outcome: "applied" });
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    expect(residualComments(DEV1)).toHaveLength(0);
+    const undelivered = (record(R_KEY).undelivered || []).filter((u) => u.part === "residual_findings");
+    expect(undelivered.map((u) => u.ticketId).sort()).toEqual([DEV1, DEV2]);
+    for (const u of undelivered) expect(u.reason).toMatch(/no residual text/);
   });
 });
 
@@ -983,5 +1071,91 @@ describe("TEAM-6164 sibling — a stale message never clears a followUpsPending 
     expect(out, out.reason).toMatchObject({ outcome: "applied" });
     expect(record(R_KEY)).toMatchObject({ ticketWrites: "applied", followUpsPending: true, status: "complete_pending_follow_ups" });
     expect(followUpTickets()).toHaveLength(0);
+  });
+});
+
+// ─── TEAM-6205 R2-01 / R2-05 (ship review round 2 on #970) ───
+/**
+ * R2-01: drop() and step 6 kept `followUpsPending:true` off the record's unresolved set
+ * (unresolvedRecordFollowUps) but then REPLACED `followUpsMaterialized` with the message's own rows,
+ * so the record forgot the follow-up B a newer report held; on redelivery A filed, nothing named B,
+ * the hold cleared and the ticket Doned with B unfiled. Every drain write now persists the merged
+ * breakdown (mergeRecordFollowUps): this message's rows plus the record's unresolved rows, verbatim.
+ * R2-05: a hollow breakdown (`followUpsPending:true`, `failed:[]`, or rows without a hash) read as
+ * resolved; it is a hold nobody can name and fails closed.
+ */
+describe("TEAM-6205 R2-01 / R2-05 — a drain write carries the record's unresolved follow-ups; a hollow breakdown is a hold", () => {
+  const PASS = { summary: "Verdict: PASS. Design reviewed against main and the feature branch, read-only; no blocking findings.\n\nNo tool failures." };
+  const FU_A = JSON.parse(call0.arguments.follow_ups)[0];
+  const FU_B = { kind: "iam_handoff", owner: "human", title: "Grant the probe role sqs:DeleteMessage in the prod account", detail: "The deploy role cannot attach this policy either; a human must apply it in the console." };
+  const hashOf = (e) => output.followUpHash(REVIEW, e.kind, e.title);
+  const failedHashes = () => (record(R_KEY).followUpsMaterialized?.failed || []).map((f) => f.hash);
+  const followUpTickets = () => [...fake.tickets.values()].filter((t) => t.parentKey === EPIC_R && /\[fu:[0-9a-f]{8}\]\s*$/.test(t.title));
+  const twinsRefuseRecord = (key) => { for (const twin of TWIN_GUARDS) expect(twin.judgeCompletionRecord(key, fake.objects.get(key), { securityReview: true })).toMatchObject({ proven: false }); };
+  /** Older report: A's create and the Done 503'd (queued, the message carries A). Newer report: A+B both 429 (retryable, the agent's retry - not queued) ⇒ record failed=[A,B], followUpsPending:true. */
+  const olderQueuedNewerHeld = async () => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503, Tickets___create_ticket: PROVIDER_503 };
+    expect(await reportReview({ ...PASS, follow_ups: JSON.stringify([FU_A]) })).toMatchObject({ status: "complete", ticketWrites: "queued" });
+    expect(fake.queue).toHaveLength(1);
+    expect(JSON.parse(fake.queue[0].Body).followUps.map((e) => e.hash)).toEqual([hashOf(FU_A)]);
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503, Tickets___create_ticket: "Jira API 429: rate limited" };
+    expect(await reportReview({ ...PASS, follow_ups: JSON.stringify([FU_A, FU_B]) })).toMatchObject({ status: "complete_pending_follow_ups" });
+    expect(fake.queue, "a retryable non-outage refusal is the agent's retry, not a queued message").toHaveLength(1);
+    expect(new Set(failedHashes())).toEqual(new Set([hashOf(FU_A), hashOf(FU_B)]));
+    expect(followUpTickets()).toHaveLength(0);
+  };
+
+  it("R2-01a drop() on A's permanent refusal keeps B (the record's unresolved row) in the persisted breakdown; followUpsPending stays true", async () => {
+    await olderQueuedNewerHeld();
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY), Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    const out = await drainQueued();
+    expect(out, out.reason).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(record(R_KEY)).toMatchObject({ ticketWrites: "dropped", followUpsPending: true, status: "complete_pending_follow_ups" });
+    expect(new Set(failedHashes()), "B is still on the record").toEqual(new Set([hashOf(FU_A), hashOf(FU_B)]));
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    twinsRefuseRecord(R_KEY);
+  });
+
+  it("R2-01b redelivery files A ⇒ superseded on B (no Done, hold kept); the newer report's retry files B and Dones", async () => {
+    await olderQueuedNewerHeld();
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY), Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    expect((await drainQueued()).outcome).toBe("dropped");
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+    const out = await drainQueued();
+    expect(out, out.reason).toMatchObject({ outcome: "dropped", superseded: true });
+    expect(fake.tickets.get(REVIEW).status, "no Done over B").toBe("In Progress");
+    expect(followUpTickets(), "A was filed").toHaveLength(1);
+    expect(record(R_KEY).followUpsPending).toBe(true);
+    expect(failedHashes()).toContain(hashOf(FU_B));
+    twinsRefuseRecord(R_KEY);
+    expect(await reportReview({ ...PASS, follow_ups: JSON.stringify([FU_A, FU_B]) })).toMatchObject({ status: "complete" });
+    expect(followUpTickets()).toHaveLength(2);
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    expect(record(R_KEY)).toMatchObject({ followUpsPending: false, status: "complete" });
+  });
+
+  it("R2-01c the ticket is already Done when the older message (A) drains and A files ⇒ applied, but B's row and followUpsPending:true stay on the record", async () => {
+    await olderQueuedNewerHeld();
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+    fake.tickets.get(REVIEW).status = "Done";
+    const out = await drainQueued();
+    expect(out, out.reason).toMatchObject({ outcome: "applied" });
+    expect(record(R_KEY)).toMatchObject({ ticketWrites: "applied", followUpsPending: true });
+    expect(failedHashes(), "B's row survives the already-Done write").toEqual([hashOf(FU_B)]);
+    expect(followUpTickets()).toHaveLength(1);
+  });
+
+  it("R2-05c a hollow breakdown (followUpsPending:true, failed:[]) is a hold nobody can name: a hold-less message is superseded, the hold stays, twins refuse", async () => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503 };
+    expect(await reportReview(PASS)).toMatchObject({ ticketWrites: "queued" });
+    patchRecord(R_KEY, { followUpsPending: true, status: "complete_pending_follow_ups", followUpsMaterialized: { created: [], skipped: [], failed: [], rerouted: [] } });
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+    const out = await drainQueued();
+    expect(out, out.reason).toMatchObject({ outcome: "dropped", superseded: true });
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    expect(record(R_KEY)).toMatchObject({ followUpsPending: true, followUpsMaterialized: { failed: [] } });
+    twinsRefuseRecord(R_KEY);
   });
 });
