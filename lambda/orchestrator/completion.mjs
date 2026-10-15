@@ -84,6 +84,28 @@ export function harvestableShipOutcome(value) {
   return HARVESTED_SHIP_OUTCOMES.includes(outcome) ? outcome : null;
 }
 
+/** TEAM-6187 — index.mjs harvestCompletionEvidence's field rule, pure, shared with the /complete route's
+ *  pre-probe overlay (src/lib/workflow/follow-up-pr-gate.ts). `fresh` (TEAM-5951/TEAM-5900) = written at/after
+ *  the task started AND after its Done stamp (or `transitioned`). Fresh → every field overwrites; else a ship
+ *  signal fills only an absent key, output/branch only when !hasEvidence. Caller decides if non-fresh counts. */
+export function freshRecordFields(entry, record, { transitioned = false, hasEvidence = false } = {}) {
+  const fields = {};
+  const fresh = record.completed_at >= entry?.startedAt && (transitioned || record.completed_at > entry?.completedAt);
+  const take = (k) => fresh || !entry?.[k];
+  if (!hasEvidence || fresh) { // deliverable evidence — fill when absent, overwrite when fresh (TEAM-5900)
+    const summary = typeof record.summary === "string" ? record.summary.trim() : "";
+    if (summary) fields.output = summary.slice(0, 10000);
+    if (record.branch) fields.branch = record.branch;
+  }
+  // Ship/CD signals — only when the record carries it and take() admits it; admitted outcomes live beside shipVerdictOf (TEAM-4763 P1-A).
+  if (record.commit_sha && take("commitSha")) fields.commitSha = record.commit_sha;
+  if (record.pr_url && take("prUrl")) fields.prUrl = record.pr_url;
+  if (record.merge_commit && take("mergeCommit")) fields.mergeCommit = record.merge_commit;
+  if (take("outcome")) { const oc = harvestableShipOutcome(record.outcome); if (oc) fields.outcome = oc; }
+  if (record.block_reason && take("blockReason")) fields.blockReason = String(record.block_reason).slice(0, 500);
+  return { fresh, fields };
+}
+
 /**
  * TEAM-4763 P1-A — the verdicts that SATISFY the D2 ship gate. "shipped" proves
  * the work landed; "handoff" proves it was delivered to another team to land,
@@ -184,6 +206,20 @@ export const SHIP_PHASES = new Set(["ship"]);
  * assignee's roster phase via opts.getAgentPhase — identical to phaseOf above.
  */
 /**
+ * TEAM-6203 — the ONE agentTasks lookup. Entries are keyed by ticket id (orchestrator) or by
+ * task id with a `ticketId` field (legacy rows; the HTTP route tolerates both). Every reader of
+ * a ticket's entry (evidence gates, ship-verdict evaluator, delegation, the merge-proof stamp)
+ * resolves it here, so no two of them can disagree about which entry a ticket owns. Pure.
+ * TEAM-6214: direct key first; among task-id-keyed entries the LAST one in insertion order wins — the
+ * pre-TEAM-6203 `byTicketId` Map `set` semantics (an older shipped row never hides a later deploy-blocked).
+ */
+export function resolveTicketEntry(agentTasks, ticketId) {
+  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
+  const id = String(ticketId ?? "");
+  return tasks[id] || Object.values(tasks).findLast((e) => e && typeof e === "object" && String(e.ticketId) === id) || null;
+}
+
+/**
  * Is this child a HUMAN review gate rather than agent work? Assignee `human:<who>`
  * (the Jira/DDB mappers derive it from the `reviewer:<who>` label) or the
  * `human-review` marker label. Exported for the HTTP route's TS twin parity test.
@@ -201,13 +237,6 @@ export function missingEvidenceTickets(children, agentTasks, requiredPhases, opt
   const phaseOf = (t) =>
     typeof t.phase === "string" && t.phase ? t.phase : getAgentPhase(t.assignee);
   const required = new Set(requiredPhases);
-  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
-  // agentTasks may be keyed by ticketId (orchestrator) or by task id with a
-  // ticketId field (route tolerates both) — build the same secondary index.
-  const byTicketId = new Map();
-  for (const entry of Object.values(tasks)) {
-    if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
-  }
   const missing = [];
   for (const t of children) {
     if (t.type === "epic") continue;
@@ -222,7 +251,7 @@ export function missingEvidenceTickets(children, agentTasks, requiredPhases, opt
     const phase = phaseOf(t);
     if (!phase || !required.has(phase)) continue;
     const ticketId = String(t.ticketId || "");
-    const entry = tasks[ticketId] || byTicketId.get(ticketId);
+    const entry = resolveTicketEntry(agentTasks, ticketId); // TEAM-6203: the ONE lookup (ticket-id or task-id keyed)
     const hasOutput = typeof entry?.output === "string" && entry.output.trim().length > 0;
     const hasArtifact = typeof entry?.artifactKey === "string" && entry.artifactKey.length > 0;
     if (!hasOutput && !hasArtifact) missing.push({ ticketId, phase });
@@ -333,11 +362,6 @@ export function evidenceBackfillFields(record, entry) {
 export async function resolveMissingEvidenceFromRecords(missing, agentTasks, deps = {}) {
   if (!Array.isArray(missing) || missing.length === 0) return missing;
   const log = typeof deps.log === "function" ? deps.log : () => {};
-  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
-  const byTicketId = new Map();
-  for (const entry of Object.values(tasks)) {
-    if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
-  }
   const remaining = [];
   for (const offender of missing) {
     const ticketId = offender?.ticketId;
@@ -354,7 +378,7 @@ export async function resolveMissingEvidenceFromRecords(missing, agentTasks, dep
       remaining.push(offender);
       continue;
     }
-    const entry = tasks[ticketId] || byTicketId.get(ticketId);
+    const entry = resolveTicketEntry(agentTasks, ticketId);
     const fields = evidenceBackfillFields(record, entry);
     if (Object.keys(fields).length > 0) {
       try {
@@ -581,12 +605,6 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
   const getAgentPhase = opts.getAgentPhase || (() => undefined);
   const phaseOf = (t) =>
     typeof t.phase === "string" && t.phase ? t.phase : getAgentPhase(t.assignee);
-  const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
-  const byTicketId = new Map();
-  for (const entry of Object.values(tasks)) {
-    if (entry && typeof entry.ticketId === "string") byTicketId.set(entry.ticketId, entry);
-  }
-
   const shipTickets = children.filter(
     (t) =>
       t.type !== "epic" &&
@@ -604,7 +622,7 @@ export function evaluateShipVerdict(children, agentTasks, shipPhases, opts = {})
   const offenders = [];
   for (const t of shipTickets) {
     const ticketId = String(t.ticketId || "");
-    const entry = tasks[ticketId] || byTicketId.get(ticketId);
+    const entry = resolveTicketEntry(agentTasks, ticketId);
     const verdict = shipVerdictOf(entry);
     // TEAM-4763 P1-A: "handoff" satisfies the gate alongside "shipped" — see
     // SHIP_SATISFIED_VERDICTS. Anything else (including null) is an offender.
@@ -791,7 +809,7 @@ export async function featureBranchLanding({ owner, repo, base, head, api, recor
   if (mergedPr && headSha && mergedHead === headSha) return proof();
   const cmp = await api(`/repos/${owner}/${repo}/compare/${enc(base)}...${enc(head)}`);
   if (cmp?.status === "identical" || cmp?.status === "behind") {
-    return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: "" };
+    return { merged: true, mergeCommit: cmp?.base_commit?.sha || "", prUrl: mergedPr?.html_url || "" }; // TEAM-6190: identity ≠ landing proof
   }
   if (!mergedPr) {
     if (cmp?.status === "ahead" || cmp?.status === "diverged") {
@@ -817,7 +835,7 @@ export async function featureBranchLanding({ owner, repo, base, head, api, recor
   const tipSha = cmp?.base_commit?.sha || null;
   const treeOf = async (sha) => (sha ? (await api(`/repos/${owner}/${repo}/git/commits/${enc(sha)}`).catch(() => null))?.tree?.sha || null : null);
   const tipTree = await treeOf(tipSha), headTree = await treeOf(headSha);
-  if (tipTree && tipTree === headTree) return { merged: true, mergeCommit: tipSha, prUrl: "" };
+  if (tipTree && tipTree === headTree) return { merged: true, mergeCommit: tipSha, prUrl: mergedPr.html_url || "" };
   // TEAM-5935: trees that DIFFER prove nothing (an unrelated commit on base differs them).
   // Prove per file over the post-merge feature changes instead.
   const files = Array.isArray(after.files) ? after.files : [];
@@ -833,7 +851,7 @@ export async function featureBranchLanding({ owner, repo, base, head, api, recor
       `; ${base} still holds the pre-merge content of: ${v.absent.join(", ")}`
     );
   }
-  if (v.landed) return { merged: true, mergeCommit: tipSha, prUrl: "" };
+  if (v.landed) return { merged: true, mergeCommit: tipSha, prUrl: mergedPr.html_url || "" };
   return inconclusive(v.why);
 }
 
@@ -866,21 +884,73 @@ export function githubPrRef(text) {
   return null;
 }
 
+/** TEAM-6190 — the ONE parse of a DL-038 chain title's "follow-up PR <url>" (null when the marker is absent). */
+export const followUpTitleRef = (title) => (/\bfollow-up PR\s/i.test(String(title ?? "")) ? githubPrRef(title) : null);
+const samePr = (a, b) => Boolean(a && b) && a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase() && a.number === b.number;
+
+const prRef = (u) => (typeof u === "string" ? githubPrRef(u) : null); // TEAM-6075: a non-string pr_url is ignored
+
+/**
+ * TEAM-6203 — the ONE answer to "which PR is this ticket's own": the DL-038 chain title's
+ * "follow-up PR <url>", else its completion record pr_url (fresher, TEAM-6062), else its cached
+ * prUrl; null when it names none. The stamp classifier (isOtherPrTicket) and the verdict
+ * delegation (verdictCarried) both resolve through here, so a ticket cannot be "another PR's" to
+ * one and "no PR's" to the other. Pure.
+ */
+export function resolveTicketPrUrl({ title, record, entry } = {}) {
+  return followUpTitleRef(title) || prRef(record?.pr_url) || prRef(entry?.prUrl);
+}
+
+/**
+ * TEAM-6054 — does a ship ticket belong to a PR other than the unified one (resolveTicketPrUrl)?
+ * TEAM-6190: with no unified PR url (no PR from the branch merged) any own PR is another. Pure.
+ */
+export function isOtherPrTicket({ entry, record, title, unifiedPrUrl }) {
+  const own = resolveTicketPrUrl({ title, record, entry });
+  return Boolean(own) && !samePr(own, prRef(unifiedPrUrl));
+}
+
+/** TEAM-6203 — a `CD:` ticket: the chain's "CD: follow-up PR <url>" (bug-fixer.md) or the unified "CD: <description>" (bug-fix-requirements.md). */
+export const CD_TITLE_RE = /^\s*CD\s*:/i;
+const isCdTicket = (t) => CD_TITLE_RE.test(String(t?.title ?? ""));
+
+/**
+ * TEAM-6190 / TEAM-6203 — may ticket `t` leave the post-stamp ship-verdict re-check because its PR's
+ * deploy is proven elsewhere? Delegation is DIRECTIONAL and role-aware (ship-review r2 of #974):
+ *   - a `CD:` ticket never borrows — the deploy verdict is its own to give;
+ *   - a ticket with ANY verdict of its own (satisfied or an explicit block) is never excused — a
+ *     satisfied one needs no excuse and a block is a block;
+ *   - the recipient's PR is resolveTicketPrUrl (chain title, record pr_url, cached prUrl), so a
+ *     `Fix (ship-review rN)` fixer with its own pr_url qualifies, not only a "follow-up PR" title;
+ *   - the carrier is another Done agent `CD:` ticket resolving to the SAME PR whose OWN verdict
+ *     (resolveTicketEntry → shipVerdictOf) is shipped/handoff. A verdict-less CD carries nothing.
+ * `records` is { [ticketId]: completion record | null } (the caller's memoized reads). Pure.
+ */
+export function verdictCarried(t, children, agentTasks, records = {}) {
+  if (!t || isCdTicket(t) || shipVerdictOf(resolveTicketEntry(agentTasks, t.ticketId)) !== null) return false;
+  const own = resolveTicketPrUrl({ title: t.title, record: records?.[t.ticketId], entry: resolveTicketEntry(agentTasks, t.ticketId) });
+  if (!own) return false;
+  return [].concat(children || []).some((c) => String(c.ticketId) !== String(t.ticketId) && isCdTicket(c) && String(c.status || "").toLowerCase() === "done" && !isHuman(c.assignee) &&
+    samePr(resolveTicketPrUrl({ title: c.title, record: records?.[c.ticketId], entry: resolveTicketEntry(agentTasks, c.ticketId) }), own) &&
+    SHIP_SATISFIED_VERDICTS.includes(shipVerdictOf(resolveTicketEntry(agentTasks, c.ticketId))));
+}
+
 /**
  * TEAM-6032 (DL-038) — the run's PRs in its configured repos, one per repo+number.
  * TEAM-6062: `prUrl` is fill-once, so a re-dispatched ticket's completion record
- * (`records[ticketId].pr_url`) is read too. Pure; foreign repos and non-PR urls are dropped.
+ * (`records[ticketId].pr_url`) is read too, and (TEAM-6190) every ticket title's "follow-up PR <url>".
+ * Pure; foreign repos and non-PR urls are dropped.
  */
-export function followUpPrRefs(agentTasks, repos, records = {}) {
+export function followUpPrRefs(agentTasks, repos, records = {}, tickets = []) {
   const refs = new Map();
-  for (const [tid, e] of Object.entries(agentTasks || {})) {
-    for (const url of [records?.[tid]?.pr_url, e?.prUrl]) {
-      if (typeof url !== "string") continue; // TEAM-6075: a non-string record pr_url must not disable the gate
-      const m = githubPrRef(url);
-      const r = m && [].concat(repos).find((x) => m.owner.toLowerCase() === String(x?.owner).toLowerCase() && m.repo.toLowerCase() === String(x?.repo).toLowerCase());
-      const key = r && `${r.owner}/${r.repo}#${m.number}`.toLowerCase();
-      if (r && !refs.has(key)) refs.set(key, { owner: r.owner, repo: r.repo, defaultBranch: r.defaultBranch, number: m.number, url: url.trim() });
-    }
+  const urls = Object.entries(agentTasks || {}).flatMap(([tid, e]) => [records?.[typeof e?.ticketId === "string" ? e.ticketId : tid]?.pr_url, e?.prUrl]); // TEAM-6203: a task-id-keyed entry's record lives under its ticketId
+  for (const t of [].concat(tickets || [])) { const m = followUpTitleRef(t?.title); if (m) urls.push(`https://github.com/${m.owner}/${m.repo}/pull/${m.number}`); } // TEAM-6190: title-only
+  for (const url of urls) {
+    if (typeof url !== "string") continue; // TEAM-6075: a non-string record pr_url must not disable the gate
+    const m = githubPrRef(url);
+    const r = m && [].concat(repos).find((x) => m.owner.toLowerCase() === String(x?.owner).toLowerCase() && m.repo.toLowerCase() === String(x?.repo).toLowerCase());
+    const key = r && `${r.owner}/${r.repo}#${m.number}`.toLowerCase();
+    if (r && !refs.has(key)) refs.set(key, { owner: r.owner, repo: r.repo, defaultBranch: r.defaultBranch, number: m.number, url: url.trim() });
   }
   return [...refs.values()];
 }
@@ -927,11 +997,11 @@ export async function followUpPrGate({ workflow, agentTasks, tickets = [], merge
     const repos = [].concat(repoRef());
     const defaultBranch = workflow.repoConfig?.repos?.[0]?.defaultBranch || "main";
     if (!mergeProof && resolvePrBase({ workflow: { ...workflow, agentTasks }, defaultBranch, getAgentPhase }).reason !== "unified_pr_merged") return [];
-    const ids = Object.keys(agentTasks || {});
+    const ids = [...new Set(Object.entries(agentTasks || {}).map(([tid, e]) => (typeof e?.ticketId === "string" ? e.ticketId : tid)))]; // TEAM-6203
     const recs = await Promise.all(ids.map((tid) => Promise.resolve().then(() => readCompletionRecord(tid)).catch(() => null)));
     const records = Object.fromEntries(ids.map((tid, i) => [tid, recs[i]]));
     const statedBases = [...new Set([].concat(tickets || []).map((t) => BASE_BRANCH_LINE_RE.exec(String(t?.description || ""))?.[1]).filter((b) => b && b !== workflow.featureBranch))];
-    const r = await openFollowUpPrs({ refs: followUpPrRefs(agentTasks, repos, records), featureBranch: workflow.featureBranch, defaultBranch, statedBases, api });
+    const r = await openFollowUpPrs({ refs: followUpPrRefs(agentTasks, repos, records, tickets), featureBranch: workflow.featureBranch, defaultBranch, statedBases, api });
     if (r.unknown.length > 0) warn(`[orchestrator] follow-up PR state unknown for ${workflow.id}: ${r.unknown.join(", ")}`);
     return [...r.open].sort();
   } catch (err) {

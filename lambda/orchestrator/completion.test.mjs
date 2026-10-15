@@ -1440,7 +1440,7 @@ describe("featureBranchLanding — stranded post-merge commits (TEAM-5828)", () 
 
   it("later commits already on main (compare behind) → merged", async () => {
     const r = await land([["/pulls?", [merged]], ["/branches/", { commit: { sha: "new222" } }], ["/compare/main...", { status: "behind", base_commit: { sha: "b1" } }]]);
-    expect(r).toEqual({ merged: true, mergeCommit: "b1", prUrl: "" });
+    expect(r).toEqual({ merged: true, mergeCommit: "b1", prUrl: merged.html_url });
   });
 
   it("TEAM-5853 #1: sync-after-squash (merge of main, empty merge-base..head diff) → merged", async () => {
@@ -1670,7 +1670,7 @@ describe("featureBranchLanding — TEAM-5913 (404 binds every recorded head; fal
       ["/compare/old111abc...F", { status: "ahead", ahead_by: 1, behind_by: 0, files: [{ filename: "f.js" }] }],
       ["/git/commits/T", { tree: { sha: "tree1" } }], ["/git/commits/F", { tree: { sha: "tree1" } }],
     ]);
-    expect(r).toEqual({ merged: true, mergeCommit: "T", prUrl: "" }); // base: merged:false
+    expect(r).toEqual({ merged: true, mergeCommit: "T", prUrl: merged.html_url }); // base: merged:false
   });
 
   it("TEAM-5913 (4): compares without `files` reaching the fallback → merged:null, never a proven strand", async () => {
@@ -1743,7 +1743,7 @@ describe("featureBranchLanding — TEAM-5935 (per-file proof; tree inequality is
 
   it("regression: F's change landed via T, U adds an unrelated file → trees differ but f.js identical on main → merged:true", async () => {
     const r = await land([...SHAPE(), ...T({ "f.js": "f1", "unrelated.js": "u1" }, { "f.js": "f0" }, { "f.js": "f1" })]);
-    expect(r).toEqual({ merged: true, mergeCommit: "U", prUrl: "" }); // base: merged:false
+    expect(r).toEqual({ merged: true, mergeCommit: "U", prUrl: merged.html_url }); // base: merged:false
   });
 
   it("T lands F's change, then U edits f.js further → third state on main → merged:null, never false", async () => {
@@ -1790,7 +1790,7 @@ describe("featureBranchLanding — TEAM-5935 (per-file proof; tree inequality is
 
   it("renamed: new path identical on main AND old path absent on main → true; old path still on main → null", async () => {
     const ren = SHAPE([{ filename: "b.js", status: "renamed", previous_filename: "a.js" }]);
-    expect(await land([...ren, ...T({ "b.js": "b1" }, { "a.js": "a0" }, { "b.js": "b1" })])).toEqual({ merged: true, mergeCommit: "U", prUrl: "" });
+    expect(await land([...ren, ...T({ "b.js": "b1" }, { "a.js": "a0" }, { "b.js": "b1" })])).toEqual({ merged: true, mergeCommit: "U", prUrl: merged.html_url });
     expect((await land([...ren, ...T({ "b.js": "b1", "a.js": "a0" }, { "a.js": "a0" }, { "b.js": "b1" })])).merged).toBe(null);
   });
 
@@ -1817,7 +1817,7 @@ describe("featureBranchLanding — TEAM-5935 (per-file proof; tree inequality is
   it("TEAM-5943: reads exactly ONE recursive tree per ref (matched by verbatim path) and never the Contents API", async () => {
     const calls = [];
     const r = await land([...SHAPE([{ filename: "src/a b/c#.js" }]), ...T({ "src/a b/c#.js": "same" }, { "src/a b/c#.js": "s0" }, { "src/a b/c#.js": "same" })], {}, calls);
-    expect(r).toEqual({ merged: true, mergeCommit: "U", prUrl: "" });
+    expect(r).toEqual({ merged: true, mergeCommit: "U", prUrl: merged.html_url });
     for (const t of ["treeU", "treeH", "treeF"]) expect(calls.filter((c) => c === `/repos/o/r/git/trees/${t}?recursive=1`)).toHaveLength(1);
     expect(calls.some((c) => c.includes("/contents/"))).toBe(false);
   });
@@ -1872,7 +1872,7 @@ describe("featureBranchLanding — TEAM-5943 (tree-entry identity: mode + sha, n
 
   it("(c) mode change landed on main (identical mode + sha on main's tip) → merged:true; content landed without the mode → null, never false", async () => {
     const landed = await land([...SHAPE("bin/run.sh"), ...T({ "bin/run.sh": EXEC }, { "bin/run.sh": REG }, { "bin/run.sh": EXEC }), LEGACY_CONTENTS]);
-    expect(landed).toEqual({ merged: true, mergeCommit: "U", prUrl: "" });
+    expect(landed).toEqual({ merged: true, mergeCommit: "U", prUrl: merged.html_url });
     // main took F's new content but kept 100644 → third state (neither pre-merge nor tip) → null
     const partial = await land([...SHAPE("bin/run.sh"), ...T({ "bin/run.sh": ["X1", "100644"] }, { "bin/run.sh": ["X0", "100644"] }, { "bin/run.sh": ["X1", "100755"] }), LEGACY_CONTENTS]);
     expect(partial.merged).toBe(null);
@@ -2252,5 +2252,155 @@ describe("TEAM-6148 PR-number segment is a whole positive integer", () => {
   it("TEAM-6148 followUpPrRefs: a junk record pr_url is dropped while the good cached prUrl survives", () => {
     const refs = completionMod.followUpPrRefs({ F: { prUrl: "https://github.com/o/r/pull/9" } }, R, { F: { pr_url: "https://github.com/o/r/pull/1%2Fnot-a-pr" } });
     expect(refs).toEqual([{ ...R[0], number: 9, url: "https://github.com/o/r/pull/9" }]);
+  });
+});
+
+// TEAM-6187 §1c — the pure field rule extracted from index.mjs harvestCompletionEvidence
+// so the /complete route (src/lib/workflow/follow-up-pr-gate.ts) can overlay the same
+// fresh records before its probe. Behaviour pinned here, not re-derived there.
+describe("freshRecordFields — harvestCompletionEvidence's field rule (TEAM-6187)", () => {
+  const entry = { startedAt: "2026-10-01T00:00:00Z", completedAt: "2026-10-01T00:05:00Z", output: "old", commitSha: "aaa", outcome: "handoff" };
+  const record = { completed_at: "2026-10-01T00:06:00Z", summary: " s ", branch: "b", commit_sha: "bbb", pr_url: "u", merge_commit: "m", outcome: "SHIPPED", block_reason: "r".repeat(600) };
+
+  it("fresh (>= startedAt and > completedAt): every field overwrites, outcome normalised, block_reason capped", () => {
+    const { fresh, fields } = completionMod.freshRecordFields(entry, record);
+    expect(fresh).toBe(true);
+    expect(fields).toEqual({ output: "s", branch: "b", commitSha: "bbb", prUrl: "u", mergeCommit: "m", outcome: "shipped", blockReason: "r".repeat(500) });
+  });
+
+  it("not fresh (<= completedAt) and hasEvidence: only ABSENT ship signals are filled; present ones are kept", () => {
+    const { fresh, fields } = completionMod.freshRecordFields(entry, { ...record, completed_at: "2026-10-01T00:05:00Z" }, { hasEvidence: true });
+    expect(fresh).toBe(false);
+    expect(fields).toEqual({ prUrl: "u", mergeCommit: "m", blockReason: "r".repeat(500) }); // commitSha + outcome already set; output/branch gated by hasEvidence
+  });
+
+  it("transitioned re-completion: a record >= startedAt is fresh even when not newer than completedAt (TEAM-5900)", () => {
+    expect(completionMod.freshRecordFields(entry, { ...record, completed_at: "2026-10-01T00:05:00Z" }, { transitioned: true }).fresh).toBe(true);
+  });
+
+  it("no startedAt → never fresh; an unknown outcome is dropped; the 10k summary cap holds", () => {
+    const r = completionMod.freshRecordFields({ output: "" }, { completed_at: "2026-10-01T00:06:00Z", summary: "x".repeat(10_050), outcome: "banana" });
+    expect(r.fresh).toBe(false);
+    expect(r.fields).toEqual({ output: "x".repeat(10_000) });
+  });
+});
+
+describe("TEAM-6054 isOtherPrTicket", () => {
+  const U9 = "https://github.com/o/r/pull/9", F12 = "https://github.com/o/r/pull/12";
+  const other = (a) => completionMod.isOtherPrTicket(a);
+  it("DL-038 chain title naming another PR → true", () =>
+    expect(other({ title: `Ship: follow-up PR ${F12}`, entry: { prUrl: U9 }, unifiedPrUrl: U9 })).toBe(true));
+  it("record pr_url wins over a stale cached prUrl (TEAM-6062) → true", () =>
+    expect(other({ record: { pr_url: F12 }, entry: { prUrl: U9 }, unifiedPrUrl: U9 })).toBe(true));
+  it("own PR IS the unified PR (owner/repo case, trailing punctuation) → false", () => {
+    expect(other({ entry: { prUrl: "https://github.com/O/R/pull/9." }, unifiedPrUrl: U9 })).toBe(false);
+    expect(other({ record: { pr_url: U9 }, unifiedPrUrl: "https://github.com/o/R/pull/9" })).toBe(false);
+  });
+  it("no PR of its own, or a non-string pr_url → false (stamped as before)", () => {
+    expect(other({ entry: {}, unifiedPrUrl: U9 })).toBe(false);
+    expect(other({ record: { pr_url: [F12] }, unifiedPrUrl: U9 })).toBe(false);
+  });
+  it("TEAM-6190 F2: no unified url (compare proof) → ANY own PR ref is another PR; none → false", () => {
+    expect(other({ title: `CD: follow-up PR ${F12}`, unifiedPrUrl: "" })).toBe(true);
+    expect(other({ entry: { prUrl: F12 }, record: { pr_url: F12 }, unifiedPrUrl: "" })).toBe(true);
+    expect(other({ record: { pr_url: U9 }, unifiedPrUrl: "" })).toBe(true);
+    expect(other({ entry: {}, unifiedPrUrl: "" })).toBe(false);
+  });
+  it("look-alike host in the title → false", () =>
+    expect(other({ title: "Ship: follow-up PR https://notgithub.com/o/r/pull/12", unifiedPrUrl: "" })).toBe(false));
+});
+
+describe("TEAM-6190 verdictCarried / title-only follow-up refs", () => {
+  const F12 = "https://github.com/o/r/pull/12", F13 = "https://github.com/o/r/pull/13";
+  const ship = { ticketId: "S", assignee: "agentcore_hub_release_manager", status: "done", title: `Ship: follow-up PR ${F12}` };
+  const cd = (title = `CD: follow-up PR ${F12}`, over = {}) => ({ ticketId: "C", assignee: "agentcore_hub_release_manager", status: "done", title, ...over });
+  const carried = (t, kids, tasks, records) => completionMod.verdictCarried(t, kids, tasks, records);
+  it("Ship: follow-up PR X is carried by a Done CD: follow-up PR X with a shipped verdict (owner/repo case-insensitive)", () => {
+    expect(carried(ship, [ship, cd()], { C: { ticketId: "C", mergeCommit: "m12" } })).toBe(true);
+    expect(carried(ship, [ship, cd("CD: follow-up PR https://github.com/O/R/pull/12")], { x: { ticketId: "C", outcome: "handoff" } })).toBe(true);
+  });
+  it("not carried: CD has no verdict, CD not Done, CD is human, a different PR, or a non-chain title", () => {
+    expect(carried(ship, [ship, cd()], { C: { ticketId: "C", output: "deployed" } })).toBe(false);
+    expect(carried(ship, [ship, cd(undefined, { status: "in_progress" })], { C: { ticketId: "C", mergeCommit: "m" } })).toBe(false);
+    expect(carried(ship, [ship, cd(undefined, { assignee: "human:x" })], { C: { ticketId: "C", mergeCommit: "m" } })).toBe(false);
+    expect(carried(ship, [ship, cd(`CD: follow-up PR ${F13}`)], { C: { ticketId: "C", mergeCommit: "m" } })).toBe(false);
+    expect(carried({ ...ship, title: "Ship unified" }, [ship, cd()], { C: { ticketId: "C", mergeCommit: "m" } })).toBe(false);
+  });
+  it("a CD ticket never carries its own verdict", () => {
+    const c = cd();
+    expect(carried(c, [c], { C: { ticketId: "C", output: "deployed" } })).toBe(false);
+  });
+  // TEAM-6203 (ship-review r2 of #974): directional, role-aware delegation.
+  it("TEAM-6203: a CD ticket never borrows — not from a shipped Ship sibling, not from a handoff one", () => {
+    const c = cd();
+    expect(carried(c, [ship, c], { S: { ticketId: "S", outcome: "shipped" }, C: { ticketId: "C", output: "deployed" } })).toBe(false);
+    expect(carried(c, [ship, c], { S: { ticketId: "S", outcome: "handoff" }, C: { ticketId: "C", output: "deployed" } })).toBe(false);
+  });
+  it("TEAM-6203: a recipient with ANY verdict of its own (blocked or satisfied) is never excused", () => {
+    for (const outcome of ["deploy-blocked", "static-ci-only", "shipped", "handoff"]) {
+      expect(carried(ship, [ship, cd()], { S: { ticketId: "S", outcome }, C: { ticketId: "C", mergeCommit: "m12" } })).toBe(false);
+    }
+  });
+  it("TEAM-6203: the carrier must be a Done `CD:` ticket with a satisfied verdict of its own — a Ship sibling or a verdict-less CD carries nothing", () => {
+    const ship2 = { ...ship, ticketId: "S2" };
+    expect(carried(ship, [ship, ship2], { S2: { ticketId: "S2", mergeCommit: "m12" } })).toBe(false);
+    expect(carried(ship, [ship, cd()], { C: { ticketId: "C", output: "deployed" } })).toBe(false);
+    expect(carried(ship, [ship, cd()], { C: { ticketId: "C", outcome: "deploy-blocked" } })).toBe(false);
+  });
+  it("TEAM-6203: a fixer with no chain title is excused via its record pr_url or cached prUrl by its PR's shipped CD; the CD is resolved the same way", () => {
+    const fixer = { ticketId: "F", assignee: "agentcore_hub_bug_fixer", status: "done", title: "Fix (ship-review r1): backend — 2 findings" };
+    expect(carried(fixer, [fixer, cd()], { F: { ticketId: "F", output: "fixed" }, C: { ticketId: "C", mergeCommit: "m12" } }, { F: { pr_url: F12 } })).toBe(true);
+    expect(carried(fixer, [fixer, cd()], { F: { ticketId: "F", output: "fixed", prUrl: F12 }, C: { ticketId: "C", mergeCommit: "m12" } })).toBe(true);
+    expect(carried(fixer, [fixer, cd()], { F: { ticketId: "F", output: "fixed", prUrl: F13 }, C: { ticketId: "C", mergeCommit: "m12" } })).toBe(false);
+    const cdNoUrl = cd("CD: deploy the fix", {});
+    expect(carried(fixer, [fixer, cdNoUrl], { F: { ticketId: "F", prUrl: F12 }, C: { ticketId: "C", mergeCommit: "m12", prUrl: F12 } })).toBe(true);
+    expect(carried(fixer, [fixer, cdNoUrl], { F: { ticketId: "F", prUrl: F12 }, C: { ticketId: "C", mergeCommit: "m12" } }, { C: { pr_url: F12 } })).toBe(true);
+    expect(carried(fixer, [fixer, cdNoUrl], { F: { ticketId: "F", prUrl: F12 }, C: { ticketId: "C", mergeCommit: "m12" } })).toBe(false);
+  });
+  it("TEAM-6203: the carrier CD's verdict is read through resolveTicketEntry (task-id-keyed entry)", () => {
+    expect(carried(ship, [ship, cd()], { task_x: { ticketId: "C", mergeCommit: "m12" } })).toBe(true);
+  });
+  it("followUpPrRefs also collects a PR named only by a chain ticket title (deduped against task urls)", () => {
+    const repos = [{ owner: "o", repo: "r", defaultBranch: "main" }];
+    const refs = completionMod.followUpPrRefs({ A: { prUrl: F13 } }, repos, {}, [ship, cd(), { ticketId: "Z", title: "no marker https://github.com/o/r/pull/99" }]);
+    expect(refs.map((r) => r.number).sort()).toEqual([12, 13]);
+    expect(refs.find((r) => r.number === 12)).toMatchObject({ owner: "o", repo: "r", defaultBranch: "main", url: F12 });
+  });
+});
+
+describe("TEAM-6203 resolveTicketEntry / resolveTicketPrUrl — the ONE agentTasks lookup and the ONE own-PR resolver", () => {
+  const { resolveTicketEntry, resolveTicketPrUrl, isOtherPrTicket, followUpPrRefs } = completionMod;
+  const F12 = "https://github.com/o/r/pull/12", U9 = "https://github.com/o/r/pull/9";
+  it("resolveTicketEntry: key hit, ticketId-field hit on a task-id key, miss → null, junk tasks → null", () => {
+    const byKey = { ticketId: "T", output: "a" }, legacy = { ticketId: "L", output: "b" };
+    const tasks = { T: byKey, task_1: legacy, junk: null };
+    expect(resolveTicketEntry(tasks, "T")).toBe(byKey);
+    expect(resolveTicketEntry(tasks, "L")).toBe(legacy);
+    expect(resolveTicketEntry(tasks, "nope")).toBeNull();
+    expect(resolveTicketEntry(null, "T")).toBeNull();
+    expect(resolveTicketEntry("str", "T")).toBeNull();
+  });
+  it("TEAM-6214: two task-id-keyed entries for one ticket → the LAST in insertion order wins (pre-TEAM-6203 byTicketId Map semantics); a direct key still outranks both", () => {
+    const older = { ticketId: "L", outcome: "shipped" }, newer = { ticketId: "L", outcome: "deploy-blocked" };
+    expect(resolveTicketEntry({ task_old: older, task_new: newer }, "L")).toBe(newer);
+    expect(resolveTicketEntry({ task_new: newer, task_old: older }, "L")).toBe(older);
+    const direct = { ticketId: "L", outcome: "handoff" };
+    expect(resolveTicketEntry({ task_old: older, L: direct, task_new: newer }, "L")).toBe(direct);
+  });
+  it("resolveTicketPrUrl: chain title → record pr_url → cached prUrl; non-strings ignored; none → null", () => {
+    expect(resolveTicketPrUrl({ title: `Ship: follow-up PR ${F12}`, record: { pr_url: U9 }, entry: { prUrl: U9 } })).toMatchObject({ number: 12 });
+    expect(resolveTicketPrUrl({ title: "Ship unified", record: { pr_url: F12 }, entry: { prUrl: U9 } })).toMatchObject({ number: 12 });
+    expect(resolveTicketPrUrl({ record: { pr_url: [F12] }, entry: { prUrl: U9 } })).toMatchObject({ number: 9 });
+    expect(resolveTicketPrUrl({ entry: {} })).toBeNull();
+    expect(resolveTicketPrUrl({})).toBeNull();
+  });
+  it("isOtherPrTicket is the resolver compared with the unified url (unchanged behaviour)", () => {
+    expect(isOtherPrTicket({ record: { pr_url: F12 }, entry: { prUrl: U9 }, unifiedPrUrl: U9 })).toBe(true);
+    expect(isOtherPrTicket({ entry: { prUrl: U9 }, unifiedPrUrl: U9 })).toBe(false);
+  });
+  it("followUpPrRefs reads a task-id-keyed entry's record under its ticketId (TEAM-6203, same defect class as R2-L1)", () => {
+    const repos = [{ owner: "o", repo: "r", defaultBranch: "main" }];
+    const refs = followUpPrRefs({ task_legacy: { ticketId: "fix-12", prUrl: U9 } }, repos, { "fix-12": { pr_url: F12 } }, []);
+    expect(refs.map((r) => r.number).sort((a, b) => a - b)).toEqual([9, 12]);
   });
 });
