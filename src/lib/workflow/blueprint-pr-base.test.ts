@@ -263,22 +263,31 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
   // each one-line blueprint (~13s; synchronous, so testTimeout never fired). Near-linear
   // instead: a back-to-back repeat of k >= minWords tokens at p shares its first
   // minWords-token key with p+k, so only pairs in one bucket are checked.
-  // TEAM-6132: the \b edges missed repeats ending in punctuation (… start. … start.) or
-  // starting with a backtick, so tokens are compared whole, case-folded, with leading and
-  // trailing punctuation stripped. Punctuation-only tokens (—, |, -) are dropped: they are
-  // not words, and dropping them makes `start — check` the same repeat as `start, check`.
-  const norm = (t: string) => t.toLowerCase().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
+  // TEAM-6183 (ship-review r1 on TEAM-6132): whole-whitespace-token comparison missed a
+  // repeat whose edge sits inside a token (`branch;and …branch;`, `…e …e/f`) and, by
+  // dropping punctuation-only tokens, joined separate table cells/rows/fences/rules into
+  // one run. Tokens are now sub-word: scan for letter/digit runs (case-folded) *or* a
+  // structural separator — `|`, a backtick fence (3+ backticks), or a standalone run of
+  // `-`/`*`/`_`/`=` (thematic break / setext underline / hr). Punctuation-only noise
+  // *between* words (`a . . . b`, a single backtick, an em dash) isn't a separate token at
+  // all — it's just dropped, so it stays part of one run, same as HEAD's `start — check`
+  // ≡ `start, check` and leading-backtick cases. A separator becomes a unique sentinel
+  // key that never equals a word or another sentinel, so a run can never span one: any
+  // minWords-key containing a sentinel is alone in its bucket, and the extension loop
+  // (`w[p+t] === w[p+k+t]`) fails the moment it crosses one.
+  const TOKEN = /[\p{L}\p{N}]+|\||`{3,}|(?<!\S)[-*_=]+(?!\S)/gu;
   const findRepeatedPhrases = (text: string, minWords = 5) => {
-    const raw = text.split(" ").filter(Boolean);
     const w: string[] = [];
-    const src: number[] = [];
-    raw.forEach((t, i) => {
-      const n = norm(t);
-      if (n) {
-        w.push(n);
-        src.push(i);
-      }
-    });
+    const start: number[] = [];
+    const end: number[] = [];
+    for (const m of text.matchAll(TOKEN)) {
+      const t = m[0];
+      // Sentinel key: unique per occurrence (its own match index), so it can't match
+      // a word or any other sentinel.
+      w.push(/^[\p{L}\p{N}]/u.test(t) ? t.toLowerCase() : `\0${m.index}`);
+      start.push(m.index);
+      end.push(m.index + t.length);
+    }
     const at = new Map<string, number[]>();
     for (let j = 0; j + minWords <= w.length; j++) {
       const key = w.slice(j, j + minWords).join(" ");
@@ -306,11 +315,11 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     // rotations (… X Y X Y … shifted by one word) all hit, so keep the leftmost.
     hits.sort((x, y) => x[0] - y[0]);
     const found: string[] = [];
-    let end = 0;
+    let runEnd = 0;
     for (const [p, k] of hits) {
-      if (p < end) continue;
-      found.push(raw.slice(src[p], src[p + k - 1] + 1).join(" "));
-      end = p + 2 * k;
+      if (p < runEnd) continue;
+      found.push(text.slice(start[p], end[p + k - 1]));
+      runEnd = p + 2 * k;
     }
     return found;
   };
@@ -321,7 +330,17 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     ["leading backtick", "`a b c d e `a b c d e"],
     ["punctuation + case variant", "Check the ticket before you start, check the ticket before you start"],
     ["plain words", "check the ticket before you check the ticket before you"],
-  ])("findRepeatedPhrases flags a %s repeat (TEAM-6132)", (_, text) => {
+    // TEAM-6183 (ship-review r1 F1): the repeat's edge sits inside a whitespace token
+    // (`branch;and`, `e/f`), which whole-token comparison can't see.
+    [
+      "a boundary inside a token (;)",
+      "branch;and PR to the default branch and PR to the default branch;",
+    ],
+    ["a repeat ending mid-token (/)", "a b c d e a b c d e/f"],
+    // Single backtick (inline code) and em dash stay part of the words, not boundaries.
+    ["an inline-code repeat", "x `foo` b c d e `foo` b c d e"],
+    ["an em-dash repeat", "a b — c d e a b — c d e"],
+  ])("findRepeatedPhrases flags a %s repeat (TEAM-6183)", (_, text) => {
     expect(findRepeatedPhrases(text)).toHaveLength(1);
   });
 
@@ -329,8 +348,28 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     ["a four-word repeat", "a b c d a b c d"],
     ["a non-adjacent repeat", "a b c d e x a b c d e"],
     ["a punctuation-only run", "- - - - - - - - - -"],
-  ])("findRepeatedPhrases ignores %s (TEAM-6132)", (_, text) => {
+    // TEAM-6183 (ship-review r1 F3): the unpadded case above never reaches comparison
+    // (p + 2k > n), so pad it until a pair is actually compared and rejected.
+    ["a padded non-adjacent repeat", "a b c d e x a b c d e y z w v"],
+    // TEAM-6183 (ship-review r1 F2): structural separators are boundaries, not dropped
+    // noise, so a run can't span a table cell, row, fence or thematic break.
+    ["repeated table cells", "a b c d e | a b c d e"],
+    ["repeated table rows", "| a b c d e | | a b c d e |"],
+    ["repeated fenced blocks", "``` a b c d e ``` ``` a b c d e ```"],
+    ["a repeat across a horizontal rule", "a b c d e --- a b c d e"],
+    ["a repeat across a thematic break (***)", "a b c d e *** a b c d e"],
+  ])("findRepeatedPhrases ignores %s (TEAM-6183)", (_, text) => {
     expect(findRepeatedPhrases(text)).toEqual([]);
+  });
+
+  it("findRepeatedPhrases stays well under 1s on a 24k-token adversarial input", () => {
+    // TEAM-6183: worst case for the bucket-pair loop is a huge bucket whose pairs all
+    // fail extension immediately (every "x<i>" differs), forcing p+1..k-1 comparisons
+    // without ever finding a repeat.
+    const adversarial = Array.from({ length: 4000 }, (_, i) => `a b c d e x${i}`).join(" ");
+    const start = performance.now();
+    expect(findRepeatedPhrases(adversarial)).toEqual([]);
+    expect(performance.now() - start).toBeLessThan(1000);
   });
 
   it("no blueprint repeats any five-plus-word phrase back-to-back", () => {
