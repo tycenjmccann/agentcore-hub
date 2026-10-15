@@ -52,9 +52,14 @@ require_no_env_key_drop() {
     return 0
   fi
   echo "ERROR: ✗ live $service env has keys the new env lacks: $dropped" >&2
-  echo "       A full redeploy replaces the whole env from .env.local, so these (likely applied with" >&2
-  echo "       deploy/ecs-express/set-env.sh) would be lost. Either add them to .env.local (if the" >&2
-  echo "       script forwards them), re-apply them with set-env.sh after the deploy, or re-run with" >&2
-  echo "       ALLOW_ENV_KEY_DROP=1 to drop them on purpose." >&2
+  echo "       A full redeploy replaces the whole env from .env.local, so these would be lost." >&2
+  if [[ "$service" == "ECS" ]]; then
+    echo "       Add them to .env.local before redeploying (if the script forwards them), or" >&2
+    echo "       re-apply them with deploy/ecs-express/set-env.sh after this deploy, or re-run" >&2
+    echo "       with ALLOW_ENV_KEY_DROP=1 to drop them on purpose." >&2
+  else
+    echo "       Add them to .env.local before redeploying (if the script forwards them), or" >&2
+    echo "       re-run with ALLOW_ENV_KEY_DROP=1 to drop them on purpose." >&2
+  fi
   return 1
 }

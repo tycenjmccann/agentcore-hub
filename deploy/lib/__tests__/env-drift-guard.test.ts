@@ -148,16 +148,17 @@ const runDeploy = (target: Target, opts: RunOpts = {}) => {
     writeFileSync(join(bin, name), body);
     chmodSync(join(bin, name), 0o755);
   }
+  const childEnv: Record<string, string> = {
+    PATH: `${bin}:${process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}`,
+    HOME: process.env.HOME ?? "/tmp",
+    LANG: "C",
+    ...(opts.shellEnv ?? {}),
+  };
   const r = spawnSync("bash", [join(root, "deploy", target, "deploy.sh")], {
     cwd: tmpdir(),
     encoding: "utf8",
     timeout: 120_000,
-    env: {
-      PATH: `${bin}:${process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin"}`,
-      HOME: process.env.HOME ?? "/tmp",
-      LANG: "C",
-      ...(opts.shellEnv ?? {}),
-    } as NodeJS.ProcessEnv,
+    env: childEnv as NodeJS.ProcessEnv,
   });
   const aws = parseCalls(join(root, "aws.log"));
   return { status: r.status, out: `${r.stdout}\n${r.stderr}`, stderr: r.stderr, aws, docker: parseCalls(join(root, "docker.log")) };
@@ -202,6 +203,13 @@ describe.each(TARGETS)("deploy/%s/deploy.sh refuses to drop live-only env keys (
     expect(r.stderr).toMatch(/ALLOW_ENV_KEY_DROP=1/);
     expect(r.out).not.toContain(SENTINEL);
     expectNothingMutated(target, r);
+    // TEAM-6337 follow-up: set-env.sh only exists for ECS — the remediation text
+    // must not point App Runner at a script that can't apply to it.
+    if (target === "ecs-express") {
+      expect(r.stderr).toMatch(/deploy\/ecs-express\/set-env\.sh/);
+    } else {
+      expect(r.stderr).not.toContain("set-env.sh");
+    }
   });
 
   it("ALLOW_ENV_KEY_DROP=1 → deploys anyway with a warning naming the dropped keys", () => {
