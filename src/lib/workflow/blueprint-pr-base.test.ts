@@ -260,21 +260,31 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
   });
 
   // TEAM-6126: this guard was /\b((?:\S+ ){4,}\S+) \1\b/g, which backtracked O(n²) over
-  // each one-line blueprint (~13s; synchronous, so testTimeout never fired). Same
-  // semantics, near-linear: a back-to-back repeat of k >= minWords words at p has
-  // identical interior words, so p+1 and p+k+1 share a (minWords-2)-word key; only
-  // pairs in one bucket are checked. The edges keep the regex's \b looseness: the
-  // repeat may start mid-word (`a b … a b …) and end before punctuation (… e … e.).
-  const isWord = (c: string | undefined) => c !== undefined && /\w/.test(c);
+  // each one-line blueprint (~13s; synchronous, so testTimeout never fired). Near-linear
+  // instead: a back-to-back repeat of k >= minWords tokens at p shares its first
+  // minWords-token key with p+k, so only pairs in one bucket are checked.
+  // TEAM-6132: the \b edges missed repeats ending in punctuation (… start. … start.) or
+  // starting with a backtick, so tokens are compared whole, case-folded, with leading and
+  // trailing punctuation stripped. Punctuation-only tokens (—, |, -) are dropped: they are
+  // not words, and dropping them makes `start — check` the same repeat as `start, check`.
+  const norm = (t: string) => t.toLowerCase().replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "");
   const findRepeatedPhrases = (text: string, minWords = 5) => {
-    const w = text.split(" ").filter(Boolean);
-    const inner = minWords - 2;
+    const raw = text.split(" ").filter(Boolean);
+    const w: string[] = [];
+    const src: number[] = [];
+    raw.forEach((t, i) => {
+      const n = norm(t);
+      if (n) {
+        w.push(n);
+        src.push(i);
+      }
+    });
     const at = new Map<string, number[]>();
-    for (let j = 1; j + inner <= w.length; j++) {
-      const key = w.slice(j, j + inner).join(" ");
+    for (let j = 0; j + minWords <= w.length; j++) {
+      const key = w.slice(j, j + minWords).join(" ");
       const ps = at.get(key);
-      if (ps) ps.push(j - 1);
-      else at.set(key, [j - 1]);
+      if (ps) ps.push(j);
+      else at.set(key, [j]);
     }
     const hits: [number, number][] = [];
     for (const ps of at.values()) {
@@ -283,18 +293,9 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
           const p = ps[a];
           const k = ps[b] - p;
           if (k < minWords || p + 2 * k > w.length) continue;
-          // Second copy's first word is a \b-suffix of the first copy's first word.
-          const head = w[p];
-          const first = w[p + k];
-          const cut = head.length - first.length;
-          if (!head.endsWith(first) || isWord(head[cut - 1]) === isWord(first[0])) continue;
-          // Second copy's last word is the first copy's last word, then \b.
-          const last = w[p + k - 1];
-          const tail = w[p + 2 * k - 1];
-          if (!tail.startsWith(last) || isWord(last[last.length - 1]) === isWord(tail[last.length])) continue;
-          let t = 1;
-          while (t < k - 1 && w[p + t] === w[p + k + t]) t++;
-          if (t === k - 1) {
+          let t = minWords;
+          while (t < k && w[p + t] === w[p + k + t]) t++;
+          if (t === k) {
             hits.push([p, k]);
             break;
           }
@@ -308,11 +309,29 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     let end = 0;
     for (const [p, k] of hits) {
       if (p < end) continue;
-      found.push(w.slice(p, p + k).join(" "));
+      found.push(raw.slice(src[p], src[p + k - 1] + 1).join(" "));
       end = p + 2 * k;
     }
     return found;
   };
+
+  // TEAM-6132: repeats ending in punctuation or starting with a backtick slipped past the \b edges.
+  it.each([
+    ["trailing punctuation", "Check the ticket before you start. Check the ticket before you start."],
+    ["leading backtick", "`a b c d e `a b c d e"],
+    ["punctuation + case variant", "Check the ticket before you start, check the ticket before you start"],
+    ["plain words", "check the ticket before you check the ticket before you"],
+  ])("findRepeatedPhrases flags a %s repeat (TEAM-6132)", (_, text) => {
+    expect(findRepeatedPhrases(text)).toHaveLength(1);
+  });
+
+  it.each([
+    ["a four-word repeat", "a b c d a b c d"],
+    ["a non-adjacent repeat", "a b c d e x a b c d e"],
+    ["a punctuation-only run", "- - - - - - - - - -"],
+  ])("findRepeatedPhrases ignores %s (TEAM-6132)", (_, text) => {
+    expect(findRepeatedPhrases(text)).toEqual([]);
+  });
 
   it("no blueprint repeats any five-plus-word phrase back-to-back", () => {
     const offenders = blueprints.flatMap(({ file, text }) => findRepeatedPhrases(text).map((r) => `${file}: ${r}`));
