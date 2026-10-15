@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { createHmac } from "node:crypto";
 
 /**
  * R1 (docs/race-condition-study.md): the Jira webhook route must enqueue
@@ -60,13 +61,25 @@ function webhookPayload(overrides: Record<string, unknown> = {}) {
   };
 }
 
+// TEAM-6121: the route now requires a valid X-Hub-Signature; every test in
+// this file runs against an authenticated (correctly signed) request so each
+// describe block below exercises its OWN behavior, not the auth gate (that
+// gate has its own describe block further down).
+const TEST_SECRET = "jira-webhook-test-secret";
+
+function sign(raw: string, secret: string = TEST_SECRET): string {
+  return `sha256=${createHmac("sha256", secret).update(raw, "utf8").digest("hex")}`;
+}
+
 async function post(body: unknown) {
   vi.resetModules();
   const { POST } = await import("./route");
+  const raw = JSON.stringify(body);
   return POST(
     new NextRequest("http://localhost/api/jira/webhook", {
       method: "POST",
-      body: JSON.stringify(body),
+      headers: { "x-hub-signature": sign(raw) },
+      body: raw,
     })
   );
 }
@@ -77,6 +90,7 @@ describe("POST /api/jira/webhook (queue mode)", () => {
     h.lambdaInvokes.length = 0;
     process.env.WORKFLOW_COMMAND_QUEUE_URL =
       "https://sqs.us-east-1.amazonaws.com/123/agentcore-hub-workflow-commands.fifo";
+    process.env.JIRA_WEBHOOK_SECRET = TEST_SECRET;
   });
 
   it("enqueues a status-change command grouped by the workflow root", async () => {
@@ -145,6 +159,7 @@ describe("POST /api/jira/webhook (legacy direct-invoke fallback)", () => {
     h.sqsSends.length = 0;
     h.lambdaInvokes.length = 0;
     delete process.env.WORKFLOW_COMMAND_QUEUE_URL;
+    process.env.JIRA_WEBHOOK_SECRET = TEST_SECRET;
   });
 
   it("invokes the orchestrator Lambda directly when no queue is configured", async () => {
@@ -158,5 +173,118 @@ describe("POST /api/jira/webhook (legacy direct-invoke fallback)", () => {
       newStatus: "ready",
       oldStatus: "todo",
     });
+  });
+});
+
+// TEAM-6121: the route must fail closed — no secret configured means no
+// caller is authenticated, and a configured secret must actually be checked
+// against Jira's own X-Hub-Signature (WebSub: "<method>=<hex hmac of raw body>").
+// A forged "→ Done" is used throughout: on main (no auth) it enqueues a command
+// that would mark a possibly-still-running task complete.
+const FORGED_DONE = webhookPayload({
+  changelog: { items: [{ field: "status", fromString: "In Review", toString: "Done" }] },
+});
+
+/**
+ * Unlike post() above, this sends raw bytes (so a signature can be computed
+ * over them, or a deliberately-invalid-JSON body can be sent unsigned) and an
+ * explicit (possibly absent) X-Hub-Signature header.
+ */
+async function postRaw(raw: string, sigHeader: string | null) {
+  vi.resetModules();
+  const { POST } = await import("./route");
+  return POST(
+    new NextRequest("http://localhost/api/jira/webhook", {
+      method: "POST",
+      headers: sigHeader === null ? {} : { "x-hub-signature": sigHeader },
+      body: raw,
+    })
+  );
+}
+
+describe("POST /api/jira/webhook — fail-closed (TEAM-6121)", () => {
+  const SAVED_SECRET = process.env.JIRA_WEBHOOK_SECRET;
+
+  beforeEach(() => {
+    h.sqsSends.length = 0;
+    h.lambdaInvokes.length = 0;
+    process.env.WORKFLOW_COMMAND_QUEUE_URL =
+      "https://sqs.us-east-1.amazonaws.com/123/agentcore-hub-workflow-commands.fifo";
+    process.env.JIRA_WEBHOOK_SECRET = TEST_SECRET;
+  });
+
+  afterEach(() => {
+    if (SAVED_SECRET === undefined) delete process.env.JIRA_WEBHOOK_SECRET;
+    else process.env.JIRA_WEBHOOK_SECRET = SAVED_SECRET;
+  });
+
+  it("JIRA_WEBHOOK_SECRET unset → 503, zero SQS sends, zero Lambda invokes", async () => {
+    delete process.env.JIRA_WEBHOOK_SECRET;
+    const raw = JSON.stringify(FORGED_DONE);
+    const res = await postRaw(raw, sign(raw));
+    expect(res.status).toBe(503);
+    expect(h.sqsSends).toHaveLength(0);
+    expect(h.lambdaInvokes).toHaveLength(0);
+  });
+
+  it("JIRA_WEBHOOK_SECRET blank → 503, zero sends", async () => {
+    process.env.JIRA_WEBHOOK_SECRET = "   ";
+    const raw = JSON.stringify(FORGED_DONE);
+    const res = await postRaw(raw, sign(raw));
+    expect(res.status).toBe(503);
+    expect(h.sqsSends).toHaveLength(0);
+  });
+
+  it("missing X-Hub-Signature → 401, zero sends (the unauthenticated forged Done)", async () => {
+    const raw = JSON.stringify(FORGED_DONE);
+    const res = await postRaw(raw, null);
+    expect(res.status).toBe(401);
+    expect(h.sqsSends).toHaveLength(0);
+    expect(h.lambdaInvokes).toHaveLength(0);
+  });
+
+  it("signature of a different body → 401, zero sends", async () => {
+    const raw = JSON.stringify(FORGED_DONE);
+    const wrongSig = sign(JSON.stringify(webhookPayload()));
+    const res = await postRaw(raw, wrongSig);
+    expect(res.status).toBe(401);
+    expect(h.sqsSends).toHaveLength(0);
+  });
+
+  it("garbage signature → 401, zero sends", async () => {
+    const raw = JSON.stringify(FORGED_DONE);
+    const res = await postRaw(raw, "sha256=deadbeef");
+    expect(res.status).toBe(401);
+    expect(h.sqsSends).toHaveLength(0);
+  });
+
+  it("sha1 method (even with a correct sha1 HMAC) → 401, zero sends", async () => {
+    const raw = JSON.stringify(FORGED_DONE);
+    const sha1Sig = `sha1=${createHmac("sha1", TEST_SECRET).update(raw, "utf8").digest("hex")}`;
+    const res = await postRaw(raw, sha1Sig);
+    expect(res.status).toBe(401);
+    expect(h.sqsSends).toHaveLength(0);
+  });
+
+  it("correct signature → 200, exactly one Done command enqueued", async () => {
+    const raw = JSON.stringify(FORGED_DONE);
+    const res = await postRaw(raw, sign(raw));
+    expect(res.status).toBe(200);
+    expect(h.sqsSends).toHaveLength(1);
+    const body = JSON.parse(h.sqsSends[0].MessageBody as string);
+    expect(body).toMatchObject({ ticketId: "TEAM-102", newStatus: "done" });
+  });
+
+  it("invalid JSON body with no signature → 401, not 400 (auth runs before parsing)", async () => {
+    const raw = "{not json";
+    const res = await postRaw(raw, null);
+    expect(res.status).toBe(401);
+    expect(h.sqsSends).toHaveLength(0);
+  });
+
+  it("invalid JSON body, correctly signed → 400 (auth passes, parsing fails)", async () => {
+    const raw = "{not json";
+    const res = await postRaw(raw, sign(raw));
+    expect(res.status).toBe(400);
   });
 });

@@ -10,7 +10,12 @@
 # the same name before creating a new one.
 #
 # Prerequisites (from .env.local):
-#   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, DEPLOYMENT_URL
+#   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, DEPLOYMENT_URL,
+#   JIRA_WEBHOOK_SECRET (TEAM-6121 — openssl rand -hex 32; the hub's
+#   /api/jira/webhook route verifies Jira's X-Hub-Signature against this same
+#   value and answers 503 until it is set on the running service too — set it
+#   there with deploy/ecs-express/set-env.sh BEFORE deploying the checking
+#   route, or every Jira delivery 503s until both are done)
 #
 # Usage:
 #   ./deploy/apprunner/setup-jira-webhook.sh
@@ -32,6 +37,11 @@ fi
 : "${JIRA_API_TOKEN:?JIRA_API_TOKEN must be set}"
 : "${JIRA_PROJECT_KEY:?JIRA_PROJECT_KEY must be set}"
 : "${DEPLOYMENT_URL:?DEPLOYMENT_URL must be set}"
+: "${JIRA_WEBHOOK_SECRET:?JIRA_WEBHOOK_SECRET must be set (openssl rand -hex 32) — TEAM-6121, the route 503s without it}"
+if [[ ! "$JIRA_WEBHOOK_SECRET" =~ ^[A-Za-z0-9._~-]+$ ]]; then
+  echo "ERROR: JIRA_WEBHOOK_SECRET must match ^[A-Za-z0-9._~-]+\$ (safe to embed in the webhook JSON payload)" >&2
+  exit 1
+fi
 
 WEBHOOK_NAME="agentcore-hub-workflow"
 WEBHOOK_URL="${DEPLOYMENT_URL}/api/jira/webhook"
@@ -102,7 +112,8 @@ WEBHOOK_PAYLOAD=$(cat <<EOF
   "filters": {
     "issue-related-events-section": "project = ${JIRA_PROJECT_KEY}"
   },
-  "excludeBody": false
+  "excludeBody": false,
+  "secret": "${JIRA_WEBHOOK_SECRET}"
 }
 EOF
 )
@@ -121,6 +132,7 @@ RESPONSE=$(curl -sf -X POST \
     echo "          URL:  ${WEBHOOK_URL}" >&2
     echo "          Events: Issue Created, Issue Updated" >&2
     echo "          Filter: project = ${JIRA_PROJECT_KEY}" >&2
+    echo "          Secret: the value of \$JIRA_WEBHOOK_SECRET (never echoed here)" >&2
     exit 1
   }
 

@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { NextRequest } from "next/server";
+import { createHmac } from "node:crypto";
 
 /**
  * TEAM-5777 — the self-park claim-release attribution chain, end to end.
@@ -322,6 +324,8 @@ beforeEach(() => {
   process.env.JIRA_PROJECT_KEY = "TEAM";
   process.env.ADVISORY_APPROVE_BACKOFF_MS = "0";
   process.env[`RUNTIME_ARN_${RM.toUpperCase()}`] = `arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/${RM}`;
+  // TEAM-6121: the real /api/jira/webhook route now requires a signed request.
+  process.env.JIRA_WEBHOOK_SECRET = "self-park-test-secret";
   // The webhook route then hands its command to the orchestrator by direct
   // InvokeCommand (captured by the Lambda mock) instead of SQS.
   delete process.env.WORKFLOW_COMMAND_QUEUE_URL;
@@ -367,13 +371,27 @@ const seedRunningClaim = () => {
   h.state.workflow.agentTasks["TEAM-24"] = { id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "running", startedAt: h.state.startedAt };
 };
 
+/**
+ * TEAM-6121: the real route now verifies X-Hub-Signature, so every call
+ * into it needs a real signed NextRequest rather than a bare {json} fake.
+ */
+function jiraWebhookRequest(payload) {
+  const raw = JSON.stringify(payload);
+  const sig = `sha256=${createHmac("sha256", process.env.JIRA_WEBHOOK_SECRET).update(raw, "utf8").digest("hex")}`;
+  return new NextRequest("http://localhost/api/jira/webhook", {
+    method: "POST",
+    headers: { "x-hub-signature": sig },
+    body: raw,
+  });
+}
+
 /** Push every queued Jira webhook through the real route, then hand the command it emitted to the real orchestrator. */
 async function deliver(fake) {
   const out = [];
   while (fake.webhooks.length) {
     const payload = fake.webhooks.shift();
     const before = h.state.lambdaInvokes.length;
-    const res = await webhookPOST({ json: async () => payload });
+    const res = await webhookPOST(jiraWebhookRequest(payload));
     const route = await res.json();
     const cmds = h.state.lambdaInvokes.slice(before).filter((i) => i.FunctionName === "agentcore-hub-orchestrator").map((i) => i.payload);
     out.push({ changelogId: payload.changelog.id, fields: payload.changelog.items.map((i) => i.field), route, cmds });
@@ -467,11 +485,11 @@ describe("TEAM-5777: self-park claim release — real Jira Lambda → fake Jira 
     const fake = await boot();
     fake.issues["TEAM-24"].fields.status.name = "Ready";
     h.state.workflow.agentTasks["TEAM-24"] = { id: "task_1", agentId: RM, ticketId: "TEAM-24", status: "pending" };
-    const res = await webhookPOST({ json: async () => ({
+    const res = await webhookPOST(jiraWebhookRequest({
       webhookEvent: "jira:issue_updated", timestamp: Date.now(),
       issue: { key: "TEAM-24", fields: structuredClone(fake.issues["TEAM-24"].fields) },
       changelog: { id: "9999", items: [{ field: "status", fieldtype: "jira", fromString: "To Do", toString: "Ready" }] },
-    }) });
+    }));
     expect((await res.json()).ignored).not.toBe(true);
     for (const c of h.state.lambdaInvokes.filter((i) => i.FunctionName === "agentcore-hub-orchestrator").map((i) => i.payload)) await handler(c);
 

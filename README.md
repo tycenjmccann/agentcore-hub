@@ -535,13 +535,14 @@ curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
 
 > **Note:** This is the only supported workflow configuration. Other Jira workflow setups will not work.
 
-**Webhook setup** (required for cascade orchestration):
+**Webhook setup** (required for cascade orchestration): `deploy/apprunner/setup-jira-webhook.sh` does this idempotently; the manual steps are:
 1. In Jira → Settings → Webhooks → Create webhook
 2. URL: `https://your-deployed-app.com/api/jira/webhook`
 3. Events: `issue_created`, `issue_updated`
    - `issue_updated` drives the cascade (transitions on existing tickets)
    - `issue_created` enables the third intake path: filing a Bug directly in Jira auto-bootstraps a workflow (the orchestrator creates the workflow row + analyst sub-task and routes it through the bug-fix flow)
 4. Filter: project = YOUR_PROJECT_KEY
+5. Secret: the value of `JIRA_WEBHOOK_SECRET` (TEAM-6121). The route fails closed — unset/blank 503s every request, and Jira signs the raw body as `X-Hub-Signature`, which the route verifies before trusting anything. **Rollout order**: generate the secret, set `JIRA_WEBHOOK_SECRET` on the running service (`deploy/ecs-express/set-env.sh`) and register the webhook with that secret *before* deploying a build that checks it — otherwise every Jira delivery 503s until both are done.
 
 **Three intake paths** (all converge on the same orchestrator):
 1. **In-app form** — `POST /api/workflow/start` (UI submission)

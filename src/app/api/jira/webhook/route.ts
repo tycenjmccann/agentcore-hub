@@ -16,6 +16,15 @@
  * Fallback: when WORKFLOW_COMMAND_QUEUE_URL is unset, invokes the
  * orchestrator Lambda directly (pre-R1 behavior) so the app keeps working
  * against an install that hasn't created the queue yet.
+ *
+ * TEAM-6121: the route fails CLOSED. There is no default secret: an unset or
+ * blank JIRA_WEBHOOK_SECRET answers 503 before any SQS/Lambda call. Otherwise
+ * Jira's own admin-webhook signature (`X-Hub-Signature: sha256=<hex hmac of
+ * the raw body>` — see src/lib/auth/hub-signature.ts) is verified before the
+ * body is parsed; a missing/wrong/non-sha256 signature answers 401. Rollout
+ * order matters: set JIRA_WEBHOOK_SECRET and re-register the Jira webhook
+ * with that secret (deploy/apprunner/setup-jira-webhook.sh) BEFORE deploying
+ * this check, or every Jira delivery gets a 503 until both are done.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -23,6 +32,7 @@ import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { mapJiraStatusToInternal } from "@/lib/workflow/jira-client";
 import { commandGroupId, commandDedupId } from "@/lib/workflow/command-queue";
+import { verifyHubSignature } from "@/lib/auth/hub-signature";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const ORCHESTRATOR_LAMBDA = process.env.ORCHESTRATOR_LAMBDA || "agentcore-hub-orchestrator";
@@ -92,9 +102,19 @@ async function dispatchCommand(
 }
 
 export async function POST(req: NextRequest) {
+  // TEAM-6121: fail closed — no secret configured means no caller is authenticated.
+  const secret = (process.env.JIRA_WEBHOOK_SECRET || "").trim();
+  if (!secret) {
+    return NextResponse.json({ error: "webhook disabled: JIRA_WEBHOOK_SECRET not configured" }, { status: 503 });
+  }
+  const raw = await req.text();
+  if (!verifyHubSignature(raw, req.headers.get("x-hub-signature"), secret)) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
   let payload: JiraWebhookPayload;
   try {
-    payload = await req.json();
+    payload = JSON.parse(raw);
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }

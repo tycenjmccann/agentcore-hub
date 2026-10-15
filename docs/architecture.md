@@ -1451,6 +1451,9 @@ aws dynamodb update-table \
 #    Event: issue_updated (status field changes)
 #    URL: https://your-app.com/api/workflow/webhook
 #    Secret: set WEBHOOK_SECRET env var to match (unset, blank or "dev-secret" = route refuses every request with 503)
+#    (The default TICKET_PROVIDER=jira path instead posts to /api/jira/webhook,
+#    which verifies Jira's own X-Hub-Signature against JIRA_WEBHOOK_SECRET —
+#    unset or blank also refuses with 503. TEAM-6121.)
 
 # 3. Switch ticket provider
 TICKET_PROVIDER=jira
