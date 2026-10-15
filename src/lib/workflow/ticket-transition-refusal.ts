@@ -19,6 +19,8 @@
  * workflow webhook route, so both callers of Tickets___transition_ticket read
  * the SAME deny-list rather than drifting apart.
  */
+import { HUB_STATUSES, jiraStatusToInternal, jiraDisplayNameOf } from "./jira-status-map";
+
 export function rejectedDetails(payload: unknown, targetStatus: string): string | null {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return null;
   const p = payload as Record<string, unknown>;
@@ -82,44 +84,12 @@ function normalizeStatus(value: unknown): string {
  * `to`/`status`/`requested` are compared against targetStatus trimmed + lowercased,
  * the same normalization the route applies before it ever reaches the Lambda.
  */
-/** The hub's own columns. A Jira move that lands in one of these is proof only when it IS the target. */
-export const HUB_STATUSES = ["todo", "ready", "in_progress", "in_review", "blocked", "done", "cancelled"];
-
 /**
- * TEAM-6141 — mirror of the jira Lambda's status map (INTERNAL_TO_JIRA / JIRA_TO_INTERNAL /
- * mapStatusToInternal in lambda/agentcore-hub-jira/index.mjs). The Lambda ships as a
- * self-contained zip, so the two copies cannot share a file; parity is pinned against the
- * REAL Lambda module by ticket-transition-refusal.jira-e2e.test.ts. Edit the Lambda first.
+ * TEAM-6146 — HUB_STATUSES, jiraStatusToInternal and jiraDisplayNameOf moved to
+ * jira-status-map.ts (the ONE shared source for the src/ side); re-exported here so
+ * existing imports (and ticket-transition-refusal.jira-e2e.test.ts) keep working.
  */
-const INTERNAL_TO_JIRA: Record<string, string> = {
-  todo: "To Do",
-  ready: "Ready",
-  in_progress: "In Progress",
-  in_review: "In Review",
-  blocked: "Blocked",
-  done: "Done",
-  cancelled: "Won't Do",
-};
-const JIRA_TO_INTERNAL: Record<string, string> = {
-  ...Object.fromEntries(Object.entries(INTERNAL_TO_JIRA).map(([k, v]) => [v.toLowerCase(), k])),
-  "wont do": "cancelled",
-  cancelled: "cancelled",
-  canceled: "cancelled",
-};
-
-/** What the Lambda reports as `status` for a Jira status name (its mapStatusToInternal). */
-export function jiraStatusToInternal(name: unknown): string {
-  const n = normalizeStatus(name);
-  return JIRA_TO_INTERNAL[n] || n.replace(/\s+/g, "_");
-}
-
-/**
- * The Jira display name the Lambda matches a requested internal status against — its
- * `effectiveStatus` (`INTERNAL_TO_JIRA[target] || target`), lowercased as it compares it.
- */
-export function jiraDisplayNameOf(target: string): string {
-  return normalizeStatus(INTERNAL_TO_JIRA[target] ?? target);
-}
+export { HUB_STATUSES, jiraStatusToInternal, jiraDisplayNameOf };
 
 const nonEmptyString = (v: unknown): v is string => typeof v === "string" && v.trim() !== "";
 

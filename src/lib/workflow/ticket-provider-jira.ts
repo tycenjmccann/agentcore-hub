@@ -12,20 +12,11 @@
  */
 
 import type { TicketProvider, CreateEpicInput, CreateTicketInput } from "./ticket-provider";
-import type { JiraTicket, JiraComment, Artifact, TicketStatus } from "./types";
+import type { JiraTicket, JiraComment, Artifact } from "./types";
 import { searchJqlAll } from "./jira-search-paginate";
+import { jiraStatusToTicketStatus } from "./jira-status-map";
 
 // ─── Status Mapping ─────────────────────────────────────────────────────────
-
-const JIRA_TO_INTERNAL_STATUS: Record<string, TicketStatus> = {
-  "To Do": "todo",
-  "Ready": "ready",
-  "In Progress": "in_progress",
-  "In Review": "in_review",
-  "Blocked": "blocked",
-  "Done": "done",
-  "Backlog": "backlog",
-};
 
 const INTERNAL_TO_JIRA_STATUS: Record<string, string> = {
   todo: "To Do",
@@ -443,7 +434,7 @@ export class JiraCloudProvider implements TicketProvider {
       type: ticketType,
       title: (fields?.summary as string) || "",
       description: this.extractTextFromADF(fields?.description as Record<string, unknown>),
-      status: JIRA_TO_INTERNAL_STATUS[statusName] || "todo",
+      status: jiraStatusToTicketStatus(statusName),
       assignee,
       parent: parent?.key as string | undefined,
       children,

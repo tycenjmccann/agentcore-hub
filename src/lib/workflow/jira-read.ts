@@ -6,6 +6,7 @@
 
 import { blockersFromLinks, type JiraIssueLink } from "./jira-client";
 import { JiraSearchTruncatedError, searchJqlAll, type JqlPage } from "./jira-search-paginate";
+import { jiraStatusToTicketStatus } from "./jira-status-map";
 
 const JIRA_SITE_URL = process.env.JIRA_SITE_URL || "";
 const JIRA_EMAIL = process.env.JIRA_EMAIL || "";
@@ -19,18 +20,6 @@ function getAuthHeader(): string {
 function getBaseUrl(): string {
   return `https://${JIRA_SITE_URL}`;
 }
-
-// ─── Status Mapping ─────────────────────────────────────────────────────────
-
-const JIRA_TO_INTERNAL_STATUS: Record<string, string> = {
-  "To Do": "todo",
-  "Ready": "ready",
-  "In Progress": "in_progress",
-  "In Review": "in_review",
-  "Blocked": "blocked",
-  "Done": "done",
-  "Backlog": "backlog",
-};
 
 // ─── Public API ─────────────────────────────────────────────────────────────
 
@@ -161,7 +150,7 @@ function mapIssueToTicket(issue: Record<string, unknown>) {
     ticketId: issue.key as string,
     title: (fields?.summary as string) || "",
     description: adfToPlainText(fields?.description),
-    status: JIRA_TO_INTERNAL_STATUS[statusName] || "todo",
+    status: jiraStatusToTicketStatus(statusName),
     assignee,
     parentId: parent?.key as string | undefined,
     blockedBy: blockedBy.length > 0 ? blockedBy.join(",") : "",

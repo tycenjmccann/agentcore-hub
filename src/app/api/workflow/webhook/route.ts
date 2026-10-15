@@ -30,7 +30,7 @@ import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, UpdateCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { secretMatches } from "@/lib/auth/secret-match";
-import { rejectedDetails, provesTransitioned } from "@/lib/workflow/ticket-transition-refusal";
+import { rejectedDetails, provesTransitioned, jiraStatusToInternal } from "@/lib/workflow/ticket-transition-refusal";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const TICKETS_TABLE = process.env.TICKETS_TABLE || "agentcore-hub-tickets";
@@ -79,7 +79,13 @@ async function handleLambdaMode(body: Record<string, unknown>): Promise<NextResp
         const statusChange = changelog?.items?.find((i: { field: string }) => i.field === "status");
 
         if (issueKey && statusChange) {
-          const mappedStatus = mapJiraStatus(statusChange.toString.toLowerCase());
+          // TEAM-6146: the shared mirror of the jira Lambda's mapStatusToInternal — Won't
+          // Do now lands as `cancelled` (not the literal "won't do") like every other
+          // caller of this map.
+          const mappedStatus = jiraStatusToInternal(statusChange.toString);
+          if (!mappedStatus) {
+            return NextResponse.json({ received: true, ignored: true, reason: "unparseable status" });
+          }
           // TEAM-6094: a Done goes through the tickets Lambda's guard — see the header.
           if (mappedStatus === "done") {
             const refused = await transitionDoneViaLambda(issueKey, "Jira webhook transition to Done");
@@ -160,15 +166,4 @@ async function transitionDoneViaLambda(ticketId: string, reason: string): Promis
     );
   }
   return null;
-}
-
-function mapJiraStatus(jiraStatus: string): string {
-  const map: Record<string, string> = {
-    "to do": "todo",
-    "in progress": "in_progress",
-    "done": "done",
-    "blocked": "blocked",
-    "in review": "in_review",
-  };
-  return map[jiraStatus] || jiraStatus;
 }

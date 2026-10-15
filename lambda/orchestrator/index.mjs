@@ -4496,9 +4496,9 @@ async function jiraFetch(path, method = "GET", body = null) {
   return null;
 }
 
-function mapJiraStatus(name) {
+export function mapJiraStatus(name) { // TEAM-6146: exported + trimmed/null-safe like mapStatusToInternal; parity-pinned
   const map = { "to do": "todo", "ready": "ready", "in progress": "in_progress", "in review": "in_review", "blocked": "blocked", "done": "done", "backlog": "backlog", "won't do": "cancelled", "wont do": "cancelled", "cancelled": "cancelled", "canceled": "cancelled" };
-  return map[name.toLowerCase()] || name.toLowerCase().replace(/\s+/g, "_");
+  return map[String(name ?? "").trim().toLowerCase()] || String(name ?? "").trim().toLowerCase().replace(/\s+/g, "_");
 }
 
 export function mapJiraIssueToTicket(issue) {
