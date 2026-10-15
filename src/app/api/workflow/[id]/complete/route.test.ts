@@ -1295,4 +1295,46 @@ describe("POST complete — effective def + live roster at every gate (TEAM-6187
     expect(res.status).toBe(200);
     expect((await res.json()).status).toBe("complete");
   });
+
+  /**
+   * TEAM-6211 — loadRoster's 15s cache used to drop the last-good live roster
+   * on a refresh failure, returning [] (the same answer as "never loaded"), so
+   * livePhaseMap fell back to the bundled roster and a live-only ship persona
+   * lost its phase. Same fixture as the "live roster classifies" sweep above,
+   * but the SECOND request lands after the cache has expired and the S3 read
+   * for config/agents.json has started failing (CD registry stays healthy).
+   */
+  it("TEAM-6211: roster refresh fails after the TTL expires — last-good live roster still classifies the ship persona", async () => {
+    h.state.s3Objects["config/agents.json"] = JSON.stringify({ agents: [{ agentId: "agentcore_hub_release_captain", phase: "ship" }] });
+    h.state.workflow = {
+      workflowId: "wf_1",
+      phase: "ship",
+      workflowDefId: "software-delivery",
+      repoConfig: REPO,
+      agentTasks: { "T-4": { ticketId: "T-4", agentId: "agentcore_hub_release_captain", output: "merged", mergeCommit: "9f1c2ab" } },
+    };
+    h.state.tickets = [{ ticketId: "T-4", type: "task", status: "done", assignee: "agentcore_hub_release_captain" }];
+    await load();
+
+    const first = await post();
+    expect(first.status).toBe(200);
+    expect((await first.json()).status).toBe("complete");
+
+    try {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(Date.now() + 16_000)); // past roster-loader's 15s TTL
+      delete h.state.s3Objects["config/agents.json"]; // the live roster read now fails
+
+      const second = await post();
+      const body = await second.json();
+      // Before the fix: livePhaseMap sees [] from loadRoster, falls back to the
+      // bundled roster (which does not know agentcore_hub_release_captain), and
+      // the run 409s required_phase_incomplete:["ship"] on an already-shipped run.
+      expect(body.error).not.toBe("required_phase_incomplete");
+      expect(second.status).toBe(200);
+      expect(body.status).toBe("complete");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

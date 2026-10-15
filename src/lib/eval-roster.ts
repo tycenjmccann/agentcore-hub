@@ -126,7 +126,15 @@ export async function loadEvalRoster(): Promise<EvalRosterAgent[]> {
     _cache = { agents, at: now };
     return agents;
   } catch (err) {
-    console.warn("[eval-roster] live agents.json unavailable, using bundled roster:", (err as Error)?.message);
+    // TEAM-6211: a failed refresh keeps the last-good LIVE roster (same fix as
+    // roster-loader.ts, same document) instead of flipping the Evaluations
+    // tab from the live runtimes to the bundled ones during a brief outage.
+    // Re-stamp so the outage costs one failed GET per TTL, not one per call.
+    console.warn("[eval-roster] live agents.json unavailable, using last-good roster:", (err as Error)?.message);
+    if (_cache) {
+      _cache.at = now;
+      return _cache.agents;
+    }
     return bundledEvalRoster();
   }
 }

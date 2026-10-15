@@ -41,6 +41,16 @@ export async function loadRoster(): Promise<RosterAgent[]> {
     _cache = { agents, at: now };
     return agents;
   } catch {
+    // TEAM-6211: a failed refresh keeps the last-good LIVE roster — the
+    // orchestrator's loadAgentRoster never drops its loaded roster either, so
+    // the two sides must agree. Re-stamp `at` so an outage costs one failed
+    // GET per TTL window rather than one per call. [] only when no live
+    // roster has EVER loaded, which is what callers' bundled-roster fallback
+    // (e.g. the /complete route's livePhaseMap) is for.
+    if (_cache) {
+      _cache.at = now;
+      return _cache.agents;
+    }
     return [];
   }
 }

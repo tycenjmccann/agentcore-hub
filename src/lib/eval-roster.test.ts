@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { deriveEvalColumns, runtimeNameFromArn, type EvalRosterAgent } from "./eval-roster";
 
 const ARN = (leaf: string) => `arn:aws:bedrock-agentcore:us-east-1:111111111111:runtime/${leaf}`;
@@ -79,5 +79,66 @@ describe("deriveEvalColumns", () => {
     ]);
     expect(hosted).toEqual({ p1: "hub" });
     expect(columns.map((c) => c.agentId)).toEqual(["hub", "p2", "p3"]);
+  });
+});
+
+/**
+ * TEAM-6211 sibling — loadEvalRoster shares roster-loader.ts's 15s TTL cache
+ * over the SAME document (config/agents.json). On a failed refresh it must
+ * keep the last-good LIVE roster rather than falling back to the bundled
+ * roster (which would flip the Evaluations tab from the live runtimes to the
+ * bundled ones during a brief S3 outage).
+ */
+const h = vi.hoisted(() => ({
+  state: { doc: undefined as string | undefined, nextError: null as Error | null, getCalls: 0 },
+}));
+
+vi.mock("@aws-sdk/client-s3", () => ({
+  S3Client: class {
+    async send() {
+      h.state.getCalls++;
+      if (h.state.nextError) {
+        const err = h.state.nextError;
+        h.state.nextError = null;
+        throw err;
+      }
+      return { Body: { transformToString: async () => h.state.doc } };
+    }
+  },
+  GetObjectCommand: class {
+    constructor(public input: Record<string, unknown>) {}
+  },
+}));
+
+describe("loadEvalRoster — last-good live roster on a failed refresh (TEAM-6211)", () => {
+  let loadEvalRoster: typeof import("./eval-roster").loadEvalRoster;
+  let bundledEvalRoster: typeof import("./eval-roster").bundledEvalRoster;
+
+  beforeEach(async () => {
+    h.state.doc = undefined;
+    h.state.nextError = null;
+    h.state.getCalls = 0;
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    vi.resetModules();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-15T00:00:00.000Z"));
+    ({ loadEvalRoster, bundledEvalRoster } = await import("./eval-roster"));
+  });
+
+  afterEach(() => {
+    delete process.env.ARTIFACT_BUCKET;
+    vi.useRealTimers();
+  });
+
+  it("a failed refresh after the TTL expires returns the last-good live roster, not the bundled one", async () => {
+    const live: EvalRosterAgent[] = [{ agentId: "agentcore_hub_release_captain", displayName: "Release Captain", runtimeArn: null }];
+    h.state.doc = JSON.stringify({ agents: live });
+    expect(await loadEvalRoster()).toEqual(live);
+
+    vi.setSystemTime(new Date(Date.now() + 15_001));
+    h.state.nextError = new Error("S3 unavailable");
+    const result = await loadEvalRoster();
+    expect(result).toEqual(live);
+    expect(result).not.toEqual(bundledEvalRoster());
   });
 });
