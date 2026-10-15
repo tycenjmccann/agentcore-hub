@@ -98,8 +98,12 @@ retries as before.
   `workflows/<wf>/shared/merge-brief.md`. Otherwise it is `null`.
 - `MessageGroupId` = `workflowId`, so one run's writes drain in order.
 - `MessageDeduplicationId` = sha256 of the ticket id, the sorted follow-up
-  hashes and the transition. A re-dispatched persona that re-reports within the
-  5-minute FIFO dedup window is collapsed into the same message.
+  hashes, the transition and the residual's identity (its verdict and amendment
+  id; empty for a PASS) - `ticketWritesDedupId` in `lambda/workflow-output/index.mjs`.
+  A re-dispatched persona that re-reports the SAME admission within the 5-minute
+  FIFO dedup window is collapsed into the same message; a PASS re-review after a
+  queued FAIL (or a FAIL on another amendment) is its own message, so the drain
+  never replays the stale admission in place of the new one (TEAM-6158).
 
 ## The probe
 

@@ -280,14 +280,26 @@ export function normalizePlan(items, { featureBranch, rootTicketId, rootTitle } 
  */
 async function readFeatureBranch(workflowId) {
   if (!WORKFLOWS_TABLE || !workflowId) return null;
+  const r = await readWorkflowRow(workflowId, "featureBranch");
+  if (!r.ok) {
+    console.warn(`[submit_ticket_plan] ${workflowId}: could not read featureBranch from ${WORKFLOWS_TABLE} (${r.error}) - branch templating SKIPPED`);
+    return null;
+  }
+  return asText(r.item?.featureBranch).trim() || null;
+}
+
+/**
+ * The run's workflows row, GetItem only: `{ ok: true, item }` (`item` null when there
+ * is no row) or `{ ok: false, error }`. Callers decide what a failure means.
+ */
+async function readWorkflowRow(workflowId, projection) {
   try {
     const r = await ddb.send(new GetCommand({
-      TableName: WORKFLOWS_TABLE, Key: { workflowId }, ProjectionExpression: "featureBranch",
+      TableName: WORKFLOWS_TABLE, Key: { workflowId }, ProjectionExpression: projection,
     }));
-    return asText(r?.Item?.featureBranch).trim() || null;
+    return { ok: true, item: r?.Item || null };
   } catch (err) {
-    console.warn(`[submit_ticket_plan] ${workflowId}: could not read featureBranch from ${WORKFLOWS_TABLE} (${err.name}: ${err.message}) - branch templating SKIPPED`);
-    return null;
+    return { ok: false, error: `${err.name}: ${err.message}` };
   }
 }
 
@@ -626,7 +638,8 @@ async function shipContractRefusal(report, { pipelineName, workflowId }) {
 // something that accidentally reads as "complete".
 const STATUS_PENDING_FOLLOW_UPS = "complete_pending_follow_ups";
 /** TEAM-5592: what a replay's brief hold stamps, carried across a re-run report_completion. */
-const BRIEF_HOLD_FIELDS = ["briefPending", "briefDelivered", "briefTargets", "briefFallbackReason", "undelivered", "replayDropped"];
+/** TEAM-5995: + `briefDisposition`, the evidence a hold was released with no gate delivery. */
+const BRIEF_HOLD_FIELDS = ["briefPending", "briefDelivered", "briefTargets", "briefFallbackReason", "undelivered", "replayDropped", "briefDisposition"];
 const STATUS_TRANSITION_FAILED = "complete_transition_failed";
 /** TEAM-5805: the record is saved and the follow-ups filed, but the merge brief is not on its gate yet. */
 const STATUS_PENDING_BRIEF = "complete_pending_brief";
@@ -688,8 +701,11 @@ export function adoptHold(report, current, { deliveredNow = false, forceHold = f
       else delete report[f];
     }
   }
-  const deliveredSince = current?.briefPending === false && current?.briefDelivered === "gate";
-  if (forceHold && !deliveredSince) report.briefPending = true;
+  // TEAM-5995: a release (no gate needs the brief, briefDisposition) is proof too.
+  const deliveredSince = current?.briefPending === false
+    && (current?.briefDelivered === "gate" || current?.briefDisposition?.release === true);
+  // A forced hold is never a released one (TEAM-5995: disposition ⇒ briefPending false).
+  if (forceHold && !deliveredSince) { report.briefPending = true; delete report.briefDisposition; }
   // TEAM-5941: the twins' Done-intent fence (gate-contract.mjs) is CARRIED verbatim,
   // whatever else this write decides — it is not a hold field, and a write that dropped
   // it would re-open the window the fence closes (the drain would stamp a hold the
@@ -716,17 +732,353 @@ export function pruneDeliveredBrief(record) {
 }
 
 /**
- * TEAM-6029: the drain's one clear for a brief it just put on its gate — a held
- * `briefPending:true` goes `false` (not deleted: the record keeps the history that it
- * was held) and its stale `part:"brief"` entry comes off. Step 6 and drop() both call
+ * TEAM-6124: a record's `undelivered[]` merged with this drain's (`fresh`), keyed by
+ * `part` + `ticketId`: a fresh entry replaces the prior one of its key, every other
+ * prior entry stays, and a prior entry whose key the drain DELIVERED this time
+ * (`delivered`, e.g. a residual-findings comment that landed on redelivery) comes off —
+ * nothing is permanent. Step 6 and drop() both write through it; a bare assignment
+ * of the drain's own list erased the record's other parts. Empty ⇒ undefined.
+ */
+const undeliveredKey = (u) => `${u?.part}|${u?.ticketId ?? ""}`;
+export function mergeUndelivered(prior, fresh = [], delivered = []) {
+  const out = new Map();
+  for (const u of Array.isArray(prior) ? prior : []) out.set(undeliveredKey(u), u);
+  for (const k of delivered) out.delete(k);
+  for (const u of fresh) out.set(undeliveredKey(u), u);
+  return out.size > 0 ? [...out.values()] : undefined;
+}
+
+/**
+ * TEAM-6029: the drain's one clear for a brief it just put on its gate — the hold
+ * goes `false` and its stale `part:"brief"` entry comes off. TEAM-6124: `false` even
+ * when no hold was ever stamped (a first delivery): adoptHold carries the hold fields
+ * only off a record that states `briefPending`, so an unstated one lost its
+ * `briefDelivered`/`briefTargets` to the next report. Step 6 and drop() both call
  * it, so neither carries the hold over a delivery. TEAM-6052: through pruneDeliveredBrief
  * the off-gate hold's `briefFallbackReason` comes off too, so a follow-ups-only drop()
  * stamps a gate delivery exactly as step 6 and report_completion do. Mutates and
  * returns `record`.
  */
 export function clearBriefHoldOnGate(record) {
-  if (record.briefPending === true) record.briefPending = false;
+  record.briefPending = false;
+  // TEAM-6097: a gate delivery supersedes an earlier no-gate-needed release.
+  delete record.briefDisposition;
   return pruneDeliveredBrief(record);
+}
+
+/**
+ * TEAM-6097 (TEAM-5995 on TEAM-6029): the release twin of clearBriefHoldOnGate, for a
+ * brief no gate needs (`disposition.release`, audited on the board by postResolvedBrief
+ * before this write). A held `briefPending:true` goes `false`, the disposition is
+ * recorded, and through pruneDeliveredBrief the stale `part:"brief"` entry and the
+ * off-gate `briefFallbackReason` come off — the reason a release was made lives in
+ * `briefDisposition.why`. Drain step 6, drop() and report_completion's retry all call
+ * it, so the three cannot diverge. TEAM-6124: `false` on a first release too (no hold
+ * stamped), or adoptHold dropped the disposition on the next report and a forced hold
+ * re-held over it. Mutates and returns `record`.
+ */
+export function clearBriefHoldOnRelease(record, disposition) {
+  record.briefPending = false;
+  record.briefDisposition = disposition;
+  return pruneDeliveredBrief(record);
+}
+
+/**
+ * TEAM-6140 (DL-039): the PROVISIONAL twin of clearBriefHoldOnRelease, for a release the
+ * caller will re-confirm AFTER this write and Done in the same call. The hold stays on
+ * (`briefPending:true` - every reader already refuses it) and the disposition is recorded
+ * with `provisional:true`, so a reader sees why it is held. Nothing is pruned: the standing
+ * hold's `undelivered` entry and `briefFallbackReason` stay until the finalize write
+ * (clearBriefHoldOnRelease, with the un-marked disposition) makes the release trusted. A
+ * compensation that fails after this write leaves a record nobody trusts, which is the
+ * point. TEAM-6152: and a fresh `provisionalNonce` - the field that makes this write's ETag
+ * identify THIS write (see provisionalNonceOf). Mutates and returns `record`; `disposition` is
+ * not mutated.
+ */
+export function holdBriefOnProvisionalRelease(record, disposition) {
+  record.briefPending = true;
+  record.briefDisposition = { ...disposition, provisional: true, provisionalNonce: randomUUID() };
+  record.briefHoldReason = `provisional: the ${disposition.kind} release (${(disposition.observed || []).map((o) => o.ticketId).join(", ")}) is re-confirmed after this write, before the Done`;
+  return record;
+}
+
+/**
+ * TEAM-6140 (DL-039): the securityReview stamp is written `provisional:true` (both twins
+ * refuse it) and this takes the marker off once the amendment is re-confirmed done after
+ * the write (TEAM-6152: and the nonce with it - it lives exactly as long as the marker).
+ * Idempotent; a record with no stamp is returned as is.
+ */
+export function finalizeSecurityReview(record) {
+  if (record?.securityReview && typeof record.securityReview === "object") {
+    delete record.securityReview.provisional;
+    delete record.securityReview.provisionalNonce;
+  }
+  return record;
+}
+
+/**
+ * TEAM-6151: the twin of finalizeSecurityReview - puts the marker back on a stamp. The
+ * drain's step 6 re-marks a replayed admission PROVISIONALLY (in its own CAS write) before
+ * step 7 re-confirms the amendment, so the confirm, the drop notice and the Done all act on
+ * a record every reader already refuses. TEAM-6152: every call mints a FRESH `provisionalNonce`
+ * - a re-establishment is a NEW write, and the nonce is what makes its ETag say so (see
+ * provisionalNonceOf) - so every finalize in flight on an earlier establishment loses its CAS.
+ * Not idempotent on the bytes, deliberately; a record with no stamp is returned as is.
+ */
+export function holdSecurityReviewProvisional(record) {
+  if (record?.securityReview && typeof record.securityReview === "object") {
+    record.securityReview.provisional = true;
+    record.securityReview.provisionalNonce = randomUUID();
+  }
+  return record;
+}
+
+/** TEAM-6151: does `record` carry the provisional marker `what` names (`"brief"` | `"securityReview"`)? */
+export function carriesProvisional(record, what) {
+  if (what === "brief") return record?.briefPending === true && record?.briefDisposition?.provisional === true;
+  return record?.securityReview?.provisional === true;
+}
+
+/**
+ * TEAM-6152 (review round 5 on DL-039): the nonce the (re-)establishment wrote beside the marker
+ * `what` names, or undefined. S3's ETag for a single-part PutObject under SSE-S3 is the MD5 of
+ * the body, so the ETag alone never identified THIS caller's provisional write: another drain's
+ * byte-identical re-establishment (the same stamp marked provisional again, the same release
+ * recorded again) kept the ETag, and a finalize whose caller had confirmed BEFORE that writer saw
+ * the amendment or gate reopen still won its IfMatch. The nonce is the per-write field: every
+ * establishment writes a fresh one, so a re-establishment is a different body (a different MD5,
+ * and under any other ETag scheme a different write anyway) and the earlier finalize 412s. The
+ * finalize requires it on its base; no reader acts on its value (both twins ignore it).
+ */
+export function provisionalNonceOf(record, what) {
+  const holder = what === "brief" ? record?.briefDisposition : record?.securityReview;
+  const nonce = holder && typeof holder === "object" ? holder.provisionalNonce : undefined;
+  return typeof nonce === "string" && nonce ? nonce : undefined;
+}
+
+/**
+ * TEAM-6152: may a residual-findings replay act on the record's securityReview stamp - re-mark
+ * it provisional (drain step 6, drop()), re-confirm it and finalize it? Never a PASS (there is no
+ * amendment to re-confirm, and both twins would refuse the marker: round 5 F2 left a PASS
+ * provisional forever) and, given the amendment the replay is confirming, only a stamp admitted
+ * on THAT amendment (or one naming none): a stamp on another amendment is a NEWER admission - a
+ * re-review whose Done was deduped onto this message - that this replay does not own. ONE
+ * predicate for all three sites, so they cannot diverge.
+ */
+export function reMarkableAdmission(record, amendment = null) {
+  const sr = record?.securityReview;
+  if (!sr || typeof sr !== "object") return false;
+  if (String(sr.verdict || "").toUpperCase() === "PASS") return false;
+  const own = asText(sr.amendmentTicketId);
+  return !amendment || !own || own === amendment;
+}
+
+/**
+ * TEAM-6164 (F1): the admission a ticket-replay drain ACTS on - re-marks provisional (step 6),
+ * re-confirms, finalizes or drops (step 7). The RECORD's non-PASS stamp first: it is the newest
+ * admission, whatever message is being drained. Keying those transitions off `msg.residual` let
+ * an OLDER residual-less PASS message (its Done 503'd) drain over a record whose newer admission
+ * is a trusted FAIL stamp and go straight to the Done - no re-mark, no amendment read, both twins
+ * admitting the trusted stamp - while the amendment was reopened or unreadable. The message's
+ * residual is the fallback only when the record holds no non-PASS stamp (no record, no stamp, or
+ * a trusted PASS - and then TEAM-6158's superseded rule in step 7 applies). The amendment id is
+ * the record stamp's first, the message's only for a stamp naming none (TEAM-6152), as before.
+ * `null` ⇒ nothing to confirm: a PASS (or no verdict) on both sides.
+ *
+ *   { source: "record" | "message", verdict, amendmentTicketId }   or null
+ */
+/**
+ * TEAM-6164 (F1 sibling, same message-vs-record class): the follow-ups the RECORD says are
+ * still unfiled (`followUpsMaterialized.failed`, stamped by the newest report_completion or
+ * drain write) that THIS message neither carries nor resolved. Step 6 wrote
+ * `followUpsPending:false` off the message's own entries alone, so an OLDER queued message
+ * with no follow-ups (a report whose Done 503'd) drained after a NEWER report stamped
+ * `followUpsPending:true` cleared that hold and Doned the ticket with the follow-up unfiled -
+ * the record cannot re-file them for it (its outcome rows carry no hash, owner or detail),
+ * so the message does not own the hold: it is superseded, and whoever stamped the hold (the
+ * agent's retry, or that report's own queued message) files them and closes the ticket.
+ * A record holding `followUpsPending:true` with no per-entry breakdown (nothing writes one
+ * today) is unresolved too - fail closed on a hold nobody can name. `[]` when the record
+ * states no hold.
+ */
+export function unresolvedRecordFollowUps(record, materialized, entries = []) {
+  if (record?.followUpsPending !== true) return [];
+  const failed = record.followUpsMaterialized?.failed;
+  if (!Array.isArray(failed)) return [{ hash: null, reason: "followUpsPending:true with no followUpsMaterialized breakdown" }];
+  const own = new Set(entries.map((e) => e?.hash).filter(Boolean));
+  const resolved = new Set([...(materialized?.created || []), ...(materialized?.skipped || []), ...(materialized?.rerouted || [])].map((r) => r?.hash).filter(Boolean));
+  const settled = (hash) => own.has(hash) || resolved.has(hash);
+  // TEAM-6205 (R2-05): a row without identity cannot be matched against anything this message
+  // filed or carries, so it is UNRESOLVED - the old filter dropped it and the hold cleared.
+  // TEAM-6217 (R3-02): a durable marker mergeRecordFollowUps persisted for such a row carries its own reason.
+  const out = failed
+    .map((f, i) => (f && typeof f === "object" && typeof f.hash === "string" && f.hash ? f
+      : f?.unresolved === true && asText(f.reason) ? { hash: null, reason: f.reason }
+        : { hash: null, reason: `followUpsMaterialized.failed[${i}] has no hash` }))
+    .filter((f) => f.hash === null || !settled(f.hash));
+  if (out.length > 0 || failed.length > 0) return out;
+  // TEAM-6205 (R2-05): a HOLLOW breakdown (`failed:[]` under `followUpsPending:true`) names no
+  // row, so the hold lifts only on positive proof - every follow-up the record itself names
+  // (`followUps[].hash`) is filed by, or carried by, this message. Otherwise fail closed.
+  const named = Array.isArray(record.followUps) ? record.followUps.map((e) => e?.hash).filter((h) => typeof h === "string" && h) : [];
+  if (named.length > 0 && named.every(settled)) return [];
+  return [{ hash: null, reason: "followUpsPending:true with an empty followUpsMaterialized.failed" }];
+}
+
+/**
+ * TEAM-6205 (R2-01): the breakdown a drain write PERSISTS. unresolvedRecordFollowUps decided the
+ * flag, but drop() and step 6 then wrote `followUpsMaterialized` off this message's rows alone, so
+ * the record forgot the follow-up B a newer report held: on redelivery A filed, nothing named B,
+ * the hold cleared and the ticket Doned over it. This message's rows win per hash; every record
+ * row for a hash this message does not have rides verbatim in its own bucket (a failed row with
+ * its reason, retryable and commentedOn), so the record never forgets an obligation or a filed
+ * ticket id. TEAM-6217 (R3-02): a record row with NO hash is an obligation nobody can name - it
+ * used to be filtered out of the persisted breakdown, so after one drop the record said failed:[A]
+ * alone and the redelivery that filed A cleared the hold. A hash-less `failed` row is now persisted
+ * as a durable unresolved marker (`{ hash: null, unresolved: true, retryable: false, reason, raw }`;
+ * an existing marker rides verbatim, so there is no growth); hash-less rows in the other buckets
+ * ride verbatim (they claim a filed ticket, not an unfiled one). Only a report_completion re-run,
+ * which rewrites the breakdown from its own materialization, clears a marker - a drain cannot name
+ * the row. ONE helper for every drain write (drop(), step 6).
+ *
+ *   { unresolved, breakdown, stillUnfiled }
+ */
+export function mergeRecordFollowUps(record, materialized, entries = []) {
+  const unresolved = unresolvedRecordFollowUps(record, materialized, entries);
+  const buckets = ["created", "skipped", "failed", "rerouted"];
+  const breakdown = Object.fromEntries(buckets.map((b) => [b, Array.isArray(materialized?.[b]) ? [...materialized[b]] : []]));
+  const mine = new Set(buckets.flatMap((b) => breakdown[b].map((r) => r?.hash)).filter(Boolean));
+  const prior = record?.followUpsMaterialized;
+  for (const b of buckets) {
+    (Array.isArray(prior?.[b]) ? prior[b] : []).forEach((row, i) => {
+      const hash = row && typeof row === "object" && typeof row.hash === "string" && row.hash ? row.hash : null;
+      if (hash) { if (!mine.has(hash)) { breakdown[b].push(row); mine.add(hash); } return; }
+      if (b !== "failed") { breakdown[b].push(row); return; }
+      breakdown.failed.push(row && typeof row === "object" && row.unresolved === true ? row : unresolvedFollowUpMarker(row, i));
+    });
+  }
+  return { unresolved, breakdown, stillUnfiled: breakdown.failed.length > 0 || unresolved.length > 0 };
+}
+
+/** TEAM-6217 (R3-02): the durable marker a hash-less `followUpsMaterialized.failed[i]` row is persisted as. */
+export function unresolvedFollowUpMarker(row, i) {
+  let raw;
+  try { raw = JSON.stringify(row); } catch { raw = undefined; }
+  return {
+    hash: null, unresolved: true, retryable: false,
+    reason: `followUpsMaterialized.failed[${i}] has no hash - an obligation nobody can name; a WorkflowOutput___report_completion re-run with the full follow_ups list restates it`,
+    raw: clampLine(raw ?? String(row), 500),
+  };
+}
+
+export function drainAdmission(record, msg) {
+  const sr = record?.securityReview;
+  const own = sr && typeof sr === "object" && asText(sr.verdict) && String(sr.verdict).toUpperCase() !== "PASS" ? sr : null;
+  if (own) return { source: "record", verdict: String(own.verdict).toUpperCase(), amendmentTicketId: asText(own.amendmentTicketId) || asText(msg?.residual?.amendmentTicketId) || null };
+  if (msg?.residual) return { source: "message", verdict: String(msg.residual.verdict || "").toUpperCase() || "non-PASS", amendmentTicketId: asText(msg.residual.amendmentTicketId) || null };
+  return null;
+}
+
+/** TEAM-6158 / TEAM-6205: a residual's identity - its verdict and amendment id - the one key every comparison uses. */
+export const residualIdentity = (r) => `${String(r?.verdict || "").toUpperCase()}|${asText(r?.amendmentTicketId)}`;
+
+/**
+ * TEAM-6205 (R2-03): the residual findings a non-PASS review owes the dev lanes, in the ONE shape
+ * the record (`residual`, beside its `securityReview` stamp, same PUT) and the queued message
+ * (`residual`) both carry. null for a PASS or a report with no admission.
+ */
+export function residualOf(review, summary, artifacts) {
+  if (!review?.residual) return null;
+  return { verdict: review.verdict, summary: clampBlock(summary, 6000), artifacts: clampLine(artifacts, 500), amendmentTicketId: review.amendmentTicketId || null };
+}
+
+/**
+ * TEAM-6217 (R3-03): the residual a record written BEFORE `residual` existed still holds - its
+ * non-PASS stamp beside the report's own `summary` and `artifacts` (:1066), the exact inputs
+ * residualOf builds the field from. Valid only when the summary's own verdict line is the stamp's
+ * verdict (parseReviewVerdict): a same-session resubmit keeps the FIRST summary under a later
+ * stamp, so a mismatch is not this admission's text. null ⇒ nothing trustworthy to rebuild.
+ */
+export function legacyResidualOf(record) {
+  const sr = record?.securityReview;
+  const verdict = String(sr?.verdict || "").toUpperCase();
+  if (!verdict || verdict === "PASS" || !asText(record?.summary).trim()) return null;
+  if (parseReviewVerdict(record.summary) !== verdict) return null;
+  return residualOf({ residual: true, verdict, amendmentTicketId: asText(sr.amendmentTicketId) || null }, record.summary, record.artifacts);
+}
+
+/**
+ * TEAM-6205 (R2-03): the residual findings a ticket-replay drain DELIVERS before its Done, keyed on
+ * the SAME admission drainAdmission re-marks, confirms and finalizes. Step 5 posted `msg.residual`
+ * and the sibling scan was gated on it, so an older residual-less PASS message drained over the
+ * record's newer FAIL stamp Doned the review with NO findings on the dev lanes (the FAIL's own
+ * message behind it then died on step 0's "already applied"), and a stale FAIL message over a
+ * trusted PASS posted its outdated findings and retried on an amendment it no longer owned.
+ *
+ *   residual     what to post: the record's own text when its stamp is the admission acted on
+ *                (`record.residual`; the message's only when it is the same admission), the
+ *                message's when the record holds no non-PASS stamp. null ⇒ nothing to post.
+ *   stale        the superseded reason when the message's non-PASS findings contradict the
+ *                record's trusted PASS admission (TEAM-6158's rule, decided before step 6 and
+ *                before any amendment read, not in step 7 after one).
+ *   missingText  the record's stamp is the admission but it carries no `residual` (written before
+ *                the field existed), its own summary cannot stand in for it (legacyResidualOf), and
+ *                the message's findings are another admission: nothing to post. TEAM-6217 (R3-03):
+ *                on an open ticket the caller HOLDS the Done (a surfaced drop) - the findings are
+ *                owed before the dev lanes are released; on a ticket already Done it records the
+ *                dev lanes as undelivered.
+ */
+export function currentResidual(record, msg, reportKey = "the completion record") {
+  const admission = drainAdmission(record, msg);
+  const none = { residual: null, stale: null, missingText: null };
+  if (!admission) return none;
+  if (admission.source === "record") {
+    const own = record.residual && typeof record.residual === "object" ? record.residual : null;
+    if (own) return { ...none, residual: own };
+    // The message's text stands in only for the SAME admission - TEAM-6152's ownership rule, by
+    // amendment: the stamp's amendment, or a stamp naming none (the verdict wording is the stamp's).
+    const stampAmendment = asText(record.securityReview?.amendmentTicketId);
+    if (msg?.residual && (!stampAmendment || asText(msg.residual.amendmentTicketId) === stampAmendment)) return { ...none, residual: msg.residual };
+    // TEAM-6217 (R3-03): a pre-field record's own summary/artifacts, when they state this verdict.
+    const legacy = legacyResidualOf(record);
+    if (legacy) return { ...none, residual: legacy };
+    const theirs = msg?.residual ? ` and the queued ${String(msg.residual.verdict || "").toUpperCase() || "non-PASS"} findings${asText(msg.residual.amendmentTicketId) ? ` on ${asText(msg.residual.amendmentTicketId)}` : ""} are another admission` : "";
+    return { ...none, missingText: `${reportKey} carries no residual text for its ${admission.verdict} admission${admission.amendmentTicketId ? ` on ${admission.amendmentTicketId}` : ""} (a record written before it carried one, and its summary does not state that verdict)${theirs} - no findings from this replay; a WorkflowOutput___report_completion re-run (or that admission's own queued message) delivers them` };
+  }
+  const sr = record?.securityReview;
+  if (sr && typeof sr === "object" && String(sr.verdict || "").toUpperCase() === "PASS") {
+    return { ...none, stale: `superseded: ${reportKey} carries a trusted PASS securityReview admission newer than this message's ${admission.verdict} residual findings - nothing posted, nothing written, no Done; the PASS admission's own queued message or report_completion retry closes the ticket` };
+  }
+  return { ...none, residual: msg.residual };
+}
+
+/**
+ * TEAM-6151: the ONE finalize write (DL-039). `base` is `{ record, etag }` exactly as THIS
+ * caller's provisional write left it; `apply(copy)` turns it trusted (clearBriefHoldOnRelease /
+ * finalizeSecurityReview, plus status). One PutObject with IfMatch on that ETag - never a
+ * re-read-and-retry: a 412 (or a 404) means a NEWER record exists (a drain's hold, a gate
+ * delivery, a revocation, another finalizer, a twin's Done-intent fence) and that record WINS.
+ * The caller withholds the Done and answers retryably; the next decision starts from a fresh
+ * read. Nothing is mutated on any failure (`apply` runs on a deep copy), and a base that does
+ * not carry the marker is refused without a write - a finalize of something never made
+ * provisional is a programming error, not a race. TEAM-6152: so is a base without the marker's
+ * `provisionalNonce` (provisionalNonceOf) - the ETag identifies this caller's write only because
+ * that write carried one; every establishment helper mints it, so a base lacking it was not
+ * written by one of them.
+ *
+ *   { ok: true, etag, record }              the trusted record, as written, and its ETag
+ *   { ok: false, superseded: true, error }  412/404: a newer record stands, untouched
+ *   { ok: false, error }                    S3 could not answer, or the base is not provisional
+ */
+export async function finalizeProvisionalRecord({ key, base, what, apply }) {
+  if (!base || base.etag === undefined) return { ok: false, error: `${key}: no ETag for the provisional write to finalize on` };
+  if (!carriesProvisional(base.record, what)) return { ok: false, error: `${key}: the record this call wrote carries no provisional ${what} to finalize` };
+  if (!provisionalNonceOf(base.record, what)) return { ok: false, error: `${key}: the provisional ${what} this call would finalize carries no provisionalNonce - not a write this call made` };
+  const record = apply(JSON.parse(JSON.stringify(base.record)));
+  const r = await conditionalPut(key, JSON.stringify(record, null, 2), { ifMatch: base.etag });
+  if (r.outcome === "won") return { ok: true, etag: r.etag, record };
+  if (r.outcome === "error") return { ok: false, error: `${r.err?.name || "Error"}: ${r.err?.message || ""}` };
+  return { ok: false, superseded: true, error: `${key} changed since the provisional write (${r.outcome}) - a newer hold, delivery or revocation stands and is left as is` };
 }
 
 /**
@@ -747,6 +1099,8 @@ export function isBriefHoldRefusal(error) {
 export function clearUndeliveredBriefTargets(record) {
   delete record.briefTargets;
   delete record.briefFallbackReason;
+  // TEAM-6097: nor an earlier release's disposition — an undelivered brief released nothing.
+  delete record.briefDisposition;
   return record;
 }
 
@@ -987,8 +1341,17 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   }
   // The admission, on the record: the twins' Done guard closes a security review
   // only on a record carrying it, so a record written any other way cannot.
+  // TEAM-6140 (DL-039): a non-PASS admission is PROVISIONAL until the amendment is re-confirmed
+  // done after the record write (finalizeSecurityReview, below); both twins refuse the marker.
+  // TEAM-6152: through the one establishment helper, so the stamp carries its nonce.
   if (review.verdict) {
     report.securityReview = { verdict: review.verdict, ...(review.amendmentTicketId ? { amendmentTicketId: review.amendmentTicketId } : {}) };
+    if (review.amendmentTicketId) holdSecurityReviewProvisional(report);
+    // TEAM-6205 (R2-03): and the findings themselves, beside the stamp in the same PUT, so the
+    // ticket-replay drain can deliver THIS admission's findings whatever message it is draining.
+    // A PASS carries none; the next report's record replaces it with the record.
+    const residualText = residualOf(review, summary, artifacts);
+    if (residualText) report.residual = residualText;
   }
 
   // ─── TEAM-4740 FR-5 / TEAM-4752 D3: a fix to main must carry the PR to main ──
@@ -1085,10 +1448,34 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // failed) is not a Done in flight: the write proceeds, bounded by the twins' TTL.
   let recordBase = { record: earlyPrior?.record ?? null, etag: earlyPrior?.etag };
   let deliveredNow = false;
+  // TEAM-6158: has THIS call landed its own securityReview stamp (a won record write that
+  // carried one, or the finalize)? Every later attempt is a rewrite, and a provisional
+  // admission found on the record from then on is NEWER than this call's.
+  let ownStampWritten = false;
   const writeRecord = async (statusOf, { forceHold = false } = {}) => {
     for (let attempt = 1; attempt <= RECORD_CAS_ATTEMPTS; attempt++) {
       adoptHold(report, recordBase.record, { deliveredNow, forceHold });
       report.status = statusOf();
+      // TEAM-6151: this write is never a FINALIZE. A finalize is one CAS on the provisional
+      // write's own ETag (finalizeProvisionalRecord); this loop re-reads and re-applies the
+      // same `report`, which is exactly how a stale admission was rebased over a newer
+      // provisional stamp. TEAM-6158 (replaces TEAM-6152's same-amendment rule): the question
+      // is not WHICH amendment but WHEN. Once this call has landed its own stamp
+      // (ownStampWritten), a provisional re-markable admission on the record - the drain's
+      // one predicate, reMarkableAdmission: non-PASS, any amendment - was established AFTER
+      // it (every establishment is a fresh write, see holdSecurityReviewProvisional), so it is
+      // newer than this call's admission and wins: the trusted stamp this attempt would
+      // serialize over it (the failed-Done rewrite, the queued stamp) is refused, whether it
+      // names the same amendment, another one, or none (a PASS). Comparing amendment ids let
+      // a trusted X rebase over a provisional Y, and a trusted PASS over any provisional FAIL.
+      // Before this call's first write, a provisional stamp predates it and a fresh report
+      // SUPERSEDES it (a PASS over a stale provisional PASS or FAIL writes - T14).
+      const curStamp = recordBase.record?.securityReview;
+      if (ownStampWritten && carriesProvisional(recordBase.record, "securityReview") && reMarkableAdmission(recordBase.record)
+        && report.securityReview && typeof report.securityReview === "object" && !carriesProvisional(report, "securityReview")) {
+        const cur = `${String(curStamp.verdict || "").toUpperCase() || "no verdict"}${asText(curStamp.amendmentTicketId) ? ` on amendment ${asText(curStamp.amendmentTicketId)}` : ""}`;
+        return { ok: false, error: `${key} carries a PROVISIONAL securityReview admission (${cur}) newer than this call's - the record write never finalizes or overwrites it; a finalize goes through finalizeProvisionalRecord, and the newer admission's own caller decides` };
+      }
       const holdWritten = (report.followUpsPending === true && recordBase.record?.followUpsPending !== true)
         || (report.briefPending === true && recordBase.record?.briefPending !== true);
       // TEAM-5994: on EVERY attempt, against the record this attempt conditions on — never
@@ -1102,6 +1489,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       const r = await conditionalPut(key, JSON.stringify(report, null, 2), recordBase.etag !== undefined ? { ifMatch: recordBase.etag } : {});
       if (r.outcome === "won") {
         recordBase = { record: JSON.parse(JSON.stringify(report)), etag: r.etag };
+        if (report.securityReview && typeof report.securityReview === "object") ownStampWritten = true;
         return { ok: true };
       }
       if (r.outcome === "error") throw r.err;
@@ -1262,22 +1650,72 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // TEAM-5830: whether or not the replay queue is configured — a hold an earlier drain
   // stamped outlives a queue URL taken off the env, and dropping it erased the hold.
   let briefHeld = false;
+  // TEAM-6130: the gate_settled release THIS call recorded (null otherwise), re-confirmed
+  // after the record write and before the Done below.
+  let releasedNow = null;
   if (!isSynthetic) {
     const held = earlyPrior.record;
-    if (held?.briefPending === true) {
+    // TEAM-6217 (R3-01): or the record's own facts say the brief is still owed (its writes were
+    // queued with the brief among them and nothing recorded an outcome - queuedBriefOwed), whether
+    // or not a drain's best-effort re-hold stamp landed. Report-side safety must not depend on a
+    // compensating write: the obligation is treated exactly as briefPending:true, so the rest of
+    // this block delivers the brief to the gate (or holds, writing briefPending:true on THIS call's
+    // own record write) before any Done. reholdBeforeRetry's stamp stays as belt-and-braces.
+    const owedKey = held?.briefPending === true ? null : queuedBriefOwed(held);
+    if (held?.briefPending === true || owedKey) {
+      if (owedKey) {
+        report.briefPending = true;
+        console.warn(`[report_completion] ${ticket_id}: ${key} queued the merge brief ${owedKey} and nothing has recorded it on the gate - treated as briefPending:true`);
+      }
       for (const f of BRIEF_HOLD_FIELDS) if (held[f] !== undefined && report[f] === undefined) report[f] = held[f];
-      const briefKey = mergeBriefKey(keys)
+      const briefKey = mergeBriefKey(keys) || owedKey
         || (Array.isArray(held.undelivered) ? held.undelivered.find((u) => u?.part === "brief" && asText(u.s3Key))?.s3Key : null);
       let brief = null;
       if (briefKey) {
         const sib = needsSiblings && scan.ok ? scan : await loadSiblings(epicKey);
-        brief = sib.ok ? await postQueuedBrief({ ticketId: ticket_id, epicKey, s3Key: briefKey, siblings: sib.siblings }) : { ok: false, error: `list_tickets under ${epicKey}: ${sib.error}` };
+        brief = sib.ok ? await postQueuedBrief({ ticketId: ticket_id, epicKey, s3Key: briefKey, siblings: sib.siblings, scanComplete: sib.complete, workflowId: workflow_id }) : { ok: false, error: `list_tickets under ${epicKey}: ${sib.error}` };
+      }
+      // TEAM-6130: a gate_settled release is re-confirmed immediately before the record
+      // write that commits it (every audit-time gate read honoured first). A gate that
+      // reads open now is the off-gate hold: briefPending stays true, Done is withheld,
+      // and the agent's retry re-chooses the gate.
+      if (brief?.ok && brief.disposition?.release && brief.disposition.kind === "gate_settled") {
+        const confirm = await confirmDoneAtCommit({ ticketIds: brief.disposition.observed.map((o) => o.ticketId), earlier: brief.gateReads });
+        if (!confirm.ok) brief = { ok: false, error: `get_issue ${confirm.ticketId} (re-confirming the Merge Approval gate is Done before recording the release): ${confirm.error}` };
+        else if (!confirm.done) {
+          const why = `the Merge Approval gate ${confirm.why} when the release was about to be recorded`;
+          brief = { ok: true, outcome: "off_gate", targets: brief.targets, reason: why, disposition: { release: false, kind: "gate_reopened", why, observed: brief.disposition.observed } };
+        }
       }
       if (brief?.ok && brief.gate) {
         Object.assign(report, { briefPending: false, briefDelivered: "gate", briefTargets: [brief.gate] });
-        pruneDeliveredBrief(report);
+        clearBriefHoldOnGate(report);
         deliveredNow = true;
         console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} is on the gate ${brief.gate} (${brief.outcome}) - briefPending cleared`);
+      } else if (brief?.ok && brief.disposition?.release) {
+        // TEAM-5995: no gate needs the brief (every gate is Done, or the run never gets
+        // one), audited on the board by postQueuedBrief. The release is the evidence, so
+        // it goes through the same CAS write as a delivery (`deliveredNow`).
+        // TEAM-6097: through the drain's own release clear (prune included).
+        Object.assign(report, { briefDelivered: "off_gate", briefTargets: brief.targets });
+        const disposition = { ...brief.disposition, at: new Date().toISOString(), by: "report_completion" };
+        // TEAM-6140 (DL-039): a gate_settled release this call will Done on is written
+        // PROVISIONALLY (the hold stays on) and finalized only after the post-write confirm.
+        // TEAM-6164 (F2 sibling): with follow-ups still pending too (no Done this call). The
+        // trusted form was written by the record-write loop below, which re-reads and re-puts
+        // the same release on every 412 - a confirm taken before the loop covered none of
+        // those iterations. Provisional through the loop (a hold every reader refuses), then
+        // the post-write confirm and the ONE finalize make it trusted, with no Done; a human
+        // who files the follow-ups can still close the ticket directly after that.
+        if (brief.disposition.kind === "gate_settled") {
+          holdBriefOnProvisionalRelease(report, disposition);
+          releasedNow = { observed: brief.disposition.observed, disposition };
+          console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} needs no gate (${brief.disposition.kind}: ${brief.disposition.why}) - release recorded PROVISIONALLY, re-confirmed after the write`);
+        } else {
+          clearBriefHoldOnRelease(report, disposition);
+          console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} needs no gate (${brief.disposition.kind}: ${brief.disposition.why}) - briefPending cleared`);
+        }
+        deliveredNow = true;
       } else {
         briefHeld = true;
         report.briefHoldReason = !briefKey ? "the report names no merge brief (evidence_keys has no shared/merge-brief.md) and the record lists none"
@@ -1288,6 +1726,17 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     }
   }
   report.followUpsPending = pendingFollowUps.length > 0;
+  // TEAM-6130: the admission designAmendmentGate made is committed by the write below (the
+  // twins trust the stamp), so the amendment is re-asked immediately before it. Reopened
+  // since: the same refusal as a never-done amendment, nothing written. Unreadable: retry.
+  if (review.residual && review.amendmentTicketId) {
+    const confirm = await confirmDoneAtCommit({ ticketIds: [review.amendmentTicketId] });
+    if (!confirm.ok) return amendmentScanRefusal({ ticketId: ticket_id, verdict: review.verdict, detail: `get_issue ${review.amendmentTicketId} (re-confirming the design amendment is done before the record write): ${confirm.error}` });
+    if (!confirm.done) {
+      console.warn(`[report_completion] REFUSED ${ticket_id}: design amendment ${confirm.why} before the record write - no record written, ticket not transitioned`);
+      return designAmendmentRefusal({ ticketId: ticket_id, verdict: review.verdict, open: { ticketId: review.amendmentTicketId }, note: `confirmed done, then ${amendmentReread(confirm)} before the record was written`, findings: countFindings(summary) });
+    }
+  }
   // TEAM-5830: the hold is whatever the WRITTEN record says, so a hold the drain stamped
   // after the read above withholds this Done, and a clear it made releases it.
   const firstWrite = await writeRecord(() => {
@@ -1305,6 +1754,67 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     return { ...completionRecordUnreadable(ticket_id, key, firstWrite.error), reason: firstWrite.reason || "completion_record_contended" };
   }
   console.log(`[report_completion] Saved s3://${BUCKET}/${key} (status ${report.status})`);
+  // TEAM-6130: a gate_settled release this call just recorded is re-asked once more before
+  // the Done it admits. TEAM-6140 (DL-039): the record above holds it PROVISIONALLY
+  // (briefPending:true, briefDisposition.provisional), so this block is what makes it
+  // trusted: a confirmed gate ⇒ the FINALIZE write (clearBriefHoldOnRelease) and only then
+  // the Done; a gate open now ⇒ the hold reason is stamped best-effort and the Done is
+  // withheld - whether that tidy-up lands cannot change what any reader does, because the
+  // record is already refused. A finalize that loses its CAS leaves the record provisional
+  // and withholds the Done the same way; the agent's retry re-chooses the gate.
+  // TEAM-6142: the FINAL gate confirm. Between it and transitionToDone sit the FINALIZE write
+  // (the one S3 CAS write DL-039 needs AFTER the last read, since it is what makes the release
+  // trusted) and the amendment block below, which a security review never reaches with a
+  // merge-brief hold - so in practice nothing else. Residual window: Jira status and the S3
+  // CAS share no transaction, so a gate reopened after this read still goes Done (see
+  // confirmDoneAtCommit).
+  // TEAM-6164 (F2 sibling): and with follow-ups pending (no Done this call) the same confirm +
+  // finalize, so the record never carries a trusted release the loop above re-put unconfirmed.
+  if (releasedNow) {
+    const confirm = await confirmDoneAtCommit({ ticketIds: releasedNow.observed.map((o) => o.ticketId) });
+    if (confirm.ok && confirm.done) {
+      // TEAM-6151: ONE conditional write on the provisional record's own ETag - never the
+      // record-write loop, which re-read and re-applied this stale release over a newer hold
+      // (a drain re-held the brief after the gate reopened), a newer gate delivery, or a
+      // newer revocation. A lost CAS leaves the newer record standing and withholds the Done.
+      const final = await finalizeProvisionalRecord({
+        key, base: recordBase, what: "brief",
+        apply: (rec) => {
+          clearBriefHoldOnRelease(rec, releasedNow.disposition);
+          delete rec.briefHoldReason;
+          rec.status = !mayTransition ? STATUS_PENDING_FOLLOW_UPS : "complete";
+          return rec;
+        },
+      });
+      if (final.ok) {
+        recordBase = { record: final.record, etag: final.etag };
+        for (const f of BRIEF_HOLD_FIELDS) { if (final.record[f] !== undefined) report[f] = final.record[f]; else delete report[f]; }
+        delete report.briefHoldReason;
+        report.status = final.record.status;
+        briefHeld = false;
+        console.log(`[report_completion] ${ticket_id}: the Merge Approval gate(s) re-confirmed Done after the write - release FINALIZED (briefPending:false)`);
+      } else {
+        // `report` still is the provisional hold the first write made; nothing to take back.
+        report.briefHoldReason = `provisional release not finalized (${final.error}) - the record holds the release provisionally (briefPending:true); the retry re-chooses the gate`;
+        briefHeld = true;
+        console.error(`[report_completion] ${ticket_id}: the release was confirmed but could not be FINALIZED on ${key} (${final.error}) - ${final.superseded ? "a newer record stands and is left as is" : "the record stays provisional (briefPending:true)"}, Done withheld; the retry re-chooses the gate`);
+      }
+    } else {
+      const why = confirm.ok ? `the Merge Approval gate ${confirm.why} after the release was recorded` : `the Merge Approval gate ${confirm.ticketId} could not be re-read after the release was recorded (${confirm.error})`;
+      report.briefPending = true;
+      delete report.briefDisposition;
+      report.briefHoldReason = `off_gate: ${why}`;
+      briefHeld = true;
+      // TEAM-6164: the follow-ups status keeps precedence, as the first write's statusOf has it.
+      const back = await writeRecord(() => (!mayTransition ? STATUS_PENDING_FOLLOW_UPS : STATUS_PENDING_BRIEF));
+      if (!back.ok) {
+        report.briefHoldReason += ` (the hold reason could not be stamped on the record: ${back.error}; the record still holds the PROVISIONAL release, which every reader refuses)`;
+        console.error(`[report_completion] ${ticket_id}: ${why}, and the hold reason could not be stamped on ${key} (${back.error}) - the record still holds the PROVISIONAL release (briefPending:true), Done withheld; the retry re-chooses the gate`);
+      } else {
+        console.warn(`[report_completion] ${ticket_id}: ${why} - release taken back (briefPending:true), Done withheld`);
+      }
+    }
+  }
   // Done waits on both holds: every follow-up filed AND the merge brief on its gate.
   const mayDone = mayTransition && !briefHeld;
 
@@ -1330,12 +1840,70 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       ticketId: ticket_id, agentId: agent_id || null, summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null,
     });
   } else {
+    // TEAM-6130: the stamp just written is what the twins admit this Done on; re-ask the
+    // amendment once more before the residual posts and the Done. Reopened since (or
+    // unreadable): the stamp comes back off the record — both twins then refuse Done
+    // without it — no findings are posted, no Done is made, and the answer is the
+    // amendment refusal saying what WAS recorded.
+    // TEAM-6140 (DL-039): the stamp above is PROVISIONAL (both twins refuse it), so this block
+    // is what admits the Done. Reopened ⇒ the stamp is taken off best-effort and the answer
+    // says whether that landed (a provisional stamp left behind is refused anyway).
+    // TEAM-6142: one take-back for both confirms (this one, and the final one after the
+    // residual posts). Tidy-up only, as DL-039 makes it: the stamp is still provisional at
+    // both sites, so a rewrite that loses its CAS leaves a record every reader already refuses;
+    // the refusal is returned (no Done) either way and carries `rollback`.
+    const amendment = review.residual && review.amendmentTicketId ? review.amendmentTicketId : null;
+    const takeBackAdmission = async (confirm, { note, detail, posted }) => {
+      delete report.securityReview;
+      const back = await writeRecord(() => STATUS_TRANSITION_FAILED);
+      const rollback = { ok: back.ok, ...(back.ok ? {} : { error: back.error }) };
+      const what = confirm.ok ? `design amendment ${confirm.why}` : `design amendment ${amendment} could not be re-read (${confirm.error})`;
+      console.warn(`[report_completion] REFUSED ${ticket_id}: ${what} ${note} - provisional securityReview stamp ${back.ok ? "removed" : `NOT removed (${back.error}); it stays PROVISIONAL, which both twins refuse`}, ${posted ? "residual findings already posted (marker-deduped)" : "no residual findings posted"}, ticket not transitioned`);
+      const refusal = confirm.ok
+        ? designAmendmentRefusal({ ticketId: ticket_id, verdict: review.verdict, open: { ticketId: amendment }, note: `confirmed done, then ${amendmentReread(confirm)} ${note}`, findings: countFindings(summary), recorded: true, rollback })
+        : amendmentScanRefusal({ ticketId: ticket_id, verdict: review.verdict, detail: `get_issue ${amendment} (re-confirming the design amendment is done ${detail}): ${confirm.error}`, recorded: true, rollback });
+      return posted ? { ...refusal, residualFindings } : refusal;
+    };
+    if (amendment) {
+      const confirm = await confirmDoneAtCommit({ ticketIds: [amendment] });
+      if (!confirm.ok || !confirm.done) return takeBackAdmission(confirm, { note: "after the record was written", detail: "after the record write", posted: false });
+    }
     // TEAM-5426: round 2 closes on a non-PASS verdict — the findings go onto the
     // dev lanes BEFORE the Done that releases them, so the cascade cannot dispatch
     // a dev turn ahead of its comment. Best-effort, never a refusal; a retry after
     // a failed transition re-posts nothing (the marker dedupe).
     if (review.residual) {
       residualFindings = await postResidualFindings({ ticketId: ticket_id, verdict: review.verdict, summary, artifacts, siblings: review.siblings });
+    }
+    // TEAM-6142: the FINAL confirm of the admission - after the residual posts (awaited ticket
+    // writes: a get_issue + add_comment per dev lane) and BEFORE the FINALIZE write. DL-039
+    // puts that finalize (one S3 CAS write, finalizeSecurityReview) between this read and the
+    // Done, and it has to sit there: it is the write that makes the stamp trusted, so it must
+    // follow the last status read of the amendment - a read after it would leave a trusted
+    // stamp behind whenever its take-back lost the CAS. It is the ONLY thing between this read
+    // and transitionToDone; nothing else may be awaited here (it only widens the window).
+    // Residual window: Jira status and the S3 CAS share no transaction, so an amendment
+    // reopened after this read still goes Done - see confirmDoneAtCommit. Refused here, the
+    // findings are already on the dev lanes (marker-deduped, so the next round's report does
+    // not re-post them) - `residualFindings` on the refusal says so. A finalize that loses its
+    // CAS ⇒ no Done, the record stays provisional (refused), a retryable answer; the retry
+    // re-confirms, re-posts nothing, and finalizes.
+    if (amendment) {
+      const confirm = await confirmDoneAtCommit({ ticketIds: [amendment] });
+      if (!confirm.ok || !confirm.done) return takeBackAdmission(confirm, { note: "after the residual findings were posted", detail: "after the residual findings were posted", posted: true });
+      // TEAM-6151: ONE conditional write on the provisional record's own ETag (see the brief
+      // finalize above) - a lost CAS means a newer stamp (a drain's re-mark, a revocation)
+      // stands; it is left as is and no Done is made.
+      const final = await finalizeProvisionalRecord({ key, base: recordBase, what: "securityReview", apply: finalizeSecurityReview });
+      if (!final.ok) {
+        console.error(`[report_completion] REFUSED ${ticket_id}: the design amendment re-confirmed done but the admission could not be FINALIZED on ${key} (${final.error}) - ${final.superseded ? "a newer record stands and is left as is" : "the record keeps the PROVISIONAL stamp"} (both twins refuse a provisional stamp), residual findings already posted (marker-deduped), ticket not transitioned; retry`);
+        return { ...admissionNotFinalized(ticket_id, key, final.error, { posted: true }), residualFindings };
+      }
+      recordBase = { record: final.record, etag: final.etag };
+      ownStampWritten = true;
+      // TEAM-6152: marker AND nonce off the in-memory report too (the failed-Done rewrite below serializes it).
+      finalizeSecurityReview(report);
+      console.log(`[report_completion] ${ticket_id}: design amendment ${amendment} re-confirmed done after the residual posts - securityReview admission FINALIZED`);
     }
     transition = await transitionToDone(ticket_id);
     if (transition.ok) {
@@ -1439,7 +2007,8 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     try {
       queued = await enqueueTicketWrites({
         ticketId: ticket_id, workflowId: workflow_id, agentId: agent_id, epicKey, entries: toMaterialize,
-        residual: review.residual ? { verdict: review.verdict, summary: clampBlock(summary, 6000), artifacts: clampLine(artifacts, 500) } : null,
+        // TEAM-6142: amendmentTicketId, so the drain re-confirms the amendment before its Done.
+        residual: residualOf(review, summary, artifacts),
         briefKey: mergeBriefKey(keys), reportKey: key,
         journey: { summary: summary.slice(0, 200), branch: branch || null, pr_url: pr_url || null },
       });
@@ -1477,7 +2046,7 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     status: !mayTransition ? STATUS_PENDING_FOLLOW_UPS : briefHeld ? STATUS_PENDING_BRIEF : transitionFailed ? STATUS_TRANSITION_FAILED : "complete",
     ...(mayTransition && !briefHeld && !transitionFailed ? {} : { next_action: "retry_report_completion" }),
     message: mayTransition && briefHeld
-      ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${ticket_id} was NOT transitioned to Done: its merge brief is not on the Merge Approval gate${report.briefHoldReason ? ` (${report.briefHoldReason})` : ""}, and a Done would make the gate Ready without the brief in front of the approver. Put the brief on the gate (or make the gate identifiable: one open Merge Approval ticket blocked by ${ticket_id}), then call WorkflowOutput___report_completion again with the SAME arguments, including the shared/merge-brief.md key in evidence_keys - the retry re-posts the brief (deduped) and closes the ticket once it is on the gate. If no gate can be named, comment that on the ticket and report BLOCKED - do not walk away.`
+      ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but ${ticket_id} was NOT transitioned to Done: its merge brief is not on the Merge Approval gate${report.briefHoldReason ? ` (${report.briefHoldReason})` : ""}, and a Done would make the gate Ready without the brief in front of the approver. Put the brief on the gate (or make the gate identifiable: one open Merge Approval ticket blocked by ${ticket_id}), then call WorkflowOutput___report_completion again with the SAME arguments, including the shared/merge-brief.md key in evidence_keys - the retry re-posts the brief (deduped) and closes the ticket once it is on the gate. If no gate can be named, comment that on the ticket and report BLOCKED - do not walk away. If the gate is already Done, or this run has no Merge Approval gate by its workflow def, the retry records that (briefDisposition) and closes the ticket; if the run owes a gate that is missing, create it (B7 step 5) unless the run is hub-materialized, then retry.`
       : transitionFailed
       ? `Completion for ${ticket_id} is SAVED (the record is durable and idempotent) but the ticket could NOT be transitioned to Done: ${transition.error}. Nothing downstream has been unblocked, so the run is waiting on this. Call WorkflowOutput___report_completion again with the SAME arguments - the record write is idempotent and follow-ups that already exist are skipped as already_materialized, so the retry effectively just re-attempts the transition. If it keeps failing, comment this error on the ticket and report BLOCKED - do not walk away.`
       : mayTransition
@@ -1588,17 +2157,57 @@ export function mergeBriefKey(keys) {
 }
 
 /**
- * One FIFO message per completion. The group is the run, so a follow-up lands
- * before a later ticket's Done; the dedup id is the ticket, its follow-up hashes and
- * the transition, so a re-report inside SQS's 5-minute window is one message.
+ * TEAM-6205 (A2, drain step 0) / TEAM-6217 (R3-01): the brief `briefKey` is still OWED by
+ * `record` - no drain or report has recorded an outcome for it (`briefDelivered` unset, no
+ * release). A recorded outcome (gate, off_gate with its hold, undelivered, a release) is an
+ * answer already. The ONE predicate both the drain and report_completion ask.
  */
+export function briefOwed(record, briefKey) {
+  return !!asText(briefKey) && record?.briefDelivered === undefined && !record?.briefDisposition?.release;
+}
+
+/**
+ * TEAM-6217 (R3-01): the merge brief a QUEUED record still owes, or null. report_completion
+ * entered its gate handling only on `briefPending === true` - a hold stamp the drain's stale-gate
+ * re-hold (reholdBeforeRetry) writes best-effort - so a 503'd or out-CAS'd stamp (or no drain
+ * tick at all) left a record saying ticketWrites:"queued" with no hold, and the agent's retry
+ * Doned the build with the gate To Do and no brief on it. The obligation is the record's own
+ * facts, read here without any stamp: its writes were queued (`ticketWrites:"queued"`), the
+ * brief was among them (its `evidence_keys` names the merge brief by the SAME rule the queue used,
+ * mergeBriefKey - or a part:"brief" undelivered entry names it), and nothing has recorded an
+ * outcome for it (briefOwed). A healthy run (no `ticketWrites`), a completion that names no
+ * merge brief, or a brief already delivered/released ⇒ null.
+ */
+export function queuedBriefOwed(record) {
+  if (record?.ticketWrites !== "queued") return null;
+  const key = mergeBriefKey(record.evidence_keys)
+    || (Array.isArray(record.undelivered) ? asText(record.undelivered.find((u) => u?.part === "brief" && asText(u.s3Key))?.s3Key) : null);
+  return briefOwed(record, key) ? key : null;
+}
+
+/**
+ * One FIFO message per completion. The group is the run, so a follow-up lands
+ * before a later ticket's Done; the dedup id is the ticket, its follow-up hashes, the
+ * transition and (TEAM-6158) the residual's identity - its verdict and amendment id - so
+ * a re-report inside SQS's 5-minute window is one message only when it is the SAME
+ * admission. Without the residual, a PASS re-review was collapsed onto the earlier
+ * FAIL message: the drain replayed the stale FAIL, and the agent (answered "do NOT
+ * retry") had no path to Done without a manual re-run. A PASS carries no residual.
+ * TEAM-6205 (A2): and the merge brief's key - a re-report that ADDED the brief inside the
+ * window was collapsed onto the brief-less message, so no message carried the brief at all.
+ */
+export function ticketWritesDedupId({ ticketId, entries = [], residual = null, briefKey = null }) {
+  const residualId = residual ? residualIdentity(residual) : "";
+  return createHash("sha256").update([ticketId, ...entries.map((e) => e.hash).sort(), "done", residualId, asText(briefKey)].join("|")).digest("hex");
+}
+
 async function enqueueTicketWrites({ ticketId, workflowId, agentId, epicKey, entries, residual, briefKey, reportKey, journey }) {
   const body = {
     v: 1, workflowId: workflowId || null, ticketId, agentId: agentId || null, epicKey: epicKey || null, transition: "done",
     followUps: entries, residual, brief: briefKey ? { s3Key: briefKey } : null, reportKey, journey,
     queuedAt: new Date().toISOString(),
   };
-  const dedup = createHash("sha256").update([ticketId, ...entries.map((e) => e.hash).sort(), "done"].join("|")).digest("hex");
+  const dedup = ticketWritesDedupId({ ticketId, entries, residual, briefKey });
   const r = await sqs.send(new SendMessageCommand({
     QueueUrl: TICKET_REPLAY_QUEUE_URL,
     MessageBody: JSON.stringify(body),
@@ -1627,22 +2236,134 @@ function decisionOf(body) {
  * One marker-deduped comment on one ticket: read it, skip when a comment already
  * carries `marker` (or `alsoMatches`), else run `beforePost` (if any) and post. The
  * replay's one way to say something on a ticket, so a redelivered message never says
- * it twice. `{ ok, outcome: "posted" | "already_posted", target }`, or
- * `{ ok: false, error, cause }` with `cause` the ticket tool's own error string.
+ * it twice. `{ ok, outcome: "posted" | "already_posted" | "withheld", target, issue }`,
+ * or `{ ok: false, error, cause }` with `cause` the ticket tool's own error string.
+ *
+ * TEAM-6130: `issue` is the ticket as the dedupe read saw it (normalizeIssue; null when
+ * the payload carried no key), so a caller whose decision rests on that ticket's STATUS
+ * can honour this read rather than only its comments. `beforePost(issue)` sees it too
+ * and may answer `{ ok: true, skip: <why> }` to withhold the post (`outcome: "withheld"`).
  */
 async function postMarkedComment(target, marker, comment, { alsoMatches = "", beforePost = null } = {}) {
   const read = await ticketTool("Tickets___get_issue", { ticket_id: target });
   if (!read.ok) return { ok: false, error: `get_issue ${target}: ${read.error}`, cause: read.error };
+  const issue = normalizeIssue(read.payload);
   if (commentBodiesOf(read.payload).some((c) => c.includes(marker) || (alsoMatches && c.includes(alsoMatches)))) {
-    return { ok: true, outcome: "already_posted", target };
+    return { ok: true, outcome: "already_posted", target, issue };
   }
   if (beforePost) {
-    const before = await beforePost();
+    const before = await beforePost(issue);
     if (!before.ok) return before;
+    if (before.skip) return { ok: true, outcome: "withheld", target, issue, reason: before.skip };
   }
   const posted = await ticketTool("Tickets___add_comment", { ticket_id: target, comment, body: comment });
   if (!posted.ok) return { ok: false, error: `add_comment ${target}: ${posted.error}`, cause: posted.error };
-  return { ok: true, outcome: "posted", target };
+  return { ok: true, outcome: "posted", target, issue };
+}
+
+/**
+ * TEAM-5995 (TEAM-5799 F9): what a brief hold owes when postQueuedBrief found NO open
+ * gate. `release: true` is the ONE way a hold goes without gate delivery, and only on
+ * evidence a reopen of the completing ticket cannot change: every human `Merge
+ * Approval:` gate under the epic is Done (a Done cannot make a Done gate Ready), or none
+ * exists on a complete roster and the run's effective def never gets one (gateOwed,
+ * runOwesMergeGate). Anything owed or UNKNOWN keeps the hold (fail closed, TEAM-5832).
+ */
+export function briefGateDisposition({ ticketId, epicKey, siblings, scanComplete, gateOwed }) {
+  if (!epicKey) return { release: false, kind: "no_epic", why: "the ticket's epic is unknown, so the gate roster cannot be read" };
+  if (scanComplete !== true) return { release: false, kind: "roster_incomplete", why: "the sibling roster is incomplete or unknown (list_tickets paged or failed), so a missing or settled gate cannot be told apart from an unseen one" };
+  const gates = (siblings || []).filter((s) => s.ticketId !== ticketId && /^Merge Approval:/i.test(asText(s.summary).trim()) && isHumanAssignee(s.assignee));
+  const observed = gates.map((g) => ({ ticketId: g.ticketId, status: asText(g.status) }));
+  if (gates.length > 0) {
+    if (gates.every((g) => isDoneStatus(g.status))) {
+      return { release: true, kind: "gate_settled", why: `every Merge Approval gate under ${epicKey} is Done (${observed.map((o) => `${o.ticketId}:${o.status}`).join(", ")}) - no gate can be made Ready by this Done`, observed };
+    }
+    return { release: false, kind: "gate_open", why: "an open Merge Approval gate exists but could not be identified or written", observed };
+  }
+  if (gateOwed?.owed === false) {
+    return { release: true, kind: "absent_never_gated", why: `no Merge Approval gate exists under ${epicKey} (roster complete) and this run never gets one (${gateOwed.detail})`, observed, gateOwed };
+  }
+  if (gateOwed?.owed === true) {
+    return { release: false, kind: "no_gate", why: `no Merge Approval gate exists under ${epicKey} (roster complete) but this run owes one (${gateOwed.detail}) - create ONE 'Merge Approval:' ticket (human assignee, blocked_by ${ticketId}; operator B7 step 5) unless the run is hub-materialized, then retry; otherwise report BLOCKED for a human to add it`, observed, gateOwed };
+  }
+  return { release: false, kind: "gate_owed_unknown", why: `no Merge Approval gate exists under ${epicKey} but whether this run owes one could not be determined (${gateOwed?.detail || "no workflow id"})`, observed, ...(gateOwed ? { gateOwed } : {}) };
+}
+
+/** A bucket JSON object: `{ ok, doc }`, `{ ok, missing: true }` on 404, else `{ ok: false, error }`. */
+async function readConfigObject(key) {
+  let text;
+  try {
+    const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: key }));
+    text = await r.Body.transformToString();
+  } catch (err) {
+    if (err?.name === "NoSuchKey" || err?.$metadata?.httpStatusCode === 404) return { ok: true, missing: true };
+    return { ok: false, error: `${key} unreadable (${err?.name || "Error"}: ${err?.message || ""})` };
+  }
+  try {
+    return { ok: true, doc: JSON.parse(text) };
+  } catch (err) {
+    return { ok: false, error: `${key} is not JSON (${err.message})` };
+  }
+}
+
+// TEAM-5995: a byte copy of lambda/orchestrator/cd-registry.mjs normalizeRepoKey (this
+// zip cannot import it); src/lib/workflow/cd-registry-mirror-parity.test.ts pins both
+// functions below to the orchestrator and src/lib/cd-registry.ts.
+function normalizeRepoKey(value) {
+  let s = String(value ?? "").trim();
+  if (!s) return null;
+  s = s.replace(/^git@[^:]+:/, "").replace(/^[a-z]+:\/\/[^/]+\//i, "");
+  s = s.replace(/^\/+|\/+$/g, "").replace(/\.git$/i, "").replace(/\/+$/, "");
+  const parts = s.split("/");
+  if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
+  return `${parts[0]}/${parts[1]}`.toLowerCase();
+}
+
+/** findCdEntry(parseCdRegistry(doc), repoConfig) !== null, on the raw registry document. */
+function cdRegistryListsRepo(doc, repoConfig) {
+  const key = normalizeRepoKey(repoConfig?.repos?.[0]?.url);
+  if (!key) return false;
+  const list = Array.isArray(doc?.repos) ? doc.repos : [];
+  return list.some((e) => normalizeRepoKey(typeof e === "string" ? e : e?.repo) === key);
+}
+
+/**
+ * TEAM-5995: does this run's EFFECTIVE def declare a Merge Approval gate?
+ * `{ owed: true | false | "unknown", detail, workflowDefId?, cdRegistered? }`. Reads the
+ * workflows row (workflowDefId, repoConfig), the def's reviewGates (and its frameworks')
+ * in config/workflows.json, and for a ship-phase gate config/cd-registry.json: an
+ * unregistered repo is a handoff run, whose ship gate the orchestrator strips
+ * (lambda/orchestrator/cd-registry.mjs). Every read it cannot make is "unknown".
+ */
+export async function runOwesMergeGate(workflowId) {
+  const unknown = (detail, extra = {}) => ({ owed: "unknown", detail, ...extra });
+  if (!workflowId) return unknown("no workflow id");
+  if (!WORKFLOWS_TABLE) return unknown("WORKFLOWS_TABLE is not set");
+  const row = await readWorkflowRow(workflowId, "workflowDefId, repoConfig");
+  if (!row.ok) return unknown(`workflows row ${workflowId} unreadable (${row.error})`);
+  if (!row.item) return unknown(`no workflows row for ${workflowId}`);
+  const workflowDefId = asText(row.item.workflowDefId).trim();
+  if (!workflowDefId) return unknown(`workflows row ${workflowId} names no workflowDefId`);
+  const cfg = await readConfigObject("config/workflows.json");
+  if (!cfg.ok) return unknown(cfg.error, { workflowDefId });
+  if (cfg.missing) return unknown("config/workflows.json does not exist", { workflowDefId });
+  const def = Array.isArray(cfg.doc?.workflows) ? cfg.doc.workflows.find((w) => w?.id === workflowDefId) : null;
+  if (!def) return unknown(`def ${workflowDefId} is not in config/workflows.json`, { workflowDefId });
+  const frameworks = def.frameworks && typeof def.frameworks === "object" ? Object.values(def.frameworks) : [];
+  const gates = [def, ...frameworks].flatMap((d) => (Array.isArray(d?.reviewGates) ? d.reviewGates : []))
+    .filter((g) => /^merge approval$/i.test(asText(g?.name).trim()));
+  if (gates.length === 0) return { owed: false, detail: `def ${workflowDefId} declares no Merge Approval gate`, workflowDefId };
+  const early = gates.find((g) => asText(g.afterPhase).trim() !== "ship");
+  if (early) return { owed: true, detail: `def ${workflowDefId}: Merge Approval after ${asText(early.afterPhase) || "an unnamed phase"}`, workflowDefId };
+  const reg = await readConfigObject("config/cd-registry.json");
+  if (!reg.ok) return unknown(reg.error, { workflowDefId });
+  if (reg.missing) return { owed: false, detail: `def ${workflowDefId}: no config/cd-registry.json, so every repo is a handoff - the ship gate is stripped`, workflowDefId, cdRegistered: false };
+  if (!reg.doc || typeof reg.doc !== "object" || !Array.isArray(reg.doc.repos)) return unknown("config/cd-registry.json has no repos array", { workflowDefId });
+  const repo = asText(row.item.repoConfig?.repos?.[0]?.url) || "no repo";
+  if (cdRegistryListsRepo(reg.doc, row.item.repoConfig)) {
+    return { owed: true, detail: `def ${workflowDefId}: CD-registered repo ${repo}, Merge Approval after ship`, workflowDefId, cdRegistered: true };
+  }
+  return { owed: false, detail: `def ${workflowDefId}: repo ${repo} is not in the CD registry, a handoff - the ship gate is stripped`, workflowDefId, cdRegistered: false };
 }
 
 /**
@@ -1671,7 +2392,7 @@ async function postMarkedComment(target, marker, comment, { alsoMatches = "", be
  * would take it; the missing object is then said on the ticket (missingBriefNotice).
  * `{ ok: false }` on anything a retry can change - the brief lands before the Done.
  */
-async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings }) {
+async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings, scanComplete, workflowId, gatesConfirmed = false }) {
   let body;
   try {
     const r = await s3.send(new GetObjectCommand({ Bucket: BUCKET, Key: s3Key }));
@@ -1691,6 +2412,7 @@ async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings }) {
   const gate = gates.find((g) => (g.blockedBy || []).includes(ticketId))
     || (gates.length === 1 && !(gates[0].blockedBy || []).length ? gates[0] : null);
   let why;
+  let disposition = null;
   if (gate) {
     const r = await postMarkedComment(gate.ticketId, marker, `${marker}\n\n${body}`, {
       alsoMatches: decision,
@@ -1702,10 +2424,56 @@ async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings }) {
     if (r.ok) return { ok: true, outcome: r.outcome, gate: gate.ticketId };
     if (!isPermanentTicketRefusal(r.cause)) return r;
     why = `the gate ${gate.ticketId} refused it (${r.error})`;
+  } else if (gates.length === 0) {
+    // TEAM-5995: no OPEN gate. Settled (every gate Done) or verified never-gated releases
+    // the hold; owed, unknown or an unreadable roster keeps it (briefGateDisposition).
+    const anyGate = siblings.some((s) => s.ticketId !== ticketId && /^Merge Approval:/i.test(asText(s.summary).trim()) && isHumanAssignee(s.assignee));
+    const gateOwed = epicKey && scanComplete === true && !anyGate ? await runOwesMergeGate(workflowId) : null;
+    disposition = briefGateDisposition({ ticketId, epicKey, siblings, scanComplete, gateOwed });
+    // TEAM-6124: "every gate is Done" was read off list_tickets — an eventually consistent
+    // search (Jira) / GSI (DynamoDB) that can still show a reopened gate Done. Before a
+    // release on it, each gate's status is confirmed by its own get_issue: one that is not
+    // Done (or names this ticket now) goes back through the gate choice above, once; one
+    // that cannot be read keeps the hold (permanent) or retries (anything else).
+    if (disposition.release && disposition.kind === "gate_settled" && !gatesConfirmed) {
+      const fresh = new Map();
+      for (const o of disposition.observed) {
+        const r = await readTicketDone(o.ticketId);
+        if (r.ok) { fresh.set(o.ticketId, r.issue); continue; }
+        if (!isPermanentTicketRefusal(r.error)) return { ok: false, error: `get_issue ${o.ticketId} (confirming the Merge Approval gate is Done): ${r.error}` };
+        disposition = { release: false, kind: "gate_unconfirmed", why: `the Merge Approval gate ${o.ticketId} could not be read to confirm it is Done (${r.error})`, observed: disposition.observed };
+        break;
+      }
+      if (disposition.release) {
+        const refreshed = siblings.map((s) => (fresh.has(s.ticketId) ? { ...s, status: fresh.get(s.ticketId).status, blockedBy: fresh.get(s.ticketId).blockedBy } : s));
+        if ([...fresh.values()].some((i) => !isDoneStatus(i.status))) {
+          console.warn(`[ticket-replay] ${ticketId}: list_tickets showed every Merge Approval gate Done but get_issue reads ${[...fresh.values()].filter((i) => !isDoneStatus(i.status)).map((i) => `${i.ticketId}:${i.status}`).join(", ")} - no release, re-choosing the gate`);
+          return postQueuedBrief({ ticketId, epicKey, s3Key, siblings: refreshed, scanComplete, workflowId, gatesConfirmed: true });
+        }
+        disposition = briefGateDisposition({ ticketId, epicKey, siblings: refreshed, scanComplete, gateOwed });
+      }
+    }
+    why = disposition.why;
   } else {
-    why = gates.length === 0 ? "no open Merge Approval gate" : `${gates.length} open Merge Approval gates (${gates.map((g) => g.ticketId).join(", ")}) and none is blocked by ${ticketId}`;
+    why = `${gates.length} open Merge Approval gates (${gates.map((g) => g.ticketId).join(", ")}) and none is blocked by ${ticketId}`;
   }
 
+  if (disposition?.release) {
+    const resolved = await postResolvedBrief({ ticketId, epicKey, s3Key, body, marker, decision, disposition });
+    if (!resolved.ok || resolved.outcome !== "gate_reopened") return resolved;
+    // TEAM-6130: a gate whose own audit-time get_issue reads open is not settled. Once,
+    // the gate choice above re-runs on the fresh statuses (the brief goes on the reopened
+    // gate, or the off-gate hold applies); a second time the hold stands (gate_reopened).
+    const fresh = new Map(resolved.reopened.map((r) => [r.ticketId, r]));
+    const refreshed = siblings.map((s) => (fresh.has(s.ticketId) ? { ...s, status: fresh.get(s.ticketId).status, blockedBy: fresh.get(s.ticketId).blockedBy ?? s.blockedBy } : s));
+    const readOpen = resolved.reopened.map((r) => `${r.ticketId}:${r.status}`).join(", ");
+    if (!gatesConfirmed) {
+      console.warn(`[ticket-replay] ${ticketId}: every Merge Approval gate was confirmed Done but the release audit's own get_issue reads ${readOpen} - no release, re-choosing the gate`);
+      return postQueuedBrief({ ticketId, epicKey, s3Key, siblings: refreshed, scanComplete, workflowId, gatesConfirmed: true });
+    }
+    disposition = { release: false, kind: "gate_reopened", why: `the Merge Approval gate ${readOpen} was reopened while the release was being audited`, observed: disposition.observed };
+    why = disposition.why;
+  }
   console.error(`[ticket-replay] ${ticketId}: brief ${s3Key} cannot go on a gate (${why}) - posting it on the ticket and its epic instead`);
   const comment = `${marker}\n\nMERGE BRIEF NOT ON THE GATE - the Merge Approval gate could not be identified or refused the brief, so it is NOT in front of the approver.\n\nMerge brief for ${ticketId} (s3://${BUCKET}/${s3Key}). It could not be posted on the Merge Approval gate: ${why}. A human must put it in front of the approver.\n\n${body}`;
   const targets = [];
@@ -1718,6 +2486,61 @@ async function postQueuedBrief({ ticketId, epicKey, s3Key, siblings }) {
   }
   if (targets.length === 0) return { ok: true, outcome: "undelivered", reason: `${why}; no fallback target took it (${refused.join("; ") || "no ticket or epic"})` };
   return { ok: true, outcome: "off_gate", targets, reason: why };
+}
+
+/**
+ * TEAM-5995: no gate needs the brief (`disposition.release`). The brief still goes on the
+ * ticket and its epic (same marker, so an earlier off-gate copy dedupes it), then the
+ * `[brief-resolved:<ticket>]` audit on the ticket, the epic and every gate observed, so
+ * the release is on the board before the record says it. A retryable failure is
+ * `{ ok: false }`: nothing is recorded and the hold stands this call. A permanent
+ * refusal is noted on the disposition and the release proceeds.
+ */
+async function postResolvedBrief({ ticketId, epicKey, s3Key, body, marker, decision, disposition }) {
+  const { why } = disposition;
+  console.log(`[ticket-replay] ${ticketId}: brief ${s3Key} needs no gate (${disposition.kind}: ${why}) - posting it on the ticket and its epic and releasing the hold`);
+  const comment = `${marker}\n\nMERGE BRIEF - no gate needs it: ${why}.\n\nMerge brief for ${ticketId} (s3://${BUCKET}/${s3Key}).\n\n${body}`;
+  const targets = [];
+  const refused = [];
+  for (const target of [ticketId, epicKey].filter(Boolean)) {
+    const r = await postMarkedComment(target, marker, comment, { alsoMatches: decision });
+    if (r.ok) targets.push(target);
+    else if (isPermanentTicketRefusal(r.cause)) refused.push(`${target}: ${r.error}`);
+    else return r;
+  }
+  const auditMarker = `[brief-resolved:${ticketId}]`;
+  const observed = disposition.observed.map((o) => `${o.ticketId}:${o.status}`).join(", ") || "none";
+  // TEAM-6130: the gates FIRST. Each audit's own get_issue is the freshest read of the gate
+  // this release rests on, so a gate that reads open withholds its audit and ends the
+  // release before the ticket/epic audits say RELEASED; every gate's status is returned
+  // (`gateReads`) for the commit-time confirm, not just its comments.
+  const gateIds = disposition.observed.map((o) => o.ticketId);
+  const gateReads = new Map();
+  const reopened = [];
+  const audit = `${auditMarker}\n\nThe merge-brief hold on ${ticketId} is RELEASED without gate delivery (${disposition.kind}): ${why}. Merge Approval gates observed: ${observed}.${disposition.gateOwed ? ` Gate owed: ${disposition.gateOwed.owed} (${disposition.gateOwed.detail}).` : ""} Recorded as briefDisposition on s3://${BUCKET}/completions/${ticketId}.json. The hub does NOT re-deliver a released brief (a re-run of WorkflowOutput___report_completion leaves it as is): if a Merge Approval gate is reopened or added for this run, a human must post the brief on it - it is at s3://${BUCKET}/${s3Key}${targets.length > 0 ? `, and a copy is in a comment on ${targets.join(" and ")}` : ""}.`;
+  const seen = new Set();
+  for (const target of [...gateIds, ticketId, epicKey].filter(Boolean)) {
+    if (seen.has(target)) continue;
+    seen.add(target);
+    const isGate = gateIds.includes(target);
+    const r = await postMarkedComment(target, auditMarker, audit, isGate ? {
+      beforePost: async (issue) => (isDoneStatus(issue?.status) ? { ok: true } : { ok: true, skip: `${target} reads ${asText(issue?.status) || "unknown"} on get_issue` }),
+    } : {});
+    if (r.ok && isGate) {
+      if (!r.issue) return { ok: false, error: `get_issue ${target} (confirming the Merge Approval gate is Done): the ticket payload carried no ticket key` };
+      gateReads.set(target, asText(r.issue.status));
+      if (!isDoneStatus(r.issue.status)) {
+        reopened.push({ ticketId: target, status: asText(r.issue.status), blockedBy: r.issue.blockedBy });
+        break;
+      }
+    }
+    if (r.ok) continue;
+    if (!isPermanentTicketRefusal(r.cause)) return { ok: false, error: `brief-resolved notice on ${target} not posted (${r.error})` };
+    refused.push(`${target}: ${r.error}`);
+  }
+  if (reopened.length > 0) return { ok: true, outcome: "gate_reopened", reopened, gateReads };
+  const released = { ...disposition, ...(refused.length > 0 ? { notice: { refused } } : {}) };
+  return { ok: true, outcome: "off_gate", targets, reason: why, disposition: released, gateReads };
 }
 
 /** The missing-brief notice: a brief the report named is gone, so a human must post it. */
@@ -1919,6 +2742,25 @@ export async function drainCompletion(msg) {
       console.error(`[ticket-replay] ${ticketId}: no readable ticket or known epic to post the drop notice on - the metric, record and journey event carry it`);
     }
     const notice = notices[0] || null;
+    // TEAM-6164 (F2): a gate_settled release this drop would persist (a follow-ups hold whose
+    // brief no gate needs) rests on the gate read step 5 took BEFORE the notices above were
+    // awaited (deferHoldOnDoneIntent, the ticket's and the epic's drop notice); the record's
+    // ETag cannot see a gate-ticket change in between. Re-ask now, the last await before the
+    // CAS. Open or unreadable ⇒ nothing stamped, the message comes back (the notices are
+    // marker-deduped) and the next tick re-chooses the gate - step 5's own answer. Without it
+    // the stamp said briefPending:false with the gate To Do, and the agent's retry (which
+    // re-reads the gate only on briefPending:true) Doned the build with no brief on the gate.
+    const stale = await settledGatesRetryReason(extra?.briefDisposition, { when: "before the drop stamp" });
+    // TEAM-6205 (R2-02): and the obligation is STATED before the message comes back. A retry with
+    // nothing written left the record saying ticketWrites:"queued" with no briefPending, and the
+    // agent's immediate report_completion retry (gate handling only on briefPending:true) Doned
+    // the build with the gate To Do and no brief on it. The stamp is this drop's follow-ups part
+    // plus the off-gate brief hold - no release, no replayDropped, still queued (reholdBeforeRetry);
+    // deferHoldOnDoneIntent already ran above for this drop's hold.
+    if (stale) {
+      const { briefDisposition: _release, ...fields } = extra || {};
+      return retry(await reholdBeforeRetry(stale, { s3Key: msg.brief?.s3Key, targets: extra?.briefTargets, fields, deferred: true }));
+    }
     // TEAM-6057: the stamp below spreads `extra` over the prior record, which cannot drop
     // a stale `briefTargets`/`briefFallbackReason` beside an undelivered brief.
     if (rec.record && extra?.briefDelivered === "undelivered") clearUndeliveredBriefTargets(rec.record);
@@ -1926,10 +2768,20 @@ export async function drainCompletion(msg) {
       // TEAM-5941: a fresh Done-intent rides along (the spread keeps it); a stale one — the
       // twin that wrote it is gone — comes off with this stamp.
       const stamp = { ...rec.record, ...(extra || {}) };
+      // TEAM-6124: the spread let this drain's undelivered[] replace the record's.
+      const merged = mergeUndelivered(rec.record.undelivered, extra?.undelivered, delivered);
+      if (merged) stamp.undelivered = merged;
+      else delete stamp.undelivered;
       // TEAM-6029: a follow-ups-only hold whose brief this drain put on the gate clears
       // the brief hold as step 6 does; the spread alone carried the old `true` and its
       // stale `part:"brief"` entry over the delivery.
       if (extra?.briefDelivered === "gate") clearBriefHoldOnGate(stamp);
+      // TEAM-6097: and one whose brief no gate needs (a released disposition) clears it
+      // the same way — the spread alone carried `briefPending:true`, the `part:"brief"`
+      // entry and the old briefFallbackReason over the release. Any other brief outcome
+      // supersedes an earlier release.
+      else if (extra?.briefDisposition?.release) clearBriefHoldOnRelease(stamp, extra.briefDisposition);
+      else if (extra?.briefDelivered) delete stamp.briefDisposition;
       const stamped = await putRecordIfUnchanged(reportKey, stripStaleDoneIntent({ ...stamp, ticketWrites: "dropped", replayDropped: { step, error, notice, ...(notices.length > 1 ? { notices } : {}), at: new Date().toISOString() } }), recordEtag);
       // TEAM-5830: a record a re-run rewrote since step 0 is not overwritten with the
       // older copy; the message comes back and the next tick decides on the new record
@@ -1958,13 +2810,50 @@ export async function drainCompletion(msg) {
     return { outcome: "dropped", reason: `${step}: ${error}`, permanent: true, notice };
   };
   const undelivered = [];
+  // TEAM-6124: the undelivered[] keys this drain DID deliver (a redelivered message
+  // re-posts its parts), so mergeUndelivered takes their earlier entries off.
+  const delivered = [];
+  // TEAM-6205 (R2-02): the ONE write a stale-gate retry makes - the off-gate brief hold on the
+  // record (reholdBriefOffGate, step 6's own re-hold), with `fields` (a drop's follow-ups part)
+  // merged first - so a retry answered here leaves the obligation STATED and the agent's
+  // report_completion retry re-chooses the gate instead of Doning brief-less. Behind the same
+  // Done-intent fence drop() and the record write defer on (`deferred`: the caller already did).
+  // Returns the retry reason to log; a lost CAS or a refused PUT changes nothing a reader trusts
+  // (the message comes back and the next tick re-stamps), so it is only said. TEAM-6217 (R3-01):
+  // this stamp is belt-and-braces, not load-bearing - report_completion derives the obligation
+  // from the queued record itself (queuedBriefOwed), so its retry delivers or holds whether or
+  // not this PUT landed. A failed PUT still answers retry: that is the only answer that keeps
+  // the message (and the brief) for the drain.
+  const reholdBeforeRetry = async (reason, { s3Key, targets = [], fields = {}, deferred = false } = {}) => {
+    if (!rec.record || !asText(s3Key)) return reason;
+    if (!deferred) {
+      const inFlight = await deferHoldOnDoneIntent({ current: rec.record, holdWritten: rec.record.briefPending !== true, ticketId, openSeen: !alreadyDone });
+      if (inFlight) return `${reason}; ${ticketId} has a Done in flight (doneIntent ${inFlight.at}), so the off-gate brief hold is not stamped - the next tick decides`;
+    }
+    const { undelivered: fresh, ...rest } = fields;
+    const base = { ...rec.record, ...rest };
+    const merged = mergeUndelivered(rec.record.undelivered, fresh, delivered);
+    if (merged) base.undelivered = merged;
+    else delete base.undelivered;
+    const back = await reholdBriefOffGate({ reportKey, record: base, etag: recordEtag, s3Key, reason, targets: Array.isArray(targets) ? targets : [] });
+    return back.ok ? `${reason}; the off-gate brief hold is stamped on ${reportKey} (briefPending:true)`
+      : `${reason}; the off-gate brief hold could NOT be stamped on ${reportKey} (${back.error}) - the next tick re-stamps it`;
+  };
 
   // 0. The record says whether these writes already landed (a second tick, a duplicate
   //    message). A record that is missing still gets its writes; one S3 cannot read is a retry.
   rec = await readRecord(reportKey);
   if (rec.error) return retry(`record ${reportKey} unreadable (${rec.error})`);
   recordEtag = rec.etag;
-  if (rec.record?.ticketWrites === "applied") return { outcome: "dropped", reason: "already applied" };
+  // TEAM-6205 (A2): unless THIS message carries a brief NO drain or report has ever recorded an
+  // outcome for (`briefDelivered` unset). A brief-less message that applied first (the agent's
+  // re-report added the brief later, its own message) left the brief unattempted, and dropping
+  // its message here lost it: steps 1-6 deliver it on a ticket already Done exactly as a
+  // redelivery does. A recorded outcome (gate, off_gate with its hold, undelivered, a release)
+  // is a drain's or a re-run's answer already; a redelivery of that message stays a no-op.
+  // TEAM-6217 (R3-01): through the one predicate report_completion's queuedBriefOwed shares.
+  const owed = briefOwed(rec.record, msg.brief?.s3Key);
+  if (rec.record?.ticketWrites === "applied" && !owed) return { outcome: "dropped", reason: "already applied" };
 
   // 1. The ticket.
   const read = await ticketTool("Tickets___get_issue", { ticket_id: ticketId });
@@ -1973,10 +2862,13 @@ export async function drainCompletion(msg) {
   if (!issue) return retry(`get_issue: ${read.error || "the ticket payload carried no ticket key"}`);
   alreadyDone = isDoneStatus(issue.status);
   const epicKey = issue.parentKey || asText(msg.epicKey) || null;
+  // TEAM-6205 (R2-03): the residual findings this replay owes the dev lanes, keyed on the SAME
+  // admission steps 6-7 act on (drainAdmission) - the record's, with the record's own text.
+  const current = currentResidual(rec.record, msg, reportKey);
 
   // 2. The follow-ups, through report_completion's own create-once path.
   const entries = Array.isArray(msg.followUps) ? msg.followUps : [];
-  const scan = entries.length > 0 || msg.brief || msg.residual
+  const scan = entries.length > 0 || msg.brief || current.residual || current.missingText
     ? await loadSiblings(epicKey) : { ok: true, siblings: [], complete: true, error: null };
   if (!scan.ok && isPermanentTicketRefusal(scan.error)) return drop("list_tickets", scan.error);
   if (!scan.ok) return retry(`list_tickets under ${epicKey}: ${scan.error}`);
@@ -1996,6 +2888,11 @@ export async function drainCompletion(msg) {
       await postUnfiledNotices({ failed: materialized.failed, entries, ticketId, epicKey, sourcePayload: read.payload, priorPosted: prior.posted });
     }
   }
+  // TEAM-6164 (F1 sibling): the record's unfiled follow-ups this message does not carry. They
+  // keep `followUpsPending:true` on every write below, and a message with no hold of its own
+  // is superseded before step 6 (it cannot file them and must not Done over them).
+  // TEAM-6205 (R2-01): and they ride in the breakdown every write below persists (mergeRecordFollowUps).
+  const { unresolved, breakdown, stillUnfiled } = mergeRecordFollowUps(rec.record, materialized, entries);
   // What holds the ticket open (the Done is withheld and the message is a surfaced
   // drop), decided after steps 4-5 so the brief and residual findings still land.
   const holds = [];
@@ -2007,7 +2904,7 @@ export async function drainCompletion(msg) {
   //    Steps 3-5 dedupe on their markers, so they run even on a ticket already Done.
   let brief = null;
   if (msg.brief?.s3Key) {
-    brief = await postQueuedBrief({ ticketId, epicKey, s3Key: msg.brief.s3Key, siblings: scan.siblings });
+    brief = await postQueuedBrief({ ticketId, epicKey, s3Key: msg.brief.s3Key, siblings: scan.siblings, scanComplete: scan.complete, workflowId });
     if (!brief.ok) return retry(brief.error);
     if (brief.outcome === "undelivered") {
       undelivered.push({ part: "brief", s3Key: msg.brief.s3Key, reason: brief.reason });
@@ -2015,7 +2912,9 @@ export async function drainCompletion(msg) {
       if (!notice.ok && !isPermanentTicketRefusal(notice.cause)) return retry(`missing-brief notice not posted (${notice.error})`);
     }
     // Off the gate is NOT delivered: it is in undelivered[] too, naming where it was put.
-    if (brief.outcome === "off_gate") undelivered.push({ part: "brief", s3Key: msg.brief.s3Key, reason: `not on the gate: ${brief.reason}`, postedOn: brief.targets });
+    // TEAM-6097: a release (no gate needs it) is not undelivered — pushing it here would
+    // overwrite the record's other undelivered parts in step 6, then be pruned anyway.
+    if (brief.outcome === "off_gate" && !brief.disposition?.release) undelivered.push({ part: "brief", s3Key: msg.brief.s3Key, reason: `not on the gate: ${brief.reason}`, postedOn: brief.targets });
     // TEAM-5940: the step-1 snapshot is stale behind the brief's provider writes above
     // (the gate write, the off-gate fallback comments, the missing-brief notice). Only a
     // snapshot that read Done can suppress the hold below, release it, or skip the Done
@@ -2030,14 +2929,19 @@ export async function drainCompletion(msg) {
     // A Done would make the gate Ready without its brief in front of the approver, so
     // an undelivered brief holds the ticket open. (A ticket a human already closed
     // has released the gate anyway: the brief is only recorded undelivered.)
-    if ((brief.outcome === "off_gate" || brief.outcome === "undelivered") && !alreadyDone) {
+    // TEAM-5995: nor does one no gate needs (brief.disposition.release, audited).
+    if ((brief.outcome === "off_gate" || brief.outcome === "undelivered") && !alreadyDone && !brief.disposition?.release) {
       holds.push({ step: "brief", error: `merge brief ${msg.brief.s3Key} is not on the Merge Approval gate (${brief.outcome === "off_gate" ? `posted on ${brief.targets.join(", ")} instead: ${brief.reason}` : brief.reason})` });
     }
   }
   // Where the brief went, said on the record and the journey event: the gate, off the
   // gate (the ticket and its epic, still undelivered), or nowhere (undelivered[] says why).
   const briefDelivery = !brief ? null
-    : brief.outcome === "off_gate" ? { briefDelivered: "off_gate", briefTargets: brief.targets, briefFallbackReason: brief.reason }
+    // TEAM-6097: a release (no gate needs the brief) carries no briefFallbackReason —
+    // its reason is briefDisposition.why, and clearBriefHoldOnRelease prunes a stale one.
+    : brief.outcome === "off_gate" ? (brief.disposition?.release
+      ? { briefDelivered: "off_gate", briefTargets: brief.targets, briefDisposition: { ...brief.disposition, at: new Date().toISOString(), by: "drain" } }
+      : { briefDelivered: "off_gate", briefTargets: brief.targets, briefFallbackReason: brief.reason })
       : brief.outcome === "undelivered" ? { briefDelivered: "undelivered" }
         : { briefDelivered: "gate", briefTargets: [brief.gate] };
 
@@ -2053,7 +2957,7 @@ export async function drainCompletion(msg) {
   // never reaches a twin at all). Kept, the hold costs a Done ticket nothing — no
   // reader acts on it until a NEW Done is attempted — and on a reopened ticket it is
   // exactly what makes the twins refuse Done until the brief is delivered.
-  const doneOverHold = alreadyDone && rec.record?.briefPending === true && !!brief && !brief.gate;
+  const doneOverHold = alreadyDone && rec.record?.briefPending === true && !!brief && !brief.gate && !brief.disposition?.release;
   if (doneOverHold) {
     const marker = `[brief-hold-released:${ticketId}]`;
     for (const target of [ticketId, ...(epicKey && epicKey !== ticketId ? [epicKey] : [])]) {
@@ -2064,22 +2968,57 @@ export async function drainCompletion(msg) {
   }
 
   // 5. Residual security findings, before the Done that releases the dev lanes.
-  if (msg.residual) {
-    const out = await postResidualFindings({ ticketId, ...msg.residual, siblings: scan.siblings });
+  //    TEAM-6205 (R2-03): the CURRENT admission's findings (currentResidual) - the record's own
+  //    text when its stamp is the admission the Done below rests on, never a stale message's.
+  if (current.residual) {
+    const out = await postResidualFindings({ ticketId, ...current.residual, siblings: scan.siblings });
     if (out.failed.some((f) => !isPermanentTicketRefusal(f.error))) return retry(`residual findings not posted on ${out.failed.map((f) => f.ticketId).join(", ")}`);
     for (const f of out.failed) undelivered.push({ part: "residual_findings", ticketId: f.ticketId, reason: f.error });
+    for (const id of [...out.posted, ...out.skipped]) delivered.push(undeliveredKey({ part: "residual_findings", ticketId: id }));
+  } else if (current.missingText && !alreadyDone) {
+    // TEAM-6217 (R3-03): the findings are owed BEFORE the Done releases the dev lanes, and nothing
+    // here can produce them - a surfaced drop (notice, stamp, ticket left open), never a Done with
+    // zero findings. The admission's own queued message behind this one (its residual is the same
+    // admission), or a report_completion re-run (which writes `residual` now), delivers and Dones.
+    return drop("residual_findings", current.missingText, { epicKey });
+  } else if (current.missingText) {
+    console.error(`[ticket-replay] ${ticketId}: residual findings NOT posted - ${current.missingText}`);
+    for (const t of scan.siblings) {
+      if (t.ticketId !== ticketId && (t.blockedBy || []).includes(ticketId)) undelivered.push({ part: "residual_findings", ticketId: t.ticketId, reason: current.missingText });
+    }
+  }
+  // TEAM-6130: a gate_settled release rests on the gates' status, and the two commits below
+  // (drop()'s stamp on a follow-ups hold, step 6's write) make it durable. Re-ask immediately
+  // before either: a gate that read open at audit time or reads open now means no release
+  // this tick — the message comes back, and the next tick re-chooses the gate on the board
+  // as it is then (the brief and audit comments are marker-deduped, so nothing posts twice).
+  const settledGates = brief?.disposition?.release && brief.disposition.kind === "gate_settled"
+    ? brief.disposition.observed.map((o) => o.ticketId) : null;
+  // TEAM-6142: with no record this is the FINAL gate confirm (step 6 is skipped); nothing
+  // is awaited between it and step 7's transitionToDone. Residual window: Jira status and
+  // the record's S3 CAS share no transaction, so a gate reopened after this read still
+  // goes Done - see confirmDoneAtCommit.
+  // TEAM-6164 (F2): through the one helper drop() uses for the same re-ask before ITS stamp.
+  if (settledGates) {
+    const stale = await settledGatesRetryReason(brief.disposition, { earlier: brief.gateReads, when: "before recording the release" });
+    // TEAM-6205 (R2-02): the obligation is STATED on the record before the message comes back
+    // (see reholdBeforeRetry) - here nothing has deferred on the Done-intent fence yet, so it does.
+    if (stale) return retry(await reholdBeforeRetry(stale, { s3Key: msg.brief.s3Key, targets: brief.targets }));
   }
   if (holds.length > 0) {
     // Round 5 P2: the hold stamps what the follow-ups really are now, so a brief-only
     // hold (every follow-up filed) does not leave the twins' Done guard refusing the
     // human who places the brief and closes the ticket.
-    const stillUnfiled = materialized.failed.length > 0;
+    // TEAM-6164: or what the record says is unfiled and this message did not resolve.
+    // TEAM-6205 (R2-01): and the breakdown it stamps carries those rows (mergeRecordFollowUps),
+    // never this message's rows alone over the record's.
     return drop(holds.map((h) => h.step).join("+"), holds.map((h) => h.error).join("; "), {
       epicKey,
       record: {
         followUpsPending: stillUnfiled, status: stillUnfiled ? STATUS_PENDING_FOLLOW_UPS : "complete",
-        ...(entries.length > 0 ? { followUpsMaterialized: materialized } : {}),
-        ...(briefDelivery ? { ...briefDelivery, ...(holds.some((h) => h.step === "brief") ? { briefPending: true } : {}) } : {}),
+        ...(entries.length > 0 || unresolved.length > 0 ? { followUpsMaterialized: breakdown } : {}),
+        // TEAM-5995: a stamped hold drops a released disposition (it ⇒ briefPending false).
+        ...(briefDelivery ? { ...briefDelivery, ...(holds.some((h) => h.step === "brief") ? { briefPending: true, briefDisposition: undefined } : {}) } : {}),
         // TEAM-5958: `{...rec.record, ...extra}` keeps a brief hold a Done landed over
         // (doneOverHold) — the brief is still off the gate, so the hold stays true.
         ...(undelivered.length > 0 ? { undelivered } : {}),
@@ -2087,13 +3026,50 @@ export async function drainCompletion(msg) {
     });
   }
 
+  // TEAM-6152: the admission a residual-findings replay acts on - re-marks (step 6, drop()),
+  // re-confirms and finalizes (step 7) - is the RECORD's: its stamp's amendmentTicketId, the
+  // admission the twins' guard will honour. The message's id is the fallback for a record whose
+  // stamp names none (or carries no re-markable stamp at all). A re-review inside the SQS dedup
+  // window is deduped onto this message, so the record's stamp can be a NEWER admission on
+  // another amendment than the one this message was queued with; confirming the message's and
+  // finalizing the record's was a Done on an amendment nobody re-read.
+  // TEAM-6164 (F1): and whether there IS an admission to act on is the record's question too,
+  // not `msg.residual`'s - a residual-less PASS message drained over a record holding a newer
+  // non-PASS stamp owes that stamp the same re-mark, confirm and finalize (drainAdmission).
+  const admission = drainAdmission(rec.record, msg);
+  const residualAmendment = admission?.amendmentTicketId ?? null;
+
+  // TEAM-6164 (F1 sibling): a record whose NEWER report stamped follow-ups this message does
+  // not carry is not this message's to Done - the TEAM-6158 superseded shape: no notice, no
+  // drop stamp, no alarm (the probe deletes a `dropped` message); the brief and residual
+  // posts above are marker-deduped. The hold's own report_completion retry, or its queued
+  // message behind this one in the FIFO group, files them and closes the ticket.
+  if (unresolved.length > 0 && !alreadyDone) {
+    const reason = `superseded: ${reportKey} holds followUpsPending:true for ${unresolved.length} follow-up(s) this message does not carry (${unresolved.map((f) => f.hash || f.reason).join(", ")}) - stamped by a newer report_completion; nothing written, no Done; that report's retry or its own queued message files them and closes ${ticketId}`;
+    console.warn(`[ticket-replay] ${ticketId}: SUPERSEDED - ${reason}`);
+    return { outcome: "dropped", superseded: true, reason };
+  }
+  // TEAM-6205 (R2-03): the same shape for a message whose residual findings contradict the record's
+  // trusted PASS admission (currentResidual.stale) - decided here, before step 6 and before any
+  // amendment read, not in step 7 after one; its own follow-ups and brief (steps 2-4) still landed.
+  if (current.stale && !alreadyDone) {
+    console.warn(`[ticket-replay] ${ticketId}: SUPERSEDED - ${current.stale}`);
+    return { outcome: "dropped", superseded: true, reason: current.stale };
+  }
+
   // 6. The record, BEFORE the Done: every retryable follow-up is filed now, and the
   //    twins' Done guard refuses a record that still says followUpsPending:true.
-  const record = rec.record;
+  //    TEAM-6164: on a ticket already Done, a hold a newer report stamped for follow-ups
+  //    this message does not carry stays true (a human, or that report's retry, files them).
+  let record = rec.record;
   if (record) {
-    Object.assign(record, { status: "complete", followUpsPending: false, ticketWrites: "queued" });
-    if (entries.length > 0) record.followUpsMaterialized = materialized;
-    if (undelivered.length > 0) record.undelivered = undelivered;
+    Object.assign(record, { status: stillUnfiled ? STATUS_PENDING_FOLLOW_UPS : "complete", followUpsPending: stillUnfiled, ticketWrites: "queued" });
+    // TEAM-6205 (R2-01): the merged breakdown - never this message's rows alone over the record's.
+    if (entries.length > 0 || unresolved.length > 0) record.followUpsMaterialized = breakdown;
+    // TEAM-6124: merged onto the record's own list, as drop() does.
+    const merged = mergeUndelivered(record.undelivered, undelivered, delivered);
+    if (merged) record.undelivered = merged;
+    else delete record.undelivered;
     if (briefDelivery) Object.assign(record, briefDelivery);
     // TEAM-6057: and an undelivered brief keeps no earlier outcome's targets or reason.
     if (briefDelivery?.briefDelivered === "undelivered") clearUndeliveredBriefTargets(record);
@@ -2101,22 +3077,135 @@ export async function drainCompletion(msg) {
     // twins' Done guard below must read it as delivered. `false`, not deleted: the
     // record keeps the history that it was held.
     // TEAM-6024: and the hold's `part:"brief"` entry in undelivered[] is stale with it.
+    // TEAM-6097 (TEAM-5995): or no gate needs it (a released briefDisposition, audited
+    // by postResolvedBrief above) — the same clear, through the release twin. Any other
+    // brief outcome supersedes an earlier release, so its briefDisposition comes off.
+    // TEAM-6140 (DL-039): a gate_settled release the Done below rests on is written
+    // PROVISIONALLY (the hold stays on) and finalized only after the post-write confirm.
+    const provisionalRelease = !!settledGates && !alreadyDone;
     if (brief?.gate) clearBriefHoldOnGate(record);
+    else if (brief?.disposition?.release && provisionalRelease) holdBriefOnProvisionalRelease(record, briefDelivery.briefDisposition);
+    else if (brief?.disposition?.release) clearBriefHoldOnRelease(record, briefDelivery.briefDisposition);
+    else if (briefDelivery) delete record.briefDisposition;
     // TEAM-5958: a hold a concurrent Done landed over (doneOverHold) stays `true` — that
-    // is the ONLY clear above: gate delivery. The ticket is Done; nothing reads the hold
+    // is the ONLY clear above: gate delivery (or a verified release, TEAM-6097). The ticket is Done; nothing reads the hold
     // until a new Done is attempted, and then it is the refusal a reopen needs.
+    // TEAM-6151: a residual-findings message is a non-PASS admission the Done below rests on.
+    // Its stamp is made PROVISIONAL in this same write - whether it was never finalized (the
+    // report queued it with follow-ups unfiled) or finalized by the report_completion whose
+    // Done 503'd (a replay) - so step 7's re-confirm, its drop notice and the Done all act on
+    // a record both twins already refuse, and the finalize after the confirm is what makes it
+    // trusted again. Never on a PASS (no amendment to re-confirm; both twins would refuse it)
+    // and never on a ticket already Done (nothing to protect; a reopen refuses until a re-run).
+    // TEAM-6152: reMarkableAdmission is the one predicate (PASS, and a stamp on another
+    // amendment than the one re-confirmed below, are admissions this replay does not own).
+    // TEAM-6164 (F1): gated on the RECORD's admission (drainAdmission), so an older PASS message
+    // re-marks a newer non-PASS stamp exactly as the stamp's own message would.
+    if (admission && !alreadyDone && reMarkableAdmission(record, residualAmendment)) holdSecurityReviewProvisional(record);
     // TEAM-5941: a stale Done-intent comes off with this write; a fresh one stays.
     stripStaleDoneIntent(record);
     // TEAM-5830: conditional on the step-0 read, like drop() above.
     const restamped = await putRecordIfUnchanged(reportKey, record, recordEtag);
     if (!restamped.ok) return retry(restamped.moved ? restamped.error : `record ${reportKey} not restamped (${restamped.error})`);
     recordEtag = restamped.etag;
+    // TEAM-6130: and once more after the write, before the Done it admits — the Done is
+    // the irreversible, cascading act. TEAM-6140 (DL-039): the write above holds the release
+    // PROVISIONALLY, so this is what makes it trusted: a confirmed gate ⇒ the FINALIZE write
+    // (clearBriefHoldOnRelease, on the ETag just received), then the Done. A gate open now ⇒
+    // the off-gate hold is stamped best-effort and no Done is made - whether the stamp lands
+    // cannot change what any reader does, because the record is already refused. A finalize
+    // that loses its CAS ⇒ no Done either; the message comes back and the next tick
+    // re-chooses the gate on the record as it is then.
+    // TEAM-6142: the FINAL gate confirm. After it, before step 7's transitionToDone: the
+    // FINALIZE write (DL-039: the write that makes the release trusted must follow the last
+    // read) and step 7's amendment re-read (a security review never carries a merge brief, so
+    // in practice not both). Residual window: a gate reopened after this read still goes Done -
+    // Jira status and the S3 CAS share no transaction (see confirmDoneAtCommit).
+    if (provisionalRelease) {
+      const confirm = await confirmDoneAtCommit({ ticketIds: settledGates });
+      if (confirm.ok && confirm.done) {
+        // TEAM-6151: through the ONE finalize (the same single CAS this always was).
+        const final = await finalizeProvisionalRecord({
+          key: reportKey, base: { record, etag: recordEtag }, what: "brief",
+          apply: (rec) => { clearBriefHoldOnRelease(rec, briefDelivery.briefDisposition); delete rec.briefHoldReason; return rec; },
+        });
+        if (!final.ok) return retry(`the Merge Approval gate(s) re-confirmed Done but the release could not be FINALIZED on ${reportKey} (${final.error}); the record holds it PROVISIONALLY (briefPending:true) and no Done is made - the next tick re-chooses the gate`);
+        record = rec.record = final.record;
+        recordEtag = final.etag;
+      } else {
+        const reason = confirm.ok ? `the Merge Approval gate ${confirm.why} after the release was recorded` : `the Merge Approval gate ${confirm.ticketId} could not be re-read after the release was recorded (${confirm.error})`;
+        // TEAM-6205 (R2-02): through the one re-hold helper step 5 and drop() now share.
+        const back = await reholdBriefOffGate({ reportKey, record, etag: recordEtag, s3Key: msg.brief.s3Key, reason, targets: brief.targets });
+        if (!back.ok) console.error(`[ticket-replay] ${ticketId}: ${reason}, and the off-gate hold could not be stamped on ${reportKey} (${back.error}) - the record still holds the PROVISIONAL release (briefPending:true), which every reader refuses; no Done is made`);
+        return retry(`${reason}; the hold is ${back.ok ? "re-stamped" : `NOT re-stamped (${back.error}) but the record still holds the release provisionally (briefPending:true)`} and no Done is made - the next tick re-chooses the gate`);
+      }
+    }
   }
 
   // 7. The Done itself — skipped when the ticket already reads Done, so a replay never
   //    makes a second status change (and so never a second webhook).
   let transitioned = false;
   if (!alreadyDone) {
+    // TEAM-6142: a residual-findings message is a non-PASS security review admitted on a
+    // done design amendment, and that admission is re-asked here, the last await before
+    // the Done (the drain had no amendment read at all). The id is the message's; a
+    // message queued before TEAM-6142 has none, so it is the record's own stamp
+    // (securityReview.amendmentTicketId, the admission the twins' guard will honour).
+    // Neither (no record, or a record without the stamp): fail closed, a surfaced drop -
+    // never a Done on an admission nothing can re-read. TEAM-6151: step 6 already made the
+    // record's stamp PROVISIONAL (both twins refuse it) BEFORE this read, so a reopen (or a
+    // permanently unreadable amendment) is a surfaced drop whose notice is truthful and whose
+    // stamp is a restatement - a drop stamp that loses its CAS leaves a record every reader
+    // already refuses. Done ⇒ the ONE finalize (a single CAS on step 6's ETag) makes the stamp
+    // trusted again; a lost finalize is a retry, no Done. Transiently unreadable: retry.
+    // Residual window, as on the report path: a reopen between this read and transitionToDone
+    // still goes Done; the finalize is the only await in between.
+    // TEAM-6152: the amendment is the RECORD's stamp's first (residualAmendment, above), and the
+    // re-mark on a drop is a fresh establishment (a new nonce) of a stamp this replay owns - never
+    // of a PASS, never of an admission on another amendment.
+    // TEAM-6164 (F1): entered on the RECORD's admission (drainAdmission) - a residual-less PASS
+    // message over a record holding a non-PASS stamp re-confirms that stamp's amendment here; only
+    // a PASS on both sides (admission null) goes to the Done with no amendment read.
+    if (admission) {
+      const amendment = residualAmendment;
+      if (!amendment) return drop("amendment", "the queued residual findings name no design amendment and the record carries no securityReview.amendmentTicketId - the admission cannot be re-confirmed", { epicKey });
+      const confirm = await confirmDoneAtCommit({ ticketIds: [amendment] });
+      if (!confirm.ok) return retry(`get_issue ${amendment} (re-confirming the design amendment is done before the Done): ${confirm.error}`);
+      if (!confirm.done) {
+        // TEAM-6158: the notice says only what this drop WRITES. Three records can be here:
+        //  - a re-markable stamp (this replay's own admission): re-marked, "PROVISIONAL again";
+        //  - a trusted PASS: a NEWER admission this message does not own (a PASS re-review
+        //    whose own message is behind this one in the FIFO group, or whose agent's retry
+        //    closes the ticket). Its residual findings are superseded: nothing to re-mark,
+        //    nothing to say on the ticket, no drop stamp (`replayDropped` would ride every
+        //    later write via adoptHold) and no TicketReplayDropped alarm - the next message
+        //    Dones the ticket. The probe deletes a `dropped` message, so it never redelivers;
+        //  - no record, or no object stamp: nothing to re-mark, the ticket really is left
+        //    open, and the full drop (notice, stamp, metric) is right - but the notice must
+        //    not claim a marker that was never written.
+        if (reMarkableAdmission(rec.record, amendment)) {
+          const stamp = { securityReview: holdSecurityReviewProvisional(JSON.parse(JSON.stringify(rec.record))).securityReview };
+          return drop("amendment", `design amendment ${confirm.why} - the security review's admission is PROVISIONAL again (securityReview.provisional:true, which both ticket providers refuse); re-review the amended design and re-run WorkflowOutput___report_completion`, {
+            epicKey, record: stamp,
+          });
+        }
+        // TEAM-6205 (R2-03): normally decided BEFORE step 6 (currentResidual.stale, no amendment read);
+        // kept as the tripwire for the same shape reaching this far.
+        const recordVerdict = String(rec.record?.securityReview?.verdict || "").toUpperCase();
+        if (rec.record?.securityReview && typeof rec.record.securityReview === "object" && recordVerdict === "PASS") {
+          const reason = `superseded: ${reportKey} carries a trusted PASS securityReview admission newer than this message's ${admission.verdict} residual findings (design amendment ${confirm.why}) - nothing re-marked, no notice posted, no drop stamped; the PASS admission's own queued message or report_completion retry closes ${ticketId}`;
+          console.warn(`[ticket-replay] ${ticketId}: SUPERSEDED - ${reason}`);
+          return { outcome: "dropped", superseded: true, reason };
+        }
+        return drop("amendment", `design amendment ${confirm.why} and the completion record ${rec.record ? "carries no securityReview admission to re-mark" : "does not exist"} (nothing written); re-review the amended design and re-run WorkflowOutput___report_completion`, { epicKey });
+      }
+      if (rec.record && carriesProvisional(rec.record, "securityReview") && reMarkableAdmission(rec.record, amendment)) {
+        const final = await finalizeProvisionalRecord({ key: reportKey, base: { record: rec.record, etag: recordEtag }, what: "securityReview", apply: finalizeSecurityReview });
+        if (!final.ok) return retry(`the design amendment ${amendment} re-confirmed done but the admission could not be FINALIZED on ${reportKey} (${final.error}); the record keeps the PROVISIONAL stamp (both ticket providers refuse it) and no Done is made - the next tick re-confirms`);
+        record = rec.record = final.record;
+        recordEtag = final.etag;
+      }
+    }
     const transition = await transitionToDone(ticketId);
     // TEAM-5805: the twins' brief-hold refusal is permanent for this message too (it
     // carried no brief that could lift it), so it is a surfaced drop, not a DLQ loop.
@@ -3139,6 +4228,97 @@ async function readTicketDone(ticketId) {
   return { ok: true, done: isDoneStatus(issue.status), issue };
 }
 
+/**
+ * TEAM-6130: confirm-at-commit. Every "X is Done, so release / admit" decision in this
+ * Lambda (a gate_settled brief release; a security review's done design amendment) is
+ * re-asked here immediately before the write that makes it durable, and once more after
+ * that write before the Done transition — a strong read taken earlier and then acted on
+ * later is a race, and the completion record's ETag cannot fence a status change on
+ * ANOTHER ticket. Every status of X read in the same invocation after the first confirm
+ * (`earlier`: postResolvedBrief's audit-time get_issue reads) is honoured first.
+ *
+ * TEAM-6140 (DL-039): the write between the two confirms records the decision
+ * PROVISIONALLY (briefPending:true + briefDisposition.provisional; securityReview.provisional),
+ * a form every reader already refuses, and the post-write confirm is followed by a FINALIZE
+ * write before the Done. So a compensation after a failed post-write confirm is tidy-up only:
+ * whether it lands cannot change what the next reader does.
+ *
+ *   { ok: true, done: true, issues: Map<ticketId, issue> }
+ *   { ok: true, done: false, open: [{ ticketId, status, error?, seenAt: "audit"|"commit" }], why }
+ *     — a permanent get_issue refusal is `done: false` too: "cannot read" is not Done
+ *   { ok: false, ticketId, error }   a transient get_issue failure (the tool's own error
+ *     string): the caller retries, nothing is written
+ *
+ * TEAM-6142: the residual window. Every caller's FINAL confirm is the last await before
+ * its transitionToDone (report: the gate at the release re-ask, the amendment after the
+ * residual posts; drain: the gate after step 6, the amendment in step 7), because the
+ * ticket's status and the record's S3 CAS share no transaction: a gate or amendment
+ * reopened after that read and before the transition still lets the Done through. More
+ * reads only narrow it; never add an await between a final confirm and the Done.
+ * Provider-side fencing (evaluated, deferred to a follow-up): each twin's Done handler
+ * could, after its Done-intent fence, re-read the tickets the record names
+ * (securityReview.amendmentTicketId, briefDisposition.observed[]) and refuse. On Jira
+ * that only narrows the window again - the read and the transition are two REST calls,
+ * and a reopen in the Jira UI bypasses every fence. On the dynamodb twin it could close
+ * it: one TransactWriteItems with a ConditionCheck on the amendment/gate rows' status
+ * beside the build ticket's status Update, atomic against any reopen through the table.
+ */
+async function confirmDoneAtCommit({ ticketIds, earlier = null }) {
+  const open = [];
+  const describe = (o) => (o.status != null ? `${o.ticketId} reads ${o.status}` : `${o.ticketId} could not be read to confirm it is Done (${o.error})`);
+  const notDone = () => ({ ok: true, done: false, open, why: open.map(describe).join(", ") });
+  if (earlier) {
+    for (const [ticketId, status] of earlier) if (!isDoneStatus(status)) open.push({ ticketId, status: asText(status), seenAt: "audit" });
+    if (open.length > 0) return notDone();
+  }
+  const issues = new Map();
+  for (const ticketId of ticketIds) {
+    const r = await readTicketDone(ticketId);
+    if (!r.ok) {
+      if (!isPermanentTicketRefusal(r.error)) return { ok: false, ticketId, error: r.error };
+      open.push({ ticketId, status: null, error: r.error, seenAt: "commit" });
+      continue;
+    }
+    issues.set(ticketId, r.issue);
+    if (!r.done) open.push({ ticketId, status: asText(r.issue.status), seenAt: "commit" });
+  }
+  return open.length > 0 ? notDone() : { ok: true, done: true, issues, why: null };
+}
+
+/**
+ * TEAM-6164 (F2): the settled-gate re-ask a release WRITE makes immediately before its CAS - the
+ * drain's step 5 (before step 6's write) and drop() (after its awaited notices, before the drop
+ * stamp). A gate read taken earlier in the same tick and acted on after other awaited ticket I/O
+ * is a race the record's ETag cannot see (the gate is another ticket). `null` ⇒ every observed gate
+ * re-reads Done and the release may be written; otherwise the retry reason: an open gate means no
+ * release this tick (the message comes back and the next tick re-chooses the gate; the brief and
+ * audit comments are marker-deduped), an unreadable one means nothing is written. Not a gate_settled
+ * release (no release, absent_never_gated) ⇒ null: nothing to re-ask.
+ */
+async function settledGatesRetryReason(disposition, { earlier = null, when } = {}) {
+  if (!disposition?.release || disposition.kind !== "gate_settled") return null;
+  const confirm = await confirmDoneAtCommit({ ticketIds: (disposition.observed || []).map((o) => o.ticketId), earlier });
+  if (!confirm.ok) return `get_issue ${confirm.ticketId} (re-confirming the Merge Approval gate is Done ${when}): ${confirm.error}`;
+  if (!confirm.done) return `the Merge Approval gate ${confirm.why} ${when} - no release recorded; the next tick re-chooses the gate`;
+  return null;
+}
+
+/**
+ * TEAM-6205 (R2-02): the off-gate brief HOLD, re-stamped on the record - step 6's answer to a gate
+ * that reads open after the release was recorded (TEAM-6130), and now step 5's and drop()'s answer
+ * to a stale gate before their retry (reholdBeforeRetry). `briefPending:true`, the `part:"brief"`
+ * entry (with where the brief was posted) so a report_completion re-run can find the brief, the
+ * off-gate reason, no release (`briefDisposition`) and no hold reason; one conditional PUT on
+ * `etag`. The caller only logs the outcome and retries: a lost CAS means a newer record stands.
+ */
+async function reholdBriefOffGate({ reportKey, record, etag, s3Key, reason, targets = [] }) {
+  const reheld = { ...record, briefPending: true, briefFallbackReason: `not on the gate: ${reason}` };
+  delete reheld.briefDisposition;
+  delete reheld.briefHoldReason;
+  reheld.undelivered = mergeUndelivered(record.undelivered, [{ part: "brief", s3Key, reason: `not on the gate: ${reason}`, postedOn: targets }], []);
+  return putRecordIfUnchanged(reportKey, reheld, etag);
+}
+
 async function transitionToDone(ticketId) {
   const r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "done" });
   if (r.ok) return { ok: true, error: null, alreadyDone: false };
@@ -3345,7 +4525,12 @@ async function skipSibling(row, { workflowId, sweeperTicketId }) {
   // sibling's own writer is active and owns the record.
   const cur = await readRecord(key);
   if (cur.error) return { ok: false, error: `completion record ${key} unreadable (${cur.error}) - not skipped` };
-  const held = cur.record?.briefPending === true ? "briefPending:true" : cur.record?.followUpsPending === true ? "followUpsPending:true" : null;
+  // TEAM-6217 (R3-01 sibling sweep): and a QUEUED record whose merge brief nothing has recorded on the
+  // gate is the same hold without the stamp (queuedBriefOwed, the one predicate report_completion
+  // uses) - the skip marker would erase the brief obligation and the skip's Done would make the gate
+  // Ready brief-less.
+  const held = cur.record?.briefPending === true ? "briefPending:true" : cur.record?.followUpsPending === true ? "followUpsPending:true"
+    : queuedBriefOwed(cur.record) ? `ticketWrites:"queued" with its merge brief ${queuedBriefOwed(cur.record)} not yet recorded on the gate` : null;
   if (held) {
     console.warn(`[report_completion] ${ticketId}: empty_sweep will NOT skip it - its completion record has ${held}; the hold is lifted by report_completion or a human, never by the sweep`);
     return { ok: false, error: `completion record ${key} has ${held} - not skipped; the hold is lifted by report_completion or a human, never by the sweep` };
@@ -4527,6 +5712,72 @@ export function designAmendmentsOf(siblings, reviewTicketId) {
  * ticket's Done without one (securityReviewRecordRefusal) — the twin reads its
  * own row, so identity is settled where it cannot be supplied by the caller.
  */
+/**
+ * The last sentence of an amendment refusal: what this call left behind. TEAM-6140 (DL-039):
+ * `rollback` says whether the post-write compensation (taking the provisional stamp off)
+ * landed - truthfully, because a stamp left behind is PROVISIONAL and refused either way.
+ */
+const amendmentRefusalTail = (recorded, rollback = null) => {
+  if (!recorded) return "Nothing was recorded and the ticket was NOT transitioned.";
+  if (rollback && rollback.ok === false) {
+    return `The completion record was written with a PROVISIONAL admission stamp and the attempt to remove it did NOT land (${rollback.error}); both ticket providers refuse a provisional stamp, so Done stays refused until a re-run of WorkflowOutput___report_completion re-judges, restamps and finalizes it; the ticket was NOT transitioned.`;
+  }
+  return `The completion record was written WITHOUT the admission stamp (status ${STATUS_TRANSITION_FAILED}; the provisional stamp was REMOVED), so both ticket providers refuse Done until a re-run of WorkflowOutput___report_completion re-judges and restamps it; the ticket was NOT transitioned.`;
+};
+
+/** TEAM-6130: the retryable "could not read whether the amendment is done" refusal, one shape for every site. */
+export function amendmentScanRefusal({ ticketId, verdict, detail, recorded = false, rollback = null }) {
+  return {
+    ok: false,
+    reason: FOLLOW_UP_SCAN_FAILED,
+    detail,
+    ...(recorded ? { recorded: true } : {}),
+    ...(recorded && rollback ? { rollback } : {}),
+    message: `${ticketId} is a ${verdict} security review, and whether its design amendment exists could not be read (${detail}). ${recorded ? amendmentRefusalTail(true, rollback) : "Nothing was recorded and the ticket was NOT transitioned"} - retry WorkflowOutput___report_completion with the same arguments.`,
+  };
+}
+
+/**
+ * TEAM-6140 (DL-039): the amendment re-confirmed done after the write, but the FINALIZE write
+ * (taking `securityReview.provisional` off) lost every compare-and-swap. The record stands,
+ * provisional - both twins refuse Done on it - and nothing else was done; `ok:false` and a
+ * status that is not "complete" keep the persona retrying.
+ */
+export function admissionNotFinalized(ticketId, key, error, { posted = false } = {}) {
+  return {
+    ok: false,
+    reason: "completion_record_contended",
+    next_action: "retry_report_completion",
+    recorded: true,
+    message: `report_completion for ${ticketId} was written to ${key} with a PROVISIONAL securityReview admission (both ticket providers refuse Done on it) but the admission could not be finalized (${error}): another writer owns the record right now. ${posted ? "The residual findings were already posted on the dev lanes (marker-deduped: a retry re-posts nothing)" : "No residual findings were posted"} and the ticket was NOT transitioned. Retry the call with the SAME arguments.`,
+  };
+}
+
+/**
+ * TEAM-6130: the design_amendment_required refusal, one shape for every site. `open` is
+ * the amendment still owed (null: none exists); `note` says why a listed/confirmed Done
+ * did not count; `recorded` says the record was written before the refusal (the stamp
+ * taken back off it); `rollback` (TEAM-6140) says whether taking it off landed.
+ */
+export function designAmendmentRefusal({ ticketId, verdict, open, note = null, findings, recorded = false, rollback = null }) {
+  return {
+    ok: false,
+    reason: DESIGN_AMENDMENT_REQUIRED,
+    detail: open ? `amendment ${open.ticketId} is still open${note ? ` (${note})` : ""}` : "no design amendment exists",
+    missing: ["design_amendment"],
+    findings_count: findings,
+    ...(open ? { amendmentTicketId: open.ticketId } : {}),
+    ...(recorded ? { recorded: true } : {}),
+    ...(recorded && rollback ? { rollback } : {}),
+    message: open
+      ? `${ticketId} is a ${verdict} security review and its design amendment ${open.ticketId} is not done yet. Stay blocked behind it; when it is done, re-review the amended design and call WorkflowOutput___report_completion again. ${amendmentRefusalTail(recorded, rollback)}`
+      : `${ticketId} is a ${verdict} security review: the dev lanes it blocks must not start on this design. File ONE "Amend design: ..." ticket (Tickets___create_ticket with parent_id=<your epic>, spawned_by_kind="review_fix", spawned_by_origin_id="${ticketId}", phase="design", the fix contract, assigned to the designer, every finding verbatim), park ${ticketId} blocked behind it, and call WorkflowOutput___report_completion after re-reviewing the amended design. ${amendmentRefusalTail(recorded, rollback)}`,
+  };
+}
+
+/** What a commit-time re-read of the amendment said, for a refusal's `note`. */
+const amendmentReread = (confirm) => (confirm.open[0].status != null ? `read ${confirm.open[0].status}` : `could not be read (${confirm.open[0].error})`);
+
 async function designAmendmentGate({ ticketId, isSynthetic, issue, issueError, agentId, summary }) {
   if (isSynthetic) return {};
   const isReviewer = issue ? issue.assignee === SECURITY_REVIEWER_AGENT : agentId === SECURITY_REVIEWER_AGENT;
@@ -4543,32 +5794,32 @@ async function designAmendmentGate({ ticketId, isSynthetic, issue, issueError, a
   if (verdict === "PASS") return { verdict };
 
   const findings = countFindings(summary);
-  const scanRefusal = (detail) => ({ refusal: {
-    ok: false,
-    reason: FOLLOW_UP_SCAN_FAILED,
-    detail,
-    message: `${ticketId} is a ${verdict} security review, and whether its design amendment exists could not be read (${detail}). Nothing was recorded and the ticket was NOT transitioned - retry WorkflowOutput___report_completion with the same arguments.`,
-  } });
+  const scanRefusal = (detail) => ({ refusal: amendmentScanRefusal({ ticketId, verdict, detail }) });
   if (!issue) return scanRefusal(`get_issue: ${issueError || "unreadable"}`);
   const scan = await loadSiblings(issue.parentKey);
   if (!scan.ok) return scanRefusal(`list_tickets under ${issue.parentKey}: ${scan.error}`);
   const amendments = designAmendmentsOf(scan.siblings, ticketId);
-  const done = amendments.find((a) => isDoneStatus(a.status));
-  if (done) return { verdict, residual: true, amendmentTicketId: done.ticketId, siblings: scan.siblings };
+  const listedDone = amendments.find((a) => isDoneStatus(a.status));
+  // TEAM-6124 (sibling of F1): list_tickets is eventually consistent, and this
+  // admission is final (the review's Done releases the dev lanes; the twins trust
+  // the stamp's amendmentTicketId without re-reading it). So a listed Done is only
+  // a candidate: get_issue must read it Done too. A transient failure refuses
+  // retryably; a permanent one, or a strong read that is not Done, is "still open".
+  let open = amendments[0];
+  let unconfirmed = null;
+  if (listedDone) {
+    const read = await readTicketDone(listedDone.ticketId);
+    if (!read.ok && !isPermanentTicketRefusal(read.error)) {
+      return scanRefusal(`get_issue ${listedDone.ticketId} (confirming the design amendment is done): ${read.error}`);
+    }
+    if (read.ok && read.done) return { verdict, residual: true, amendmentTicketId: listedDone.ticketId, siblings: scan.siblings };
+    open = listedDone;
+    unconfirmed = read.ok ? `reads ${read.issue.status} on get_issue` : `could not be read to confirm it is done (${read.error})`;
+    console.warn(`[report_completion] ${ticketId}: list_tickets shows amendment ${listedDone.ticketId} done but it ${unconfirmed} - treated as still open`);
+  }
   // An absent amendment on a truncated roster proves nothing; an OPEN one does.
   if (!amendments.length && !scan.complete) return scanRefusal(`list_tickets under ${issue.parentKey}: roster truncated (complete:false)`);
-  const open = amendments[0];
-  return { refusal: {
-    ok: false,
-    reason: DESIGN_AMENDMENT_REQUIRED,
-    detail: open ? `amendment ${open.ticketId} is still open` : "no design amendment exists",
-    missing: ["design_amendment"],
-    findings_count: findings,
-    ...(open ? { amendmentTicketId: open.ticketId } : {}),
-    message: open
-      ? `${ticketId} is a ${verdict} security review and its design amendment ${open.ticketId} is not done yet. Stay blocked behind it; when it is done, re-review the amended design and call WorkflowOutput___report_completion again. Nothing was recorded and the ticket was NOT transitioned.`
-      : `${ticketId} is a ${verdict} security review: the dev lanes it blocks must not start on this design. File ONE "Amend design: ..." ticket (Tickets___create_ticket with parent_id=<your epic>, spawned_by_kind="review_fix", spawned_by_origin_id="${ticketId}", phase="design", the fix contract, assigned to the designer, every finding verbatim), park ${ticketId} blocked behind it, and call WorkflowOutput___report_completion after re-reviewing the amended design. Nothing was recorded and the ticket was NOT transitioned.`,
-  } };
+  return { refusal: designAmendmentRefusal({ ticketId, verdict, open, note: unconfirmed ? `listed done, but it ${unconfirmed}` : null, findings }) };
 }
 
 /**

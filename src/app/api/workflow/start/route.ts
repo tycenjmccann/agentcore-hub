@@ -9,12 +9,13 @@
  * The Next.js app does NOT invoke any agents directly.
  */
 
-import { timingSafeEqual, createHash } from "node:crypto";
+import { createHash } from "node:crypto";
 import { NextRequest, NextResponse } from "next/server";
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, DeleteCommand, TransactWriteCommand } from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { secretMatches } from "@/lib/auth/secret-match";
 import { validateIntakeSources, getSourceValidationMode, shouldRejectSubmission } from "@/lib/workflow/intake";
 import { validateSourcesShape } from "@/lib/workflow/source-shape";
 import { checkRepoConfig, definitiveFailures, describeRepoCheckFailure, parseGitHubUrl } from "@/lib/workflow/repo-check";
@@ -87,13 +88,6 @@ const TERMINAL_PHASES = new Set(["complete", "error", "cancelled"]);
 // onto the winner instead of double-creating. The window can therefore be tuned
 // freely for latency without reopening the double-create race.
 const DEDUP_INFLIGHT_GRACE_MS = 120_000;
-
-function secretMatches(provided: string, expected: string): boolean {
-  const a = Buffer.from(provided);
-  const b = Buffer.from(expected);
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(a, b);
-}
 
 function mintWorkflowId(): string {
   return `wf_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;

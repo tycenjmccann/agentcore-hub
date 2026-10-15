@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { ticketsSuccess, JIRA_NAME_MATCH_CLOSED } from "@/lib/workflow/__fixtures__/ticket-transition-success";
 
 /**
  * TEAM-4266 — the completion evidence record POST /api/workflow/[id]/tickets/transition
@@ -73,8 +74,15 @@ const h = vi.hoisted(() => {
     // Runs right after a successful GetObjectCommand — lets a test mutate the bucket
     // in the window between the read and the conditional write, i.e. the real race.
     afterGet: (() => void) | null;
-    // What the tickets Lambda replies with (dynamodb-mode success by default).
+    // What the tickets Lambda replies with. TEAM-6131: `null` (the default) makes the
+    // mock ECHO the real tickets success shape for the ticket + status the route asked
+    // for (ticketsSuccess) — the bare `{status:"transitioned"}` it used to answer is no
+    // longer proof of anything. Set an object to answer that exact payload instead.
     lambdaPayload: unknown;
+    // TEAM-6123 — when set, overrides lambdaPayload with this EXACT raw text
+    // (not JSON.stringify'd), so a test can hand the route payload text that is
+    // not valid JSON at all, which lambdaPayload alone cannot produce.
+    lambdaRawPayload: string | null;
     // When set, getTicketsForWorkflowFromJira throws it.
     jiraListError: Error | null;
     // TEAM-4286: when set, LambdaClient.send THROWS it (an invoke that never got a
@@ -87,7 +95,7 @@ const h = vi.hoisted(() => {
     tickets: [], workflow: { workflowId: "wf_1" }, calls: [], bucket: {},
     ctorLog: [], ctorKeys: [], putCtorKeys: [], jiraListCalls: [], dynamoListCalls: [],
     s3PutError: null, s3PutErrors: [], s3DeleteErrors: [], s3GetError: null, afterGet: null,
-    lambdaPayload: { status: "transitioned" }, jiraListError: null,
+    lambdaPayload: null, lambdaRawPayload: null, jiraListError: null,
     lambdaError: null, lambdaFunctionError: null, etagSeq: 0,
   };
   const precondition = () => {
@@ -198,13 +206,22 @@ vi.mock("@aws-sdk/client-lambda", () => {
       // evidence record alone; neither was reachable while this mock always resolved
       // a clean payload.
       if (h.state.lambdaError) throw h.state.lambdaError;
+      // TEAM-6131: with no explicit payload, answer what the tickets Lambda really
+      // answers for THIS request — its key and `to` echo the invoke's own parameters.
+      const req = JSON.parse(Buffer.from(cmd.input.Payload as Uint8Array).toString()) as {
+        parameters: { ticket_id: string; transition_id: string };
+      };
+      const echoed = ticketsSuccess(req.parameters.ticket_id, req.parameters.transition_id);
+      const payloadText = h.state.lambdaRawPayload !== null
+        ? h.state.lambdaRawPayload
+        : JSON.stringify(h.state.lambdaPayload === null ? echoed : h.state.lambdaPayload);
       if (h.state.lambdaFunctionError) {
         return {
           FunctionError: h.state.lambdaFunctionError,
-          Payload: Buffer.from(JSON.stringify(h.state.lambdaPayload)),
+          Payload: Buffer.from(payloadText),
         };
       }
-      return { Payload: Buffer.from(JSON.stringify(h.state.lambdaPayload)) };
+      return { Payload: Buffer.from(payloadText) };
     }
   }
   return { LambdaClient, InvokeCommand };
@@ -244,8 +261,8 @@ const DDB_REFUSAL = {
   content: [{ text: 'Invalid transition "done" from status "done". Available: reopen (→ todo)' }],
 };
 const JIRA_REFUSAL = { error: 'No transition to "Done" found. Available: Reopen (-> To Do)' };
-/** …and their success shapes — note jira's `status` is NOT "transitioned". */
-const DDB_SUCCESS = { key: "TEAM-X", status: "transitioned", from: "in_progress", to: "done", transition: "Done" };
+/** …and their success shapes — note jira's `status` is NOT "transitioned" (shared fixtures, TEAM-6131). */
+const DDB_SUCCESS = ticketsSuccess("TEAM-X", "done");
 const JIRA_SUCCESS = { ticketId: "TEAM-X", status: "done", message: "Transitioned to done" };
 
 /** Seed the fake bucket as if an agent's report_completion had already written. */
@@ -267,7 +284,8 @@ beforeEach(() => {
   h.state.s3DeleteErrors.length = 0;
   h.state.s3GetError = null;
   h.state.afterGet = null;
-  h.state.lambdaPayload = { status: "transitioned" };
+  h.state.lambdaPayload = null;
+  h.state.lambdaRawPayload = null;
   h.state.jiraListError = null;
   h.state.lambdaError = null;
   h.state.lambdaFunctionError = null;
@@ -567,6 +585,217 @@ describe("transition route — a refused transition is not a success (TEAM-4282 
     expect(dels()).toHaveLength(0);
     expect(puts()[2].input.IfMatch).toBe('"etag-1"'); // the version our refill wrote
     expect(stored()).toEqual({ [KEY]: original });
+  });
+});
+
+/**
+ * TEAM-6123 (P2) — rejectedDetails is a DENY-list: it answers null for any
+ * payload it doesn't recognize as a refusal, and the route treated that null as
+ * "the ticket moved" — reporting success:true (and keeping the evidence record)
+ * for a ticket that was never proven to have transitioned. None of these shapes
+ * prove anything, so each must now 502 — and, like the pre-existing FunctionError/
+ * throw branches, must NOT revert the evidence record: an unproven response is
+ * ambiguous, not a proven refusal.
+ */
+describe("transition route — an unproven transition is not a success (TEAM-6123)", () => {
+  it.each([
+    ["unparseable payload text", "not json"],
+    ["empty payload", ""],
+    ['literal JSON "null" payload', "null"],
+    ['"{}" payload', "{}"],
+  ])("%s → 502, record left in place (not reverted)", async (_label, raw) => {
+    await load();
+    h.state.lambdaRawPayload = raw;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).not.toHaveProperty("success");
+    expect(json).toMatchObject({ ticketId: "TEAM-X", completionRecordWritten: true, completionRecordReverted: false });
+    expect(dels()).toHaveLength(0);
+    expect(Object.keys(stored())).toEqual([KEY]);
+  });
+
+  it('a refusal-shaped-but-unrecognized object ({ok:true,status:"blocked"}) → 502, record left in place', async () => {
+    await load();
+    h.state.lambdaPayload = { ok: true, status: "blocked" };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).toMatchObject({ completionRecordWritten: true, completionRecordReverted: false });
+    expect(dels()).toHaveLength(0);
+  });
+
+  it("the real tickets-Lambda success shape still 200s (regression guard)", async () => {
+    await load();
+    h.state.lambdaPayload = { key: "TEAM-X", status: "transitioned", from: "in_progress", to: "done" };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ success: true, completionRecordWritten: true });
+  });
+
+  it("the real jira-Lambda success shape still 200s (regression guard)", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = { ticketId: "TEAM-X", status: "done", message: "Transitioned to done" };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ success: true, completionRecordWritten: true });
+  });
+
+  it("a real refusal is still 409 and reverts, not 502 (the two codes stay distinct)", async () => {
+    await load();
+    h.state.lambdaPayload = DDB_REFUSAL;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ completionRecordReverted: true });
+  });
+
+  it("unproven, with NO evidence → 502 with zero S3 traffic (detection is independent of the write)", async () => {
+    await load();
+    h.state.lambdaRawPayload = "{}";
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done" });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).not.toHaveProperty("completionRecordWritten");
+    expect(json).not.toHaveProperty("completionRecordReverted");
+    expect(s3calls()).toHaveLength(0);
+  });
+});
+
+/**
+ * TEAM-6131 (review fix round 2, P2 x2) — provesTransitioned must prove THE ticket moved
+ * to THE status that was requested:
+ *   F3: a bare `{status:"transitioned"}` (no `to`, no key — a shape the real tickets
+ *       Lambda never returns) counted as proof and the route answered 200.
+ *   F4: the jira Lambda matches a transition by NAME or destination and reports the
+ *       destination's status; a workflow whose "Done" lands in "Closed" answered
+ *       `status:"closed"` → 502 although the ticket moved, and every retry refused.
+ */
+describe("transition route — proof names the requested ticket and status (TEAM-6131)", () => {
+  it('F3: a bare {status:"transitioned"} (no key, no `to`) → 502, record left in place', async () => {
+    await load();
+    h.state.lambdaPayload = { status: "transitioned" };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).not.toHaveProperty("success");
+    expect(json).toMatchObject({ ticketId: "TEAM-X", completionRecordWritten: true, completionRecordReverted: false });
+    expect(dels()).toHaveLength(0);
+  });
+
+  it("F3: the real tickets shape for a DIFFERENT ticket → 502", async () => {
+    await load();
+    h.state.lambdaPayload = ticketsSuccess("TEAM-Y", "done");
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(502);
+    expect(await res.json()).not.toHaveProperty("success");
+  });
+
+  it("F3: the real tickets shape landing in a different status → 502 (unchanged)", async () => {
+    await load();
+    h.state.lambdaPayload = ticketsSuccess("TEAM-X", "blocked");
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(502);
+  });
+
+  it("F4: the jira Lambda's name≠destination shape (Done → Closed) → 200", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = { ...JIRA_NAME_MATCH_CLOSED, ticketId: "TEAM-X" };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ success: true, ticketId: "TEAM-X", newStatus: "done", completionRecordWritten: true });
+  });
+
+  it("F4: …but the same shape for a DIFFERENT ticket → 502", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = JIRA_NAME_MATCH_CLOSED; // ticketId TEAM-7
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(502);
+  });
+
+  it("F4: an arbitrary landed status (in_progress for a requested done) is still 502, even with requested/matchedTransition", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = { ...JIRA_NAME_MATCH_CLOSED, ticketId: "TEAM-X", status: "in_progress" };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ completionRecordWritten: true, completionRecordReverted: false });
+  });
+
+  it("the default echo fixture is the REAL tickets shape for the requested ticket + status (a non-done target still 200s)", async () => {
+    await load();
+    h.state.tickets = [{ ticketId: "TEAM-X", status: "in_progress", assignee: "agentcore_hub_backend_dev", title: "Build the thing" }];
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "blocked" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ success: true, ticketId: "TEAM-X", newStatus: "blocked" });
+  });
+});
+
+/**
+ * TEAM-6141 (review fix round 3, P2) — the TEAM-6131 pair proved too much: an absent or
+ * empty `status` normalized to "" (not a hub column) and fell into a fallback that only
+ * checked `requested` + three non-empty metadata strings, so a Lambda answer that related
+ * neither the landed status to the echoed destination nor the transition's name to the
+ * requested action answered 200 — and the completion record this call wrote stayed
+ * attached to work that did not close. Left UNREVERTED like every other unproven shape.
+ */
+describe("transition route — the Jira pair must account for the move (TEAM-6141)", () => {
+  const unconfirmed = async (payload: unknown) => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = payload;
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    const json = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(json).not.toHaveProperty("success");
+    expect(json).toMatchObject({ error: "Ticket transition unconfirmed", ticketId: "TEAM-X", completionRecordWritten: true, completionRecordReverted: false });
+    expect(dels()).toHaveLength(0);
+  };
+
+  it("(a) no `status` + requested done + an unrelated matched transition (Start Progress → In Progress) → 502", () =>
+    unconfirmed({ ticketId: "TEAM-X", requested: "done", matchedTransition: { id: "21", name: "Start Progress", to: "In Progress" } }));
+
+  it('(b) `status:""` + requested done + the real Done → Closed transition → 502', () =>
+    unconfirmed({ ...JIRA_NAME_MATCH_CLOSED, ticketId: "TEAM-X", status: "" }));
+
+  it("(c) landed waiting_for_review via a transition NAMED Start Review (as written in the ticket, no id) → 502", () =>
+    unconfirmed({ ticketId: "TEAM-X", status: "waiting_for_review", requested: "done", matchedTransition: { name: "Start Review", to: "Waiting for review" } }));
+
+  it("(c) …and with an id — the complete metadata that used to be enough → 502", () =>
+    unconfirmed({ ticketId: "TEAM-X", status: "waiting_for_review", requested: "done", matchedTransition: { id: "51", name: "Start Review", to: "Waiting for review" } }));
+
+  it("a landed status that is not the echoed destination's (closed vs → Resolved) → 502", () =>
+    unconfirmed({ ...JIRA_NAME_MATCH_CLOSED, ticketId: "TEAM-X", matchedTransition: { id: "31", name: "Done", to: "Resolved" } }));
+
+  it("regression: the real Done → Closed shape still 200s", async () => {
+    process.env.TICKET_PROVIDER = "jira";
+    await load();
+    h.state.lambdaPayload = { ...JIRA_NAME_MATCH_CLOSED, ticketId: "TEAM-X" };
+
+    const res = await post({ ticketId: "TEAM-X", targetStatus: "done", evidence: EVIDENCE });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ success: true, ticketId: "TEAM-X", newStatus: "done", completionRecordWritten: true });
   });
 });
 
@@ -1364,7 +1593,9 @@ describe("TEAM-4286: an ambiguous Lambda failure leaves the record and says so",
 
   it.each([
     ["a thrown invoke", () => { h.state.lambdaError = new Error("socket hang up"); }, "socket hang up"],
-    ["a FunctionError", () => { h.state.lambdaFunctionError = "Unhandled"; }, '{"status":"transitioned"}'],
+    // TEAM-6131: the payload a FunctionError carries is the runtime's error object, stated
+    // explicitly — the default mock answer is now the echoed real success shape.
+    ["a FunctionError", () => { h.state.lambdaFunctionError = "Unhandled"; h.state.lambdaPayload = { errorMessage: "boom" }; }, '{"errorMessage":"boom"}'],
   ])("TEAM-4286: %s with NO evidence keeps today's 500 body exactly", async (_label, arrange, details) => {
     await load();
     arrange();
