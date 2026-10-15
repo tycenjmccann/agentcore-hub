@@ -2255,6 +2255,36 @@ describe("TEAM-6148 PR-number segment is a whole positive integer", () => {
   });
 });
 
+// TEAM-6187 §1c — the pure field rule extracted from index.mjs harvestCompletionEvidence
+// so the /complete route (src/lib/workflow/follow-up-pr-gate.ts) can overlay the same
+// fresh records before its probe. Behaviour pinned here, not re-derived there.
+describe("freshRecordFields — harvestCompletionEvidence's field rule (TEAM-6187)", () => {
+  const entry = { startedAt: "2026-10-01T00:00:00Z", completedAt: "2026-10-01T00:05:00Z", output: "old", commitSha: "aaa", outcome: "handoff" };
+  const record = { completed_at: "2026-10-01T00:06:00Z", summary: " s ", branch: "b", commit_sha: "bbb", pr_url: "u", merge_commit: "m", outcome: "SHIPPED", block_reason: "r".repeat(600) };
+
+  it("fresh (>= startedAt and > completedAt): every field overwrites, outcome normalised, block_reason capped", () => {
+    const { fresh, fields } = completionMod.freshRecordFields(entry, record);
+    expect(fresh).toBe(true);
+    expect(fields).toEqual({ output: "s", branch: "b", commitSha: "bbb", prUrl: "u", mergeCommit: "m", outcome: "shipped", blockReason: "r".repeat(500) });
+  });
+
+  it("not fresh (<= completedAt) and hasEvidence: only ABSENT ship signals are filled; present ones are kept", () => {
+    const { fresh, fields } = completionMod.freshRecordFields(entry, { ...record, completed_at: "2026-10-01T00:05:00Z" }, { hasEvidence: true });
+    expect(fresh).toBe(false);
+    expect(fields).toEqual({ prUrl: "u", mergeCommit: "m", blockReason: "r".repeat(500) }); // commitSha + outcome already set; output/branch gated by hasEvidence
+  });
+
+  it("transitioned re-completion: a record >= startedAt is fresh even when not newer than completedAt (TEAM-5900)", () => {
+    expect(completionMod.freshRecordFields(entry, { ...record, completed_at: "2026-10-01T00:05:00Z" }, { transitioned: true }).fresh).toBe(true);
+  });
+
+  it("no startedAt → never fresh; an unknown outcome is dropped; the 10k summary cap holds", () => {
+    const r = completionMod.freshRecordFields({ output: "" }, { completed_at: "2026-10-01T00:06:00Z", summary: "x".repeat(10_050), outcome: "banana" });
+    expect(r.fresh).toBe(false);
+    expect(r.fields).toEqual({ output: "x".repeat(10_000) });
+  });
+});
+
 describe("TEAM-6054 isOtherPrTicket", () => {
   const U9 = "https://github.com/o/r/pull/9", F12 = "https://github.com/o/r/pull/12";
   const other = (a) => completionMod.isOtherPrTicket(a);

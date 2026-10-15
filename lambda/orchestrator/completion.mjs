@@ -84,6 +84,28 @@ export function harvestableShipOutcome(value) {
   return HARVESTED_SHIP_OUTCOMES.includes(outcome) ? outcome : null;
 }
 
+/** TEAM-6187 — index.mjs harvestCompletionEvidence's field rule, pure, shared with the /complete route's
+ *  pre-probe overlay (src/lib/workflow/follow-up-pr-gate.ts). `fresh` (TEAM-5951/TEAM-5900) = written at/after
+ *  the task started AND after its Done stamp (or `transitioned`). Fresh → every field overwrites; else a ship
+ *  signal fills only an absent key, output/branch only when !hasEvidence. Caller decides if non-fresh counts. */
+export function freshRecordFields(entry, record, { transitioned = false, hasEvidence = false } = {}) {
+  const fields = {};
+  const fresh = record.completed_at >= entry?.startedAt && (transitioned || record.completed_at > entry?.completedAt);
+  const take = (k) => fresh || !entry?.[k];
+  if (!hasEvidence || fresh) { // deliverable evidence — fill when absent, overwrite when fresh (TEAM-5900)
+    const summary = typeof record.summary === "string" ? record.summary.trim() : "";
+    if (summary) fields.output = summary.slice(0, 10000);
+    if (record.branch) fields.branch = record.branch;
+  }
+  // Ship/CD signals — only when the record carries it and take() admits it; admitted outcomes live beside shipVerdictOf (TEAM-4763 P1-A).
+  if (record.commit_sha && take("commitSha")) fields.commitSha = record.commit_sha;
+  if (record.pr_url && take("prUrl")) fields.prUrl = record.pr_url;
+  if (record.merge_commit && take("mergeCommit")) fields.mergeCommit = record.merge_commit;
+  if (take("outcome")) { const oc = harvestableShipOutcome(record.outcome); if (oc) fields.outcome = oc; }
+  if (record.block_reason && take("blockReason")) fields.blockReason = String(record.block_reason).slice(0, 500);
+  return { fresh, fields };
+}
+
 /**
  * TEAM-4763 P1-A — the verdicts that SATISFY the D2 ship gate. "shipped" proves
  * the work landed; "handoff" proves it was delivered to another team to land,
