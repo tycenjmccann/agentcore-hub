@@ -264,19 +264,37 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
   // TEAM-6194 (ship-review r2 on TEAM-6132; replaces the TEAM-6183 sub-word tokenizer, which
   // counted `a/b/c/d/e` as five words and hid `run printf foo | grep bar` x2 behind sentinel
   // keys): the counting unit is the whitespace token, as on main. Each token's key is its
-  // case-folded form with leading/trailing non-letter/digit chars stripped (`start.` ≡ `Start`,
-  // `` `foo` `` ≡ `foo`); a punctuation-only token (`|`, `-`, `=`, `—`, fences) keeps its raw
-  // text as key and is not a "real" word. A repeat is k tokens at p whose copy sits at p+k:
-  // interior tokens match by key; the edges keep main's \b looseness — the second copy's first
-  // token may be a suffix of the first copy's first token cut at a non-letter/digit
+  // case-folded form with leading/trailing non-identifier chars stripped (`start.` ≡ `Start`,
+  // `` `foo` `` ≡ `foo`); a token with no letter/digit (`|`, `-`, `=`, `—`, `_`, fences) keeps
+  // its raw text as key and is not a "real" word. A repeat is k tokens at p whose copy sits at
+  // p+k: interior tokens match by key; the edges keep main's \b looseness — the second copy's
+  // first token may be a suffix of the first copy's first token cut at a non-identifier char
   // (`branch;and … and …`), and its last token may extend past the first copy's last token at
   // one (`… e … e/f`). Edge tokens must be real words (so a run never starts or ends on a `|`,
   // fence or rule) and the copy must hold >= minWords real words, so structural tokens may sit
   // inside a repeat (`a - b c d`) but can never pad one out. Near-linear: a repeat with
   // k >= minWords + 2 has >= minWords exact interior keys, so those are bucketed on
   // key[p+1..p+minWords]; the two shorter k are a direct O(n) scan.
-  const EDGE_PUNCT = /^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu;
+  // TEAM-6212 (ship-review r3 on TEAM-6132): an identifier char is a letter, digit or `_`, as
+  // in main's `\w` edge test, so `snake_case` vs `case` is not a cut and `_a` keeps its `_`.
+  // Edge trimming is an index scan over code points, not a regex: a `[^…]+$` alternative
+  // backtracks O(len²) on a long punctuation run inside a token. The single-char cut lookups
+  // below read UTF-16 units, like main's; an astral letter at a cut is treated as a boundary.
+  const IDENT = /[\p{L}\p{N}_]/u;
   const ALNUM = /[\p{L}\p{N}]/u;
+  const trimEdges = (tok: string) => {
+    let a = -1;
+    let b = 0;
+    let i = 0;
+    for (const ch of tok) {
+      if (IDENT.test(ch)) {
+        if (a < 0) a = i;
+        b = i + ch.length;
+      }
+      i += ch.length;
+    }
+    return a < 0 ? "" : tok.slice(a, b);
+  };
   const findRepeatedPhrases = (text: string, minWords = 5) => {
     const w: string[] = [];
     const start: number[] = [];
@@ -284,20 +302,21 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     const key: string[] = [];
     const real: boolean[] = [];
     for (const m of text.matchAll(/\S+/g)) {
-      const norm = m[0].toLowerCase().replace(EDGE_PUNCT, "");
+      const norm = trimEdges(m[0].toLowerCase());
+      const isReal = ALNUM.test(norm);
       w.push(m[0]);
-      key.push(norm || m[0]);
-      real.push(norm !== "");
+      key.push(isReal ? norm : m[0]);
+      real.push(isReal);
       start.push(m.index);
       end.push(m.index + m[0].length);
     }
     const n = w.length;
-    // `second` equals `first` or is a suffix of it cut right after a non-letter/digit.
+    // `second` equals `first` or is a suffix of it cut right after a non-identifier char.
     const suffixOf = (first: string, second: string) =>
-      first === second || (first.endsWith(second) && !ALNUM.test(first[first.length - second.length - 1]));
-    // `second` equals `first` or extends it, with a non-letter/digit right after `first`.
+      first === second || (first.endsWith(second) && !IDENT.test(first[first.length - second.length - 1]));
+    // `second` equals `first` or extends it, with a non-identifier char right after `first`.
     const prefixOf = (first: string, second: string) =>
-      first === second || (second.startsWith(first) && !ALNUM.test(second[first.length]));
+      first === second || (second.startsWith(first) && !IDENT.test(second[first.length]));
     // Cheapest checks first: on adversarial input almost every pair dies at an edge.
     const check = (p: number, k: number) => {
       if (!real[p + k] || !real[p + k - 1]) return false;
@@ -411,6 +430,44 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     const adversarial = Array.from({ length: 4000 }, (_, i) => `a b c d e x${i}`).join(" ");
     const start = performance.now();
     expect(findRepeatedPhrases(adversarial)).toEqual([]);
+    expect(performance.now() - start).toBeLessThan(1000);
+  });
+
+  // TEAM-6212 (ship-review r3 F1 on TEAM-6132): `_` is an identifier character, as in main's
+  // `\w`-based edge test. It is never a boundary cut and is never trimmed from a token's edge,
+  // so `snake_case` vs `case` and `_a` vs `a` are different words, not a repeat.
+  it.each([
+    ["an underscore cut at the head", "snake_case is not the same case is not the same"],
+    ["an underscore extension at the tail", "use the value from case use the value from case_sensitive"],
+    ["an underscore-prefixed head", "prefix_a b c d e a b c d e"],
+    ["a leading underscore", "_a b c d e a b c d e"],
+    ["a trailing underscore", "a b c d e_ a b c d e"],
+    ["an underscore-led second head cut at a letter", "a_b c d e f _b c d e f"],
+    ["a tail extended through an underscore", "a b c d e a b c d e_"],
+  ])("findRepeatedPhrases ignores %s (TEAM-6212)", (_, text) => {
+    expect(findRepeatedPhrases(text)).toEqual([]);
+  });
+
+  // The edge `_` is kept, not stripped: a real cut right before it (`-`) still matches.
+  it.each([
+    ["an underscore-led head after a hyphen cut", "a-_b c d e f _b c d e f"],
+    ["a tail extended past a hyphen into an underscore", "a b c d e- a b c d e-_"],
+  ])("findRepeatedPhrases flags %s (TEAM-6212)", (_, text) => {
+    expect(findRepeatedPhrases(text)).toHaveLength(1);
+  });
+
+  // TEAM-6212 (ship-review r3 F2): edge trimming is linear in the token length. The
+  // `[^…]+$` alternative of a trimming regex backtracks O(len²) on a long punctuation run
+  // inside a token (3s at 40k chars); only the interior variant discriminates, the other
+  // two are belt-and-braces.
+  it.each([
+    ["interior", "a" + "!".repeat(40000) + "b"],
+    ["leading", "!".repeat(40000) + "b"],
+    ["trailing", "a" + "!".repeat(40000)],
+  ])("findRepeatedPhrases stays well under 1s on a %s 40k-char punctuation run (TEAM-6212)", (_, token) => {
+    const text = ["one", "two", "three", "four", "five", token, "six", "seven", "eight", "nine", "ten"].join(" ");
+    const start = performance.now();
+    expect(findRepeatedPhrases(text)).toEqual([]);
     expect(performance.now() - start).toBeLessThan(1000);
   });
 
