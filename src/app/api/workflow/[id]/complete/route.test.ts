@@ -1145,7 +1145,7 @@ describe("POST complete — open follow-up PR gate (TEAM-6136 / TEAM-6187)", () 
       ["/compare/", 200, { status: "ahead", ahead_by: 3 }],
       ["/pulls/77", 200, openPr],
     ];
-    const rowWith = (stamp: unknown, input: Record<string, unknown> | undefined = { sdlcFramework: "playbook" }) => {
+    const rowWith = (stamp: unknown, input: Record<string, unknown> | null = { sdlcFramework: "playbook" }) => {
       const wf = workflow() as Record<string, unknown>;
       if (stamp === undefined) delete wf.sdlcFramework;
       else wf.sdlcFramework = stamp;
@@ -1203,7 +1203,8 @@ describe("POST complete — open follow-up PR gate (TEAM-6136 / TEAM-6187)", () 
     });
 
     it("NON-EMPTY stamp alone selects the overlay: \"playbook\" with no input → 200 complete", async () => {
-      h.state.workflow = rowWith("playbook", undefined);
+      h.state.workflow = rowWith("playbook", null);
+      expect("input" in (h.state.workflow as Record<string, unknown>)).toBe(false); // the stamp is the ONLY selector
       await load();
       await expectOverlayApplied();
     });
