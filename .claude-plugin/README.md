@@ -34,7 +34,7 @@ skills/
 agents/
 └── deploy-runner.md           # subagent for long-running deploys (5–15 min)
 .claude-plugin/bin/
-├── apply-env.sh               # writes .env.local from a JSON answer blob
+├── apply-env.sh               # writes .env.local from a JSON answer blob — preserves unmanaged keys on a re-run (TEAM-6338)
 ├── run-module.sh <module>     # the one place that knows script order per module
 └── verify-module.sh <module>
 ```

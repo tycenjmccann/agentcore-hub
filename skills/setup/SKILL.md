@@ -311,7 +311,7 @@ EOF
 rm /tmp/agentcore-hub-answers.json
 ```
 
-`apply-env.sh` is the one place that writes `.env.local`. The skill does **not** write env vars by hand.
+`apply-env.sh` is the one place that writes `.env.local`. The skill does **not** write env vars by hand. It only rewrites the keys it manages (see "Re-runs" below) — every other key already in the file is carried over, not dropped.
 
 If `apply-env.sh` prints `JIRA_WEBHOOK_SECRET_NEW=1`, note it: the answers brought a webhook secret that differs from the one the existing deployment was set up with, and the deploy-target step below must run the Jira webhook step **before** redeploying the hub (`apply-env.sh` also carries `DEPLOYMENT_URL` over from the previous `.env.local`, so that step has its target).
 
@@ -401,6 +401,8 @@ On test pass: this is when you declare the install complete. Move any "install c
 ## Re-runs
 
 The user may run `/agentcore-hub:setup` more than once. Before any module runs, `run-module.sh` should detect what already exists and skip steps that are already done (the underlying scripts are idempotent — they exit 0 if the resource exists). Never wipe `.env.local`. Never delete AWS resources.
+
+A re-run's `apply-env.sh` call regenerates only the keys it manages (`MANAGED_KEYS`, TEAM-6338) — brand name, region, the module-specific keys, `JIRA_WEBHOOK_SECRET`/`DEPLOYMENT_URL` (carried over per above). Every other line already in `.env.local` — a hand-added key (e.g. `EXPECTED_ACCOUNT_ID`) or one `run-module.sh`/`deploy.sh` added after a previous run (`BUILDER_AGENT_ID`, `CODING_AGENT_RUNTIME_ARN`, `CLOUD_CODE_TABLE`, `AGENTCORE_ROLE_ARN`, `LAMBDA_ROLE_ARN`) — is carried over verbatim into a trailing "Preserved" section, so it is never dropped by a re-run.
 
 ---
 
