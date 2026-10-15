@@ -16,6 +16,15 @@
  * Fallback: when WORKFLOW_COMMAND_QUEUE_URL is unset, invokes the
  * orchestrator Lambda directly (pre-R1 behavior) so the app keeps working
  * against an install that hasn't created the queue yet.
+ *
+ * TEAM-6324: verifies Jira's `X-Hub-Signature: sha256=<hex>` header
+ * (verifyHubSignature, src/lib/auth/hub-signature.ts) against
+ * JIRA_WEBHOOK_SECRET before any parse or dispatch, when that secret is
+ * configured. Unlike workflow/webhook's WEBHOOK_SECRET gate, an unset secret
+ * here is passthrough (not a fail-closed 503) — see DEPLOY.md's "Jira webhook
+ * signing" section for why that two-sided rollout order is safe — but it logs
+ * one console.warn per cold start so an install that never configures it is
+ * still visible in the logs.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -23,6 +32,7 @@ import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
 import { mapJiraStatusToInternal } from "@/lib/workflow/jira-client";
 import { commandGroupId, commandDedupId } from "@/lib/workflow/command-queue";
+import { verifyHubSignature } from "@/lib/auth/hub-signature";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
 const ORCHESTRATOR_LAMBDA = process.env.ORCHESTRATOR_LAMBDA || "agentcore-hub-orchestrator";
@@ -30,6 +40,10 @@ const COMMAND_QUEUE_URL = process.env.WORKFLOW_COMMAND_QUEUE_URL || "";
 
 const lambda = new LambdaClient({ region: REGION });
 const sqs = new SQSClient({ region: REGION });
+
+// Logged once per module instance so an install that never sets the secret
+// still gets a visible signal, without spamming on every webhook delivery.
+let warnedUnauthenticated = false;
 
 interface JiraWebhookPayload {
   webhookEvent?: string;
@@ -92,9 +106,23 @@ async function dispatchCommand(
 }
 
 export async function POST(req: NextRequest) {
+  const raw = await req.text();
+  const secret = (process.env.JIRA_WEBHOOK_SECRET || "").trim();
+
+  if (secret) {
+    if (!verifyHubSignature(raw, req.headers.get("x-hub-signature"), secret)) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+  } else if (!warnedUnauthenticated) {
+    warnedUnauthenticated = true;
+    console.warn(
+      "[jira-webhook] JIRA_WEBHOOK_SECRET not set — accepting UNSIGNED webhooks; see DEPLOY.md"
+    );
+  }
+
   let payload: JiraWebhookPayload;
   try {
-    payload = await req.json();
+    payload = JSON.parse(raw);
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
