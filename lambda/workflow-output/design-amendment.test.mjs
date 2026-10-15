@@ -601,7 +601,7 @@ describe("TEAM-6144 — the live path and the drain key the same residual to the
 
   it("a different summary, amendment or verdict is a different round", () => {
     const base = residualKey(residualOf(REVIEW, raw, ART));
-    expect(residualKey(residualOf(REVIEW, raw + " more", ART))).not.toBe(base);
+    expect(residualKey(residualOf(REVIEW, raw.replace("- High: x", "- High: y"), ART))).not.toBe(base);
     expect(residualKey(residualOf({ ...REVIEW, amendmentTicketId: "TEAM-5400" }, raw, ART))).not.toBe(base);
     expect(residualKey(residualOf({ ...REVIEW, verdict: "CHANGES_NEEDED" }, raw, ART))).not.toBe(base);
   });

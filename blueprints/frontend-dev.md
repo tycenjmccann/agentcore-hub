@@ -96,7 +96,7 @@ ticket the verified reason it is a genuinely different case.
 
 ### Step 1: Gather Context
 1. Read the design doc / requirements from S3 shared artifacts
-   Read your ticket's comments too: a `Residual security findings` comment (`[residual-findings:<review ticket>]`) lists security findings the design did not resolve — handle each in your implementation, or say in your completion summary why it does not apply
+   Read your ticket's comments too: a `Residual security findings` comment (`[residual-findings:<review ticket>:<round>]`) lists security findings the design did not resolve (a ticket can carry one per review round; the NEWEST one is the current findings, earlier ones are superseded) — handle each in your implementation, or say in your completion summary why it does not apply
 2. Read the relevant source files from the repo (component, styles, config)
 3. Understand the existing patterns (CSS approach, component structure, state management)
 4. Check CLAUDE.md in the repo for project conventions
