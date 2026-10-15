@@ -329,7 +329,10 @@ const FAKE_CHILDREN = [
 // TEAM-6069: config.sh now sources this for the fleet runtime table defaults
 // (EVENTS_TABLE/WORKFLOWS_TABLE/CLOUD_CODE_TABLE) — without a real copy here,
 // the fake repo's config.sh dies with "No such file or directory" at source time.
-const REAL_LIBS = ["deploy/lib/agentcore-lookup.sh", "deploy/lib/runtime-env-defaults.sh"];
+// TEAM-6202: same reason for load-env-local.sh, the nounset-safe .env.local
+// loader config.sh now sources unconditionally (not just when .env.local
+// exists).
+const REAL_LIBS = ["deploy/lib/agentcore-lookup.sh", "deploy/lib/runtime-env-defaults.sh", "deploy/lib/load-env-local.sh"];
 
 function makeFakeRepo() {
   const dir = mkdtempSync(join(tmpdir(), "si-handoff-apply-"));

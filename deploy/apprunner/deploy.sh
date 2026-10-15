@@ -39,13 +39,13 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-# Load .env.local so we can forward runtime env vars to App Runner.
-if [[ -f .env.local ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env.local
-  set +a
-fi
+# Load .env.local so we can forward runtime env vars to App Runner, via the
+# shared loader (TEAM-6202) so a .env.local line referencing an unset
+# variable doesn't abort this set -euo pipefail script with "unbound
+# variable" (same fix as TEAM-6200 F4, generalized).
+# shellcheck disable=SC1091
+source "$REPO_ROOT/deploy/lib/load-env-local.sh"
+load_env_local .env.local
 
 # Eval gate (FR-7): the container bakes in agents.json/workflows.json — refuse
 # to build/push ungated config. Runs before the docker build and S3 reads.
