@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { deliveryRollUp } from "./completion.mjs";
 
 /**
  * TEAM-3686 F3 + F4 — the orchestrator's completion gates.
@@ -946,6 +947,57 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
   };
   // TEAM-6062: the id carries a hash of the open-PR set (notif_completion_followup_pr_<hash8>_wf_1).
   const fuNotified = () => h.state.notifications.some(({ n }) => n.id.startsWith("notif_completion_followup_pr_") && n.id.endsWith("_wf_1"));
+
+  // TEAM-6054: the GitHub mergeCommit stamp must not copy the UNIFIED PR's merge proof onto a
+  // post-merge follow-up chain ticket (DL-038 "Ship: follow-up PR <url>", release_manager → ship phase),
+  // and leaving it unstamped must not close the run static-ci-only (it is excluded from the re-check).
+  const FU_SHIP = { ticketId: "B-7", assignee: "agentcore_hub_release_manager", type: "task", status: "done", phase: "ship", title: `Ship: follow-up PR ${FU_URL}` };
+  const FU_SHIP_TASK = { ticketId: "B-7", agentId: "agentcore_hub_release_manager", output: "follow-up PR reviewed", prUrl: FU_URL };
+  const UNIFIED_URL = "https://github.com/o/r/pull/846";
+  const runFuShip = async ({ tasks = {}, pulls = {}, prs = [MERGED_PR] } = {}) => {
+    h.state.merges.length = 0;
+    h.state.storeCompletions.length = 0;
+    h.state.terminalClaims.length = 0;
+    h.state.snapshots = [[...FU_CHILDREN, FU_SHIP]];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...FU_TASKS, "B-7": { ...FU_SHIP_TASK }, ...tasks } };
+    mockGitHub({ prs, headSha: "head000", pulls: { 9: UNIFIED_PR9, 846: { ...UNIFIED_PR9, number: 846 }, ...pulls } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+  };
+  const stampsOf = (tid) => h.state.merges.filter((m) => m.tid === tid).map((m) => m.fields);
+  const MERGED_FU12 = { 12: fuPr({ state: "closed", merged_at: "2026-09-03T10:00:00Z", merge_commit_sha: "m12" }) };
+  it("TEAM-6054: follow-up PR merged via its own chain → its Ship ticket is NOT stamped, and the run still completes (no static-ci-only)", async () => {
+    await runFuShip({ pulls: MERGED_FU12 });
+    expect(stampsOf("B-7")).toEqual([]);
+    expect(h.state.terminalClaims).toEqual([]);
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+  it("TEAM-6054: follow-up PR state unreadable (gate fails open) → its Ship ticket is NOT stamped merged; fail-open completion unchanged", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await runFuShip({ pulls: { 12: 502 } });
+    expect(h.state.freshWorkflow.agentTasks["B-7"].mergeCommit).toBeUndefined();
+    expect(deliveryRollUp([], { "B-7": h.state.freshWorkflow.agentTasks["B-7"] }).prState).toBe("open");
+    expect(h.state.storeCompletions.length).toBe(1);
+    warn.mockRestore();
+  });
+  it("TEAM-6054: the unified PR's own Ship ticket is still stamped with the unified merge proof", async () => {
+    await runFuShip({
+      tasks: { "B-4": { ticketId: "B-4", agentId: "agentcore_hub_release_manager", output: "shipped", prUrl: UNIFIED_URL } },
+      pulls: MERGED_FU12,
+      prs: [{ ...MERGED_PR, html_url: UNIFIED_URL }],
+    });
+    expect(stampsOf("B-4")).toEqual([{ mergeCommit: "m846", mergeVerifiedBy: "github" }]);
+    expect(stampsOf("B-7")).toEqual([]);
+    expect(h.state.terminalClaims).toEqual([]);
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+  it("TEAM-6054: compare-based proof (no unified PR url) → the chain title alone excludes B-7; B-4 still stamped", async () => {
+    await runFuShip({ tasks: { "B-4": { ticketId: "B-4", agentId: "agentcore_hub_release_manager", output: "shipped" } }, pulls: MERGED_FU12 });
+    expect(stampsOf("B-4")).toEqual([{ mergeCommit: "m846", mergeVerifiedBy: "github" }]);
+    expect(stampsOf("B-7")).toEqual([]);
+    expect(h.state.terminalClaims).toEqual([]);
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
 
   it("TEAM-6032: unified PR merged + follow-up PR to main still OPEN → run refused, escalated once", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});

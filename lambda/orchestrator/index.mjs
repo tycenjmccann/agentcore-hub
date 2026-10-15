@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, githubPrRef, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES, isIntentOnlyReservation } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, githubPrRef, isOtherPrTicket, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES, isIntentOnlyReservation } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -3538,8 +3538,13 @@ export async function completeWorkflow(workflow) {
     if (verdict?.required && !verdict.shipped && mergeProof) {
       // Stamp GitHub's proof onto ship tasks that self-reported nothing. A
       // recorded BLOCK outcome is never overwritten — a block is a block.
+      // TEAM-6054: a ticket of ANOTHER PR (DL-038 follow-up chain) is neither stamped nor re-checked —
+      // followUpPrGate above already refused while its PR is open, and its CD reports its own merge_commit.
+      const otherPr = new Set(), titleOf = new Map(children.map((t) => [String(t.ticketId), t.title]));
       for (const o of verdict.offenders) {
         if (o.verdict && o.verdict !== "none") continue;
+        const record = await readCompletionRecord(o.ticketId).catch(() => null); // memoized: the gate read it
+        if (isOtherPrTicket({ entry: freshWf?.agentTasks?.[o.ticketId], record, title: titleOf.get(o.ticketId), unifiedPrUrl: mergeProof.prUrl })) { otherPr.add(o.ticketId); continue; }
         const fields = {
           mergeCommit: mergeProof.mergeCommit || `merged:${workflow.featureBranch}`,
           mergeVerifiedBy: "github",
@@ -3551,7 +3556,7 @@ export async function completeWorkflow(workflow) {
       console.log(`[orchestrator] ${workflow.id}: GitHub proves ${workflow.featureBranch} merged (${mergeProof.mergeCommit || "compare"}) — ship verdict taken from ground truth`);
       freshWf = await store.getWorkflow(workflow.id);
       verdict = evaluateShipVerdict(
-        children, freshWf?.agentTasks || workflow.agentTasks || {}, shipPhases, shipOpts
+        children.filter((t) => !otherPr.has(String(t.ticketId))), freshWf?.agentTasks || workflow.agentTasks || {}, shipPhases, shipOpts
       );
     }
     if (verdict?.required && !verdict.shipped) {

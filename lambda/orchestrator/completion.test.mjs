@@ -2254,3 +2254,26 @@ describe("TEAM-6148 PR-number segment is a whole positive integer", () => {
     expect(refs).toEqual([{ ...R[0], number: 9, url: "https://github.com/o/r/pull/9" }]);
   });
 });
+
+describe("TEAM-6054 isOtherPrTicket", () => {
+  const U9 = "https://github.com/o/r/pull/9", F12 = "https://github.com/o/r/pull/12";
+  const other = (a) => completionMod.isOtherPrTicket(a);
+  it("DL-038 chain title naming another PR → true", () =>
+    expect(other({ title: `Ship: follow-up PR ${F12}`, entry: { prUrl: U9 }, unifiedPrUrl: U9 })).toBe(true));
+  it("record pr_url wins over a stale cached prUrl (TEAM-6062) → true", () =>
+    expect(other({ record: { pr_url: F12 }, entry: { prUrl: U9 }, unifiedPrUrl: U9 })).toBe(true));
+  it("own PR IS the unified PR (owner/repo case, trailing punctuation) → false", () => {
+    expect(other({ entry: { prUrl: "https://github.com/O/R/pull/9." }, unifiedPrUrl: U9 })).toBe(false);
+    expect(other({ record: { pr_url: U9 }, unifiedPrUrl: "https://github.com/o/R/pull/9" })).toBe(false);
+  });
+  it("no PR of its own, or a non-string pr_url → false (stamped as before)", () => {
+    expect(other({ entry: {}, unifiedPrUrl: U9 })).toBe(false);
+    expect(other({ record: { pr_url: [F12] }, unifiedPrUrl: U9 })).toBe(false);
+  });
+  it("compare-based proof (no unified url): only the chain title decides", () => {
+    expect(other({ title: `CD: follow-up PR ${F12}`, unifiedPrUrl: "" })).toBe(true);
+    expect(other({ entry: { prUrl: F12 }, record: { pr_url: F12 }, unifiedPrUrl: "" })).toBe(false);
+  });
+  it("look-alike host in the title → false", () =>
+    expect(other({ title: "Ship: follow-up PR https://notgithub.com/o/r/pull/12", unifiedPrUrl: "" })).toBe(false));
+});

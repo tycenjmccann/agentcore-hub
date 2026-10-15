@@ -867,6 +867,21 @@ export function githubPrRef(text) {
 }
 
 /**
+ * TEAM-6054 — does a ship ticket belong to a PR other than the unified one? Its own PR is the DL-038
+ * chain title's "follow-up PR <url>", else its completion record pr_url (fresher, TEAM-6062), else its
+ * cached prUrl. With no unified PR url (a compare-based proof) only the chain title decides. Pure.
+ */
+export function isOtherPrTicket({ entry, record, title, unifiedPrUrl }) {
+  const ref = (u) => (typeof u === "string" ? githubPrRef(u) : null); // TEAM-6075: a non-string pr_url is ignored
+  const fu = /\bfollow-up PR\s/i.test(String(title ?? "")) ? githubPrRef(title) : null;
+  const unified = ref(unifiedPrUrl);
+  if (!unified) return Boolean(fu);
+  const own = fu || ref(record?.pr_url) || ref(entry?.prUrl);
+  const lc = (s) => String(s).toLowerCase();
+  return Boolean(own) && !(lc(own.owner) === lc(unified.owner) && lc(own.repo) === lc(unified.repo) && own.number === unified.number);
+}
+
+/**
  * TEAM-6032 (DL-038) — the run's PRs in its configured repos, one per repo+number.
  * TEAM-6062: `prUrl` is fill-once, so a re-dispatched ticket's completion record
  * (`records[ticketId].pr_url`) is read too. Pure; foreign repos and non-PR urls are dropped.
