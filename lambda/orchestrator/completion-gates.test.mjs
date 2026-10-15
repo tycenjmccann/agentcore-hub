@@ -1061,6 +1061,73 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     expect(h.state.storeCompletions.length).toBe(1);
   });
 
+
+  // TEAM-6203 (ship-review r2 of #974): delegation is DIRECTIONAL and role-aware. Only a non-CD
+  // chain/fixer ticket with no verdict of its own may be excused, and only by its PR's Done `CD:` ticket
+  // whose OWN verdict is satisfied. A CD ticket never borrows; an explicit block is never removed.
+  const quiet = () => [vi.spyOn(console, "error").mockImplementation(() => {}), vi.spyOn(console, "warn").mockImplementation(() => {})];
+  const noOpenPrRefusal = (error) => expect(error.mock.calls.some((c) => String(c[0]).includes("CompletionRejectedOpenFollowUpPr"))).toBe(false);
+  it("TEAM-6203 F1-cont: Ship: follow-up PR X reported shipped but CD: follow-up PR X has NO verdict → CD cannot borrow, run NOT completed (static-ci-only)", async () => {
+    const [error, warn] = quiet();
+    await runFuShip({ pulls: MERGED_FU12, extra: [FU_CD], tasks: { "B-7": { ...FU_SHIP_TASK, outcome: "shipped" }, "B-8": { ticketId: "B-8", agentId: "agentcore_hub_release_manager", output: "deployed" } } });
+    expect(stampsOf("B-8")).toEqual([]);
+    noOpenPrRefusal(error);
+    expect(h.state.storeCompletions.length).toBe(0);
+    staticCiOnly();
+    error.mockRestore(); warn.mockRestore();
+  });
+  it("TEAM-6203 F1-cont: Ship handoff + unreadable follow-up PR (gate fails open) + verdict-less CD → borrowed handoff masks no deploy; run NOT completed (static-ci-only)", async () => {
+    const [error, warn] = quiet();
+    await runFuShip({ pulls: { 12: 502 }, extra: [FU_CD], tasks: { "B-7": { ...FU_SHIP_TASK, outcome: "handoff" }, "B-8": { ticketId: "B-8", agentId: "agentcore_hub_release_manager", output: "deployed" } } });
+    expect(stampsOf("B-8")).toEqual([]);
+    noOpenPrRefusal(error);
+    expect(h.state.storeCompletions.length).toBe(0);
+    staticCiOnly();
+    error.mockRestore(); warn.mockRestore();
+  });
+  it("TEAM-6203 R2-N1: an explicit deploy-blocked CD is never removed by a shipped same-PR Ship sibling → run closes deploy-blocked", async () => {
+    const [error, warn] = quiet();
+    await runFuShip({ pulls: MERGED_FU12, extra: [FU_CD], tasks: { "B-7": { ...FU_SHIP_TASK, outcome: "shipped" }, "B-8": { ticketId: "B-8", agentId: "agentcore_hub_release_manager", output: "deploy refused", outcome: "deploy-blocked", blockReason: "gate refused" } } });
+    expect(stampsOf("B-8")).toEqual([]);
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(h.state.terminalClaims.map(({ id, outcome, reason }) => ({ id, outcome, reason }))).toEqual([{ id: "wf_1", outcome: "deploy-blocked", reason: "gate refused" }]);
+    error.mockRestore(); warn.mockRestore();
+  });
+  it("TEAM-6203 R2-N1: an explicit static-ci-only Ship is never removed by its shipped CD sibling → run closes static-ci-only", async () => {
+    const [error, warn] = quiet();
+    await runFuShip({ pulls: MERGED_FU12, extra: [FU_CD], tasks: { "B-7": { ...FU_SHIP_TASK, outcome: "static-ci-only" }, ...FU_CD_SHIPPED } });
+    expect(stampsOf("B-7")).toEqual([]);
+    expect(h.state.storeCompletions.length).toBe(0);
+    staticCiOnly();
+    error.mockRestore(); warn.mockRestore();
+  });
+  it("TEAM-6203 R2-N2: a ship_fix fixer titled `Fix (ship-review rN)` (phase ship, own pr_url, no chain title) is excused by its PR's shipped CD → run completes", async () => {
+    const FIXER = { ticketId: "B-9", assignee: "agentcore_hub_bug_fixer", type: "task", status: "done", phase: "ship", title: "Fix (ship-review r1): backend — 2 findings" };
+    h.state.merges.length = 0; h.state.storeCompletions.length = 0; h.state.terminalClaims.length = 0;
+    h.state.snapshots = [[...FU_CHILDREN, FIXER, FU_CD]];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...FU_TASKS, "B-9": { ticketId: "B-9", agentId: "agentcore_hub_bug_fixer", output: "fixed", prUrl: FU_URL }, ...FU_CD_SHIPPED } };
+    mockGitHub({ prs: [MERGED_PR], headSha: "head000", pulls: { 9: UNIFIED_PR9, ...MERGED_FU12 } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(stampsOf("B-9")).toEqual([]);
+    expect(h.state.terminalClaims).toEqual([]);
+    expect(h.state.storeCompletions.length).toBe(1);
+  });
+  it("TEAM-6203 R2-L1: a task-id-keyed legacy agentTasks entry ({ticketId, prUrl: other PR}) is resolved like the verdict evaluator → NOT stamped with the unified proof, run NOT completed", async () => {
+    const [error, warn] = quiet();
+    const FIX12 = { ticketId: "fix-12", assignee: "agentcore_hub_bug_fixer", type: "task", status: "done", phase: "ship" };
+    h.state.merges.length = 0; h.state.storeCompletions.length = 0; h.state.terminalClaims.length = 0;
+    h.state.snapshots = [[...SHIP_CHILDREN, FIX12]];
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...SHIP_TASKS, task_legacy: { ticketId: "fix-12", output: "fixed", prUrl: FU_URL } } };
+    mockGitHub({ prs: [{ ...MERGED_PR, html_url: UNIFIED_URL }], headSha: "head000", pulls: { 9: UNIFIED_PR9, 846: { ...UNIFIED_PR9, number: 846 }, ...MERGED_FU12 } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(stampsOf("fix-12").some((f) => "mergeCommit" in f)).toBe(false);
+    expect(h.state.storeCompletions.length).toBe(0);
+    staticCiOnly();
+    error.mockRestore(); warn.mockRestore();
+  });
+
   it("TEAM-6032: unified PR merged + follow-up PR to main still OPEN → run refused, escalated once", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     await runFollowUp({ 12: fuPr() });
