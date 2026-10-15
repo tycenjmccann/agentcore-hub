@@ -50,11 +50,11 @@ import { deliveryModeFor, loadCdRegistry } from "@/lib/cd-registry";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
 import { resolveMissingEvidenceFromRecords } from "@/lib/workflow/completion-evidence";
 import {
-  completionRecordsFor,
-  dropCarriedOffenders,
   followUpPrGateConfigured,
   memoizedReader,
   openFollowUpPrsAtCompletion,
+  readCompletionRecords,
+  recheckShipVerdict,
   type MergeProbe,
 } from "@/lib/workflow/follow-up-pr-gate";
 // TEAM-6136 F6: the orchestrator's OWN framework selector (pure, no imports) —
@@ -816,6 +816,8 @@ export async function POST(
     //     dropCarriedOffenders over the SAME inputs completeWorkflow uses (the gate's
     //     overlaid tasks + GitHub proof when the gate ran, else the stored row; every
     //     child's completions/<id>.json through one memoized reader).
+    //     TEAM-6231 — via completion.mjs recheckShipVerdict: fresh records are overlaid
+    //     even without the gate (F2), a FAILED read is remembered and never excused (F3).
     try {
       let view = (workflow.agentTasks as Record<string, ShipTaskLike>) || {};
       let mergeProof: MergeProbe | null = null;
@@ -826,7 +828,7 @@ export async function POST(
           return await readCompletionRecordFromS3(ticketId);
         } catch (err) {
           if (isMissingObject(err)) return null;
-          throw err; // the gate falls back to the cached prUrl; the re-check reads it as null
+          throw err; // the gate falls back to the cached prUrl; the re-check lists it as failed
         }
       });
       // 2c-0. TEAM-6136 — the TEAM-6032 (DL-038) follow-up PR gate, BEFORE the
@@ -885,11 +887,19 @@ export async function POST(
       }
       if (verdict.required && !verdict.shipped) {
         const children = tickets.filter((t) => t.type !== "epic");
-        verdict = dropCarriedOffenders(evaluateShipVerdict(tickets, view, requiredPhases, phaseById), {
+        const { records, failed } = await readCompletionRecords(
+          children.map((t) => String(t.ticketId)),
+          readRecord
+        );
+        verdict = recheckShipVerdict({
+          evaluate: (tasks) => evaluateShipVerdict(tickets, tasks as Record<string, ShipTaskLike>, requiredPhases, phaseById),
           children,
           agentTasks: view,
-          records: await completionRecordsFor(children.map((t) => String(t.ticketId)), readRecord),
+          records,
+          failed,
           mergeProof,
+          shipPhases: requiredPhases.filter((p) => SHIP_PHASES.has(p)),
+          getAgentPhase: (agentId) => phaseById[agentId],
         });
       }
       if (verdict.required && !verdict.shipped) {

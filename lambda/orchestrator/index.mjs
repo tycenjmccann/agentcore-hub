@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, freshRecordFields, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, githubPrRef, isOtherPrTicket, dropCarriedOffenders, resolveTicketEntry, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES, isIntentOnlyReservation } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, freshRecordFields, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, githubPrRef, isOtherPrTicket, readCompletionRecords, recheckShipVerdict, resolveTicketEntry, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES, isIntentOnlyReservation } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -425,21 +425,6 @@ async function dispatchReadyDependent(_workflow, sibling) {
   return (await handleTicketReadyUnified(sibling.ticketId, fresh)) === true; // TEAM-5791: the reconcile ready branch tallies it
 }
 
-/**
- * Read one JSON object out of the artifact bucket, or null when it isn't there /
- * isn't JSON (TEAM-4120 FR-3). Injected as the escalation tree's `s3Get` so the
- * module never constructs an S3 client. "Missing" and "unreadable" are the same
- * answer to the caller: there is no evidence.
- */
-async function readArtifactJson(key) {
-  try {
-    const res = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: key }));
-    return JSON.parse(await res.Body.transformToString());
-  } catch {
-    return null;
-  }
-}
-
 // One detector per warm container so its per-agent median cache is reused
 // across the 5-minute sweeps (rebuilt from scratch on a cold start).
 let _detector = null;
@@ -557,12 +542,21 @@ let _completionRecordCache = new Map();
 function resetCompletionRecordCache() {
   _completionRecordCache = new Map();
 }
-async function readCompletionRecord(ticketId) {
-  if (!ARTIFACT_BUCKET || !ticketId) return null;
+// TEAM-6231 F3: the memo holds the RAW read — missing → null, any other failure rejects — so the ship re-check
+// (readCompletionRecords) can tell failed from missing; every other caller keeps readCompletionRecord's catch → null.
+const isMissingObject = (err) => ["NoSuchKey", "NotFound"].includes(err?.name || err?.Code || "") || err?.$metadata?.httpStatusCode === 404;
+function readCompletionRecordRaw(ticketId) {
+  if (!ARTIFACT_BUCKET || !ticketId) return Promise.resolve(null);
   if (_completionRecordCache.has(ticketId)) return _completionRecordCache.get(ticketId);
-  const p = readArtifactJson(`completions/${ticketId}.json`).then((r) => (isIntentOnlyReservation(r) ? null : r)); // TEAM-5996: a Done-intent reservation is no record
+  const p = s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: `completions/${ticketId}.json` }))
+    .then(async (res) => JSON.parse(await res.Body.transformToString()), (err) => { if (isMissingObject(err)) return null; throw err; })
+    .then((r) => (isIntentOnlyReservation(r) ? null : r)); // TEAM-5996: a Done-intent reservation is no record
+  p.catch(() => {}); // a cached rejection is observed by its readers, never unhandled
   _completionRecordCache.set(ticketId, p);
   return p;
+}
+async function readCompletionRecord(ticketId) {
+  return readCompletionRecordRaw(ticketId).catch(() => null);
 }
 
 /**
@@ -3387,8 +3381,7 @@ export async function completeWorkflow(workflow) {
               }));
               return JSON.parse(await res.Body.transformToString());
             } catch (err) {
-              const code = err?.name || err?.Code || "";
-              if (code === "NoSuchKey" || code === "NotFound" || err?.$metadata?.httpStatusCode === 404) return null;
+              if (isMissingObject(err)) return null;
               throw err; // logged by the resolver; offender stays
             }
           },
@@ -3523,7 +3516,7 @@ export async function completeWorkflow(workflow) {
       // TEAM-6192: the delegation (dropCarriedOffenders, shared with POST /complete) runs with or without proof.
       const tasks = freshWf?.agentTasks || {};
       const titleOf = new Map(children.map((t) => [String(t.ticketId), t.title]));
-      const records = Object.fromEntries(await Promise.all(children.map(async (t) => [String(t.ticketId), await readCompletionRecord(t.ticketId).catch(() => null)])));
+      const { records, failed } = await readCompletionRecords(children.map((t) => t.ticketId), readCompletionRecordRaw); // TEAM-6231 F3: failed ≠ missing
       if (mergeProof) {
         for (const o of verdict.offenders) {
           if (o.verdict && o.verdict !== "none") continue;
@@ -3534,13 +3527,15 @@ export async function completeWorkflow(workflow) {
             mergeVerifiedBy: "github",
           };
           if (mergeProof.prUrl && !entry?.prUrl) fields.prUrl = mergeProof.prUrl;
-          try { await store.mergeTaskMetadata(workflow.id, o.ticketId, fields); }
+          try { await store.mergeTaskMetadata(workflow.id, o.ticketId, fields); if (entry) Object.assign(entry, fields); }
           catch (err) { console.warn(`[orchestrator] merge-proof stamp failed for ${o.ticketId}: ${err?.message || err}`); }
         }
         console.log(`[orchestrator] ${workflow.id}: GitHub proves ${workflow.featureBranch} merged (${mergeProof.mergeCommit || "compare"}) — ship verdict taken from ground truth`);
       }
-      freshWf = await store.getWorkflow(workflow.id);
-      verdict = dropCarriedOffenders(evaluateShipVerdict(children, freshWf?.agentTasks || workflow.agentTasks || {}, shipPhases, shipOpts), { children, agentTasks: freshWf?.agentTasks, records, mergeProof });
+      // TEAM-6231 F1: a failed re-read keeps the pre-re-check snapshot (stamps applied above), never falls through green.
+      freshWf = await store.getWorkflow(workflow.id).catch((err) => (console.warn(`[orchestrator] ${workflow.id}: ship re-check re-read failed, deciding on the prior snapshot: ${err?.message || err}`), freshWf));
+      // TEAM-6231 F2/F4: overlay fresh records, re-evaluate, delegate — completion.mjs recheckShipVerdict, shared with POST /complete.
+      verdict = recheckShipVerdict({ evaluate: (tasks) => evaluateShipVerdict(children, tasks, shipPhases, shipOpts), children, agentTasks: freshWf?.agentTasks || workflow.agentTasks || {}, records, failed, mergeProof, shipPhases, getAgentPhase: shipOpts.getAgentPhase });
     }
     if (verdict?.required && !verdict.shipped) {
       const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");

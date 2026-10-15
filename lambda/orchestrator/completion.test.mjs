@@ -2482,3 +2482,86 @@ describe("TEAM-6192 dropCarriedOffenders", () => {
     expect(drop(v, { children: [fixer, C], agentTasks: tasks, records: { S: { pr_url: FU } }, mergeProof: PROOF }).shipped).toBe(true);
   });
 });
+
+// TEAM-6231 (ship-review of #980) — the shared helpers both completion surfaces call for the
+// re-check: the failure-aware record read (F3), the pure fresh-record overlay (F2), the knowable
+// unified PR without proof (F4), and recheckShipVerdict, which composes them over each surface's own evaluator.
+describe("TEAM-6231 re-check helpers (F2-F4)", () => {
+  const FU = "https://github.com/o/r/pull/12", UNI = "https://github.com/o/r/pull/846";
+  const RM = "agentcore_hub_release_manager";
+  const U = { ticketId: "U", type: "task", status: "done", phase: "ship", assignee: RM, title: "Ship: unified release" };
+  const S = { ticketId: "S", type: "task", status: "done", phase: "ship", assignee: RM, title: `Ship: follow-up PR ${FU}` };
+  const C = { ticketId: "C", type: "task", status: "done", phase: "ship", assignee: RM, title: `CD: follow-up PR ${FU}` };
+  const SHIPPED_C = { ticketId: "C", output: "deployed", prUrl: FU, mergeCommit: "m12", outcome: "shipped" };
+  const U_MERGED = { ticketId: "U", output: "merged", prUrl: UNI, mergeCommit: "m846" };
+  const evaluate = (tasks) => completion.evaluateShipVerdict([U, S, C], tasks, ["ship"]);
+
+  it("readCompletionRecords: missing → null; a FAILED read → null AND in `failed`; never throws", async () => {
+    const read = async (id) => {
+      if (id === "S") throw Object.assign(new Error("Access Denied"), { name: "AccessDenied" });
+      return id === "C" ? { pr_url: FU } : null;
+    };
+    const { records, failed } = await completion.readCompletionRecords(["U", "S", "C"], read);
+    expect(records).toEqual({ U: null, S: null, C: { pr_url: FU } });
+    expect([...failed]).toEqual(["S"]);
+    const sync = await completion.readCompletionRecords(["X"], () => { throw new Error("sync boom"); });
+    expect([...sync.failed]).toEqual(["X"]);
+  });
+
+  it("overlayFreshRecords: a fresh record overwrites, a stale / startedAt-less one does not; input untouched", () => {
+    const tasks = {
+      S: { ticketId: "S", output: "x", startedAt: "2026-09-03T00:00:00Z", completedAt: "2026-09-03T01:00:00Z" },
+      T: { ticketId: "T", output: "y", startedAt: "2026-09-03T00:00:00Z", completedAt: "2026-09-03T05:00:00Z" },
+      N: { ticketId: "N", output: "z" },
+    };
+    const before = JSON.parse(JSON.stringify(tasks));
+    const rec = { completed_at: "2026-09-03T02:00:00Z", outcome: "deploy-blocked", block_reason: "do not deploy" };
+    const out = completion.overlayFreshRecords(tasks, { S: rec, T: rec, N: rec });
+    expect(out.S).toMatchObject({ outcome: "deploy-blocked", blockReason: "do not deploy" });
+    expect(out.T).toBe(tasks.T); // record predates the Done stamp → not fresh
+    expect(out.N).toBe(tasks.N); // no startedAt → never overlaid (harvest's onlyFresh rule)
+    expect(tasks).toEqual(before);
+  });
+
+  it("unifiedPrRefOf: proof wins; else a Done agent ship-phase NON-chain ticket with a mergeCommit; else null", () => {
+    expect(completion.unifiedPrRefOf({ children: [U, S, C], agentTasks: {}, mergeProof: { merged: true, prUrl: UNI } })).toMatchObject({ number: 846 });
+    expect(completion.unifiedPrRefOf({ children: [U, S, C], agentTasks: { U: U_MERGED, C: SHIPPED_C } })).toMatchObject({ number: 846 });
+    // the chain CD's own mergeCommit never names the unified PR; a dev-phase ticket never does either
+    expect(completion.unifiedPrRefOf({ children: [S, C], agentTasks: { C: SHIPPED_C } })).toBeNull();
+    const dev = { ...U, phase: "development" };
+    expect(completion.unifiedPrRefOf({ children: [dev], agentTasks: { U: U_MERGED } })).toBeNull();
+    expect(completion.unifiedPrRefOf({ children: [U], agentTasks: { U: { ticketId: "U", prUrl: UNI } } })).toBeNull(); // no mergeCommit
+  });
+
+  it("dropCarriedOffenders: a recipient whose record read FAILED is kept, with or without proof (F3)", () => {
+    const tasks = { U: U_MERGED, S: { ticketId: "S", output: "reviewed", prUrl: FU }, C: SHIPPED_C };
+    const v = evaluate(tasks);
+    for (const mergeProof of [{ merged: true, prUrl: UNI }, null]) {
+      expect(completion.dropCarriedOffenders(v, { children: [U, S, C], agentTasks: tasks, failed: new Set(["S"]), mergeProof })).toBe(v);
+      expect(completion.dropCarriedOffenders(v, { children: [U, S, C], agentTasks: tasks, failed: new Set(), mergeProof }).shipped).toBe(true);
+    }
+  });
+
+  it("dropCarriedOffenders without proof: a chain-titled ticket ON the knowable unified PR is kept (F4)", () => {
+    const S846 = { ...S, title: `Ship: follow-up PR ${UNI}` }, C846 = { ...C, title: `CD: follow-up PR ${UNI}` };
+    const tasks = { U: U_MERGED, S: { ticketId: "S", output: "x", prUrl: UNI }, C: { ticketId: "C", prUrl: UNI, mergeCommit: "m846", outcome: "shipped" } };
+    const v = completion.evaluateShipVerdict([U, S846, C846], tasks, ["ship"]);
+    expect(completion.dropCarriedOffenders(v, { children: [U, S846, C846], agentTasks: tasks })).toBe(v);
+  });
+
+  it("documented trust boundary (DL-038): without proof and with NOTHING naming the unified PR, the chain title is trusted → excused", () => {
+    const S846 = { ...S, title: `Ship: follow-up PR ${UNI}` }, C846 = { ...C, title: `CD: follow-up PR ${UNI}` };
+    const tasks = { S: { ticketId: "S", output: "x", prUrl: UNI }, C: { ticketId: "C", prUrl: UNI, mergeCommit: "m846", outcome: "shipped" } };
+    const v = completion.evaluateShipVerdict([S846, C846], tasks, ["ship"]);
+    expect(completion.dropCarriedOffenders(v, { children: [S846, C846], agentTasks: tasks }).shipped).toBe(true);
+  });
+
+  it("recheckShipVerdict: a fresh deploy-blocked record on the recipient surfaces as the outcome, never excused (F2)", () => {
+    const tasks = { U: U_MERGED, S: { ticketId: "S", output: "x", prUrl: FU, startedAt: "2026-09-03T00:00:00Z", completedAt: "2026-09-03T01:00:00Z" }, C: SHIPPED_C };
+    const records = { S: { completed_at: "2026-09-03T02:00:00Z", outcome: "deploy-blocked", block_reason: "do not deploy" } };
+    const out = completion.recheckShipVerdict({ evaluate, children: [U, S, C], agentTasks: tasks, records });
+    expect(out).toMatchObject({ shipped: false, outcome: "deploy-blocked", blockReason: "do not deploy", offenders: [{ ticketId: "S", verdict: "deploy-blocked" }] });
+    // without that record the same chain is delivered
+    expect(completion.recheckShipVerdict({ evaluate, children: [U, S, C], agentTasks: tasks, records: {} }).shipped).toBe(true);
+  });
+});

@@ -1,5 +1,5 @@
 {
-  "_comment": "TEAM-6192 — ONE delivered DL-038 follow-up chain for BOTH completion surfaces: src/app/api/workflow/[id]/complete/route.test.ts and lambda/orchestrator/completion-gates.test.mjs. U = the unified Ship ticket (carries the unified merge proof); S = 'Ship: follow-up PR <url>' (output + its own PR, no verdict); C = 'CD: follow-up PR <url>' (its own merge_commit + outcome shipped). Each harness adds only its own scaffolding (def, other phases, GitHub stub mechanics).",
+  "_comment": "TEAM-6192 — ONE delivered DL-038 follow-up chain for BOTH completion surfaces: src/app/api/workflow/[id]/complete/route.test.ts and lambda/orchestrator/completion-gates.test.mjs. U = the unified Ship ticket (carries the unified merge proof); S = 'Ship: follow-up PR <url>' (output + its own PR, no verdict); C = 'CD: follow-up PR <url>' (its own merge_commit + outcome shipped). Each harness adds only its own scaffolding (def, other phases, GitHub stub mechanics). TEAM-6231 (ship-review of #980): shipFreshBlocked* = S row with no verdict + a FRESH deploy-blocked completions/S.json (F2); recordReadError = completions/S.json read FAILS, not missing (F3); unifiedTitledAsChain = the unified PR's own Ship/CD titled like a chain while U's mergeCommit names it (F4).",
   "featureBranch": "feature/EPIC-1-fix",
   "unifiedPrUrl": "https://github.com/o/r/pull/846",
   "followUpPrUrl": "https://github.com/o/r/pull/12",
@@ -17,7 +17,17 @@
     "cdNotShipped": { "ticketId": "C", "agentId": "agentcore_hub_release_manager", "output": "deployed", "prUrl": "https://github.com/o/r/pull/12" },
     "cdShippedRecord": { "ticket_id": "C", "pr_url": "https://github.com/o/r/pull/12", "merge_commit": "m12", "outcome": "shipped", "summary": "deployed" },
     "nonChainShipTitle": "Fix (ship-review r1): follow-up findings",
-    "shipOwnBlock": { "outcome": "deploy-blocked", "blockReason": "follow-up deploy gate rejected" }
+    "shipOwnBlock": { "outcome": "deploy-blocked", "blockReason": "follow-up deploy gate rejected" },
+    "shipFreshBlockedRow": { "startedAt": "2026-09-03T00:00:00Z", "completedAt": "2026-09-03T01:00:00Z" },
+    "shipFreshBlockedRecord": { "ticket_id": "S", "completed_at": "2026-09-03T02:00:00Z", "pr_url": "https://github.com/o/r/pull/12", "outcome": "deploy-blocked", "block_reason": "do not deploy", "summary": "follow-up PR reviewed" },
+    "recordReadError": { "name": "AccessDenied", "message": "Access Denied" },
+    "unifiedTitledAsChain": {
+      "titles": { "S": "Ship: follow-up PR https://github.com/o/r/pull/846", "C": "CD: follow-up PR https://github.com/o/r/pull/846" },
+      "agentTasks": {
+        "S": { "ticketId": "S", "agentId": "agentcore_hub_release_manager", "output": "unified PR reviewed", "prUrl": "https://github.com/o/r/pull/846" },
+        "C": { "ticketId": "C", "agentId": "agentcore_hub_release_manager", "output": "deployed", "prUrl": "https://github.com/o/r/pull/846", "mergeCommit": "m846", "outcome": "shipped" }
+      }
+    }
   },
   "github": {
     "branchHeadSha": "head000",

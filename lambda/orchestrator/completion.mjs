@@ -939,20 +939,73 @@ export function verdictCarried(t, children, agentTasks, records = {}) {
  * TEAM-6192 — the ONE delegation step after the ship-verdict evaluation, shared by completeWorkflow's
  * re-check and POST /api/workflow/[id]/complete: drop the verdict-less offenders verdictCarried excuses.
  * Proof-aware: with GitHub `mergeProof` a ticket on the unified PR is never excused (isOtherPrTicket);
- * without it only a DL-038 chain ticket (followUpTitleRef) is. Only "none" offenders leave, so
- * outcome/blockReason stand unless none is left; handoff is false (an excused ticket claimed nothing). Pure.
+ * without it only a DL-038 chain ticket (followUpTitleRef) not on the knowable unified PR (unifiedPrRefOf,
+ * TEAM-6231 F4) is. A ticket in `failed` (its completions/<id>.json read failed, not missing) is never
+ * excused (TEAM-6231 F3). Only "none" offenders leave, so outcome/blockReason stand unless none is left;
+ * handoff is false (an excused ticket claimed nothing). Pure.
  */
-export function dropCarriedOffenders(verdict, { children = [], agentTasks = {}, records = {}, mergeProof = null } = {}) {
+export function dropCarriedOffenders(verdict, { children = [], agentTasks = {}, records = {}, failed = new Set(), mergeProof = null, shipPhases, getAgentPhase } = {}) {
   if (!verdict?.required || verdict.shipped) return verdict;
   const byId = new Map([].concat(children || []).map((t) => [String(t.ticketId), t]));
+  const unified = mergeProof ? null : unifiedPrRefOf({ children, agentTasks, records, shipPhases, getAgentPhase });
   const offenders = verdict.offenders.filter((o) => {
     const t = byId.get(String(o.ticketId));
-    if (!t || !verdictCarried(t, children, agentTasks, records)) return true;
+    if (!t || failed?.has?.(String(t.ticketId)) || !verdictCarried(t, children, agentTasks, records)) return true;
     const entry = resolveTicketEntry(agentTasks, t.ticketId);
-    return mergeProof ? !isOtherPrTicket({ entry, record: records?.[t.ticketId], title: t.title, unifiedPrUrl: mergeProof.prUrl }) : !followUpTitleRef(t.title);
+    if (mergeProof) return !isOtherPrTicket({ entry, record: records?.[t.ticketId], title: t.title, unifiedPrUrl: mergeProof.prUrl });
+    return !followUpTitleRef(t.title) || samePr(resolveTicketPrUrl({ title: t.title, record: records?.[t.ticketId], entry }), unified);
   });
   if (offenders.length === verdict.offenders.length) return verdict;
   return offenders.length ? { ...verdict, offenders } : { ...verdict, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [] };
+}
+
+/**
+ * TEAM-6231 F4 — the run's unified PR as far as it is knowable WITHOUT GitHub proof: `mergeProof.prUrl`
+ * when given, else the own PR (resolveTicketPrUrl) of a Done agent ship-phase ticket that is not a DL-038
+ * chain ticket and carries a mergeCommit (the resolvePrBase "unified_pr_merged" fact); else null. The row
+ * has no pre-completion unified prUrl (`delivery.prUrl` is written after completion). Pure.
+ */
+export function unifiedPrRefOf({ children = [], agentTasks = {}, records = {}, mergeProof = null, shipPhases, getAgentPhase = () => undefined } = {}) {
+  if (mergeProof?.prUrl) return prRef(mergeProof.prUrl);
+  const phases = shipPhases ? new Set(shipPhases) : SHIP_PHASES;
+  for (const t of [].concat(children || [])) {
+    const entry = resolveTicketEntry(agentTasks, t?.ticketId);
+    if (String(t?.status || "").toLowerCase() !== "done" || isHuman(t.assignee) || followUpTitleRef(t.title) || !nonEmptyString(entry?.mergeCommit)) continue;
+    if (!phases.has(typeof t.phase === "string" && t.phase ? t.phase : getAgentPhase(t.assignee))) continue;
+    const own = resolveTicketPrUrl({ title: t.title, record: records?.[t.ticketId], entry });
+    if (own) return own;
+  }
+  return null;
+}
+
+/** TEAM-6231 F3 — every id through the caller's (memoized) reader: `records[id]` is the record or null;
+ *  a read that THREW is null in `records` and listed in `failed` (failed ≠ missing). Never throws. */
+export async function readCompletionRecords(ticketIds, read) {
+  const failed = new Set();
+  const entries = await Promise.all([].concat(ticketIds || []).map(async (id) => {
+    try { return [String(id), (await read(id)) ?? null]; } catch { failed.add(String(id)); return [String(id), null]; }
+  }));
+  return { records: Object.fromEntries(entries), failed };
+}
+
+/** TEAM-6231 F2 — the pre-probe harvest's onlyFresh rule (freshRecordFields) as a pure overlay: an entry with
+ *  `startedAt` whose record (`records[key]`, as the harvest reads it) is FRESH gets its fields. New map; no writes. */
+export function overlayFreshRecords(agentTasks, records = {}) {
+  const out = { ...(agentTasks || {}) };
+  for (const [key, entry] of Object.entries(agentTasks || {})) {
+    const record = records?.[key];
+    if (!entry || typeof entry !== "object" || !entry.startedAt || !record) continue;
+    const { fresh, fields } = freshRecordFields(entry, record);
+    if (fresh && Object.keys(fields).length > 0) out[key] = { ...entry, ...fields };
+  }
+  return out;
+}
+
+/** TEAM-6231 — the ONE post-gate re-check both surfaces run: overlay fresh records, re-evaluate with the
+ *  surface's own `evaluate(agentTasks)`, then delegate (a fresh explicit block is the ticket's own verdict). */
+export function recheckShipVerdict({ evaluate, agentTasks = {}, records = {}, ...ctx }) {
+  const view = overlayFreshRecords(agentTasks, records);
+  return dropCarriedOffenders(evaluate(view), { ...ctx, agentTasks: view, records });
 }
 
 /**

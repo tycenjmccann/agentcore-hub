@@ -37,9 +37,11 @@ const h = vi.hoisted(() => {
     s3Objects: Record<string, string>;
     s3Gets: string[];
     s3Error: Error | null;
+    // TEAM-6231 F3: per-key read errors (one record unreadable, the rest served normally).
+    s3Errors: Record<string, Error>;
   } = {
     workflow: {}, tickets: [], def: {}, updates: [], updateError: null, workflowAfterFail: null,
-    s3Objects: {}, s3Gets: [], s3Error: null,
+    s3Objects: {}, s3Gets: [], s3Error: null, s3Errors: {},
   };
   return { state };
 });
@@ -98,6 +100,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
     async send(cmd: { input: { Key: string } }) {
       h.state.s3Gets.push(cmd.input.Key);
       if (h.state.s3Error) throw h.state.s3Error;
+      if (h.state.s3Errors[cmd.input.Key]) throw h.state.s3Errors[cmd.input.Key];
       const body = h.state.s3Objects[cmd.input.Key];
       if (body === undefined) {
         const e = new Error("The specified key does not exist.");
@@ -141,6 +144,7 @@ beforeEach(() => {
   h.state.s3Objects = { [CD_REGISTRY_KEY]: REGISTERED_O_R };
   h.state.s3Gets.length = 0;
   h.state.s3Error = null;
+  h.state.s3Errors = {};
   for (const k of SAVED) saved[k] = process.env[k];
   process.env.TICKET_PROVIDER = "dynamodb";
   // TEAM-3976: the completions-record fallback is gated on ARTIFACT_BUCKET (read
@@ -1416,5 +1420,44 @@ describe("POST complete — TEAM-6192 delivered follow-up chain (shared fixture)
     expect(body.offenders).toEqual([{ ticketId: "S", phase: "ship", verdict: "deploy-blocked" }]);
     const values = h.state.updates[0].ExpressionAttributeValues as Record<string, unknown>;
     expect(values[":reason"]).toBe(chain.variants.shipOwnBlock.blockReason);
+  });
+
+  // TEAM-6231 (ship-review of #980) — the no-proof / degraded-read holes, same fixture as the orchestrator.
+  it("8. F2: a FRESH deploy-blocked completions/S.json the row never harvested (merge-verify off) → deploy-blocked 'do not deploy', not excused", async () => {
+    process.env.SHIP_MERGE_VERIFY = "off";
+    h.state.workflow = workflow({ S: { ...clone(chain.agentTasks.S), ...chain.variants.shipFreshBlockedRow } });
+    h.state.s3Objects["completions/S.json"] = JSON.stringify(chain.variants.shipFreshBlockedRecord);
+    await load();
+    const body = await (await post()).json();
+    expect(body.status).toBe("deploy-blocked");
+    expect(body.offenders).toEqual([{ ticketId: "S", phase: "ship", verdict: "deploy-blocked" }]);
+    const values = h.state.updates[0].ExpressionAttributeValues as Record<string, unknown>;
+    expect(values[":reason"]).toBe(chain.variants.shipFreshBlockedRecord.block_reason);
+  });
+
+  for (const verify of ["on", "off"] as const) {
+    it(`9. F3 (merge-verify ${verify}): completions/S.json read FAILS (not missing) → S is not excused → static-ci-only`, async () => {
+      if (verify === "off") process.env.SHIP_MERGE_VERIFY = "off";
+      h.state.s3Errors["completions/S.json"] = Object.assign(new Error(chain.variants.recordReadError.message), {
+        name: chain.variants.recordReadError.name,
+      });
+      github(chain.github.followUpPrMerged);
+      await load();
+      const body = await (await post()).json();
+      expect(body.status).toBe("static-ci-only");
+      expect(body.offenders).toEqual([{ ticketId: "S", phase: "ship", verdict: "none" }]);
+    });
+  }
+
+  it("10. F4: no proof, the unified PR's own Ship titled like a chain (U's mergeCommit names #846) → not excused → static-ci-only", async () => {
+    process.env.SHIP_MERGE_VERIFY = "off";
+    const f4 = chain.variants.unifiedTitledAsChain;
+    const titles: Record<string, string> = f4.titles;
+    h.state.tickets = clone(chain.tickets).map((t) => (titles[t.ticketId] ? { ...t, title: titles[t.ticketId] } : t));
+    h.state.workflow = workflow(clone(f4.agentTasks));
+    await load();
+    const body = await (await post()).json();
+    expect(body.status).toBe("static-ci-only");
+    expect(body.offenders).toEqual([{ ticketId: "S", phase: "ship", verdict: "none" }]);
   });
 });

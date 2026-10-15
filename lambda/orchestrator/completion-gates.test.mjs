@@ -39,6 +39,8 @@ const h = vi.hoisted(() => ({
     queries: 0,
     freshWorkflow: /** @type {any} */ (null),
     getWorkflowThrows: false,
+    getWorkflowFailAt: 0, // TEAM-6231 F1: >0 → only the Nth store.getWorkflow call throws
+    getWorkflowCalls: 0,
     escalationOverride: null, // TEAM-5914: () => result | throws, replaces the once-append for one test
     storeCompletions: /** @type {any[]} */ ([]),
     finalized: /** @type {any[]} */ ([]),
@@ -87,6 +89,7 @@ const h = vi.hoisted(() => ({
     // backfill captured. Mirrors evidence-harvest.test.mjs.
     s3Objects: /** @type {Record<string, string>} */ ({}),
     s3Gets: /** @type {string[]} */ ([]),
+    s3Errors: /** @type {Record<string, any>} */ ({}), // TEAM-6231 F3: completions/<key> → a non-NoSuchKey read error
     merges: /** @type {any[]} */ ([]),
   },
 }));
@@ -133,6 +136,7 @@ vi.mock("@aws-sdk/client-s3", () => ({
       if (typeof key === "string" && key.startsWith("completions/")) {
         // TEAM-3976: raw-string records (s3Objects) or object records
         // (s3Completions, TEAM-3985). Absent → the SDK's named NoSuchKey.
+        if (h.state.s3Errors[key]) throw Object.assign(new Error(h.state.s3Errors[key].message), { name: h.state.s3Errors[key].name });
         const raw = h.state.s3Objects[key] !== undefined
           ? h.state.s3Objects[key]
           : h.state.s3Completions[key] !== undefined ? JSON.stringify(h.state.s3Completions[key]) : undefined;
@@ -174,6 +178,7 @@ vi.mock("./workflow-store.mjs", () => ({
   initWorkflowStore: vi.fn(() => {}), // called at index.mjs module load
   getWorkflow: vi.fn(async (id) => {
     if (h.state.getWorkflowThrows) throw new Error("workflow read exploded");
+    if (++h.state.getWorkflowCalls === h.state.getWorkflowFailAt) throw new Error("workflow re-read exploded");
     return h.state.freshWorkflow?.id === id ? h.state.freshWorkflow : null;
   }),
   completeWorkflow: vi.fn(async (id, ts) => {
@@ -266,6 +271,9 @@ beforeEach(() => {
   h.state.queries = 0;
   h.state.freshWorkflow = null;
   h.state.getWorkflowThrows = false;
+  h.state.getWorkflowFailAt = 0;
+  h.state.getWorkflowCalls = 0;
+  h.state.s3Errors = {};
   h.state.escalationOverride = null;
   h.state.storeCompletions.length = 0;
   h.state.finalized.length = 0;
@@ -1643,6 +1651,48 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
       await run({ tasks: { S: { ...chain.agentTasks.S, ...chain.variants.shipOwnBlock } } });
       expect(h.state.storeCompletions.length).toBe(0);
       expect(claims()).toEqual([{ outcome: "deploy-blocked", reason: chain.variants.shipOwnBlock.blockReason }]);
+    });
+
+    // TEAM-6231 (ship-review of #980) — the no-proof / degraded-read holes, same fixture as the route.
+    it("7. F1: the re-check's workflow re-read fails (merge-verify off, S own block) → the earlier deploy-blocked stands, never complete", async () => {
+      process.env.SHIP_MERGE_VERIFY = "off";
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      h.state.getWorkflowCalls = 0;
+      h.state.getWorkflowFailAt = 4; // live phase, evidence, ship verdict, then the re-check's re-read
+      await run({ tasks: { S: { ...chain.agentTasks.S, ...chain.variants.shipOwnBlock } } });
+      expect(h.state.getWorkflowCalls).toBeGreaterThanOrEqual(4);
+      expect(h.state.storeCompletions.length).toBe(0);
+      expect(claims()).toEqual([{ outcome: "deploy-blocked", reason: chain.variants.shipOwnBlock.blockReason }]);
+      expect(warn.mock.calls.some(([m]) => /ship re-check re-read failed/.test(String(m)))).toBe(true);
+      warn.mockRestore();
+    });
+
+    it("8. F2: a FRESH deploy-blocked completions/S.json the row never harvested (merge-verify off) → deploy-blocked 'do not deploy', not excused", async () => {
+      process.env.SHIP_MERGE_VERIFY = "off";
+      h.state.s3Completions["completions/S.json"] = clone(chain.variants.shipFreshBlockedRecord);
+      await run({ tasks: { S: { ...chain.agentTasks.S, ...chain.variants.shipFreshBlockedRow } } });
+      expect(h.state.storeCompletions.length).toBe(0);
+      expect(claims()).toEqual([{ outcome: "deploy-blocked", reason: chain.variants.shipFreshBlockedRecord.block_reason }]);
+    });
+
+    for (const verify of ["on", "off"]) {
+      it(`9. F3 (merge-verify ${verify}): completions/S.json read FAILS (not missing) → S is not excused → static-ci-only`, async () => {
+        if (verify === "off") process.env.SHIP_MERGE_VERIFY = "off";
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+        h.state.s3Errors["completions/S.json"] = chain.variants.recordReadError;
+        await run();
+        expect(h.state.storeCompletions.length).toBe(0);
+        expect(claims()).toEqual([{ outcome: "static-ci-only", reason: null }]);
+        warn.mockRestore();
+      });
+    }
+
+    it("10. F4: no proof, the unified PR's own Ship titled like a chain (U's mergeCommit names #846) → not excused → static-ci-only", async () => {
+      process.env.SHIP_MERGE_VERIFY = "off";
+      const f4 = chain.variants.unifiedTitledAsChain;
+      await run({ tickets: chain.tickets.map((t) => (f4.titles[t.ticketId] ? { ...t, title: f4.titles[t.ticketId] } : t)), tasks: f4.agentTasks });
+      expect(h.state.storeCompletions.length).toBe(0);
+      expect(claims()).toEqual([{ outcome: "static-ci-only", reason: null }]);
     });
   });
 });

@@ -23,6 +23,8 @@ import {
   featureBranchLanding,
   freshRecordFields,
   isIntentOnlyReservation,
+  readCompletionRecords as readCompletionRecordsMjs,
+  recheckShipVerdict as recheckShipVerdictMjs,
   recordedHeads,
 } from "../../../lambda/orchestrator/completion.mjs";
 import { ghGet, parseGitHubUrl } from "@/lib/workflow/repo-check";
@@ -72,15 +74,32 @@ interface ShipVerdictLike {
  * dropCarriedOffenders, also called by completeWorkflow's re-check). Drops only the
  * verdict-less offenders verdictCarried excuses; proof-aware for the unified ticket.
  */
+type DelegationCtx = {
+  children: Array<Record<string, unknown>>;
+  agentTasks: unknown;
+  records: Record<string, CompletionRecord | null>;
+  /** TEAM-6231 F3 — ids whose record read FAILED (not missing): never excused. */
+  failed?: Set<string>;
+  mergeProof: MergeProbe | null;
+  shipPhases?: string[];
+  getAgentPhase?: (agentId: string) => string | undefined;
+};
 export const dropCarriedOffenders = dropCarriedOffendersMjs as unknown as <V extends ShipVerdictLike>(
   verdict: V,
-  ctx: {
-    children: Array<Record<string, unknown>>;
-    agentTasks: unknown;
-    records: Record<string, CompletionRecord | null>;
-    mergeProof: MergeProbe | null;
-  }
+  ctx: DelegationCtx
 ) => V;
+
+/** TEAM-6231 — the orchestrator's one re-check (completion.mjs recheckShipVerdict): fresh-record
+ *  overlay (F2) → `evaluate` (each surface's own evaluateShipVerdict) → dropCarriedOffenders. */
+export const recheckShipVerdict = recheckShipVerdictMjs as unknown as <V extends ShipVerdictLike>(
+  ctx: Omit<DelegationCtx, "agentTasks"> & { agentTasks: unknown; evaluate: (agentTasks: unknown) => V }
+) => V;
+
+/** TEAM-6231 F3 — every id through the reader; a rejection is `null` + listed in `failed`. Never throws. */
+export const readCompletionRecords = readCompletionRecordsMjs as unknown as (
+  ticketIds: string[],
+  read: ReadCompletionRecord
+) => Promise<{ records: Record<string, CompletionRecord | null>; failed: Set<string> }>;
 
 type FeatureBranchLanding = (args: {
   owner: string;
@@ -215,7 +234,7 @@ export async function completionRecordsFor(
   ticketIds: string[],
   read: ReadCompletionRecord
 ): Promise<Record<string, CompletionRecord | null>> {
-  return Object.fromEntries(await Promise.all(ticketIds.map(async (id) => [id, await read(id).catch(() => null)] as const)));
+  return (await readCompletionRecords(ticketIds, read)).records;
 }
 
 export type FollowUpPrOutcome =
