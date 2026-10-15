@@ -937,7 +937,7 @@ describe("TEAM-6164 F1 — the older message in the FIFO group never Dones over 
   // a trusted PASS and retried on an unreadable amendment it no longer owned (T28, above). The record
   // now carries `residual` beside its stamp (same PUT), and currentResidual() delivers the record's
   // findings / supersedes a contradicted message before step 6.
-  const residualComments = (id) => fake.tickets.get(id).comments.filter((c) => c.includes(output.residualMarker(REVIEW)));
+  const residualComments = (id) => fake.tickets.get(id).comments.filter((c) => c.includes(output.residualMarkerPrefix(REVIEW)));
   /** queueTwo, but the FAIL report's own residual posts 503'd (so the queued message is what owes them). */
   const queueTwoFindingsUnposted = async (order) => {
     seedReview();
@@ -959,6 +959,8 @@ describe("TEAM-6164 F1 — the older message in the FIFO group never Dones over 
     expect(atDone, "the findings were on both dev lanes when the Done was made").toEqual([1, 1]);
     expect(residualComments(DEV1)[0]).toContain("verdict FAIL");
     expect(residualComments(DEV1)[0]).toContain(reviewCompletion.summary.split("\n")[0]);
+    // TEAM-6144: the drain-posted marker is the one the live path computes for the same residual.
+    expect(residualComments(DEV1)[0]).toContain(output.residualMarker(REVIEW, output.residualOf({ residual: true, verdict: "FAIL", amendmentTicketId: AMEND }, reviewCompletion.summary, reviewCompletion.artifacts)));
     expect(record(R_KEY).securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND });
     const second = await drainMsg(1);
     expect(second).toMatchObject({ outcome: "dropped", reason: "already applied" });

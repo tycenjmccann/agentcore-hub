@@ -108,7 +108,7 @@ vi.mock("@aws-sdk/client-lambda", () => ({
 }));
 
 process.env.ARTIFACT_BUCKET = "test-bucket";
-const { handler, parseReviewVerdict, countFindings, residualMarker } = await import("./index.mjs");
+const { handler, parseReviewVerdict, countFindings, residualMarker, residualOf, legacyResidualOf, normalizeResidual, residualKey } = await import("./index.mjs");
 // TEAM-6130: both twins' Done guard, judged on the record a late refusal leaves behind.
 const TWIN_GUARDS = [() => import("../agentcore-hub-jira/gate-contract.mjs"), () => import("../agentcore-hub-tickets/gate-contract.mjs")];
 
@@ -196,7 +196,7 @@ for (const twin of ["dynamodb", "jira"]) {
       for (const dev of ["TEAM-5358", "TEAM-5359"]) {
         const posted = h.comments.get(dev);
         expect(posted).toHaveLength(1);
-        expect(posted[0]).toContain(residualMarker("TEAM-5357"));
+        expect(posted[0]).toContain(residualMarker("TEAM-5357", residualOf({ residual: true, verdict: "FAIL", amendmentTicketId: "TEAM-5399" }, COMPLETION.summary, COMPLETION.artifacts)));
         expect(countFindings(posted[0])).toBe(5);
       }
       expect(h.comments.has("TEAM-5356"), "the design ticket does not block on the review").toBe(false);
@@ -452,6 +452,63 @@ for (const twin of ["dynamodb", "jira"]) {
       expect(h.comments.get("TEAM-5359")).toHaveLength(1);
     });
 
+    // TEAM-6144: the marker is keyed by review ROUND (a hash of the normalized residual), not the
+    // review alone. A T2 refusal leaves round 1's comments on the dev lanes; the next round's
+    // findings used to be skipped there as "already posted".
+    const residualComments = (id) => (h.comments.get(id) || []).filter((c) => c.includes("[residual-findings:TEAM-5357"));
+    const ROUND_2 = "Verdict: FAIL\n\n- High: round-2 finding: token not rotated\n- Medium: round-2 finding: log redaction";
+    /** T2: the amendment reopens while the residual findings are posted ⇒ refused, round 1's comments stay; then it is Done again. */
+    const refuseRoundOneAfterPosting = async () => {
+      load("done");
+      h.beforeGetIssue = (id) => { if (id === "TEAM-5358") h.issueStatus.set("TEAM-5399", "To Do"); };
+      const res = await report();
+      expect(res).toMatchObject({ ok: false, reason: "design_amendment_required", residualFindings: { posted: ["TEAM-5358", "TEAM-5359"], skipped: [], failed: [] } });
+      h.beforeGetIssue = null;
+      h.issueStatus.delete("TEAM-5399");
+      h.calls.length = 0;
+      h.seq.length = 0;
+    };
+
+    it("TEAM-6144 (T2c) the amendment reopened while round 1's findings were posted, is Done again, and the re-review reports NEW findings ⇒ round 2's comment is posted on each dev lane beside round 1's, before the Done", async () => {
+      await refuseRoundOneAfterPosting();
+      const res = await report({ summary: ROUND_2 });
+      expect(res.status).toBe("complete");
+      expect(res.residualFindings).toEqual({ posted: ["TEAM-5358", "TEAM-5359"], skipped: [], failed: [] });
+      for (const dev of ["TEAM-5358", "TEAM-5359"]) {
+        const rounds = residualComments(dev);
+        expect(rounds, "round 1's comment stays (comments are never deleted); round 2's is added after it").toHaveLength(2);
+        expect(rounds[0]).not.toContain("round-2 finding");
+        expect(rounds[1]).toContain("round-2 finding");
+        expect(rounds[1].match(/\[residual-findings:[^\]]+\]/)[0], "each round has its own marker").not.toBe(rounds[0].match(/\[residual-findings:[^\]]+\]/)[0]);
+      }
+      const lastComment = h.seq.lastIndexOf("Tickets___add_comment");
+      expect(lastComment, "round 2's findings land before round 2's Done").toBeGreaterThan(-1);
+      expect(lastComment).toBeLessThan(h.seq.indexOf("Tickets___transition_ticket"));
+    });
+
+    it("TEAM-6144 the re-review after a reopen reports the SAME findings ⇒ the same round: nothing re-posted", async () => {
+      await refuseRoundOneAfterPosting();
+      const res = await report();
+      expect(res.status).toBe("complete");
+      expect(res.residualFindings).toEqual({ posted: [], skipped: ["TEAM-5358", "TEAM-5359"], failed: [] });
+      expect(residualComments("TEAM-5358")).toHaveLength(1);
+      expect(residualComments("TEAM-5359")).toHaveLength(1);
+    });
+
+    it("TEAM-6144 another round's marker, or the legacy review-only marker, does not count as this round's; this round's exact marker does", async () => {
+      load("done");
+      h.comments.set("TEAM-5358", ["[residual-findings:TEAM-5357:000000000000] an earlier round"]);
+      h.comments.set("TEAM-5359", ["[residual-findings:TEAM-5357] a pre-TEAM-6144 comment"]);
+      const res = await report();
+      expect(res.status).toBe("complete");
+      expect(res.residualFindings).toEqual({ posted: ["TEAM-5358", "TEAM-5359"], skipped: [], failed: [] });
+      expect(residualComments("TEAM-5358")).toHaveLength(2);
+      expect(residualComments("TEAM-5359")).toHaveLength(2);
+      const again = await report();
+      expect(again.residualFindings).toEqual({ posted: [], skipped: ["TEAM-5358", "TEAM-5359"], failed: [] });
+      expect(residualComments("TEAM-5358")).toHaveLength(2);
+    });
+
     it("(b) PASS goes Done with exactly the calls of any other ticket — no list_tickets", async () => {
       load(null);
       const res = await report({ summary: "Verdict: PASS\n\nNo findings above P3." });
@@ -513,6 +570,40 @@ describe("TEAM-5426 — an unreadable review ticket falls back to agent_id", () 
     // pinned in agentcore-hub-tickets/replay-design-amendment.test.mjs.
     expect(wroteRecord()).toBe(true);
     expect(record().securityReview).toBeUndefined();
+  });
+});
+
+describe("TEAM-6144 — the live path and the drain key the same residual to the same round", () => {
+  const REVIEW = { residual: true, verdict: "FAIL", amendmentTicketId: "TEAM-5399" };
+  const ART = "workflows/wf_x/shared/security-review.md";
+  // A summary whose 6000-char cut lands on whitespace: clampBlock once leaves it trailing, a
+  // second clampBlock (the drain re-clamping an already-clamped residual) trims it.
+  const head = "Verdict: FAIL\n- High: x\n";
+  const raw = head + "a".repeat(5999 - head.length) + "      tail";
+
+  it("the cut really lands on whitespace", () => {
+    expect(raw.trim().slice(0, 6000).endsWith(" ")).toBe(true);
+  });
+
+  it("live residual, its JSON round trip (record / queued message), the legacy rebuild and a double normalize all key alike", () => {
+    const live = residualOf(REVIEW, raw, ART);
+    const drain = JSON.parse(JSON.stringify(live));
+    const legacy = legacyResidualOf({ securityReview: { verdict: "FAIL", amendmentTicketId: "TEAM-5399" }, summary: live.summary, artifacts: live.artifacts });
+    const twice = normalizeResidual(normalizeResidual(live));
+    for (const r of [drain, legacy, twice]) {
+      expect(r).toEqual(live);
+      expect(residualKey(r)).toBe(residualKey(live));
+      expect(residualMarker("TEAM-5357", r)).toBe(residualMarker("TEAM-5357", live));
+    }
+    expect(residualKey({ ...REVIEW, summary: raw, artifacts: ART }), "the raw inputs normalize to the same key").toBe(residualKey(live));
+    expect(residualMarker("TEAM-5357", live)).toMatch(/^\[residual-findings:TEAM-5357:[0-9a-f]{12}\]$/);
+  });
+
+  it("a different summary, amendment or verdict is a different round", () => {
+    const base = residualKey(residualOf(REVIEW, raw, ART));
+    expect(residualKey(residualOf(REVIEW, raw + " more", ART))).not.toBe(base);
+    expect(residualKey(residualOf({ ...REVIEW, amendmentTicketId: "TEAM-5400" }, raw, ART))).not.toBe(base);
+    expect(residualKey(residualOf({ ...REVIEW, verdict: "CHANGES_NEEDED" }, raw, ART))).not.toBe(base);
   });
 });
 
