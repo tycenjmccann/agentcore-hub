@@ -260,51 +260,75 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
   });
 
   // TEAM-6126: this guard was /\b((?:\S+ ){4,}\S+) \1\b/g, which backtracked O(n²) over
-  // each one-line blueprint (~13s; synchronous, so testTimeout never fired). Near-linear
-  // instead: a back-to-back repeat of k >= minWords tokens at p shares its first
-  // minWords-token key with p+k, so only pairs in one bucket are checked.
-  // TEAM-6183 (ship-review r1 on TEAM-6132): whole-whitespace-token comparison missed a
-  // repeat whose edge sits inside a token (`branch;and …branch;`, `…e …e/f`) and, by
-  // dropping punctuation-only tokens, joined separate table cells/rows/fences/rules into
-  // one run. Tokens are now sub-word: scan for letter/digit runs (case-folded) *or* a
-  // structural separator — `|`, a backtick fence (3+ backticks), or a standalone run of
-  // `-`/`*`/`_`/`=` (thematic break / setext underline / hr). Punctuation-only noise
-  // *between* words (`a . . . b`, a single backtick, an em dash) isn't a separate token at
-  // all — it's just dropped, so it stays part of one run, same as HEAD's `start — check`
-  // ≡ `start, check` and leading-backtick cases. A separator becomes a unique sentinel
-  // key that never equals a word or another sentinel, so a run can never span one: any
-  // minWords-key containing a sentinel is alone in its bucket, and the extension loop
-  // (`w[p+t] === w[p+k+t]`) fails the moment it crosses one.
-  const TOKEN = /[\p{L}\p{N}]+|\||`{3,}|(?<!\S)[-*_=]+(?!\S)/gu;
+  // each one-line blueprint (~13s; synchronous, so testTimeout never fired).
+  // TEAM-6194 (ship-review r2 on TEAM-6132; replaces the TEAM-6183 sub-word tokenizer, which
+  // counted `a/b/c/d/e` as five words and hid `run printf foo | grep bar` x2 behind sentinel
+  // keys): the counting unit is the whitespace token, as on main. Each token's key is its
+  // case-folded form with leading/trailing non-letter/digit chars stripped (`start.` ≡ `Start`,
+  // `` `foo` `` ≡ `foo`); a punctuation-only token (`|`, `-`, `=`, `—`, fences) keeps its raw
+  // text as key and is not a "real" word. A repeat is k tokens at p whose copy sits at p+k:
+  // interior tokens match by key; the edges keep main's \b looseness — the second copy's first
+  // token may be a suffix of the first copy's first token cut at a non-letter/digit
+  // (`branch;and … and …`), and its last token may extend past the first copy's last token at
+  // one (`… e … e/f`). Edge tokens must be real words (so a run never starts or ends on a `|`,
+  // fence or rule) and the copy must hold >= minWords real words, so structural tokens may sit
+  // inside a repeat (`a - b c d`) but can never pad one out. Near-linear: a repeat with
+  // k >= minWords + 2 has >= minWords exact interior keys, so those are bucketed on
+  // key[p+1..p+minWords]; the two shorter k are a direct O(n) scan.
+  const EDGE_PUNCT = /^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu;
+  const ALNUM = /[\p{L}\p{N}]/u;
   const findRepeatedPhrases = (text: string, minWords = 5) => {
     const w: string[] = [];
     const start: number[] = [];
     const end: number[] = [];
-    for (const m of text.matchAll(TOKEN)) {
-      const t = m[0];
-      // Sentinel key: unique per occurrence (its own match index), so it can't match
-      // a word or any other sentinel.
-      w.push(/^[\p{L}\p{N}]/u.test(t) ? t.toLowerCase() : `\0${m.index}`);
+    const key: string[] = [];
+    const real: boolean[] = [];
+    for (const m of text.matchAll(/\S+/g)) {
+      const norm = m[0].toLowerCase().replace(EDGE_PUNCT, "");
+      w.push(m[0]);
+      key.push(norm || m[0]);
+      real.push(norm !== "");
       start.push(m.index);
-      end.push(m.index + t.length);
+      end.push(m.index + m[0].length);
+    }
+    const n = w.length;
+    // `second` equals `first` or is a suffix of it cut right after a non-letter/digit.
+    const suffixOf = (first: string, second: string) =>
+      first === second || (first.endsWith(second) && !ALNUM.test(first[first.length - second.length - 1]));
+    // `second` equals `first` or extends it, with a non-letter/digit right after `first`.
+    const prefixOf = (first: string, second: string) =>
+      first === second || (second.startsWith(first) && !ALNUM.test(second[first.length]));
+    // Cheapest checks first: on adversarial input almost every pair dies at an edge.
+    const check = (p: number, k: number) => {
+      if (!real[p + k] || !real[p + k - 1]) return false;
+      if (!suffixOf(key[p], key[p + k])) return false;
+      if (!prefixOf(key[p + k - 1], key[p + 2 * k - 1])) return false;
+      let t = 1;
+      while (t < k - 1 && key[p + t] === key[p + k + t]) t++;
+      if (t !== k - 1) return false;
+      let words = 0;
+      for (let i = p; i < p + k; i++) if (real[i]) words++;
+      return words >= minWords;
+    };
+    const hits: [number, number][] = [];
+    for (let k = minWords; k < minWords + 2; k++) {
+      for (let p = 0; p + 2 * k <= n; p++) if (check(p, k)) hits.push([p, k]);
     }
     const at = new Map<string, number[]>();
-    for (let j = 0; j + minWords <= w.length; j++) {
-      const key = w.slice(j, j + minWords).join(" ");
-      const ps = at.get(key);
-      if (ps) ps.push(j);
-      else at.set(key, [j]);
+    for (let j = 1; j + minWords <= n; j++) {
+      const bucket = key.slice(j, j + minWords).join(" ");
+      const ps = at.get(bucket);
+      if (ps) ps.push(j - 1);
+      else at.set(bucket, [j - 1]);
     }
-    const hits: [number, number][] = [];
     for (const ps of at.values()) {
       for (let a = 0; a < ps.length; a++) {
+        const p = ps[a];
         for (let b = a + 1; b < ps.length; b++) {
-          const p = ps[a];
           const k = ps[b] - p;
-          if (k < minWords || p + 2 * k > w.length) continue;
-          let t = minWords;
-          while (t < k && w[p + t] === w[p + k + t]) t++;
-          if (t === k) {
+          if (k < minWords + 2) continue;
+          if (p + 2 * k > n) break;
+          if (check(p, k)) {
             hits.push([p, k]);
             break;
           }
@@ -340,7 +364,13 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     // Single backtick (inline code) and em dash stay part of the words, not boundaries.
     ["an inline-code repeat", "x `foo` b c d e `foo` b c d e"],
     ["an em-dash repeat", "a b — c d e a b — c d e"],
-  ])("findRepeatedPhrases flags a %s repeat (TEAM-6183)", (_, text) => {
+    // TEAM-6194 (ship-review r2 F2): a structural token *inside* five real words is part of
+    // the repeat, exactly as main's regex sees it — never a sentinel that hides it.
+    ["a repeat around a pipe", "run printf foo | grep bar run printf foo | grep bar"],
+    ["a repeat around a dash", "check a - b c d check a - b c d"],
+    ["a repeat around an equals sign", "check whether a = b today check whether a = b today"],
+    ["a repeat around an asterisk", "check whether a * b works check whether a * b works"],
+  ])("findRepeatedPhrases flags a %s repeat (TEAM-6183/TEAM-6194)", (_, text) => {
     expect(findRepeatedPhrases(text)).toHaveLength(1);
   });
 
@@ -354,11 +384,23 @@ describe("post-merge follow-up PR ship chain (TEAM-6032)", () => {
     // TEAM-6183 (ship-review r1 F2): structural separators are boundaries, not dropped
     // noise, so a run can't span a table cell, row, fence or thematic break.
     ["repeated table cells", "a b c d e | a b c d e"],
+    ["repeated table cells with a trailing pipe", "| a b c d e | a b c d e |"],
     ["repeated table rows", "| a b c d e | | a b c d e |"],
     ["repeated fenced blocks", "``` a b c d e ``` ``` a b c d e ```"],
     ["a repeat across a horizontal rule", "a b c d e --- a b c d e"],
     ["a repeat across a thematic break (***)", "a b c d e *** a b c d e"],
-  ])("findRepeatedPhrases ignores %s (TEAM-6183)", (_, text) => {
+    // TEAM-6194 (ship-review r2 F1): a whitespace token is one word however many letter
+    // runs it holds, so these are two- to four-word repeats, not five.
+    ["a four-word repeat with snake_case", "read snake_case before starting read snake_case before starting"],
+    ["a repeated slash path", "a/b/c/d/e a/b/c/d/e"],
+    ["a single slash-joined token", "a/b/c/d/e/a/b/c/d/e"],
+    ["underscore vs hyphen joined tokens", "a_b_c_d_e a-b-c-d-e"],
+    ["a repeated dotted version", "1.2.3.4.5 1.2.3.4.5"],
+    ["a repeated URL", "https://example.com/a/b/c/d/e https://example.com/a/b/c/d/e"],
+    ["a repeated 'see URL'", "see https://x.io/a/b see https://x.io/a/b"],
+    // TEAM-6194 (ship-review r2 F3): a tilde fence is punctuation-only like a backtick fence.
+    ["repeated tilde-fenced blocks", "~~~ a b c d e ~~~ ~~~ a b c d e ~~~"],
+  ])("findRepeatedPhrases ignores %s (TEAM-6183/TEAM-6194)", (_, text) => {
     expect(findRepeatedPhrases(text)).toEqual([]);
   });
 
