@@ -838,6 +838,28 @@ export function reMarkableAdmission(record, amendment = null) {
 }
 
 /**
+ * TEAM-6164 (F1): the admission a ticket-replay drain ACTS on - re-marks provisional (step 6),
+ * re-confirms, finalizes or drops (step 7). The RECORD's non-PASS stamp first: it is the newest
+ * admission, whatever message is being drained. Keying those transitions off `msg.residual` let
+ * an OLDER residual-less PASS message (its Done 503'd) drain over a record whose newer admission
+ * is a trusted FAIL stamp and go straight to the Done - no re-mark, no amendment read, both twins
+ * admitting the trusted stamp - while the amendment was reopened or unreadable. The message's
+ * residual is the fallback only when the record holds no non-PASS stamp (no record, no stamp, or
+ * a trusted PASS - and then TEAM-6158's superseded rule in step 7 applies). The amendment id is
+ * the record stamp's first, the message's only for a stamp naming none (TEAM-6152), as before.
+ * `null` ⇒ nothing to confirm: a PASS (or no verdict) on both sides.
+ *
+ *   { source: "record" | "message", verdict, amendmentTicketId }   or null
+ */
+export function drainAdmission(record, msg) {
+  const sr = record?.securityReview;
+  const own = sr && typeof sr === "object" && asText(sr.verdict) && String(sr.verdict).toUpperCase() !== "PASS" ? sr : null;
+  if (own) return { source: "record", verdict: String(own.verdict).toUpperCase(), amendmentTicketId: asText(own.amendmentTicketId) || asText(msg?.residual?.amendmentTicketId) || null };
+  if (msg?.residual) return { source: "message", verdict: String(msg.residual.verdict || "").toUpperCase() || "non-PASS", amendmentTicketId: asText(msg.residual.amendmentTicketId) || null };
+  return null;
+}
+
+/**
  * TEAM-6151: the ONE finalize write (DL-039). `base` is `{ record, etag }` exactly as THIS
  * caller's provisional write left it; `apply(copy)` turns it trusted (clearBriefHoldOnRelease /
  * finalizeSecurityReview, plus status). One PutObject with IfMatch on that ETag - never a
@@ -1460,7 +1482,13 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
         const disposition = { ...brief.disposition, at: new Date().toISOString(), by: "report_completion" };
         // TEAM-6140 (DL-039): a gate_settled release this call will Done on is written
         // PROVISIONALLY (the hold stays on) and finalized only after the post-write confirm.
-        if (brief.disposition.kind === "gate_settled" && mayTransition) {
+        // TEAM-6164 (F2 sibling): with follow-ups still pending too (no Done this call). The
+        // trusted form was written by the record-write loop below, which re-reads and re-puts
+        // the same release on every 412 - a confirm taken before the loop covered none of
+        // those iterations. Provisional through the loop (a hold every reader refuses), then
+        // the post-write confirm and the ONE finalize make it trusted, with no Done; a human
+        // who files the follow-ups can still close the ticket directly after that.
+        if (brief.disposition.kind === "gate_settled") {
           holdBriefOnProvisionalRelease(report, disposition);
           releasedNow = { observed: brief.disposition.observed, disposition };
           console.log(`[report_completion] ${ticket_id}: held merge brief ${briefKey} needs no gate (${brief.disposition.kind}: ${brief.disposition.why}) - release recorded PROVISIONALLY, re-confirmed after the write`);
@@ -1521,7 +1549,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // merge-brief hold - so in practice nothing else. Residual window: Jira status and the S3
   // CAS share no transaction, so a gate reopened after this read still goes Done (see
   // confirmDoneAtCommit).
-  if (releasedNow && mayTransition) {
+  // TEAM-6164 (F2 sibling): and with follow-ups pending (no Done this call) the same confirm +
+  // finalize, so the record never carries a trusted release the loop above re-put unconfirmed.
+  if (releasedNow) {
     const confirm = await confirmDoneAtCommit({ ticketIds: releasedNow.observed.map((o) => o.ticketId) });
     if (confirm.ok && confirm.done) {
       // TEAM-6151: ONE conditional write on the provisional record's own ETag - never the
@@ -1556,7 +1586,8 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       delete report.briefDisposition;
       report.briefHoldReason = `off_gate: ${why}`;
       briefHeld = true;
-      const back = await writeRecord(() => STATUS_PENDING_BRIEF);
+      // TEAM-6164: the follow-ups status keeps precedence, as the first write's statusOf has it.
+      const back = await writeRecord(() => (!mayTransition ? STATUS_PENDING_FOLLOW_UPS : STATUS_PENDING_BRIEF));
       if (!back.ok) {
         report.briefHoldReason += ` (the hold reason could not be stamped on the record: ${back.error}; the record still holds the PROVISIONAL release, which every reader refuses)`;
         console.error(`[report_completion] ${ticket_id}: ${why}, and the hold reason could not be stamped on ${key} (${back.error}) - the record still holds the PROVISIONAL release (briefPending:true), Done withheld; the retry re-chooses the gate`);
@@ -2461,6 +2492,16 @@ export async function drainCompletion(msg) {
       console.error(`[ticket-replay] ${ticketId}: no readable ticket or known epic to post the drop notice on - the metric, record and journey event carry it`);
     }
     const notice = notices[0] || null;
+    // TEAM-6164 (F2): a gate_settled release this drop would persist (a follow-ups hold whose
+    // brief no gate needs) rests on the gate read step 5 took BEFORE the notices above were
+    // awaited (deferHoldOnDoneIntent, the ticket's and the epic's drop notice); the record's
+    // ETag cannot see a gate-ticket change in between. Re-ask now, the last await before the
+    // CAS. Open or unreadable ⇒ nothing stamped, the message comes back (the notices are
+    // marker-deduped) and the next tick re-chooses the gate - step 5's own answer. Without it
+    // the stamp said briefPending:false with the gate To Do, and the agent's retry (which
+    // re-reads the gate only on briefPending:true) Doned the build with no brief on the gate.
+    const stale = await settledGatesRetryReason(extra?.briefDisposition, { when: "before the drop stamp" });
+    if (stale) return retry(stale);
     // TEAM-6057: the stamp below spreads `extra` over the prior record, which cannot drop
     // a stale `briefTargets`/`briefFallbackReason` beside an undelivered brief.
     if (rec.record && extra?.briefDelivered === "undelivered") clearUndeliveredBriefTargets(rec.record);
@@ -2643,10 +2684,10 @@ export async function drainCompletion(msg) {
   // is awaited between it and step 7's transitionToDone. Residual window: Jira status and
   // the record's S3 CAS share no transaction, so a gate reopened after this read still
   // goes Done - see confirmDoneAtCommit.
+  // TEAM-6164 (F2): through the one helper drop() uses for the same re-ask before ITS stamp.
   if (settledGates) {
-    const confirm = await confirmDoneAtCommit({ ticketIds: settledGates, earlier: brief.gateReads });
-    if (!confirm.ok) return retry(`get_issue ${confirm.ticketId} (re-confirming the Merge Approval gate is Done before recording the release): ${confirm.error}`);
-    if (!confirm.done) return retry(`the Merge Approval gate ${confirm.why} after the release was confirmed - no release recorded; the next tick re-chooses the gate`);
+    const stale = await settledGatesRetryReason(brief.disposition, { earlier: brief.gateReads, when: "before recording the release" });
+    if (stale) return retry(stale);
   }
   if (holds.length > 0) {
     // Round 5 P2: the hold stamps what the follow-ups really are now, so a brief-only
@@ -2674,9 +2715,11 @@ export async function drainCompletion(msg) {
   // window is deduped onto this message, so the record's stamp can be a NEWER admission on
   // another amendment than the one this message was queued with; confirming the message's and
   // finalizing the record's was a Done on an amendment nobody re-read.
-  const residualAmendment = msg.residual
-    ? (reMarkableAdmission(rec.record) ? asText(rec.record.securityReview.amendmentTicketId) : "") || asText(msg.residual.amendmentTicketId) || null
-    : null;
+  // TEAM-6164 (F1): and whether there IS an admission to act on is the record's question too,
+  // not `msg.residual`'s - a residual-less PASS message drained over a record holding a newer
+  // non-PASS stamp owes that stamp the same re-mark, confirm and finalize (drainAdmission).
+  const admission = drainAdmission(rec.record, msg);
+  const residualAmendment = admission?.amendmentTicketId ?? null;
 
   // 6. The record, BEFORE the Done: every retryable follow-up is filed now, and the
   //    twins' Done guard refuses a record that still says followUpsPending:true.
@@ -2717,7 +2760,9 @@ export async function drainCompletion(msg) {
     // and never on a ticket already Done (nothing to protect; a reopen refuses until a re-run).
     // TEAM-6152: reMarkableAdmission is the one predicate (PASS, and a stamp on another
     // amendment than the one re-confirmed below, are admissions this replay does not own).
-    if (msg.residual && !alreadyDone && reMarkableAdmission(record, residualAmendment)) holdSecurityReviewProvisional(record);
+    // TEAM-6164 (F1): gated on the RECORD's admission (drainAdmission), so an older PASS message
+    // re-marks a newer non-PASS stamp exactly as the stamp's own message would.
+    if (admission && !alreadyDone && reMarkableAdmission(record, residualAmendment)) holdSecurityReviewProvisional(record);
     // TEAM-5941: a stale Done-intent comes off with this write; a fresh one stays.
     stripStaleDoneIntent(record);
     // TEAM-5830: conditional on the step-0 read, like drop() above.
@@ -2782,7 +2827,10 @@ export async function drainCompletion(msg) {
     // TEAM-6152: the amendment is the RECORD's stamp's first (residualAmendment, above), and the
     // re-mark on a drop is a fresh establishment (a new nonce) of a stamp this replay owns - never
     // of a PASS, never of an admission on another amendment.
-    if (msg.residual) {
+    // TEAM-6164 (F1): entered on the RECORD's admission (drainAdmission) - a residual-less PASS
+    // message over a record holding a non-PASS stamp re-confirms that stamp's amendment here; only
+    // a PASS on both sides (admission null) goes to the Done with no amendment read.
+    if (admission) {
       const amendment = residualAmendment;
       if (!amendment) return drop("amendment", "the queued residual findings name no design amendment and the record carries no securityReview.amendmentTicketId - the admission cannot be re-confirmed", { epicKey });
       const confirm = await confirmDoneAtCommit({ ticketIds: [amendment] });
@@ -2807,7 +2855,7 @@ export async function drainCompletion(msg) {
         }
         const recordVerdict = String(rec.record?.securityReview?.verdict || "").toUpperCase();
         if (rec.record?.securityReview && typeof rec.record.securityReview === "object" && recordVerdict === "PASS") {
-          const reason = `superseded: ${reportKey} carries a trusted PASS securityReview admission newer than this message's ${String(msg.residual.verdict || "").toUpperCase() || "non-PASS"} residual findings (design amendment ${confirm.why}) - nothing re-marked, no notice posted, no drop stamped; the PASS admission's own queued message or report_completion retry closes ${ticketId}`;
+          const reason = `superseded: ${reportKey} carries a trusted PASS securityReview admission newer than this message's ${admission.verdict} residual findings (design amendment ${confirm.why}) - nothing re-marked, no notice posted, no drop stamped; the PASS admission's own queued message or report_completion retry closes ${ticketId}`;
           console.warn(`[ticket-replay] ${ticketId}: SUPERSEDED - ${reason}`);
           return { outcome: "dropped", superseded: true, reason };
         }
@@ -3780,6 +3828,24 @@ async function confirmDoneAtCommit({ ticketIds, earlier = null }) {
     if (!r.done) open.push({ ticketId, status: asText(r.issue.status), seenAt: "commit" });
   }
   return open.length > 0 ? notDone() : { ok: true, done: true, issues, why: null };
+}
+
+/**
+ * TEAM-6164 (F2): the settled-gate re-ask a release WRITE makes immediately before its CAS - the
+ * drain's step 5 (before step 6's write) and drop() (after its awaited notices, before the drop
+ * stamp). A gate read taken earlier in the same tick and acted on after other awaited ticket I/O
+ * is a race the record's ETag cannot see (the gate is another ticket). `null` ⇒ every observed gate
+ * re-reads Done and the release may be written; otherwise the retry reason: an open gate means no
+ * release this tick (the message comes back and the next tick re-chooses the gate; the brief and
+ * audit comments are marker-deduped), an unreadable one means nothing is written. Not a gate_settled
+ * release (no release, absent_never_gated) ⇒ null: nothing to re-ask.
+ */
+async function settledGatesRetryReason(disposition, { earlier = null, when } = {}) {
+  if (!disposition?.release || disposition.kind !== "gate_settled") return null;
+  const confirm = await confirmDoneAtCommit({ ticketIds: (disposition.observed || []).map((o) => o.ticketId), earlier });
+  if (!confirm.ok) return `get_issue ${confirm.ticketId} (re-confirming the Merge Approval gate is Done ${when}): ${confirm.error}`;
+  if (!confirm.done) return `the Merge Approval gate ${confirm.why} ${when} - no release recorded; the next tick re-chooses the gate`;
+  return null;
 }
 
 async function transitionToDone(ticketId) {

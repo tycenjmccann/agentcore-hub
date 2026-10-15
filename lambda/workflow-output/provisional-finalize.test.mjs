@@ -791,3 +791,124 @@ describe("TEAM-6158 F2 — the drop notice says only what was written; the dedup
     expect(fake.objects.has(B_KEY), "no record was conjured by the drop").toBe(false);
   });
 });
+
+// ─── TEAM-6164 F1 (ship review on #969) ───
+/**
+ * The drain keyed every amendment-side transition off `msg.residual` (the re-mark in step 6,
+ * the confirm/finalize/drop in step 7). A residual-less PASS message - the report whose Done
+ * 503'd FIRST - drained over a record whose NEWER admission is a trusted FAIL stamp went
+ * straight to the Done: no re-mark, zero amendment reads, both twins admitting the trusted
+ * stamp, while the amendment was reopened or unreadable. The admission the drain acts on is
+ * now the RECORD's non-PASS stamp (drainAdmission), the message's residual only a fallback.
+ * Both FIFO orders, each with a reopened and an unreadable amendment, under the REAL twin
+ * Done guard; the FAIL-then-PASS pair re-pins T13/TEAM-6158 (the stale FAIL is superseded).
+ */
+describe("TEAM-6164 F1 — the older message in the FIFO group never Dones over the record's newer non-PASS admission", () => {
+  const PASS = { summary: "Verdict: PASS. Design reviewed against main and the feature branch, read-only; no blocking findings.\n\nNo tool failures." };
+  const callsSince = (from, tool, pred = () => true) => fake.calls.slice(from).filter((c) => c.tool === tool && pred(c.params || {}));
+  /** Two Done-503'd reports in `order`; the record ends holding the SECOND report's admission; the REAL twin guard then judges every Done. */
+  const queueTwo = async (order) => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503 };
+    for (const which of order) expect(which === "PASS" ? await reportReview(PASS) : await reportReview()).toMatchObject({ status: "complete", ticketWrites: "queued" });
+    expect(fake.queue, "one message per report (the dedup id carries the residual)").toHaveLength(2);
+    expect(record(R_KEY).securityReview).toEqual(order[1] === "PASS" ? { verdict: "PASS" } : { verdict: "FAIL", amendmentTicketId: AMEND });
+    expect(JSON.parse(fake.queue[0].Body).residual?.verdict ?? null).toBe(order[0] === "PASS" ? null : "FAIL");
+    expect(JSON.parse(fake.queue[1].Body).residual?.verdict ?? null).toBe(order[1] === "PASS" ? null : "FAIL");
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+  };
+  const amendmentUnreadable = () => { fake.failTool = { ...fake.failTool, Tickets___get_issue: (p) => (p.ticket_id === AMEND ? PROVIDER_503 : null) }; };
+  const amendmentReadable = () => { fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) }; };
+  const drainMsg = (i) => output.drainCompletion(JSON.parse(fake.queue[i].Body));
+
+  it("T24 PASS queued, then FAIL queued (record: FAIL on AMEND); AMEND reopened; the older PASS message drains ⇒ the record's amendment is re-read, a surfaced drop, the stamp PROVISIONAL again, no Done; the FAIL message behind it drops the same way", async () => {
+    await queueTwo(["PASS", "FAIL"]);
+    fake.tickets.get(AMEND).status = "To Do";
+    const from = fake.calls.length;
+    const out = await drainMsg(0);
+    expect(out, out.reason).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(out.reason).toMatch(/^amendment: design amendment TEAM-5399 reads To Do - the security review's admission is PROVISIONAL again/);
+    expect(callsSince(from, "Tickets___get_issue", (p) => p.ticket_id === AMEND).length, "the RECORD's amendment was re-read").toBeGreaterThan(0);
+    expect(transitionsOf(REVIEW, from)).toHaveLength(0);
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    expect(record(R_KEY)).toMatchObject({ ticketWrites: "dropped", replayDropped: { step: "amendment" } });
+    expect(record(R_KEY).securityReview, "the record's FAIL stamp is re-marked, never overwritten with the message's PASS").toEqual({ verdict: "FAIL", amendmentTicketId: AMEND, provisional: true, provisionalNonce: expect.any(String) });
+    twinsRefuseAdmission(R_KEY, /on amendment TEAM-5399/);
+    const second = await drainMsg(1);
+    expect(second, second.reason).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    twinsRefuseAdmission(R_KEY);
+  });
+
+  it("T25 PASS queued, then FAIL queued; AMEND unreadable (503); the older PASS message drains ⇒ retry, no Done, the stamp re-marked and refused; readable + Done ⇒ the same message finalizes the FAIL stamp and Dones", async () => {
+    await queueTwo(["PASS", "FAIL"]);
+    amendmentUnreadable();
+    const from = fake.calls.length;
+    const held = await drainMsg(0);
+    expect(held, held.reason).toMatchObject({ outcome: "retry" });
+    expect(held.reason).toMatch(/get_issue TEAM-5399 \(re-confirming the design amendment is done before the Done\)/);
+    expect(transitionsOf(REVIEW, from)).toHaveLength(0);
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    expect(record(R_KEY).securityReview).toMatchObject({ verdict: "FAIL", amendmentTicketId: AMEND, provisional: true });
+    twinsRefuseAdmission(R_KEY);
+    amendmentReadable();
+    const out = await drainMsg(0);
+    expect(out, out.reason).toMatchObject({ outcome: "applied" });
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    expect(record(R_KEY)).toMatchObject({ ticketWrites: "applied", securityReview: { verdict: "FAIL", amendmentTicketId: AMEND } });
+    expect(record(R_KEY).securityReview.provisional).toBeUndefined();
+    twinsAdmitAdmission(R_KEY);
+  });
+
+  it("T26 PASS queued, then FAIL queued; AMEND Done ⇒ the older PASS message re-marks the record's FAIL stamp, confirms ITS amendment, finalizes, Dones - three writes, the stamp stays FAIL", async () => {
+    await queueTwo(["PASS", "FAIL"]);
+    const from = fake.calls.length;
+    const putsBefore = keyPuts(R_KEY).length;
+    let seenAtDone = null;
+    fake.onTransition = (t) => { if (t.ticketId === REVIEW) seenAtDone = record(R_KEY); };
+    const out = await drainMsg(0);
+    expect(out, out.reason).toMatchObject({ outcome: "applied" });
+    expect(callsSince(from, "Tickets___get_issue", (p) => p.ticket_id === AMEND).length).toBeGreaterThan(0);
+    const bodies = keyPuts(R_KEY).slice(putsBefore).map(bodyOf);
+    expect(bodies).toHaveLength(3); // re-mark (provisional), finalize, applied
+    expect(bodies[0].securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND, provisional: true, provisionalNonce: expect.any(String) });
+    expect(bodies[1].securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND });
+    expect(bodies[2]).toMatchObject({ ticketWrites: "applied", securityReview: { verdict: "FAIL", amendmentTicketId: AMEND } });
+    expect(seenAtDone.securityReview, "never a Done on a provisional record").toEqual({ verdict: "FAIL", amendmentTicketId: AMEND });
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    twinsAdmitAdmission(R_KEY);
+  });
+
+  it("T27 FAIL queued, then PASS queued (record: PASS); AMEND reopened; the older FAIL drains under the real guard ⇒ superseded (no notice, no stamp); the PASS message Dones (T13 kept)", async () => {
+    await queueTwo(["FAIL", "PASS"]);
+    fake.tickets.get(AMEND).status = "To Do";
+    const from = fake.calls.length;
+    const stale = await drainMsg(0);
+    expect(stale, stale.reason).toMatchObject({ outcome: "dropped", superseded: true });
+    expect(stale.permanent).toBeUndefined();
+    expect(record(R_KEY)).toMatchObject({ ticketWrites: "queued", securityReview: { verdict: "PASS" } });
+    expect(record(R_KEY).replayDropped).toBeUndefined();
+    expect(callsSince(from, "Tickets___add_comment", (p) => /PROVISIONAL again|replay-dropped/.test(String(p.comment)))).toHaveLength(0);
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    const pass = await drainMsg(1);
+    expect(pass, pass.reason).toMatchObject({ outcome: "applied" });
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    expect(record(R_KEY)).toMatchObject({ ticketWrites: "applied", securityReview: { verdict: "PASS" } });
+    twinsAdmitAdmission(R_KEY);
+  });
+
+  it("T28 FAIL queued, then PASS queued; AMEND unreadable ⇒ the older FAIL retries (no Done); readable + reopened ⇒ superseded; the PASS message Dones", async () => {
+    await queueTwo(["FAIL", "PASS"]);
+    amendmentUnreadable();
+    const held = await drainMsg(0);
+    expect(held, held.reason).toMatchObject({ outcome: "retry" });
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    expect(record(R_KEY).securityReview, "a trusted PASS is never re-marked").toEqual({ verdict: "PASS" });
+    amendmentReadable();
+    fake.tickets.get(AMEND).status = "To Do";
+    expect(await drainMsg(0)).toMatchObject({ outcome: "dropped", superseded: true });
+    expect((await drainMsg(1)).outcome).toBe("applied");
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    twinsAdmitAdmission(R_KEY);
+  });
+});
