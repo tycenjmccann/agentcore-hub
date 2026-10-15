@@ -17,18 +17,39 @@
 #   "deploy_target": "local" | "apprunner" | "byo" | "skip",
 #   "github": { "mode": "pat" | "mcp" | "skip", "pat": "...", "mcp_servers": "...", "owner": "octocat", "repo": "my-project" },
 #   "jira": { "site_url": "...", "email": "...", "api_token": "...", "project_key": "...",
-#             "webhook_secret": "..." (optional) } | null
+#             "webhook_secret": "..." (optional),
+#             "disable_webhook_signing": true (optional, strict JSON boolean) } | null
 # }
 #
-# JIRA_WEBHOOK_SECRET (TEAM-6336): the /setup skill never asks for it — DEPLOY.md
-# ("Jira webhook signing") has the operator add it to .env.local by hand — so a
-# re-run regenerating this file from the answers used to drop the line, and the
-# next full redeploy (deploy/*/deploy.sh forward it from .env.local) then
-# silently returned the hub to unsigned passthrough. Now: answers.jira.webhook_secret
+# JIRA_WEBHOOK_SECRET (TEAM-6336, TEAM-6347): the /setup skill never asks for
+# it — DEPLOY.md ("Jira webhook signing") has the operator add it to .env.local
+# by hand — so a re-run regenerating this file used to drop the line, and the
+# next full redeploy (deploy/*/deploy.sh forward it from .env.local) silently
+# returned the hub to unsigned passthrough. Resolution: answers.jira.webhook_secret
 # wins when non-empty; otherwise the value already in .env.local is carried
-# over; otherwise the key stays absent (signing off, as before). A non-empty
-# value is checked against the shared charset rule BEFORE the backup/overwrite,
-# so a refused run leaves .env.local untouched.
+# over; otherwise the key stays absent (signing off, as before).
+#
+# The resolved value is ALWAYS emitted, independent of the module set and the
+# ticket provider (TEAM-6347 R2-F1: the emit used to sit inside the
+# workflow/jira branch, so re-running with modules ["core","cloud-code"] — or
+# switching the provider to dynamodb — dropped it). /api/jira/webhook is the
+# only consumer and keeping a signing key is never the weaker posture. The ONE
+# way to drop it is answers.jira.disable_webhook_signing === true (strict JSON
+# boolean): carry-over and emit are skipped and a notice is printed. Giving
+# both a non-empty webhook_secret and the disable flag is refused as
+# contradictory. A non-empty value is checked against the shared charset rule
+# BEFORE the backup/overwrite, so a refused run leaves .env.local untouched;
+# the disable path skips the guard, since a malformed leftover line must not
+# block its own removal.
+#
+# DEPLOYMENT_URL is carried over the same way (last known value; the skill's
+# deploy-target step overwrites it). Without it a re-run could not run
+# deploy/apprunner/setup-jira-webhook.sh BEFORE the hub redeploy, which is the
+# Jira-first order DEPLOY.md requires (TEAM-6347 R2-F2). When the answers bring
+# a secret that differs from the on-disk one and a real (non-placeholder)
+# DEPLOYMENT_URL exists, one `JIRA_WEBHOOK_SECRET_NEW=1 …` marker line is
+# printed so the skill runs the Jira webhook step first. Never printed on a
+# first install, on plain carry-over, or when the secret is unchanged.
 #
 # brand_name is a *display* string only — sets NEXT_PUBLIC_BRAND_NAME so the
 # header, sidebar, and page titles read "Bob's AI Hub" instead of "AgentCore
@@ -57,23 +78,45 @@ fi
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 ENV_FILE="$REPO_ROOT/.env.local"
 
-# Resolve JIRA_WEBHOOK_SECRET before anything is written (see the header). The
-# existing value is read in a subshell through the same loader every consumer
-# uses, with the caller's own shell value cleared first so only the file counts.
-# shellcheck disable=SC1091
-source "$REPO_ROOT/deploy/lib/jira-webhook-secret.sh"
-jira_webhook_secret=$(jq -r '.jira.webhook_secret // ""' "$ANSWERS")
-if [[ -z "$jira_webhook_secret" && -f "$ENV_FILE" ]]; then
-  jira_webhook_secret=$(
-    unset JIRA_WEBHOOK_SECRET
+# Read ONE key from the existing .env.local through the same loader every
+# consumer uses, in a subshell with the caller's own shell value cleared first
+# so only the file counts. Empty when the file or the key is absent.
+read_env_local_value() {
+  (
+    unset "$1"
     # shellcheck disable=SC1091
     source "$REPO_ROOT/deploy/lib/load-env-local.sh"
     load_env_local "$ENV_FILE"
-    printf '%s' "${JIRA_WEBHOOK_SECRET:-}"
+    printf '%s' "${!1:-}"
   )
+}
+
+# Resolve JIRA_WEBHOOK_SECRET and DEPLOYMENT_URL before anything is written
+# (see the header).
+# shellcheck disable=SC1091
+source "$REPO_ROOT/deploy/lib/jira-webhook-secret.sh"
+disable_webhook_signing=$(jq -r '.jira.disable_webhook_signing == true' "$ANSWERS")
+jira_webhook_secret=$(jq -r '.jira.webhook_secret // ""' "$ANSWERS")
+if [[ "$disable_webhook_signing" == "true" && -n "$jira_webhook_secret" ]]; then
+  echo "ERROR: ✗ answers give both jira.webhook_secret and jira.disable_webhook_signing=true — pick one (DEPLOY.md 'Jira webhook signing')" >&2
+  exit 1
 fi
-if [[ -n "$jira_webhook_secret" ]]; then
-  require_jira_webhook_secret_format "$jira_webhook_secret" || exit 1
+existing_secret=$(read_env_local_value JIRA_WEBHOOK_SECRET)
+existing_deployment_url=$(read_env_local_value DEPLOYMENT_URL)
+
+secret_is_new=false
+if [[ "$disable_webhook_signing" == "true" ]]; then
+  jira_webhook_secret=""
+  echo "JIRA_WEBHOOK_SECRET: disabled by answers.jira.disable_webhook_signing — not carried over into .env.local. Also unset it on the live service (./deploy/ecs-express/set-env.sh --unset JIRA_WEBHOOK_SECRET, or redeploy) and remove the secret from the Jira webhook (DEPLOY.md 'Jira webhook signing')."
+else
+  if [[ -z "$jira_webhook_secret" ]]; then
+    jira_webhook_secret="$existing_secret"
+  elif [[ "$jira_webhook_secret" != "$existing_secret" && -n "$existing_deployment_url" && "$existing_deployment_url" != *placeholder* ]]; then
+    secret_is_new=true
+  fi
+  if [[ -n "$jira_webhook_secret" ]]; then
+    require_jira_webhook_secret_format "$jira_webhook_secret" || exit 1
+  fi
 fi
 
 if [[ -f "$ENV_FILE" ]]; then
@@ -128,6 +171,18 @@ emit() {
   emit AWS_REGION "$aws_region"
   echo ""
 
+  # Kept regardless of module set and ticket provider (TEAM-6347, see header).
+  if [[ -n "$jira_webhook_secret" || -n "$existing_deployment_url" ]]; then
+    echo "# --- Carried over across re-runs (DEPLOY.md 'Jira webhook signing') ---"
+    if [[ -n "$jira_webhook_secret" ]]; then
+      emit JIRA_WEBHOOK_SECRET "$jira_webhook_secret"
+    fi
+    if [[ -n "$existing_deployment_url" ]]; then
+      emit DEPLOYMENT_URL "$existing_deployment_url"
+    fi
+    echo ""
+  fi
+
   if [[ "$has_workflow" == "true" ]]; then
     echo "# --- Workflow module ---"
     emit TICKET_PROVIDER "$ticket_provider"
@@ -148,9 +203,6 @@ emit() {
       emit JIRA_EMAIL "$jira_email"
       emit JIRA_API_TOKEN "$jira_token"
       emit JIRA_PROJECT_KEY "$jira_project"
-      if [[ -n "$jira_webhook_secret" ]]; then
-        emit JIRA_WEBHOOK_SECRET "$jira_webhook_secret"
-      fi
       emit TICKET_TOOLS_LAMBDA "agentcore-hub-jira"
     fi
 
@@ -179,3 +231,6 @@ emit() {
 
 chmod 600 "$ENV_FILE"
 echo "Wrote $ENV_FILE (mode 600)"
+if [[ "$secret_is_new" == "true" ]]; then
+  echo "JIRA_WEBHOOK_SECRET_NEW=1 — the secret differs from the one the deployed hub was set up with: run ./deploy/apprunner/setup-jira-webhook.sh BEFORE redeploying the hub (Jira first, DEPLOY.md 'Jira webhook signing')"
+fi
