@@ -49,18 +49,36 @@ const saved: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {}
  * A fake Jira Cloud whose transition list is `transitions`; records every transition POST body.
  * TEAM-6165: `status` / `key` / `labels` are what the issue reads as (default: an In Progress
  * TEAM-7 with no labels), and every comment POST is recorded into `comments`.
+ * TEAM-6206: `status` and `key` may be ARRAYS — one entry per `?fields=status` GET, the last
+ * repeating (the node:test stub's `statusSequence` idiom) — so a board move between the
+ * Lambda's first read and its post-guard re-read is expressible; every served status name is
+ * recorded into `statusReads`, and `failStatusReadAt: n` answers the n-th status GET with a 500.
  */
 function installFakeJira(
   transitions: Array<{ id: string; name: string; to: { name: string } }>,
-  { status = "In Progress", key = TICKET, labels = [] as string[], comments = [] as unknown[] } = {}
+  {
+    status = "In Progress" as string | string[],
+    key = TICKET as string | string[],
+    labels = [] as string[],
+    comments = [] as unknown[],
+    statusReads = [] as string[],
+    failStatusReadAt = 0,
+  } = {}
 ) {
   const posts: unknown[] = [];
+  const nth = <T,>(v: T | T[], i: number): T => (Array.isArray(v) ? v[Math.min(i, v.length - 1)] : v);
   const json = (o: unknown, status = 200) => new Response(JSON.stringify(o), { status });
   vi.stubGlobal("fetch", async (url: string | URL, init: RequestInit = {}) => {
     const u = String(url);
     const method = (init.method || "GET").toUpperCase();
-    if (method === "GET" && u === `${ISSUE}?fields=status`) return json({ key, fields: { status: { name: status } } });
-    if (method === "GET" && u === `${ISSUE}?fields=labels,description`) return json({ key, fields: { labels, description: null } });
+    if (method === "GET" && u === `${ISSUE}?fields=status`) {
+      const i = statusReads.length;
+      const name = nth(status, i);
+      statusReads.push(name);
+      if (failStatusReadAt === i + 1) return json({ errorMessages: ["Jira is unavailable"] }, 500);
+      return json({ key: nth(key, i), fields: { status: { name } } });
+    }
+    if (method === "GET" && u === `${ISSUE}?fields=labels,description`) return json({ key: nth(key, 0), fields: { labels, description: null } });
     if (method === "POST" && u === `${ISSUE}/comment`) {
       comments.push(JSON.parse(String(init.body)));
       return json({ id: "c1" }, 201);
@@ -274,5 +292,98 @@ describe("the REAL jira Lambda on an issue that is ALREADY Done (TEAM-6165)", ()
     expect(res.error).toMatch(/No transition to "Done" found/);
     expect(provesTransitioned(res, "done", TICKET)).toBe(false);
     expect(posts).toEqual([]);
+  });
+});
+
+/**
+ * TEAM-6206 (ship review r2 R2-04) — the TEAM-6165 acknowledgement keyed on the Lambda's FIRST
+ * status read, taken before the Done guard's awaits (the labels/description GET and, in prod,
+ * the completion-record S3 read). An issue a human reopened inside that window read Done once
+ * and is To Do by the time the ack went out — and the webhook route takes the ack as proof of
+ * Done. The ack is now grounded on a re-read taken right before it: still Done on the same key
+ * is acknowledged exactly as before; a changed status takes the ordinary transition path (as a
+ * non-Done issue always has); an unreadable re-read refuses with nothing written.
+ */
+describe("the REAL jira Lambda when the issue REOPENS during the Done guard (TEAM-6206, R2-04)", () => {
+  const REOPEN_ONLY = [{ id: "11", name: "Reopen", to: { name: "To Do" } }];
+  const DONE_OFFERED = [{ id: "31", name: "Done", to: { name: "Done" } }];
+  const REASON = "Jira webhook transition to Done";
+
+  it("(1) first read Done, re-read To Do, no Done transition offered: NOT acknowledged — the ordinary path refuses", async () => {
+    const comments: unknown[] = [];
+    const statusReads: string[] = [];
+    const posts = installFakeJira(REOPEN_ONLY, { status: ["Done", "To Do"], comments, statusReads });
+    const res = await transitionDone(await loadHandler(), { reason: REASON });
+
+    expect(res.alreadyDone).toBeUndefined();
+    expect(res.noop).toBeUndefined();
+    expect(res.error).toMatch(/No transition to "Done" found/);
+    expect(provesTransitioned(res, "done", TICKET)).toBe(false);
+    expect(posts).toEqual([]);
+    // The re-read happened, and what followed is the ORDINARY path (its reason comment went
+    // out before the transitions lookup, as for any non-Done issue) — not the no-op ack.
+    expect(statusReads).toEqual(["Done", "To Do"]);
+    expect(comments).toHaveLength(1);
+  });
+
+  it("(2) first read Done, re-read To Do, Done offered: NOT acknowledged — the ordinary Done transition is POSTed", async () => {
+    const statusReads: string[] = [];
+    const posts = installFakeJira(DONE_OFFERED, { status: ["Done", "To Do"], statusReads });
+    const res = await transitionDone(await loadHandler());
+
+    expect(res.alreadyDone).toBeUndefined();
+    expect(res).toEqual(JIRA_DONE_SUCCESS);
+    expect(posts).toEqual([{ transition: { id: "31" } }]);
+    expect(statusReads).toEqual(["Done", "To Do"]);
+    expect(provesTransitioned(res, "done", TICKET)).toBe(true); // a REAL move, proven by the POST it made
+  });
+
+  it("(3) first read Done, re-read FAILS: refused — no ack, no comment, no transition", async () => {
+    const comments: unknown[] = [];
+    const statusReads: string[] = [];
+    const posts = installFakeJira(REOPEN_ONLY, { status: "Done", comments, statusReads, failStatusReadAt: 2 });
+    const res = await transitionDone(await loadHandler(), { reason: REASON });
+
+    expect(res.alreadyDone).toBeUndefined();
+    expect(res.error).toMatch(/status re-read failed/);
+    expect(res.error).toMatch(/Jira API 500/);
+    expect(provesTransitioned(res, "done", TICKET)).toBe(false);
+    expect(posts).toEqual([]);
+    expect(comments).toEqual([]);
+    expect(statusReads).toEqual(["Done", "Done"]);
+  });
+
+  it("(4) first read Done on TEAM-7, re-read Done but on a DIFFERENT key (moved issue): NOT acknowledged", async () => {
+    const posts = installFakeJira(REOPEN_ONLY, { status: "Done", key: [TICKET, "TEAM-99"] });
+    const res = await transitionDone(await loadHandler());
+
+    expect(res.alreadyDone).toBeUndefined();
+    expect(res.error).toMatch(/No transition to "Done" found/);
+    expect(provesTransitioned(res, "done", TICKET)).toBe(false);
+    expect(posts).toEqual([]);
+  });
+
+  it("(5) first read Done, re-read Cancelled (Won't Do): refused as a terminal move, nothing written", async () => {
+    const comments: unknown[] = [];
+    const posts = installFakeJira(REOPEN_ONLY, { status: ["Done", "Won't Do"], comments });
+    const res = await transitionDone(await loadHandler(), { reason: REASON });
+
+    expect(res.alreadyDone).toBeUndefined();
+    expect(res.error).toMatch(/Cannot move TEAM-7 to done/);
+    expect(posts).toEqual([]);
+    expect(comments).toEqual([]);
+  });
+
+  it("(6) still Done on the same key at the re-read: the TEAM-6165 ack, byte-identical, after exactly two status reads", async () => {
+    const comments: unknown[] = [];
+    const statusReads: string[] = [];
+    const posts = installFakeJira(REOPEN_ONLY, { status: ["Done", "Done"], comments, statusReads });
+    const res = await transitionDone(await loadHandler(), { reason: REASON });
+
+    expect(res).toEqual(JIRA_ALREADY_DONE);
+    expect(statusReads).toEqual(["Done", "Done"]);
+    expect(posts).toEqual([]);
+    expect(comments).toEqual([]);
+    expect(provesTransitioned(res, "done", TICKET)).toBe(true);
   });
 });

@@ -42,6 +42,7 @@ export const JIRA_NAME_MATCH_CLOSED = {
  * TEAM-6165 — a literal `done` on an issue Jira ALREADY reads Done (the webhook announcing
  * a board move): the Lambda runs the Done guard, then acknowledges without commenting or
  * POSTing a transition. `ticketId` is the key Jira returned, verified equal to the request.
+ * TEAM-6206: `status` is grounded on a re-read taken after the guard, not the first read.
  */
 export const JIRA_ALREADY_DONE = {
   ticketId: "TEAM-7",
