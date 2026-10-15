@@ -78,6 +78,34 @@ function sign(body: unknown, secret: string): string {
   return "sha256=" + createHmac("sha256", secret).update(JSON.stringify(body), "utf8").digest("hex");
 }
 
+// TEAM-6344: a body whose stream errors mid-read (e.g. a dropped connection),
+// exercised below to prove a read failure is a 400, not an unhandled 500.
+function erroredBody(): ReadableStream<Uint8Array> {
+  return new ReadableStream({
+    start(controller) {
+      controller.error(new Error("simulated body-read failure"));
+    },
+  });
+}
+
+async function postRaw(body: BodyInit, headers?: Record<string, string>) {
+  vi.resetModules();
+  const { POST } = await import("./route");
+  return POST(
+    new NextRequest(
+      "http://localhost/api/jira/webhook",
+      {
+        method: "POST",
+        body,
+        headers,
+        // "half" duplex is required by undici/fetch when streaming a body;
+        // not yet in the DOM RequestInit lib type.
+        duplex: "half",
+      } as ConstructorParameters<typeof NextRequest>[1]
+    )
+  );
+}
+
 describe("POST /api/jira/webhook (queue mode)", () => {
   beforeEach(() => {
     h.sqsSends.length = 0;
@@ -260,6 +288,28 @@ describe("POST /api/jira/webhook (signature)", () => {
     expect(bad.status).toBe(401);
     expect(h.sqsSends).toHaveLength(1);
   });
+
+  // TEAM-6344 (R1-F2): the HMAC must verify over the exact bytes received,
+  // not over a decoded string — req.text() would strip the leading BOM
+  // before hashing, so a signature computed over the real bytes would
+  // never verify against a text-decoded re-hash.
+  it("accepts a BOM-prefixed body signed over all received bytes", async () => {
+    const json = JSON.stringify(webhookPayload());
+    const bytes = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(json, "utf8")]);
+    const sig = "sha256=" + createHmac("sha256", "test-secret").update(bytes).digest("hex");
+    const res = await postRaw(bytes, { "x-hub-signature": sig });
+    expect(res.status).toBe(200);
+    expect(h.sqsSends).toHaveLength(1);
+  });
+
+  // TEAM-6344 (R1-F1): a body-read failure must be a 400, same as invalid
+  // JSON, even when a secret is configured — not an unhandled rejection.
+  it("returns 400 when the body stream errors mid-read", async () => {
+    const res = await postRaw(erroredBody(), { "x-hub-signature": sign(webhookPayload(), "test-secret") });
+    expect(res.status).toBe(400);
+    expect(h.sqsSends).toHaveLength(0);
+    expect(h.lambdaInvokes).toHaveLength(0);
+  });
 });
 
 describe("POST /api/jira/webhook (secret unset — passthrough + one-time warning)", () => {
@@ -301,5 +351,14 @@ describe("POST /api/jira/webhook (secret unset — passthrough + one-time warnin
     const res = await post(webhookPayload());
     expect(res.status).toBe(200);
     expect(h.sqsSends).toHaveLength(1);
+  });
+
+  // TEAM-6344 (R1-F1): on the default secret-unset path, a body-read
+  // failure must still return 400, not an unhandled 500.
+  it("returns 400 when the body stream errors mid-read, even with the secret unset", async () => {
+    const res = await postRaw(erroredBody());
+    expect(res.status).toBe(400);
+    expect(h.sqsSends).toHaveLength(0);
+    expect(h.lambdaInvokes).toHaveLength(0);
   });
 });

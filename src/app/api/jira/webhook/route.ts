@@ -25,6 +25,12 @@
  * per cold start so an install that never configures it is still visible in
  * the logs. DEPLOY.md's "Jira webhook signing" section has the required
  * rollout order (Jira first, then the hub) — reversing it drops deliveries.
+ *
+ * TEAM-6344: the body is read once as bytes (req.arrayBuffer(), inside a
+ * try) so the HMAC verifies the exact bytes Jira sent — req.text() would
+ * strip a leading UTF-8 BOM and replace invalid UTF-8 first. A body-read
+ * failure returns the same 400 as an invalid-JSON body, regardless of
+ * whether the secret is configured.
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -106,7 +112,15 @@ async function dispatchCommand(
 }
 
 export async function POST(req: NextRequest) {
-  const raw = await req.text();
+  // TEAM-6344: read the body once as bytes. A stream/read failure here is
+  // the same user-facing outcome as an invalid-JSON body on main.
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(await req.arrayBuffer());
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+  }
+
   // TEAM-6333: trim only decides opt-in (a blank/whitespace-only secret means
   // unset). The HMAC key is the exact configured value, untrimmed — the same
   // bytes setup-jira-webhook.sh sends Jira, and what Jira does with whatever
@@ -115,7 +129,7 @@ export async function POST(req: NextRequest) {
   const secret = process.env.JIRA_WEBHOOK_SECRET || "";
 
   if (secret.trim()) {
-    if (!verifyHubSignature(raw, req.headers.get("x-hub-signature"), secret)) {
+    if (!verifyHubSignature(bytes, req.headers.get("x-hub-signature"), secret)) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
   } else if (!warnedUnauthenticated) {
@@ -127,7 +141,9 @@ export async function POST(req: NextRequest) {
 
   let payload: JiraWebhookPayload;
   try {
-    payload = JSON.parse(raw);
+    // TEAM-6344: TextDecoder strips a leading BOM and replaces invalid UTF-8
+    // the same way req.json() (and main's req.text()) would.
+    payload = JSON.parse(new TextDecoder().decode(bytes));
   } catch {
     return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
   }
