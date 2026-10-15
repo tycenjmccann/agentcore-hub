@@ -11,6 +11,8 @@
 #
 # Prerequisites (from .env.local):
 #   JIRA_SITE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY, DEPLOYMENT_URL
+#   Optional: JIRA_WEBHOOK_SECRET — [A-Za-z0-9._~+/=-]+ only (openssl rand -hex 32);
+#   refused otherwise (TEAM-6334, deploy/lib/jira-webhook-secret.sh)
 #
 # Usage:
 #   ./deploy/apprunner/setup-jira-webhook.sh
@@ -32,6 +34,17 @@ load_env_local .env.local
 : "${JIRA_API_TOKEN:?JIRA_API_TOKEN must be set}"
 : "${JIRA_PROJECT_KEY:?JIRA_PROJECT_KEY must be set}"
 : "${DEPLOYMENT_URL:?DEPLOYMENT_URL must be set}"
+
+# TEAM-6334: refuse a secret the two writers cannot pass through byte-identical
+# (newline, whitespace, shell metachars) BEFORE touching Jira — otherwise Jira
+# would sign with these bytes and the hub (set via set-env.sh) with others,
+# and every delivery would 401. One rule, shared with set-env.sh. Resolved
+# from this script's own location so it works from any cwd.
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../lib/jira-webhook-secret.sh"
+if [[ -n "${JIRA_WEBHOOK_SECRET:-}" ]]; then
+  require_jira_webhook_secret_format "$JIRA_WEBHOOK_SECRET" || exit 1
+fi
 
 WEBHOOK_NAME="agentcore-hub-workflow"
 WEBHOOK_URL="${DEPLOYMENT_URL}/api/jira/webhook"

@@ -60,19 +60,24 @@ secret lands on the hub first while Jira still sends unsigned deliveries,
 every delivery gets `401` and its status transition is dropped — Jira does
 not redeliver it — until Jira is configured too.
 
-- **(a) Jira side.** Generate a secret (`openssl rand -hex 32`) and set it on
-  the webhook: Jira admin → System → WebHooks → `agentcore-hub-workflow` →
-  Secret, or re-run `./deploy/apprunner/setup-jira-webhook.sh` with
-  `JIRA_WEBHOOK_SECRET` set in `.env.local`. Jira then signs every delivery.
+- **(a) Jira side.** Generate the secret with `openssl rand -hex 32`. It must
+  match `[A-Za-z0-9._~+/=-]+` — no spaces, newlines, quotes or `$`:
+  `.env.local` is `source`d by bash and `set-env.sh` joins its arguments on
+  newlines, so anything else would reach Jira and the hub as different bytes.
+  Both writers refuse such a value before any network call
+  (`deploy/lib/jira-webhook-secret.sh`, TEAM-6334). Set it on the webhook:
+  Jira admin → System → WebHooks → `agentcore-hub-workflow` → Secret, or
+  re-run `./deploy/apprunner/setup-jira-webhook.sh` with `JIRA_WEBHOOK_SECRET`
+  set in `.env.local`. Jira then signs every delivery.
 - **(b) Hub side.**
   ```bash
   source deploy/config.sh
   ./deploy/ecs-express/set-env.sh JIRA_WEBHOOK_SECRET=<the same value>
   ```
   (never the raw ECS update API — it replaces the whole container env, which
-  would blank the other live secrets on this service). The value is used
-  byte-for-byte as the HMAC key (no trimming), so it must be identical on
-  both sides.
+  would blank the other live secrets on this service). The hub uses the value
+  byte-for-byte as the HMAC key (no trimming); the charset rule above is what
+  guarantees the bytes are identical on both sides.
 
 Between (a) and (b) the hub still accepts unsigned requests (and logs one
 `console.warn` per instance). Once (b) rolls out, an unsigned or mismatched
