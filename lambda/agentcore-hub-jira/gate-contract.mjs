@@ -939,8 +939,10 @@ export function descriptionCarriesConsoleLink(description, { pipeline, region } 
 // ticket-replay drain (workflow-output drainCompletion) stamps it when the merge
 // brief could not be put on the Merge Approval gate: a Done would make the gate
 // Ready without the brief in front of the approver. A delivery to the gate (the
-// drain's step 6, or a re-run report_completion) restamps it `false`; a record
-// without the field never held a brief. TEAM-5832: the writer stamps the hold on
+// drain's step 6, or a re-run report_completion) restamps it `false`; so does a
+// finding that no gate needs the brief (every gate Done, or a run whose def never
+// gets one), recorded as `briefDisposition` (TEAM-5995); a record without the
+// field never held a brief. TEAM-5832: the writer stamps the hold on
 // ANY ticket whose report named the brief (no assignee check), so every Done that
 // is not ship-phase or a security review reads it through judgeBriefHold — and
 // that read is in THIS band too: the hold comes from a durable writer, so "could
@@ -1438,7 +1440,8 @@ export function designAmendmentVerdict(siblings, self = {}) {
  * TEAM-5426: may this record close a SECURITY REVIEW? Only a record that
  * report_completion wrote after its design-amendment check passed carries
  * `securityReview: { verdict, amendmentTicketId? }` — a PASS, or a non-PASS with
- * the done amendment it was admitted on. A record without the stamp (written
+ * the done amendment it was admitted on and no `provisional` marker (TEAM-6140: the
+ * marker means the post-write confirm never finalized it). A record without the stamp (written
  * before TEAM-5426, or by a report the Lambda could not tell was a review) says
  * nothing about the verdict, so it is refused: the summary is never re-parsed
  * here, the stamp is the one answer. Recovery is the same as every other
@@ -1450,6 +1453,11 @@ export function securityReviewRecordRefusal(key, record) {
   const sr = record && typeof record.securityReview === "object" ? record.securityReview : null;
   const retry = "re-run WorkflowOutput___report_completion with the same arguments so it re-judges the verdict";
   if (!sr) return `${key} carries no securityReview verdict (not written by a report_completion that passed the design-amendment check) — ${retry}`;
+  // TEAM-6140 (DL-039): report_completion writes a non-PASS admission PROVISIONALLY and takes
+  // the marker off only after the amendment is re-confirmed done AFTER the write. A stamp
+  // still carrying it was never finalized (a lost finalize, or a compensation that could not
+  // land) and is not trusted, whatever its verdict says.
+  if (sr.provisional === true) return `${key} carries a PROVISIONAL securityReview admission${typeof sr.amendmentTicketId === "string" && sr.amendmentTicketId.trim() ? ` on amendment ${sr.amendmentTicketId.trim()}` : ""} (written before the amendment was re-confirmed done at commit, never finalized) — ${retry}`;
   const verdict = String(sr.verdict || "").toUpperCase();
   if (verdict === "PASS") return null;
   if (!verdict) return `${key} carries a securityReview stamp with no verdict — ${retry}`;

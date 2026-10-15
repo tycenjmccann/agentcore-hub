@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { NextRequest } from "next/server";
+import { ticketsSuccess, JIRA_NAME_MATCH_CLOSED, JIRA_ALREADY_DONE } from "@/lib/workflow/__fixtures__/ticket-transition-success";
 
 /**
  * TEAM-5781 — the webhook's `request_fix` branch minted a ticket id with its own
@@ -15,7 +16,29 @@ import { NextRequest } from "next/server";
  */
 const h = vi.hoisted(() => ({
   sends: [] as Array<{ name: string; input: Record<string, unknown> }>,
+  // TEAM-6094: every tickets-Lambda invoke, and what the next one answers / throws.
+  invokes: [] as Array<{ FunctionName?: string; InvocationType?: string; payload: Record<string, unknown> }>,
+  lambdaResp: {} as { Payload?: Uint8Array; FunctionError?: string },
+  lambdaThrows: null as Error | null,
 }));
+
+vi.mock("@aws-sdk/client-lambda", () => {
+  class InvokeCommand {
+    constructor(public input: { FunctionName?: string; InvocationType?: string; Payload?: Uint8Array }) {}
+  }
+  class LambdaClient {
+    async send(cmd: InvokeCommand) {
+      h.invokes.push({
+        FunctionName: cmd.input.FunctionName,
+        InvocationType: cmd.input.InvocationType,
+        payload: JSON.parse(Buffer.from(cmd.input.Payload as Uint8Array).toString()),
+      });
+      if (h.lambdaThrows) throw h.lambdaThrows;
+      return h.lambdaResp;
+    }
+  }
+  return { LambdaClient, InvokeCommand };
+});
 
 vi.mock("@aws-sdk/client-dynamodb", () => ({ DynamoDBClient: class {} }));
 
@@ -52,21 +75,53 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
 
 let POST: typeof import("./route").POST;
 
+const SECRET = "s3cr3t-webhook-value";
+const SAVED = { WEBHOOK_SECRET: process.env.WEBHOOK_SECRET, TICKET_TOOLS_LAMBDA: process.env.TICKET_TOOLS_LAMBDA };
+
+const lambdaAnswers = (body: unknown, FunctionError?: string) => {
+  h.lambdaResp = { Payload: new TextEncoder().encode(JSON.stringify(body)), ...(FunctionError ? { FunctionError } : {}) };
+};
+
+// TEAM-6123 — unlike lambdaAnswers, does not JSON.stringify: lets a test hand the
+// route the EXACT raw bytes a Lambda payload could be, including text that is not
+// valid JSON at all (lambdaAnswers can only ever produce valid JSON text).
+const lambdaAnswersRaw = (text: string) => {
+  h.lambdaResp = { Payload: new TextEncoder().encode(text) };
+};
+
 beforeEach(async () => {
   h.sends.length = 0;
+  h.invokes.length = 0;
+  h.lambdaThrows = null;
+  lambdaAnswers(ticketsSuccess("TEAM-7", "done", "in_review"));
+  process.env.WEBHOOK_SECRET = SECRET;
+  delete process.env.TICKET_TOOLS_LAMBDA;
   vi.resetModules();
   ({ POST } = await import("./route"));
 });
 
-function post(body: Record<string, unknown>) {
+afterEach(() => {
+  for (const [k, v] of Object.entries(SAVED)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
+});
+
+function post(body: Record<string, unknown>, secret: string | null = SECRET) {
   return POST(
     new NextRequest("http://localhost/api/workflow/webhook", {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "content-type": "application/json", ...(secret === null ? {} : { "x-webhook-secret": secret }) },
       body: JSON.stringify(body),
     })
   );
 }
+
+const JIRA_DONE = { event_type: "jira_transition", issue_key: "TEAM-7", changelog: { items: [{ field: "status", toString: "Done" }] } };
+const directDoneWrites = () =>
+  h.sends.filter(
+    (s) => s.name === "UpdateCommand" && (s.input.ExpressionAttributeValues as Record<string, unknown>)?.[":s"] === "done"
+  );
 
 describe("POST /api/workflow/webhook — request_fix is not a live action (TEAM-5781)", () => {
   it("request_fix is ignored and writes NOTHING to DynamoDB (no orphan ticket-id mint, no bare upsert)", async () => {
@@ -82,15 +137,16 @@ describe("POST /api/workflow/webhook — request_fix is not a live action (TEAM-
     expect(h.sends.length).toBe(0);
   });
 
-  it("sanity: jira_transition still writes exactly one status Update (the mock really observes writes)", async () => {
+  it("sanity: a non-done jira_transition still writes exactly one status Update (the mock really observes writes)", async () => {
     const res = await post({
       event_type: "jira_transition",
       issue_key: "TEAM-7",
-      changelog: { items: [{ field: "status", toString: "Done" }] },
+      changelog: { items: [{ field: "status", toString: "In Progress" }] },
     });
     const json = await res.json();
     expect(json).toEqual({ received: true, processed: true, mode: "lambda" });
     expect(h.sends.filter((s) => s.name === "UpdateCommand").length).toBe(1);
+    expect(h.invokes.length).toBe(0);
   });
 });
 
@@ -117,6 +173,7 @@ describe("POST /api/workflow/webhook — agent_completion is not a live action (
     const json = await res.json();
     expect(json).toEqual({ received: true, ignored: true });
     expect(h.sends.length).toBe(0);
+    expect(h.invokes.length).toBe(0);
     expect(
       h.sends.some(
         (s) => s.name === "UpdateCommand" && (s.input.ExpressionAttributeValues as Record<string, unknown>)?.[":s"] === "done"
@@ -133,10 +190,318 @@ describe("POST /api/workflow/webhook — agent_completion is not a live action (
     const json = await res.json();
     expect(json).toEqual({ received: true, ignored: true });
     expect(h.sends.length).toBe(0);
+    expect(h.invokes.length).toBe(0);
     expect(
       h.sends.some(
         (s) => s.name === "UpdateCommand" && (s.input.ExpressionAttributeValues as Record<string, unknown>)?.[":s"] === "done"
       )
     ).toBe(false);
+  });
+});
+
+/**
+ * TEAM-6094 (TEAM-6097) — the route failed OPEN: `WEBHOOK_SECRET || "dev-secret"`
+ * plus `if (WEBHOOK_SECRET !== "dev-secret" && …)` meant an unset secret (or the
+ * placeholder itself) skipped the check, so any caller could post a Jira-shaped
+ * `→ Done`, which was then written straight to DynamoDB past the tickets Lambda's
+ * completion-record / brief-hold guard and doneIntent fence.
+ */
+describe("POST /api/workflow/webhook — auth fails closed (TEAM-6094)", () => {
+  it("WEBHOOK_SECRET unset → 503, zero DynamoDB sends, zero Lambda invokes", async () => {
+    delete process.env.WEBHOOK_SECRET;
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(503);
+    expect(h.sends.length).toBe(0);
+    expect(h.invokes.length).toBe(0);
+  });
+
+  it("WEBHOOK_SECRET blank → 503, zero sends", async () => {
+    process.env.WEBHOOK_SECRET = "   ";
+    const res = await post(JIRA_DONE, "   ");
+    expect(res.status).toBe(503);
+    expect(h.sends.length).toBe(0);
+    expect(h.invokes.length).toBe(0);
+  });
+
+  it('WEBHOOK_SECRET="dev-secret" (the old default) → 503 even with a matching header, zero sends', async () => {
+    process.env.WEBHOOK_SECRET = "dev-secret";
+    const res = await post(JIRA_DONE, "dev-secret");
+    expect(res.status).toBe(503);
+    expect(h.sends.length).toBe(0);
+    expect(h.invokes.length).toBe(0);
+  });
+
+  it("wrong header with a real secret configured → 401, zero sends", async () => {
+    const res = await post(JIRA_DONE, "not-the-secret");
+    expect(res.status).toBe(401);
+    expect(h.sends.length).toBe(0);
+    expect(h.invokes.length).toBe(0);
+  });
+
+  it("same-length wrong header → 401 (constant-time compare, not a prefix check)", async () => {
+    const res = await post(JIRA_DONE, SECRET.slice(0, -1) + "X");
+    expect(res.status).toBe(401);
+    expect(h.sends.length + h.invokes.length).toBe(0);
+  });
+
+  it("missing header with a real secret configured → 401, zero sends", async () => {
+    const res = await post(JIRA_DONE, null);
+    expect(res.status).toBe(401);
+    expect(h.sends.length).toBe(0);
+    expect(h.invokes.length).toBe(0);
+  });
+});
+
+describe("POST /api/workflow/webhook — done routes through the tickets Lambda guard (TEAM-6094)", () => {
+  it("jira_transition Done → no direct done UpdateCommand; one Tickets___transition_ticket invoke with the console's payload shape", async () => {
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+    expect(directDoneWrites()).toHaveLength(0);
+    expect(h.sends.length).toBe(0);
+    expect(h.invokes).toHaveLength(1);
+    expect(h.invokes[0]).toMatchObject({
+      FunctionName: "agentcore-hub-tickets",
+      InvocationType: "RequestResponse",
+      payload: {
+        tool_name: "Tickets___transition_ticket",
+        parameters: { ticket_id: "TEAM-7", transition_id: "done", reason: expect.any(String) },
+      },
+    });
+  });
+
+  it("TICKET_TOOLS_LAMBDA names the function (jira mode)", async () => {
+    process.env.TICKET_TOOLS_LAMBDA = "agentcore-hub-jira";
+    vi.resetModules();
+    ({ POST } = await import("./route"));
+    lambdaAnswers({ ticketId: "TEAM-7", status: "done", message: "ok" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(h.invokes[0].FunctionName).toBe("agentcore-hub-jira");
+  });
+
+  it("a Jira-shaped body with no event_type (the real webhook) → Done also goes through the Lambda", async () => {
+    const res = await post({ issue: { key: "TEAM-7" }, changelog: { items: [{ field: "status", toString: "Done" }] } });
+    expect(res.status).toBe(200);
+    expect(directDoneWrites()).toHaveLength(0);
+    expect(h.invokes).toHaveLength(1);
+    expect(h.invokes[0].payload).toMatchObject({ parameters: { ticket_id: "TEAM-7", transition_id: "done" } });
+  });
+
+  it("tickets Lambda refuses the Done (tickets twin: content text, e.g. a brief hold) → 409, no direct write", async () => {
+    lambdaAnswers({ content: [{ text: "TEAM-7 has briefPending:true (brief not on the Merge Approval gate)" }] });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(409);
+    const json = await res.json();
+    expect(json).toMatchObject({ error: "Ticket transition rejected", ticketId: "TEAM-7" });
+    expect(json.details).toMatch(/briefPending:true/);
+    expect(h.sends.length).toBe(0);
+    expect(h.invokes).toHaveLength(1);
+  });
+
+  it("jira twin's refusal shape ({ error }) → 409, no direct write", async () => {
+    lambdaAnswers({ error: "completion record completions/TEAM-7.json not proven" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(409);
+    expect((await res.json()).details).toMatch(/not proven/);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it("FunctionError → 502, no direct write", async () => {
+    lambdaAnswers({ errorMessage: "Task timed out" }, "Unhandled");
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it("the invoke itself throws → 502, no direct write", async () => {
+    h.lambdaThrows = Object.assign(new Error("AccessDeniedException"), { name: "AccessDeniedException" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect((await res.json()).details).toMatch(/AccessDenied/);
+    expect(h.sends.length).toBe(0);
+  });
+});
+
+/**
+ * TEAM-6123 (P2) — rejectedDetails is a DENY-list: it answers null for any
+ * payload it doesn't recognize as a refusal, and a 200 with no FunctionError and
+ * no recognized refusal was treated as "the ticket moved". None of these five
+ * shapes prove a transition happened, so each must now 502 instead of the old
+ * 200 processed:true — and, since the invoke genuinely returned with no
+ * FunctionError, there is still no direct DynamoDB write either way.
+ */
+describe("POST /api/workflow/webhook — an unproven Done is not a success (TEAM-6123)", () => {
+  it("unparseable payload text → 502, no direct write", async () => {
+    lambdaAnswersRaw("not json");
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it("empty payload → 502, no direct write", async () => {
+    lambdaAnswersRaw("");
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it('literal JSON "null" payload → 502, no direct write', async () => {
+    lambdaAnswersRaw("null");
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it('"{}" payload → 502, no direct write', async () => {
+    lambdaAnswersRaw("{}");
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it('a refusal-shaped-but-unrecognized object ({ok:true,status:"blocked"}) → 502, no direct write', async () => {
+    lambdaAnswers({ ok: true, status: "blocked" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it("the real tickets-Lambda success shape still 200s (regression guard)", async () => {
+    lambdaAnswers({ key: "TEAM-7", status: "transitioned", from: "in_review", to: "done" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+  });
+
+  it("the real jira-Lambda success shape still 200s (regression guard)", async () => {
+    lambdaAnswers({ ticketId: "TEAM-7", status: "done", message: "Transitioned to done" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+  });
+
+  it("a real refusal is still 409, not 502 (the two codes stay distinct)", async () => {
+    lambdaAnswers({ content: [{ text: "TEAM-7 has briefPending:true" }] });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(409);
+  });
+});
+
+/**
+ * TEAM-6131 (review fix round 2) — the proof must name THE ticket and THE status the
+ * route asked the Lambda for. F3: a bare `{status:"transitioned"}` (a shape the real
+ * tickets Lambda never returns) was proof → 200. F4: the jira Lambda matches a
+ * transition by NAME or destination and reports the destination's status, so a
+ * workflow whose "Done" lands in "Closed" answered `status:"closed"` → 502 although
+ * the ticket moved. The Lambda now also reports `requested` + `matchedTransition`.
+ */
+describe("POST /api/workflow/webhook — proof names the requested ticket and status (TEAM-6131)", () => {
+  it('F3: a bare {status:"transitioned"} (no key, no `to`) → 502, no direct write', async () => {
+    lambdaAnswers({ status: "transitioned" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ error: "tickets Lambda did not confirm the transition", ticketId: "TEAM-7" });
+    expect(h.sends.length).toBe(0);
+    expect(h.invokes).toHaveLength(1);
+  });
+
+  it("F3: the real tickets shape for a DIFFERENT ticket → 502, no direct write", async () => {
+    lambdaAnswers(ticketsSuccess("TEAM-8", "done", "in_review"));
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+
+  it("F4: the jira Lambda's name≠destination shape (Done → Closed) → 200", async () => {
+    lambdaAnswers(JIRA_NAME_MATCH_CLOSED);
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+  });
+
+  it("F4: …but for a DIFFERENT ticket → 502", async () => {
+    lambdaAnswers({ ...JIRA_NAME_MATCH_CLOSED, ticketId: "TEAM-8" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+  });
+
+  it("F4: an arbitrary landed status (in_progress for a requested done) → 502, even with requested/matchedTransition", async () => {
+    lambdaAnswers({ ...JIRA_NAME_MATCH_CLOSED, status: "in_progress" });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(h.sends.length).toBe(0);
+  });
+});
+
+/**
+ * TEAM-6141 (review fix round 3, P2) — the TEAM-6131 pair proved too much: an absent or
+ * empty `status` normalized to "" (not a hub column) and fell into a fallback that only
+ * checked `requested` + three non-empty metadata strings. Nothing related the landed
+ * status to the echoed destination, or the transition's name to the requested action, so
+ * all of these answered 200. They are shapes the real Lambda never emits for a requested
+ * done (see ticket-transition-refusal.jira-e2e.test.ts); the real Done → Closed shape
+ * still 200s (regression guard above).
+ */
+describe("POST /api/workflow/webhook — the Jira pair must account for the move (TEAM-6141)", () => {
+  const unconfirmed = async (payload: unknown) => {
+    lambdaAnswers(payload);
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ error: "tickets Lambda did not confirm the transition", ticketId: "TEAM-7" });
+    expect(h.sends.length).toBe(0);
+    expect(h.invokes).toHaveLength(1);
+  };
+
+  it("(a) no `status` + requested done + an unrelated matched transition (Start Progress → In Progress) → 502, no direct write", () =>
+    unconfirmed({ ticketId: "TEAM-7", requested: "done", matchedTransition: { id: "21", name: "Start Progress", to: "In Progress" } }));
+
+  it('(b) `status:""` + requested done + the real Done → Closed transition → 502, no direct write', () =>
+    unconfirmed({ ...JIRA_NAME_MATCH_CLOSED, status: "" }));
+
+  it("(c) landed waiting_for_review via a transition NAMED Start Review (as written in the ticket, no id) → 502, no direct write", () =>
+    unconfirmed({ ticketId: "TEAM-7", status: "waiting_for_review", requested: "done", matchedTransition: { name: "Start Review", to: "Waiting for review" } }));
+
+  it("(c) …and with an id — the complete metadata that used to be enough → 502, no direct write", () =>
+    unconfirmed({ ticketId: "TEAM-7", status: "waiting_for_review", requested: "done", matchedTransition: { id: "51", name: "Start Review", to: "Waiting for review" } }));
+
+  it("a landed status that is not the echoed destination's (closed vs → Resolved) → 502, no direct write", () =>
+    unconfirmed({ ...JIRA_NAME_MATCH_CLOSED, matchedTransition: { id: "31", name: "Done", to: "Resolved" } }));
+
+  it("regression: the real Done → Closed shape still 200s", async () => {
+    lambdaAnswers(JIRA_NAME_MATCH_CLOSED);
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+  });
+});
+
+/**
+ * TEAM-6165 (ship review F4) — the webhook announces a Done that already happened in Jira.
+ * The jira Lambda now acknowledges it (JIRA_ALREADY_DONE, pinned against the real handler in
+ * ticket-transition-refusal.jira-e2e.test.ts) instead of refusing "No transition to Done";
+ * its Done guard still refuses a held / unproven ticket, and that refusal stays a 409.
+ */
+describe("POST /api/workflow/webhook — a Done Jira already has (TEAM-6165)", () => {
+  it("the jira Lambda's already-Done acknowledgement → 200 via the tickets Lambda, no direct write", async () => {
+    lambdaAnswers(JIRA_ALREADY_DONE);
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ received: true, processed: true, mode: "lambda", via: "tickets-lambda" });
+    expect(directDoneWrites()).toHaveLength(0);
+    expect(h.invokes).toHaveLength(1);
+  });
+
+  it("the Done guard's structured refusal on an already-Done ticket → 409, no direct write", async () => {
+    lambdaAnswers({
+      ok: false,
+      reason: "completion_record_required",
+      hint: "call WorkflowOutput___report_completion(ticket_id=…) — it writes the record and transitions the ticket for you",
+      error: "Cannot move TEAM-7 to Done: a ship-phase ticket needs its completion record first — (ARTIFACT_BUCKET is unset, so completions/TEAM-7.json cannot be read)",
+    });
+    const res = await post(JIRA_DONE);
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: "Ticket transition rejected", ticketId: "TEAM-7" });
+    expect(h.sends.length).toBe(0);
   });
 });

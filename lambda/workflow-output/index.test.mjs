@@ -390,7 +390,7 @@ vi.mock("./s3-conditional.mjs", async (importOriginal) => {
   try { real = await importOriginal(); } catch { real = { probeConditionalHeaders: async () => ({ verdict: "inconclusive", reason: "module absent" }) }; }
   return { ...real, probeConditionalHeaders: (...args) => (h.probe ? h.probe(...args) : real.probeConditionalHeaders(...args)) };
 });
-const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord, doneIntentFresh, DONE_INTENT_TTL_MS, holdDeferredOnDoneIntent, deferHoldOnDoneIntent } = await import("./index.mjs");
+const { handler, inferToolFromArgs, followUpHash, followUpBanner, sweepSkipOrder, toolFailure, isAlreadyDoneRefusal, isDefiniteCreateRefusal, adoptHold, RECORD_CAS_ATTEMPTS, parseCompletionRecord, doneIntentFresh, DONE_INTENT_TTL_MS, holdDeferredOnDoneIntent, deferHoldOnDoneIntent, clearBriefHoldOnRelease, holdBriefOnProvisionalRelease, finalizeSecurityReview } = await import("./index.mjs");
 /** TEAM-5167: age a stored claim — rewrite every timestamp in its body to `ms` ago. */
 const age = (key, ms) => {
   const body = JSON.parse(h.objects.get(key));
@@ -1683,6 +1683,45 @@ describe("report_completion — R3-1: a refused or failed Done transition", () =
     expect(forced.replayDropped).toBeUndefined();
     // …except a delivery to the gate newer than the refusal
     expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "gate" }, { forceHold: true }).briefPending).toBe(false);
+  });
+
+  it("TEAM-5995 T4: adoptHold — a hold released with no gate needed (briefDisposition) counts as delivered: a refusal does not re-force it, and it is carried", () => {
+    const fresh = () => ({ ticket_id: "T", status: "complete" });
+    const released = { briefPending: false, briefDelivered: "off_gate", briefDisposition: { release: true, kind: "gate_settled", at: "2026-10-14T00:00:00.000Z", by: "drain" } };
+    expect(adoptHold(fresh(), released, { forceHold: true }).briefPending).toBe(false);
+    expect(adoptHold(fresh(), released)).toMatchObject({ briefPending: false, briefDisposition: released.briefDisposition });
+    // anything short of a recorded release is still forced
+    expect(adoptHold(fresh(), { ...released, briefDisposition: { release: false } }, { forceHold: true }).briefPending).toBe(true);
+    expect(adoptHold(fresh(), { briefPending: false, briefDelivered: "off_gate" }, { forceHold: true }).briefPending).toBe(true);
+    // a stale disposition on `report` goes when the current record's hold has none
+    expect(adoptHold({ ...fresh(), briefDisposition: released.briefDisposition }, { briefPending: true, briefDelivered: "off_gate" }).briefDisposition).toBeUndefined();
+  });
+
+  it("TEAM-6140 (DL-039): a PROVISIONAL release is a hold - adoptHold carries it and a refusal drops it; the helpers prune only on finalize; the security stamp finalizes idempotently", () => {
+    const fresh = () => ({ ticket_id: "T", status: "complete" });
+    const disposition = { release: true, kind: "gate_settled", observed: [{ ticketId: "G", status: "Done" }], at: "2026-10-14T00:00:00.000Z", by: "drain" };
+    const provisional = { briefPending: true, briefDelivered: "off_gate", briefDisposition: { ...disposition, provisional: true } };
+    // carried as a hold field, never read as delivered (deliveredSince needs briefPending:false)
+    expect(adoptHold(fresh(), provisional)).toMatchObject({ briefPending: true, briefDisposition: { provisional: true } });
+    const forced = adoptHold(fresh(), provisional, { forceHold: true });
+    expect(forced.briefPending).toBe(true);
+    expect(forced.briefDisposition).toBeUndefined();
+    // the helper leaves the standing hold's evidence in place; finalize prunes it and drops the marker
+    const held = { briefPending: true, briefFallbackReason: "not on the gate: two open gates", undelivered: [{ part: "brief", s3Key: "k" }, { part: "residual_findings", ticketId: "D" }] };
+    holdBriefOnProvisionalRelease(held, disposition);
+    expect(held).toMatchObject({ briefPending: true, briefDisposition: { ...disposition, provisional: true }, briefFallbackReason: "not on the gate: two open gates" });
+    expect(held.undelivered).toHaveLength(2);
+    expect(held.briefHoldReason).toMatch(/^provisional: the gate_settled release \(G\)/);
+    expect(disposition.provisional, "the caller's disposition is not mutated").toBeUndefined();
+    clearBriefHoldOnRelease(held, disposition);
+    expect(held).toMatchObject({ briefPending: false, briefDisposition: disposition, undelivered: [{ part: "residual_findings", ticketId: "D" }] });
+    expect(held.briefDisposition.provisional).toBeUndefined();
+    expect(held.briefFallbackReason).toBeUndefined();
+    // the security stamp
+    const stamped = { securityReview: { verdict: "FAIL", amendmentTicketId: "A", provisional: true } };
+    expect(finalizeSecurityReview(stamped).securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "A" });
+    expect(finalizeSecurityReview(stamped).securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: "A" });
+    expect(finalizeSecurityReview({ status: "complete" })).toEqual({ status: "complete" });
   });
 
   it("TEAM-5941: adoptHold carries the twins' doneIntent verbatim — hold or no hold, delivered or not — and drops a copy the current record no longer has", () => {
@@ -4241,6 +4280,32 @@ describe("report_completion — FR-10 empty_sweep", () => {
     }
   });
 
+  it("TEAM-6217 (R3-01 sibling sweep): a sibling whose QUEUED record still owes its merge brief (evidence_keys names it, no outcome recorded) is NOT skipped - same hold without the stamp (queuedBriefOwed); a queued record naming no brief, or one whose brief was delivered, still skips", async () => {
+    const QUEUED = "completions/TEAM-4645.json";
+    const owed = JSON.stringify({ ticket_id: "TEAM-4645", status: "complete", ticketWrites: "queued", evidence_keys: "workflows/wf_1/shared/plan.md,workflows/wf_1/shared/merge-brief.md" });
+    h.objects.set(QUEUED, owed);
+    h.etags.set(QUEUED, '"queued-4645"');
+    const res = result(await sweep());
+    expect(res.status).toBe("complete");
+    expect(h.puts.filter((p) => p.Key === QUEUED)).toHaveLength(0);
+    expect(calls("Tickets___transition_ticket").map((p) => p.ticket_id)).not.toContain("TEAM-4645");
+    expect(res.emptySweepSkipped).toEqual(["TEAM-4644", "TEAM-4643"]);
+    expect(res.emptySweepFailed).toEqual([{ ticketId: "TEAM-4645", reason: expect.stringContaining('ticketWrites:"queued" with its merge brief workflows/wf_1/shared/merge-brief.md') }]);
+    expect(h.objects.get(QUEUED)).toBe(owed);
+    // No false positive: a queued record with no merge brief among its keys, and one whose brief is recorded delivered, skip as before.
+    for (const rec of [
+      { ticket_id: "TEAM-4645", status: "complete", ticketWrites: "queued", evidence_keys: "workflows/wf_1/shared/plan.md" },
+      { ticket_id: "TEAM-4645", status: "complete", ticketWrites: "queued", evidence_keys: "workflows/wf_1/shared/merge-brief.md", briefDelivered: "gate", briefPending: false },
+    ]) {
+      h.puts.length = 0;
+      h.objects.set(QUEUED, JSON.stringify(rec));
+      h.etags.set(QUEUED, `"q-${Math.random()}"`);
+      const again = result(await sweep());
+      expect(again.emptySweepFailed ?? []).toEqual([]);
+      expect(again.emptySweepSkipped).toContain("TEAM-4645");
+    }
+  });
+
   it("TEAM-5941: a sibling whose record carries a FRESH doneIntent (a twin is committing its Done) is NOT skipped - no overwrite, no transition, reported in emptySweepFailed; a STALE one is skipped as before", async () => {
     const FENCED = "completions/TEAM-4645.json";
     const fenced = JSON.stringify({ ticket_id: "TEAM-4645", status: "complete", doneIntent: { at: new Date().toISOString(), provider: "dynamodb", nonce: "n1" } });
@@ -5171,5 +5236,98 @@ describe("TEAM-6057 — clearUndeliveredBriefTargets", () => {
     expect(clearUndeliveredBriefTargets(rec)).toBe(rec);
     expect(rec).toEqual({ briefPending: true, briefDelivered: "undelivered", undelivered: [{ part: "brief", s3Key: "b.md" }] });
     expect(clearUndeliveredBriefTargets({ briefDelivered: "undelivered" })).toEqual({ briefDelivered: "undelivered" });
+  });
+});
+
+describe("TEAM-6097 — clearBriefHoldOnRelease / clearBriefHoldOnGate", () => {
+  const OTHER = { part: "residual_findings", ticketId: "TEAM-5603", reason: "Jira API 400: ticket is archived" };
+  const held = () => ({
+    briefPending: true, briefDelivered: "off_gate", briefTargets: ["T", "E"], briefFallbackReason: "2 open Merge Approval gates",
+    undelivered: [{ part: "brief", s3Key: "b.md" }, OTHER],
+  });
+  const DISPOSITION = { release: true, kind: "gate_settled", why: "every gate Done", at: "2026-10-14T00:00:00.000Z", by: "drain" };
+
+  it("release: hold false, disposition set, brief entry and briefFallbackReason pruned, other undelivered parts kept", async () => {
+    const { clearBriefHoldOnRelease } = await import("./index.mjs");
+    const rec = held();
+    expect(clearBriefHoldOnRelease(rec, DISPOSITION)).toBe(rec);
+    expect(rec.briefPending).toBe(false);
+    expect(rec.briefDisposition).toEqual(DISPOSITION);
+    expect(rec.briefFallbackReason).toBeUndefined();
+    expect(rec.undelivered).toEqual([OTHER]);
+    // A brief-only undelivered list goes entirely.
+    const only = clearBriefHoldOnRelease({ ...held(), undelivered: [{ part: "brief" }] }, DISPOSITION);
+    expect(only.undelivered).toBeUndefined();
+  });
+
+  it("gate delivery supersedes a release: clearBriefHoldOnGate deletes briefDisposition", async () => {
+    const { clearBriefHoldOnGate, clearBriefHoldOnRelease } = await import("./index.mjs");
+    const rec = clearBriefHoldOnRelease(held(), DISPOSITION);
+    Object.assign(rec, { briefDelivered: "gate", briefTargets: ["G"] });
+    clearBriefHoldOnGate(rec);
+    expect(rec.briefDisposition).toBeUndefined();
+    expect(rec.briefPending).toBe(false);
+    expect(rec.undelivered).toEqual([OTHER]);
+  });
+
+  it("an undelivered brief cannot claim a release: clearUndeliveredBriefTargets deletes briefDisposition", async () => {
+    const { clearUndeliveredBriefTargets } = await import("./index.mjs");
+    const rec = { briefDelivered: "undelivered", briefDisposition: DISPOSITION };
+    expect(clearUndeliveredBriefTargets(rec).briefDisposition).toBeUndefined();
+  });
+});
+
+// ─── TEAM-6205 R2-01 / R2-05 (ship review round 2 on #970): the follow-ups hold helpers ───
+describe("TEAM-6205 R2-05 — unresolvedRecordFollowUps fails closed on a malformed or hollow breakdown", () => {
+  const none = { created: [], skipped: [], failed: [], rerouted: [] };
+
+  it("R2-05a rows without identity, and an empty failed[] under followUpsPending:true, are unresolved (a hold nobody can name)", async () => {
+    const { unresolvedRecordFollowUps } = await import("./index.mjs");
+    for (const failed of [[], [null], [{ reason: "x" }], [{ hash: null }], [{ hash: "" }], ["abc"]]) {
+      const out = unresolvedRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed } }, none, []);
+      expect(out.length, JSON.stringify(failed)).toBeGreaterThan(0);
+      expect(out.every((f) => f.hash === null && typeof f.reason === "string" && f.reason.length > 0), JSON.stringify(out)).toBe(true);
+    }
+    // valid rows: resolved by this message (created/skipped/rerouted) or carried by it ⇒ [] (unchanged)
+    expect(unresolvedRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1" }] } }, { ...none, created: [{ hash: "a1" }] }, [])).toEqual([]);
+    expect(unresolvedRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1" }] } }, none, [{ hash: "a1" }])).toEqual([]);
+    expect(unresolvedRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1" }, { hash: "b2" }] } }, none, [{ hash: "a1" }])).toEqual([{ hash: "b2" }]);
+    // a malformed row beside a valid one: the valid one resolves, the malformed one still holds
+    expect(unresolvedRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1" }, { reason: "no hash" }] } }, none, [{ hash: "a1" }])).toHaveLength(1);
+    // no hold stated ⇒ nothing, whatever the breakdown
+    expect(unresolvedRecordFollowUps({ followUpsPending: false, followUpsMaterialized: { failed: [null] } }, none, [])).toEqual([]);
+    expect(unresolvedRecordFollowUps(null, none, [])).toEqual([]);
+    // no breakdown at all ⇒ the sentinel (unchanged)
+    expect(unresolvedRecordFollowUps({ followUpsPending: true }, none, [])).toHaveLength(1);
+  });
+
+  it("R2-05b a hollow failed[] is resolved only when every follow-up the record names is filed by, or carried by, this message", async () => {
+    const { unresolvedRecordFollowUps } = await import("./index.mjs");
+    const rec = { followUpsPending: true, followUps: [{ hash: "a1" }, { hash: "b2" }], followUpsMaterialized: { failed: [] } };
+    expect(unresolvedRecordFollowUps(rec, { ...none, created: [{ hash: "a1" }], skipped: [{ hash: "b2" }] }, [])).toEqual([]);
+    expect(unresolvedRecordFollowUps(rec, { ...none, created: [{ hash: "a1" }] }, [{ hash: "b2" }])).toEqual([]);
+    expect(unresolvedRecordFollowUps(rec, { ...none, created: [{ hash: "a1" }] }, []).length, "b2 is named and unfiled").toBeGreaterThan(0);
+    expect(unresolvedRecordFollowUps({ ...rec, followUps: [] }, none, []).length, "nothing named: fail closed").toBeGreaterThan(0);
+    expect(unresolvedRecordFollowUps({ ...rec, followUps: undefined }, none, []).length).toBeGreaterThan(0);
+  });
+
+  it("R2-01 mergeRecordFollowUps: the record's unresolved rows ride verbatim in the persisted breakdown; sentinels only hold the flag", async () => {
+    const { mergeRecordFollowUps } = await import("./index.mjs");
+    const b = { hash: "b2", reason: "Jira API 429: rate limited", retryable: true, commentedOn: ["TEAM-1"] };
+    const m = mergeRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1", reason: "x" }, b] } }, { ...none, created: [{ hash: "a1", ticketId: "TEAM-9" }] }, [{ hash: "a1" }]);
+    expect(m.unresolved).toEqual([b]);
+    expect(m.breakdown).toEqual({ created: [{ hash: "a1", ticketId: "TEAM-9" }], skipped: [], failed: [b], rerouted: [] });
+    expect(m.stillUnfiled).toBe(true);
+    // this message's own failed row and the record's copy of it are one row
+    const own = { hash: "a1", reason: "Jira API 400: bad", retryable: false, commentedOn: [] };
+    const dup = mergeRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1", reason: "older" }, b] } }, { ...none, failed: [own] }, [{ hash: "a1" }]);
+    expect(dup.breakdown.failed).toEqual([own, b]);
+    // hollow: the flag holds, nothing fabricated into failed[]
+    const hollow = mergeRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [] } }, none, []);
+    expect(hollow.stillUnfiled).toBe(true);
+    expect(hollow.breakdown.failed).toEqual([]);
+    // no hold on the record: this message's rows alone decide
+    expect(mergeRecordFollowUps({ followUpsPending: false }, none, [])).toMatchObject({ unresolved: [], stillUnfiled: false });
+    expect(mergeRecordFollowUps(null, { ...none, failed: [own] }, [{ hash: "a1" }])).toMatchObject({ unresolved: [], stillUnfiled: true });
   });
 });

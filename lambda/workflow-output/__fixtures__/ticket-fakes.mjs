@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 /**
  * TEAM-5592: in-memory stand-ins for the I/O behind report_completion's replay path,
  * shared by provider-outage.test.mjs and ticket-probe.test.mjs.
@@ -26,14 +28,26 @@ export const PROVIDER_503 = `Jira API 503: ${JSON.stringify(SUSPENDED_BODY)}`;
 
 export const fake = {};
 
+/**
+ * TEAM-6152: what S3 returns as the ETag of a single-part PutObject under SSE-S3 is the
+ * MD5 of the body, so two byte-identical writes share one ETag. `etagMode:"content"` (the
+ * default) models exactly that; `"sequence"` is the pre-6152 fake (`"e<n>"`, a NEW ETag on
+ * every PUT, which is what hid round 5's F1: an IfMatch finalize that could not tell its
+ * own provisional write from another writer's identical re-establishment).
+ */
+export const contentEtag = (body) => `"${createHash("md5").update(text(body)).digest("hex")}"`;
+
 export function resetFake() {
   Object.assign(fake, {
-    objects: new Map(), etags: new Map(), etagSeq: 0, puts: [],
+    objects: new Map(), etags: new Map(), etagSeq: 0, etagMode: "content", puts: [],
     tickets: new Map(), nextKey: 5700, calls: [], webhooks: [],
     down: false, downError: PROVIDER_503, failTool: null, lambdaFail: null, putError: null, getError: null, beforeTool: null,
     // TEAM-5941: run inside a Done transition before the status changes — what the real
     // twin does there is fence the completion record (a PutObject with doneIntent).
     onTransition: null,
+    // TEAM-6152: `async (input) => {}`, awaited BEFORE a PutObject runs (the sibling of
+    // beforeTool) - a test can run a whole second drain inside one actor's PUT.
+    beforePut: null,
     queue: [], sends: [], dedup: new Map(), sendError: null, receiptSeq: 0,
     metrics: [], events: [], lambdaInvokes: [],
   });
@@ -56,6 +70,7 @@ export function s3Module() {
         const input = c?.input || {};
         const has = fake.objects.has(input.Key);
         if (name === "PutObjectCommand") {
+          if (fake.beforePut) await fake.beforePut(input);
           fake.puts.push(input);
           const refused = fake.putError?.(input);
           if (refused) throw refused;
@@ -64,7 +79,7 @@ export function s3Module() {
             throw err("PreconditionFailed", 412, "At least one of the pre-conditions you specified did not hold");
           }
           fake.objects.set(input.Key, text(input.Body));
-          const ETag = `"e${++fake.etagSeq}"`;
+          const ETag = fake.etagMode === "sequence" ? `"e${++fake.etagSeq}"` : contentEtag(input.Body);
           fake.etags.set(input.Key, ETag);
           return { ETag };
         }

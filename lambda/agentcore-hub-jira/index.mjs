@@ -2458,6 +2458,55 @@ async function transitionTicket(params) {
     );
   }
 
+  // TEAM-6165: a Done the issue ALREADY has (the Jira webhook announcing a board move
+  // that happened) is acknowledged, not re-attempted — Jira offers no Done transition
+  // from Done, so it used to refuse with "No transition to Done" after commenting. Only
+  // a literal `done` request with no blockers, on the very issue asked for (Jira returns
+  // a moved issue's CURRENT key), and only after the guard above admitted it exactly as
+  // for a real Done. No comment, no transition, no Done-intent fence: the fence guards
+  // THIS request's commit window and a no-op has none (an intent written here would be
+  // stale and defer a real hold). `skip` and every other target keep the path below.
+  // TEAM-6206: the status this keys on is re-read AFTER the guard, right before the ack.
+  const keyMatches = (issue) => String(issue?.key ?? "").trim().toUpperCase() === String(ticket_id).trim().toUpperCase();
+  if (
+    targetStatus === "done" &&
+    blockers.length === 0 &&
+    mapStatusToInternal(current?.fields?.status?.name) === "done" &&
+    keyMatches(current)
+  ) {
+    // TEAM-6206 (ship review r2 R2-04): `current` is STALE behind the guard's awaits above
+    // (the labels/description GET, the completion-record S3 read). An issue a human
+    // reopened in that window read Done once and is To Do now; acknowledging it would hand
+    // the webhook proof of a Done that no longer holds. So the evidence is a re-read taken
+    // right here: only a status that STILL reads Done, on the same key, is acknowledged.
+    // Unreadable → refuse (never an ack, never a blind transition). Changed → the two
+    // refusals the first read enforced run against what the issue reads NOW, then the
+    // request takes the ordinary transition path below, exactly as a non-Done issue does.
+    let fresh;
+    try {
+      fresh = await jiraFetch(`/rest/api/3/issue/${ticket_id}?fields=status`);
+    } catch (err) {
+      throw new Error(`Cannot acknowledge ${ticket_id} as Done: status re-read failed (${err.message}) — not acknowledged, not transitioned.`);
+    }
+    const freshInternal = mapStatusToInternal(fresh?.fields?.status?.name);
+    if (freshInternal === "done" && keyMatches(fresh)) {
+      console.log(`[jira-tools] ${ticket_id} is already Done — acknowledged, no transition performed`);
+      return {
+        ticketId: fresh.key,
+        status: "done",
+        message: "Already Done - no transition performed",
+        requested: "done",
+        alreadyDone: true,
+        noop: true,
+        ...(gateVerification ? { gateVerification } : {}),
+      };
+    }
+    checkPrecondition(fresh);
+    const movedTerminal = terminalMoveRefusal(freshInternal, targetInternal);
+    if (movedTerminal) throw new Error(`Cannot move ${ticket_id} to ${targetInternal}: ${movedTerminal}`);
+    console.log(`[jira-tools] ${ticket_id} read Done before the guard but ${freshInternal} (key ${fresh?.key ?? "?"}) after it — not acknowledged, taking the transition path`);
+  }
+
   // Add the reason as a comment BEFORE the transition. The transition fires the
   // status webhook → orchestrator rejection handler reads the latest comment;
   // commenting first avoids a race where rework starts before the feedback lands.
@@ -2622,6 +2671,14 @@ async function transitionTicket(params) {
     ticketId: ticket_id,
     status: finalStatus,
     message: `Transitioned to ${finalStatus}`,
+    // TEAM-6131: what was asked for, and which Jira transition answered it. `status` stays
+    // the destination Jira actually landed in (the match above is by NAME or destination,
+    // so a workflow whose "Done" lands in e.g. "Closed" reports `status:"closed"`); the hub's
+    // provesTransitioned (src/lib/workflow/ticket-transition-refusal.ts) reads this pair to
+    // tell that move apart from a move into one of the hub's own other columns. Additive:
+    // the `message` literal above is pinned by deploy/runtime-agent/tests/test_park_gate.py.
+    requested: targetInternal,
+    matchedTransition: { id: match.id, name: match.name, to: match.to.name },
     ...(blockers.length ? { blockedByAdded: blockers } : {}),
     ...(gateVerification ? { gateVerification } : {}),
     ...(conflict ? { conflict: "done_over_cancelled" } : hold.conflict ? { conflict: hold.conflict } : {}),
