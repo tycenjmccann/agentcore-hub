@@ -2350,6 +2350,13 @@ describe("TEAM-6203 resolveTicketEntry / resolveTicketPrUrl — the ONE agentTas
     expect(resolveTicketEntry(null, "T")).toBeNull();
     expect(resolveTicketEntry("str", "T")).toBeNull();
   });
+  it("TEAM-6214: two task-id-keyed entries for one ticket → the LAST in insertion order wins (pre-TEAM-6203 byTicketId Map semantics); a direct key still outranks both", () => {
+    const older = { ticketId: "L", outcome: "shipped" }, newer = { ticketId: "L", outcome: "deploy-blocked" };
+    expect(resolveTicketEntry({ task_old: older, task_new: newer }, "L")).toBe(newer);
+    expect(resolveTicketEntry({ task_new: newer, task_old: older }, "L")).toBe(older);
+    const direct = { ticketId: "L", outcome: "handoff" };
+    expect(resolveTicketEntry({ task_old: older, L: direct, task_new: newer }, "L")).toBe(direct);
+  });
   it("resolveTicketPrUrl: chain title → record pr_url → cached prUrl; non-strings ignored; none → null", () => {
     expect(resolveTicketPrUrl({ title: `Ship: follow-up PR ${F12}`, record: { pr_url: U9 }, entry: { prUrl: U9 } })).toMatchObject({ number: 12 });
     expect(resolveTicketPrUrl({ title: "Ship unified", record: { pr_url: F12 }, entry: { prUrl: U9 } })).toMatchObject({ number: 12 });

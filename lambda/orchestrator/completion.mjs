@@ -188,11 +188,13 @@ export const SHIP_PHASES = new Set(["ship"]);
  * task id with a `ticketId` field (legacy rows; the HTTP route tolerates both). Every reader of
  * a ticket's entry (evidence gates, ship-verdict evaluator, delegation, the merge-proof stamp)
  * resolves it here, so no two of them can disagree about which entry a ticket owns. Pure.
+ * TEAM-6214: direct key first; among task-id-keyed entries the LAST one in insertion order wins — the
+ * pre-TEAM-6203 `byTicketId` Map `set` semantics (an older shipped row never hides a later deploy-blocked).
  */
 export function resolveTicketEntry(agentTasks, ticketId) {
   const tasks = agentTasks && typeof agentTasks === "object" ? agentTasks : {};
   const id = String(ticketId ?? "");
-  return tasks[id] || Object.values(tasks).find((e) => e && typeof e === "object" && String(e.ticketId) === id) || null;
+  return tasks[id] || Object.values(tasks).findLast((e) => e && typeof e === "object" && String(e.ticketId) === id) || null;
 }
 
 /**

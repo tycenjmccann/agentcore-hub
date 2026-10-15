@@ -1128,6 +1128,24 @@ describe("completeWorkflow — ship-phase merge gate (TEAM-3721)", () => {
     error.mockRestore(); warn.mockRestore();
   });
 
+  it("TEAM-6214 R3-N1: two task-id-keyed legacy entries for the unified Ship ticket (no direct key) → the LAST wins, an older shipped row never hides a later deploy-blocked → run closes deploy-blocked, 0 completion claims", async () => {
+    const [error, warn] = quiet();
+    h.state.merges.length = 0; h.state.storeCompletions.length = 0; h.state.terminalClaims.length = 0;
+    h.state.snapshots = [[...SHIP_CHILDREN]];
+    const { "B-4": _directKey, ...rest } = SHIP_TASKS; // legacy rows only — no "B-4" key
+    h.state.freshWorkflow = { id: "wf_1", agentTasks: { ...rest,
+      task_old: { ticketId: "B-4", agentId: "agentcore_hub_release_manager", output: "shipped", outcome: "shipped", prUrl: UNIFIED_URL },
+      task_new: { ticketId: "B-4", agentId: "agentcore_hub_release_manager", output: "deploy refused", outcome: "deploy-blocked", blockReason: "pipeline failed", prUrl: UNIFIED_URL },
+    } };
+    mockGitHub({ prs: [{ ...MERGED_PR, html_url: UNIFIED_URL }], headSha: "head000", pulls: { 9: UNIFIED_PR9, 846: { ...UNIFIED_PR9, number: 846 } } });
+    await loadShip();
+    await completeWorkflow({ ...SHIP_WF });
+    expect(stampsOf("B-4")).toEqual([]); // an explicit block is never overwritten by the merge-proof stamp
+    expect(h.state.storeCompletions.length).toBe(0);
+    expect(h.state.terminalClaims.map(({ id, outcome, reason }) => ({ id, outcome, reason }))).toEqual([{ id: "wf_1", outcome: "deploy-blocked", reason: "pipeline failed" }]);
+    error.mockRestore(); warn.mockRestore();
+  });
+
   it("TEAM-6032: unified PR merged + follow-up PR to main still OPEN → run refused, escalated once", async () => {
     const error = vi.spyOn(console, "error").mockImplementation(() => {});
     await runFollowUp({ 12: fuPr() });
