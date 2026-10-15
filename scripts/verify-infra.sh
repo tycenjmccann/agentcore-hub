@@ -51,6 +51,13 @@ else
   TICKETS_ROLE="${TICKETS_ROLE:-AgentCoreHubTicketsLambdaRole}"
 fi
 
+# Ticket-tools Lambda name per TICKET_PROVIDER (TEAM-6161): the shell mirror of
+# ticketToolsLambdaName (deploy/lib/ticket-provider.mjs), parity-pinned against
+# it by deploy/lib/__tests__/ticket-provider.test.ts. An explicit
+# TICKET_TOOLS_LAMBDA still wins (same override idiom as TICKETS_ROLE above).
+source "$SCRIPT_DIR/../deploy/lib/runtime-env-defaults.sh"
+resolve_runtime_lambda_names
+
 # Parse args
 for arg in "$@"; do
   case $arg in
@@ -357,8 +364,8 @@ else
 fi
 
 # Lambda
-check "Lambda: agentcore-hub-tickets" \
-  "aws lambda get-function --function-name agentcore-hub-tickets --region $REGION"
+check "Lambda: $TICKET_TOOLS_LAMBDA" \
+  "aws lambda get-function --function-name $TICKET_TOOLS_LAMBDA --region $REGION"
 
 # The ticket tools read run artifacts (completions/*) out of the artifact bucket.
 # The bucket-wide s3:GetObject from deploy/setup-tickets-lambda.mjs covers the read —
