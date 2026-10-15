@@ -49,7 +49,14 @@ import { loadRoster } from "@/lib/workflow/roster-loader";
 import { deliveryModeFor, loadCdRegistry } from "@/lib/cd-registry";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
 import { resolveMissingEvidenceFromRecords } from "@/lib/workflow/completion-evidence";
-import { followUpPrGateConfigured, openFollowUpPrsAtCompletion } from "@/lib/workflow/follow-up-pr-gate";
+import {
+  completionRecordsFor,
+  dropCarriedOffenders,
+  followUpPrGateConfigured,
+  memoizedReader,
+  openFollowUpPrsAtCompletion,
+  type MergeProbe,
+} from "@/lib/workflow/follow-up-pr-gate";
 // TEAM-6136 F6: the orchestrator's OWN framework selector (pure, no imports) —
 // imported directly, as follow-up-pr-gate.ts imports completion.mjs, so there is
 // one implementation of "which SDLC framework does this run follow".
@@ -805,13 +812,23 @@ export async function POST(
     //     "complete": it closes on the honest terminal phase and emits a terminal
     //     event (see closeBlocked). Same COMPLETION_EVIDENCE_REQUIRED gate — enforce
     //     by default; the explicit opt-out only shadow-logs and completes.
+    //     TEAM-6192 — then, after the gate, the orchestrator's re-check: its own
+    //     dropCarriedOffenders over the SAME inputs completeWorkflow uses (the gate's
+    //     overlaid tasks + GitHub proof when the gate ran, else the stored row; every
+    //     child's completions/<id>.json through one memoized reader).
     try {
-      const verdict = evaluateShipVerdict(
-        tickets,
-        (workflow.agentTasks as Record<string, ShipTaskLike>) || {},
-        requiredPhases,
-        phaseById
-      );
+      let view = (workflow.agentTasks as Record<string, ShipTaskLike>) || {};
+      let mergeProof: MergeProbe | null = null;
+      let verdict = evaluateShipVerdict(tickets, view, requiredPhases, phaseById);
+      const readRecord = memoizedReader(async (ticketId) => {
+        if (!ARTIFACT_BUCKET) return null;
+        try {
+          return await readCompletionRecordFromS3(ticketId);
+        } catch (err) {
+          if (isMissingObject(err)) return null;
+          throw err; // the gate falls back to the cached prUrl; the re-check reads it as null
+        }
+      });
       // 2c-0. TEAM-6136 — the TEAM-6032 (DL-038) follow-up PR gate, BEFORE the
       //       blocked close so both terminal writes are gated (the orchestrator's
       //       order). Same function as the orchestrator, same guard: no
@@ -830,15 +847,7 @@ export async function POST(
         const outcome = await openFollowUpPrsAtCompletion({
           workflow,
           tickets: tickets.filter((t) => t.type !== "epic"), // parity: children = getChildTickets(epicId)
-          readCompletionRecord: async (ticketId) => {
-            if (!ARTIFACT_BUCKET) return null;
-            try {
-              return await readCompletionRecordFromS3(ticketId);
-            } catch (err) {
-              if (isMissingObject(err)) return null;
-              throw err; // the gate falls back to the cached prUrl
-            }
-          },
+          readCompletionRecord: readRecord,
           getAgentPhase: (agentId) => phases[agentId],
           token: process.env.GITHUB_PAT,
         });
@@ -871,6 +880,17 @@ export async function POST(
             { status: 409 }
           );
         }
+        view = (outcome.agentTasks as Record<string, ShipTaskLike> | undefined) ?? view;
+        mergeProof = outcome.mergeProof ?? null;
+      }
+      if (verdict.required && !verdict.shipped) {
+        const children = tickets.filter((t) => t.type !== "epic");
+        verdict = dropCarriedOffenders(evaluateShipVerdict(tickets, view, requiredPhases, phaseById), {
+          children,
+          agentTasks: view,
+          records: await completionRecordsFor(children.map((t) => String(t.ticketId)), readRecord),
+          mergeProof,
+        });
       }
       if (verdict.required && !verdict.shipped) {
         const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");

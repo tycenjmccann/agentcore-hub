@@ -44,7 +44,7 @@ import { createDetector } from "./dead-session-detector.mjs";
 import { createCascade } from "./cascade.mjs";
 import { createReconcileSweep } from "./reconcile-sweep.mjs";
 import { createReviewCap, parseDecision } from "./review-cap.mjs";
-import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, freshRecordFields, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, githubPrRef, isOtherPrTicket, verdictCarried, resolveTicketEntry, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES, isIntentOnlyReservation } from "./completion.mjs";
+import { isWorkflowComplete as evaluateWorkflowComplete, missingEvidenceTickets, resolveMissingEvidenceFromRecords, evaluateShipVerdict, deliveryRollUp, freshRecordFields, harvestableShipOutcome, completionBlockedNotice, resolvePrBase, featureBranchLanding, recordedHeads, followUpPrGate, githubPrRef, isOtherPrTicket, dropCarriedOffenders, resolveTicketEntry, SHIP_PHASES, TERMINAL_WORKFLOW_PHASES, isIntentOnlyReservation } from "./completion.mjs";
 import { isPipelineEnabled } from "./pipeline-enabled.mjs";
 import { CD_REGISTRY_KEY, EMPTY_CD_REGISTRY, parseCdRegistry, isCdRegistered, effectiveWorkflowDef, resolveDelivery, deliveryModeContext } from "./cd-registry.mjs";
 import { pickTicketSession, renderPriorSessionBlock, renderRejectionSessionHint } from "./coding-session-hint.mjs";
@@ -3513,33 +3513,34 @@ export async function completeWorkflow(workflow) {
   }
 
   try {
-    if (verdict?.required && !verdict.shipped && mergeProof) {
+    if (verdict?.required && !verdict.shipped) {
       // Stamp GitHub's proof onto ship tasks that self-reported nothing. A
       // recorded BLOCK outcome is never overwritten — a block is a block.
       // TEAM-6054: a ticket of ANOTHER PR (DL-038 follow-up chain) is never stamped with the unified proof.
       // TEAM-6190/TEAM-6203: it stays in the re-check unless verdictCarried excuses it — directional: only a
       // verdict-less non-CD ticket, only by its own PR's Done `CD:` ticket's satisfied verdict; a CD never borrows.
       // Entries resolve via resolveTicketEntry (ticket-id or task-id keyed), records via the memoized reader the gate warmed.
+      // TEAM-6192: the delegation (dropCarriedOffenders, shared with POST /complete) runs with or without proof.
       const tasks = freshWf?.agentTasks || {};
       const titleOf = new Map(children.map((t) => [String(t.ticketId), t.title]));
       const records = Object.fromEntries(await Promise.all(children.map(async (t) => [String(t.ticketId), await readCompletionRecord(t.ticketId).catch(() => null)])));
-      for (const o of verdict.offenders) {
-        if (o.verdict && o.verdict !== "none") continue;
-        const entry = resolveTicketEntry(tasks, o.ticketId);
-        if (isOtherPrTicket({ entry, record: records[o.ticketId], title: titleOf.get(o.ticketId), unifiedPrUrl: mergeProof.prUrl })) continue;
-        const fields = {
-          mergeCommit: mergeProof.mergeCommit || `merged:${workflow.featureBranch}`,
-          mergeVerifiedBy: "github",
-        };
-        if (mergeProof.prUrl && !entry?.prUrl) fields.prUrl = mergeProof.prUrl;
-        try { await store.mergeTaskMetadata(workflow.id, o.ticketId, fields); }
-        catch (err) { console.warn(`[orchestrator] merge-proof stamp failed for ${o.ticketId}: ${err?.message || err}`); }
+      if (mergeProof) {
+        for (const o of verdict.offenders) {
+          if (o.verdict && o.verdict !== "none") continue;
+          const entry = resolveTicketEntry(tasks, o.ticketId);
+          if (isOtherPrTicket({ entry, record: records[o.ticketId], title: titleOf.get(o.ticketId), unifiedPrUrl: mergeProof.prUrl })) continue;
+          const fields = {
+            mergeCommit: mergeProof.mergeCommit || `merged:${workflow.featureBranch}`,
+            mergeVerifiedBy: "github",
+          };
+          if (mergeProof.prUrl && !entry?.prUrl) fields.prUrl = mergeProof.prUrl;
+          try { await store.mergeTaskMetadata(workflow.id, o.ticketId, fields); }
+          catch (err) { console.warn(`[orchestrator] merge-proof stamp failed for ${o.ticketId}: ${err?.message || err}`); }
+        }
+        console.log(`[orchestrator] ${workflow.id}: GitHub proves ${workflow.featureBranch} merged (${mergeProof.mergeCommit || "compare"}) — ship verdict taken from ground truth`);
       }
-      console.log(`[orchestrator] ${workflow.id}: GitHub proves ${workflow.featureBranch} merged (${mergeProof.mergeCommit || "compare"}) — ship verdict taken from ground truth`);
       freshWf = await store.getWorkflow(workflow.id);
-      verdict = evaluateShipVerdict(
-        children.filter((t) => !verdictCarried(t, children, freshWf?.agentTasks, records)), freshWf?.agentTasks || workflow.agentTasks || {}, shipPhases, shipOpts
-      );
+      verdict = dropCarriedOffenders(evaluateShipVerdict(children, freshWf?.agentTasks || workflow.agentTasks || {}, shipPhases, shipOpts), { children, agentTasks: freshWf?.agentTasks, records, mergeProof });
     }
     if (verdict?.required && !verdict.shipped) {
       const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");

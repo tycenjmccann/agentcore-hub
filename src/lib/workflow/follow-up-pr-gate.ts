@@ -18,6 +18,7 @@
  * harvestCompletionEvidence, featureBranchMergeProbe and githubApi (index.mjs).
  */
 import {
+  dropCarriedOffenders as dropCarriedOffendersMjs,
   followUpPrGate,
   featureBranchLanding,
   freshRecordFields,
@@ -55,6 +56,31 @@ type FollowUpPrGate = (args: {
   warn: (msg: string) => void;
 }) => Promise<string[]>;
 const gate = followUpPrGate as unknown as FollowUpPrGate;
+
+/** The ship verdict's shape (completion.mjs evaluateShipVerdict / the route's port). */
+interface ShipVerdictLike {
+  required: boolean;
+  shipped: boolean;
+  handoff: boolean;
+  outcome: string | null;
+  blockReason: string | null;
+  offenders: Array<{ ticketId: string; phase?: string; verdict: string }>;
+}
+
+/**
+ * TEAM-6192 — NOT a port: the orchestrator's own delegation step (completion.mjs
+ * dropCarriedOffenders, also called by completeWorkflow's re-check). Drops only the
+ * verdict-less offenders verdictCarried excuses; proof-aware for the unified ticket.
+ */
+export const dropCarriedOffenders = dropCarriedOffendersMjs as unknown as <V extends ShipVerdictLike>(
+  verdict: V,
+  ctx: {
+    children: Array<Record<string, unknown>>;
+    agentTasks: unknown;
+    records: Record<string, CompletionRecord | null>;
+    mergeProof: MergeProbe | null;
+  }
+) => V;
 
 type FeatureBranchLanding = (args: {
   owner: string;
@@ -165,7 +191,7 @@ export async function overlayFreshRecords(
 }
 
 /** One read per ticket per completion attempt (the orchestrator's _completionRecordCache). */
-function memoizedReader(read: ReadCompletionRecord): ReadCompletionRecord {
+export function memoizedReader(read: ReadCompletionRecord): ReadCompletionRecord {
   const cache = new Map<string, Promise<CompletionRecord | null>>();
   return (ticketId) => {
     let p = cache.get(ticketId);
@@ -180,7 +206,21 @@ function memoizedReader(read: ReadCompletionRecord): ReadCompletionRecord {
   };
 }
 
-export type FollowUpPrOutcome = { unmerged: { reason: string } } | { prs: string[] };
+/**
+ * TEAM-6192 — `{ [ticketId]: record | null }` for dropCarriedOffenders, built like
+ * completeWorkflow's re-check (every child through the memoized reader, an unreadable
+ * record is null).
+ */
+export async function completionRecordsFor(
+  ticketIds: string[],
+  read: ReadCompletionRecord
+): Promise<Record<string, CompletionRecord | null>> {
+  return Object.fromEntries(await Promise.all(ticketIds.map(async (id) => [id, await read(id).catch(() => null)] as const)));
+}
+
+export type FollowUpPrOutcome =
+  | { unmerged: { reason: string } }
+  | { prs: string[]; agentTasks?: AgentTasks; mergeProof?: MergeProbe | null };
 
 /**
  * Overlay → probe → gate, in the orchestrator's order (index.mjs completeWorkflow).
@@ -190,7 +230,10 @@ export type FollowUpPrOutcome = { unmerged: { reason: string } } | { prs: string
  *   { prs }                   the open follow-up PR urls that refuse completion;
  *                             [] when there are none or a check could not run
  *                             (fail-open — never throws, so a caller's surrounding
- *                             catch can never be reached through here).
+ *                             catch can never be reached through here). TEAM-6192:
+ *                             when the checks ran, also the overlaid `agentTasks`
+ *                             and the `mergeProof` (merged:true probe, else null)
+ *                             the caller's dropCarriedOffenders must use.
  */
 export async function openFollowUpPrsAtCompletion(opts: {
   workflow: Record<string, unknown>;
@@ -207,17 +250,18 @@ export async function openFollowUpPrsAtCompletion(opts: {
     const agentTasks = await overlayFreshRecords((opts.workflow.agentTasks as AgentTasks) || {}, readCompletionRecord);
     const probe = await featureBranchMergeProbe({ workflow: opts.workflow, agentTasks, api });
     if (probe.merged === false) return { unmerged: { reason: probe.reason || "feature branch is not merged into the base" } };
+    const mergeProof = probe.merged === true ? probe : null;
     const prs = await gate({
       workflow: { id, ...opts.workflow }, // the gate's warns name `workflow.id`
       agentTasks,
       tickets: opts.tickets,
-      mergeProof: probe.merged === true ? probe : null,
+      mergeProof,
       readCompletionRecord,
       getAgentPhase: opts.getAgentPhase,
       api,
       warn: console.warn,
     });
-    return { prs };
+    return { prs, agentTasks, mergeProof };
   } catch (err) {
     console.warn(`[complete] follow-up PR check skipped for ${id}: ${(err as Error).message}`);
     return { prs: [] };

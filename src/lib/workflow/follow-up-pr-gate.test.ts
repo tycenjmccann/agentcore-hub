@@ -82,7 +82,7 @@ describe("follow-up PR gate wrapper (TEAM-6136)", () => {
       token: "t",
       fetchImpl: openFetch(),
     });
-    expect(r).toEqual({ prs: ["https://github.com/o/r/pull/78"] });
+    expect(r).toMatchObject({ prs: ["https://github.com/o/r/pull/78"] });
   });
 
   it("a record read that throws falls back to the cached prUrl; a throwing dep never escapes", async () => {
@@ -94,7 +94,7 @@ describe("follow-up PR gate wrapper (TEAM-6136)", () => {
       token: "t",
       fetchImpl: openFetch(),
     });
-    expect(r).toEqual({ prs: ["https://github.com/o/r/pull/78"] });
+    expect(r).toMatchObject({ prs: ["https://github.com/o/r/pull/78"] });
     await expect(
       openFollowUpPrsAtCompletion({
         workflow,
@@ -104,7 +104,7 @@ describe("follow-up PR gate wrapper (TEAM-6136)", () => {
         token: "t",
         fetchImpl: openFetch(),
       })
-    ).resolves.toEqual({ prs: [] });
+    ).resolves.toMatchObject({ prs: [] });
   });
 });
 
@@ -182,7 +182,8 @@ describe("openFollowUpPrsAtCompletion — probe + overlay feed the gate (TEAM-61
       workflow: wf, tickets: [], readCompletionRecord: async () => null, getAgentPhase, token: "t",
       fetchImpl: routed([["/pulls?head=", 200, [MERGED_PR]], ["/branches/", 200, { commit: { sha: "h1" } }], ["/pulls/78", 200, OPEN]]),
     });
-    expect(r).toEqual({ prs: ["https://github.com/o/r/pull/78"] });
+    expect(r).toMatchObject({ prs: ["https://github.com/o/r/pull/78"] });
+    expect(r).toMatchObject({ mergeProof: { merged: true } }); // TEAM-6192: the proof the route's dropCarriedOffenders uses
   });
 
   it("a proven-unmerged branch returns the refusal and never reads the follow-up PR", async () => {
@@ -208,7 +209,8 @@ describe("openFollowUpPrsAtCompletion — probe + overlay feed the gate (TEAM-61
       "T-9": { completed_at: "2026-10-01T00:01:00Z", pr_url: "https://github.com/o/r/pull/78" }, // stale for overlay, still the gate's pr_url
     });
     const r = await openFollowUpPrsAtCompletion({ workflow: wf, tickets: [], readCompletionRecord: fn, getAgentPhase, token: "t", fetchImpl: openFetch() });
-    expect(r).toEqual({ prs: ["https://github.com/o/r/pull/78"] });
+    expect(r).toMatchObject({ prs: ["https://github.com/o/r/pull/78"] });
+    expect(r).toMatchObject({ agentTasks: { "T-4": { mergeCommit: "m1" } } }); // TEAM-6192: the overlaid view the route re-checks
     expect(reads.sort()).toEqual(["T-4", "T-9"]);
   });
 });

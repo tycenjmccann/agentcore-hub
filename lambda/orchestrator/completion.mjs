@@ -936,6 +936,26 @@ export function verdictCarried(t, children, agentTasks, records = {}) {
 }
 
 /**
+ * TEAM-6192 — the ONE delegation step after the ship-verdict evaluation, shared by completeWorkflow's
+ * re-check and POST /api/workflow/[id]/complete: drop the verdict-less offenders verdictCarried excuses.
+ * Proof-aware: with GitHub `mergeProof` a ticket on the unified PR is never excused (isOtherPrTicket);
+ * without it only a DL-038 chain ticket (followUpTitleRef) is. Only "none" offenders leave, so
+ * outcome/blockReason stand unless none is left; handoff is false (an excused ticket claimed nothing). Pure.
+ */
+export function dropCarriedOffenders(verdict, { children = [], agentTasks = {}, records = {}, mergeProof = null } = {}) {
+  if (!verdict?.required || verdict.shipped) return verdict;
+  const byId = new Map([].concat(children || []).map((t) => [String(t.ticketId), t]));
+  const offenders = verdict.offenders.filter((o) => {
+    const t = byId.get(String(o.ticketId));
+    if (!t || !verdictCarried(t, children, agentTasks, records)) return true;
+    const entry = resolveTicketEntry(agentTasks, t.ticketId);
+    return mergeProof ? !isOtherPrTicket({ entry, record: records?.[t.ticketId], title: t.title, unifiedPrUrl: mergeProof.prUrl }) : !followUpTitleRef(t.title);
+  });
+  if (offenders.length === verdict.offenders.length) return verdict;
+  return offenders.length ? { ...verdict, offenders } : { ...verdict, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [] };
+}
+
+/**
  * TEAM-6032 (DL-038) — the run's PRs in its configured repos, one per repo+number.
  * TEAM-6062: `prUrl` is fill-once, so a re-dispatched ticket's completion record
  * (`records[ticketId].pr_url`) is read too, and (TEAM-6190) every ticket title's "follow-up PR <url>".
