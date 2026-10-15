@@ -2,7 +2,10 @@
 # ─── JIRA_WEBHOOK_SECRET format guard (TEAM-6334) ─────────────────────────────
 # The ONE definition of what a Jira webhook secret may look like. Both writers
 # source it: deploy/apprunner/setup-jira-webhook.sh (the Jira side) and
-# deploy/ecs-express/set-env.sh (the hub side). Jira signs with the exact bytes
+# deploy/ecs-express/set-env.sh (the hub side) — and so do the two full-redeploy
+# scripts, deploy/ecs-express/deploy.sh and deploy/apprunner/deploy.sh, which
+# forward a JIRA_WEBHOOK_SECRET kept in .env.local into the container env and
+# must refuse an unsafe one before any AWS call (TEAM-6336). Jira signs with the exact bytes
 # it is given and the hub verifies with the exact bytes it is given
 # (src/app/api/jira/webhook/route.ts, no trimming) — so the two writers must
 # pass the value through unchanged. They cannot promise that for arbitrary

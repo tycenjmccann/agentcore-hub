@@ -54,6 +54,18 @@ cd "$REPO_ROOT"
 source "$REPO_ROOT/deploy/lib/load-env-local.sh"
 load_env_local .env.local
 
+# TEAM-6336: a full redeploy rebuilds the container env from .env.local below,
+# so if the operator keeps JIRA_WEBHOOK_SECRET there (DEPLOY.md "Jira webhook
+# signing") it is forwarded — after the same charset guard the two writers
+# (setup-jira-webhook.sh, set-env.sh) apply — BEFORE any AWS call. Unset or
+# empty is not forwarded, so the hub stays in unsigned passthrough as today;
+# a non-empty value the hub and Jira could not hold byte-identical aborts here.
+# shellcheck disable=SC1091
+source "$REPO_ROOT/deploy/lib/jira-webhook-secret.sh"
+if [[ -n "${JIRA_WEBHOOK_SECRET:-}" ]]; then
+  require_jira_webhook_secret_format "$JIRA_WEBHOOK_SECRET" || exit 1
+fi
+
 # Eval gate (FR-7): the container bakes in agents.json/workflows.json — refuse
 # to build/push ungated config. Runs before the docker build and S3 reads.
 source "$REPO_ROOT/deploy/lib/check-eval-gate.sh"
@@ -483,7 +495,7 @@ echo "  [6/6] ECS Express Mode service: $SERVICE_NAME"
 ENV_JSON="[{\"name\":\"HOSTNAME\",\"value\":\"0.0.0.0\"},{\"name\":\"PORT\",\"value\":\"8080\"},{\"name\":\"NODE_ENV\",\"value\":\"production\"}"
 for var in AWS_REGION TICKET_PROVIDER WORKFLOWS_TABLE EVENTS_TABLE TICKETS_TABLE \
            ARTIFACT_BUCKET TICKET_TOOLS_LAMBDA JIRA_SITE_URL JIRA_EMAIL \
-           JIRA_API_TOKEN JIRA_PROJECT_KEY GITHUB_PAT GITHUB_OWNER GITHUB_REPO HUB_REPO_URL \
+           JIRA_API_TOKEN JIRA_PROJECT_KEY JIRA_WEBHOOK_SECRET GITHUB_PAT GITHUB_OWNER GITHUB_REPO HUB_REPO_URL \
            MCP_SERVERS BUILDER_AGENT_ID AGENTCORE_ROLE_ARN LAMBDA_ROLE_ARN \
            NEXT_PUBLIC_BRAND_NAME EVAL_CONFIG_TABLE DEPLOY_MODE \
            WORKFLOW_RUNTIME_COUNT CODING_AGENT_RUNTIME_ARN CLOUD_CODE_TABLE \
