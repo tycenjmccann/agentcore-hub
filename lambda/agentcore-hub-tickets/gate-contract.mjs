@@ -1609,3 +1609,47 @@ export function judgeCreateClaim(bodyText, now = Date.now()) {
   if (!Number.isFinite(at) || now - at > CREATE_CLAIM_STALE_MS) return { kind: "stale" };
   return { kind: "pending" };
 }
+
+// ── TEAM-6143: the Done's require_done precondition ──────────────────────────
+//
+// workflow-output re-confirms a design amendment / Merge Approval gate is Done as the
+// last await before the build ticket's Done (TEAM-6142), but a reopen between that read
+// and the write still let the Done through. `require_done` carries those ticket ids on
+// the Done itself. The dynamodb twin checks them in ONE TransactWriteItems with the
+// status Update (closes the window against any reopen through the table); the jira twin
+// re-reads them right before the transition POST (narrows it only - a reopen in the
+// Jira UI after that read still lands). Internal: the fleet's transition tool never
+// sends it. Both twins refuse with the same text and reason.
+
+export const DONE_PRECONDITION_FAILED = "done_precondition_failed";
+/** More than any real Done needs (one amendment, or a handful of gates). */
+export const REQUIRE_DONE_MAX = 10;
+const REQUIRE_DONE_KEY_RE = /^[A-Z][A-Z0-9_]*-\d+$/;
+
+/**
+ * The `require_done` ids to enforce, normalized: CSV / array / single key, trimmed,
+ * upper-cased, deduped, the build ticket's own key dropped (a Done never waits on
+ * itself, and DynamoDB refuses two operations on one item in a transaction).
+ * `{ ids }`, or `{ error }` for an entry that is not a ticket key or a list over the cap.
+ */
+export function normalizeRequireDone(raw, selfKey) {
+  const list = Array.isArray(raw) ? raw : typeof raw === "string" && raw.trim() ? raw.split(",") : [];
+  const self = String(selfKey ?? "").trim().toUpperCase();
+  const ids = [];
+  for (const entry of list) {
+    const id = String(entry ?? "").trim().toUpperCase();
+    if (!id) continue;
+    if (!REQUIRE_DONE_KEY_RE.test(id)) return { error: `Invalid require_done entry ${JSON.stringify(String(entry))} — expected a ticket key` };
+    if (id !== self && !ids.includes(id)) ids.push(id);
+  }
+  if (ids.length > REQUIRE_DONE_MAX) return { error: `require_done names ${ids.length} tickets — at most ${REQUIRE_DONE_MAX}` };
+  return { ids };
+}
+
+/** The refusal text when a required ticket is not Done at the commit. Byte-identical in both twins. */
+export function donePreconditionRefusal(issueKey, openIds) {
+  return (
+    `Done precondition failed: ${openIds.join(", ")} not done — ${issueKey} not transitioned ` +
+    `(a ticket this Done was admitted on was reopened before the commit; re-confirm and retry).`
+  );
+}

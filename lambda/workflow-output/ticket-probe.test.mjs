@@ -2171,6 +2171,38 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     expect(record().securityReview.provisional).toBe(true);
   });
 
+  // TEAM-6143: the drain's Done carries the amendment its step-7 confirm read Done as
+  // require_done; a provider refusal (reopened after that confirm) is a retry, never a Done or
+  // a drop, the finalized stamp is put back PROVISIONAL on a fresh read, and the next tick's
+  // own re-check answers the reopen ("PROVISIONAL again").
+  it("TEAM-6143 (drain, W4) the provider refuses the Done on require_done ⇒ retried, no Done, the stamp PROVISIONAL again; the next tick drops on the reopen", async () => {
+    withResidual();
+    setRecord({ securityReview: { verdict: "FAIL", amendmentTicketId: AMEND } });
+    const gc = await import("../agentcore-hub-tickets/gate-contract.mjs");
+    fake.failTool = { Tickets___transition_ticket: (p) => {
+      if (p.ticket_id !== BUILD) return null;
+      fake.tickets.get(AMEND).status = "To Do"; // reopened between step 7's confirm and the commit
+      return gc.donePreconditionRefusal(BUILD, [AMEND]);
+    } };
+    expect((await tick()).out.drained).toMatchObject({ applied: 0, dropped: 0 });
+    const dones = fake.calls.filter((c) => c.tool === "Tickets___transition_ticket" && c.params?.ticket_id === BUILD);
+    expect(dones).toHaveLength(1);
+    expect(dones[0].params.require_done).toEqual([AMEND]);
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    expect(record().replayDropped).toBeUndefined();
+    expect(record().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND, provisional: true, provisionalNonce: expect.any(String) });
+    for (const twin of TWIN_GUARDS) {
+      expect((await twin()).securityReviewRecordRefusal(KEY, record())).toMatch(/PROVISIONAL securityReview admission on amendment TEAM-5698/);
+    }
+
+    fake.failTool = null;
+    expireVisibility();
+    expect((await tick()).out.drained).toMatchObject({ applied: 0, dropped: 1 });
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    expect(record()).toMatchObject({ ticketWrites: "dropped", replayDropped: { step: "amendment" } });
+    expect(record().replayDropped.error).toMatch(/PROVISIONAL again/);
+  });
+
   it("TEAM-6142 (drain) a message queued before TEAM-6142 (no amendmentTicketId) re-confirms the record's stamped amendment", async () => {
     withResidual();
     const body = JSON.parse(fake.queue[0].Body);

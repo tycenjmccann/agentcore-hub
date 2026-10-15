@@ -5020,3 +5020,117 @@ test("TEAM-5785: a failed post-POST claim read is unknown, not moved: park kept,
     }
   });
 }
+
+// ─── TEAM-6143: the Done's require_done precondition (Jira: NARROWING only) ──
+// workflow-output passes the design amendment / Merge Approval gates its final confirm
+// read Done. Jira has no transaction, so the twin re-reads each one after its Done-intent
+// fence, immediately before the POST, and refuses with the shared text - a reopen after
+// that read (or in the Jira UI) still goes Done; the dynamodb twin is the one that closes it.
+{
+  const ID = "TEAM-4067";
+  const KEY = `completions/${ID}.json`;
+  const AMEND = "TEAM-4070";
+  const DEV_LABELS = ["agent:agentcore_hub_backend_dev", "phase:development"];
+  const CLEAN = JSON.stringify({ ticketId: ID, status: "complete", followUpsPending: false });
+  /** installDoneStub plus the required ticket's status read, by name (or a Response). */
+  const withRequired = (cap, statusOf) => {
+    const inner = globalThis.fetch;
+    cap.requiredReads = 0;
+    globalThis.fetch = async (url, init = {}) => {
+      if (String(url).includes(`/issue/${AMEND}?fields=status`)) {
+        cap.requiredReads += 1;
+        const s = await statusOf(cap.requiredReads - 1);
+        if (s instanceof Response) return s;
+        return new Response(JSON.stringify({ key: AMEND, fields: { status: { name: s } } }), { status: 200 });
+      }
+      return inner(url, init);
+    };
+  };
+
+  test("TEAM-6143 (J1): the required ticket reads Done at the post-fence re-read ⇒ the Done is POSTed", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: ID });
+    withRequired(cap, () => "Done");
+    try {
+      const res = await doneTransition(mod.handler, ID, { require_done: [AMEND] });
+      assert.equal(res.error, undefined);
+      assert.equal(res.status, "done");
+      assert.equal(cap.requiredReads, 1);
+      assert.deepEqual(cap.transitions, [{ transition: { id: "31" } }]);
+      assert.equal(s3Calls.puts.length, 1, "the fence only - nothing to clear");
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-6143 (J2): the amendment was reopened before the re-read ⇒ refused with the shared done_precondition_failed text; no POST; the intent cleared", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod, s3Calls } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: ID });
+    const seq = [];
+    s3Calls.onRecordPut = () => { seq.push("s3 put"); };
+    withRequired(cap, () => { seq.push("re-read"); return "In Progress"; });
+    try {
+      const res = await doneTransition(mod.handler, ID, { require_done: [AMEND] });
+      assert.equal(res.ok, false);
+      assert.equal(res.reason, gateContract.DONE_PRECONDITION_FAILED);
+      assert.deepEqual(res.open, [AMEND]);
+      assert.equal(res.error, gateContract.donePreconditionRefusal(ID, [AMEND]));
+      assert.deepEqual(cap.transitions, [], "a refused Done must not fire in Jira");
+      assert.deepEqual(seq, ["s3 put", "re-read", "s3 put"], "the re-read follows the fence; the clear follows the refusal");
+      assert.equal(JSON.parse(recordBodies[KEY]).doneIntent, undefined);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-6143 (J3): the re-read fails ⇒ refused fail-closed (cannot verify), no POST", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod } = await loadShipGate({ recordBodies });
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: ID });
+    withRequired(cap, () => new Response("boom", { status: 500 }));
+    try {
+      const res = await doneTransition(mod.handler, ID, { require_done: [AMEND] });
+      assert.match(res.error, new RegExp(`Cannot verify the done precondition on ${AMEND}`));
+      assert.deepEqual(cap.transitions, []);
+      assert.equal(JSON.parse(recordBodies[KEY]).doneIntent, undefined);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-6143 (J4, the residual): a reopen AFTER the re-read (while the POST is in flight) still goes Done - Jira only narrows the window", async () => {
+    const recordBodies = { [KEY]: CLEAN };
+    const { mod } = await loadShipGate({ recordBodies });
+    let amendment = "Done";
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: ID, onTransition: () => { amendment = "In Progress"; } });
+    withRequired(cap, () => amendment);
+    try {
+      const res = await doneTransition(mod.handler, ID, { require_done: [AMEND] });
+      assert.equal(res.status, "done");
+      assert.equal(amendment, "In Progress");
+      assert.equal(cap.transitions.length, 1);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+
+  test("TEAM-6143 (J5): a malformed require_done entry is refused before any write", async () => {
+    const { mod, s3Calls } = await loadShipGate({ recordBodies: { [KEY]: CLEAN } });
+    const cap = installDoneStub({ labels: DEV_LABELS, ticketId: ID });
+    try {
+      const res = await doneTransition(mod.handler, ID, { require_done: ["nope"] });
+      assert.ok(res.error);
+      assert.deepEqual(cap.transitions, []);
+      assert.equal(s3Calls.puts.length, 0);
+    } finally {
+      cap.restore();
+      delete process.env.ARTIFACT_BUCKET;
+    }
+  });
+}

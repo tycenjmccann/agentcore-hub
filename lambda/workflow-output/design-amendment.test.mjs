@@ -33,6 +33,8 @@ const h = vi.hoisted(() => ({
   // TEAM-6140: a PUT S3 refuses (`(input) => Error | null`, e.g. a 412), the PUTs that LANDED,
   // and one sequence of PUTs (`put:<Key>`) and tool calls, so write-vs-call order is testable.
   putError: null, landed: [], seq: [],
+  // TEAM-6143: what transition_ticket answers (`(params) => object | null`; null = `{ ok: true }`).
+  transitionReply: null,
 }));
 
 vi.mock("@aws-sdk/client-s3", () => ({
@@ -101,6 +103,10 @@ vi.mock("@aws-sdk/client-lambda", () => ({
         h.comments.set(params.ticket_id, [...(h.comments.get(params.ticket_id) || []), params.comment]);
         return reply({ ticketId: params.ticket_id, message: "Comment added" });
       }
+      if (tool === "Tickets___transition_ticket" && h.transitionReply) {
+        const answer = h.transitionReply(params);
+        if (answer) return reply(answer);
+      }
       return reply({ ok: true });
     }
   },
@@ -140,6 +146,7 @@ beforeEach(() => {
   h.putError = null;
   h.landed.length = 0;
   h.seq.length = 0;
+  h.transitionReply = null;
 });
 
 for (const twin of ["dynamodb", "jira"]) {
@@ -362,6 +369,36 @@ for (const twin of ["dynamodb", "jira"]) {
         const m = await twin();
         expect(m.securityReviewRecordRefusal("completions/TEAM-5357.json", standing)).toMatch(/PROVISIONAL securityReview admission on amendment TEAM-5399/);
         expect(m.judgeCompletionRecord("completions/TEAM-5357.json", JSON.stringify(standing), { securityReview: true }).proven).toBe(false);
+      }
+    });
+
+    // TEAM-6143: the Done itself carries the amendment as require_done, so a reopen after the
+    // final confirm is refused by the provider at the commit (the dynamodb twin's transaction;
+    // the Jira twin's post-fence re-read) and answered like that confirm's own refusal.
+    const doneCalls = () => h.calls.filter((c) => c.tool === "Tickets___transition_ticket");
+    it("TEAM-6143 (W1) the Done is sent with require_done: [the amendment the final confirm read done]", async () => {
+      load("done");
+      const res = await report();
+      expect(res.status).toBe("complete");
+      expect(doneCalls()).toHaveLength(1);
+      expect(doneCalls()[0].params).toMatchObject({ ticket_id: "TEAM-5357", transition_id: "done", require_done: ["TEAM-5399"] });
+    });
+
+    it("TEAM-6143 (W2) the provider refuses the Done (amendment reopened after the final confirm) ⇒ the admission is taken back, no Done, design_amendment_required with the rollback", async () => {
+      load("done");
+      const gc = await import(`../${twin === "jira" ? "agentcore-hub-jira" : "agentcore-hub-tickets"}/gate-contract.mjs`);
+      const refusal = gc.donePreconditionRefusal("TEAM-5357", ["TEAM-5399"]);
+      h.transitionReply = () => (twin === "jira"
+        ? { ok: false, reason: gc.DONE_PRECONDITION_FAILED, open: ["TEAM-5399"], error: refusal }
+        : { ok: false, reason: gc.DONE_PRECONDITION_FAILED, open: ["TEAM-5399"], content: [{ type: "text", text: refusal }] });
+      const res = await report();
+      expect(res).toMatchObject({ ok: false, reason: "design_amendment_required", amendmentTicketId: "TEAM-5399", recorded: true, rollback: { ok: true } });
+      expect(res.detail).toBe("amendment TEAM-5399 is still open (confirmed done, then read not done when the Done was committed (the ticket provider's require_done precondition))");
+      expect(doneCalls(), "one Done attempt, refused; no ambiguous re-read retry").toHaveLength(1);
+      expect(lastRecord().securityReview).toBeUndefined();
+      expect(lastRecord().status).toBe("complete_transition_failed");
+      for (const guard of TWIN_GUARDS) {
+        expect((await guard()).securityReviewRecordRefusal("completions/TEAM-5357.json", lastRecord())).toMatch(/carries no securityReview verdict/);
       }
     });
 

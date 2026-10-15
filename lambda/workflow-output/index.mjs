@@ -1765,9 +1765,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
   // TEAM-6142: the FINAL gate confirm. Between it and transitionToDone sit the FINALIZE write
   // (the one S3 CAS write DL-039 needs AFTER the last read, since it is what makes the release
   // trusted) and the amendment block below, which a security review never reaches with a
-  // merge-brief hold - so in practice nothing else. Residual window: Jira status and the S3
-  // CAS share no transaction, so a gate reopened after this read still goes Done (see
-  // confirmDoneAtCommit).
+  // merge-brief hold - so in practice nothing else. TEAM-6143: the Done carries these gates as
+  // require_done, so a gate reopened after this read is refused at the commit (atomically on
+  // the dynamodb twin, a re-read on Jira - see confirmDoneAtCommit).
   // TEAM-6164 (F2 sibling): and with follow-ups pending (no Done this call) the same confirm +
   // finalize, so the record never carries a trusted release the loop above re-put unconfirmed.
   if (releasedNow) {
@@ -1882,8 +1882,9 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
     // follow the last status read of the amendment - a read after it would leave a trusted
     // stamp behind whenever its take-back lost the CAS. It is the ONLY thing between this read
     // and transitionToDone; nothing else may be awaited here (it only widens the window).
-    // Residual window: Jira status and the S3 CAS share no transaction, so an amendment
-    // reopened after this read still goes Done - see confirmDoneAtCommit. Refused here, the
+    // TEAM-6143: the Done carries the amendment as require_done, so a reopen after this read
+    // is refused at the commit too (closed on dynamodb, narrowed on Jira - see
+    // confirmDoneAtCommit) and taken back like this read's refusal. Refused here, the
     // findings are already on the dev lanes (marker-deduped, so the next round's report does
     // not re-post them) - `residualFindings` on the refusal says so. A finalize that loses its
     // CAS ⇒ no Done, the record stays provisional (refused), a retryable answer; the retry
@@ -1905,7 +1906,31 @@ async function reportCompletion({ ticket_id, summary, artifacts = "", branch, co
       finalizeSecurityReview(report);
       console.log(`[report_completion] ${ticket_id}: design amendment ${amendment} re-confirmed done after the residual posts - securityReview admission FINALIZED`);
     }
-    transition = await transitionToDone(ticket_id);
+    // TEAM-6143: the Done carries what it was admitted on - the amendment just finalized, and
+    // the Merge Approval gate(s) a finalized gate_settled release rests on - so the provider
+    // refuses it if one was reopened after the final confirm above (dynamodb: in the same
+    // transaction as the status write; jira: a re-read right before the POST, narrowing only).
+    const requireDone = [...(amendment ? [amendment] : []), ...(releasedNow && !briefHeld ? releasedNow.observed.map((o) => o.ticketId) : [])];
+    transition = await transitionToDone(ticket_id, { requireDone });
+    if (!transition.ok && transition.preconditionFailed) {
+      // A lost confirm, discovered at the commit: the same take-back as the re-checks above.
+      // The record is FINALIZED by now, so the take-back is the write that matters (not
+      // tidy-up); writeRecord re-reads past the ETag the twin's Done-intent fence moved.
+      // The refusal names the tickets that were not Done; a security review never carries a
+      // merge brief, so in practice it is one or the other.
+      const named = (id) => new RegExp(`(^|[^A-Z0-9_-])${id}([^A-Z0-9_-]|$)`).test(asText(transition.error));
+      if (amendment && named(amendment)) {
+        const reopened = { ok: true, done: false, open: [{ ticketId: amendment, status: "not done", seenAt: "commit" }], why: `${amendment} was reopened before the Done committed (${transition.error})` };
+        return takeBackAdmission(reopened, { note: "when the Done was committed (the ticket provider's require_done precondition)", detail: "at the Done", posted: !!review.residual });
+      }
+      // The gate: the off-gate hold the post-write gate confirm stamps, written by the
+      // failed-Done rewrite below (briefPending:true ⇒ STATUS_PENDING_BRIEF, no Done).
+      if (releasedNow && !briefHeld) {
+        report.briefPending = true;
+        delete report.briefDisposition;
+        report.briefHoldReason = `off_gate: the Merge Approval gate was reopened before the Done committed (${transition.error})`;
+      }
+    }
     if (transition.ok) {
       console.log(`[report_completion] Transitioned ${ticket_id} → Done${transition.alreadyDone ? " (already Done - idempotent)" : ""}`);
       // TEAM-4754 moved this off the S3 write and gated it on `mayTransition`;
@@ -2995,9 +3020,9 @@ export async function drainCompletion(msg) {
   const settledGates = brief?.disposition?.release && brief.disposition.kind === "gate_settled"
     ? brief.disposition.observed.map((o) => o.ticketId) : null;
   // TEAM-6142: with no record this is the FINAL gate confirm (step 6 is skipped); nothing
-  // is awaited between it and step 7's transitionToDone. Residual window: Jira status and
-  // the record's S3 CAS share no transaction, so a gate reopened after this read still
-  // goes Done - see confirmDoneAtCommit.
+  // is awaited between it and step 7's transitionToDone, whose require_done carries these
+  // gates (TEAM-6143), so a gate reopened after this read is refused at the commit - see
+  // confirmDoneAtCommit.
   // TEAM-6164 (F2): through the one helper drop() uses for the same re-ask before ITS stamp.
   if (settledGates) {
     const stale = await settledGatesRetryReason(brief.disposition, { earlier: brief.gateReads, when: "before recording the release" });
@@ -3061,6 +3086,10 @@ export async function drainCompletion(msg) {
   //    twins' Done guard refuses a record that still says followUpsPending:true.
   //    TEAM-6164: on a ticket already Done, a hold a newer report stamped for follow-ups
   //    this message does not carry stays true (a human, or that report's retry, files them).
+  // TEAM-6143: what step 7's Done is admitted on (a finalized gate_settled release's gates,
+  // the re-confirmed amendment) - sent as require_done, so the provider refuses the Done if
+  // one was reopened after its final confirm.
+  const requireDone = [];
   let record = rec.record;
   if (record) {
     Object.assign(record, { status: stillUnfiled ? STATUS_PENDING_FOLLOW_UPS : "complete", followUpsPending: stillUnfiled, ticketWrites: "queued" });
@@ -3119,8 +3148,8 @@ export async function drainCompletion(msg) {
     // TEAM-6142: the FINAL gate confirm. After it, before step 7's transitionToDone: the
     // FINALIZE write (DL-039: the write that makes the release trusted must follow the last
     // read) and step 7's amendment re-read (a security review never carries a merge brief, so
-    // in practice not both). Residual window: a gate reopened after this read still goes Done -
-    // Jira status and the S3 CAS share no transaction (see confirmDoneAtCommit).
+    // in practice not both). TEAM-6143: step 7's Done carries these gates as require_done, so a
+    // gate reopened after this read is refused at the commit (see confirmDoneAtCommit).
     if (provisionalRelease) {
       const confirm = await confirmDoneAtCommit({ ticketIds: settledGates });
       if (confirm.ok && confirm.done) {
@@ -3158,8 +3187,8 @@ export async function drainCompletion(msg) {
     // stamp is a restatement - a drop stamp that loses its CAS leaves a record every reader
     // already refuses. Done ⇒ the ONE finalize (a single CAS on step 6's ETag) makes the stamp
     // trusted again; a lost finalize is a retry, no Done. Transiently unreadable: retry.
-    // Residual window, as on the report path: a reopen between this read and transitionToDone
-    // still goes Done; the finalize is the only await in between.
+    // TEAM-6143: as on the report path, the Done carries the amendment as require_done, so a
+    // reopen between this read and the commit is refused there (a retry, below).
     // TEAM-6152: the amendment is the RECORD's stamp's first (residualAmendment, above), and the
     // re-mark on a drop is a fresh establishment (a new nonce) of a stamp this replay owns - never
     // of a PASS, never of an admission on another amendment.
@@ -3205,8 +3234,28 @@ export async function drainCompletion(msg) {
         record = rec.record = final.record;
         recordEtag = final.etag;
       }
+      requireDone.push(amendment);
     }
-    const transition = await transitionToDone(ticketId);
+    // Every path that reaches here with settledGates has re-confirmed them Done last (step 6's
+    // finalize, or - with no record - the re-ask above step 6).
+    if (settledGates) requireDone.push(...settledGates);
+    const transition = await transitionToDone(ticketId, { requireDone });
+    // TEAM-6143: a required ticket was reopened after the final confirm - no Done. Retry (never
+    // a drop: the next receive's step 6 re-marks the admission/release PROVISIONAL and step 7's
+    // own re-check sees the reopen and answers it - "PROVISIONAL again", or the gate re-chosen).
+    // Until then the record is FINALIZED, so it is put back in the refused form now, best-effort,
+    // on a FRESH read: the twin's Done-intent fence (and its clear) moved the ETag.
+    if (!transition.ok && transition.preconditionFailed) {
+      const fresh = await readRecord(reportKey);
+      let remark = null;
+      if (fresh.record && admission && reMarkableAdmission(fresh.record, residualAmendment) && !carriesProvisional(fresh.record, "securityReview")) {
+        remark = await putRecordIfUnchanged(reportKey, holdSecurityReviewProvisional(fresh.record), fresh.etag);
+      } else if (fresh.record && settledGates && fresh.record.briefPending !== true) {
+        remark = await reholdBriefOffGate({ reportKey, record: fresh.record, etag: fresh.etag, s3Key: msg.brief?.s3Key, reason: `the Merge Approval gate was reopened before the Done committed (${transition.error})`, targets: brief?.targets || [] });
+      }
+      const state = !fresh.record ? `the record could not be re-read (${fresh.error || "no record"})` : !remark ? "the record already refuses it" : remark.ok ? "the record is PROVISIONAL again" : `the record could not be re-marked (${remark.error})`;
+      return retry(`transition refused at the commit: ${transition.error} - ${state}; no Done is made, the next tick re-confirms`);
+    }
     // TEAM-5805: the twins' brief-hold refusal is permanent for this message too (it
     // carried no brief that could lift it), so it is a surfaced drop, not a DLQ loop.
     if (!transition.ok && (isPermanentTicketRefusal(transition.error) || isBriefHoldRefusal(transition.error))) return drop("transition", transition.error);
@@ -4201,6 +4250,15 @@ export const ALREADY_DONE_RES = [
 export const isAlreadyDoneRefusal = (error) => ALREADY_DONE_RES.some((re) => re.test(asText(error)));
 
 /**
+ * TEAM-6143: both twins' refusal when a `require_done` ticket is not Done at the commit
+ * (gate-contract.mjs donePreconditionRefusal). A documented BYTE-COPY of that text's
+ * prefix - the twins ship in other zips. Deliberately not `Status precondition failed:`
+ * (the harness park's marker).
+ */
+export const DONE_PRECONDITION_RE = /^Done precondition failed:/;
+export const isDonePreconditionRefusal = (error) => DONE_PRECONDITION_RE.test(asText(error).trim());
+
+/**
  * The reported ticket's own Done transition, as a VALUE — `{ ok, error, alreadyDone }`.
  *
  * TEAM-4756 R3-1. This replaces a raw `lambda.send(new InvokeCommand(...))` that read
@@ -4255,13 +4313,16 @@ async function readTicketDone(ticketId) {
  * ticket's status and the record's S3 CAS share no transaction: a gate or amendment
  * reopened after that read and before the transition still lets the Done through. More
  * reads only narrow it; never add an await between a final confirm and the Done.
- * Provider-side fencing (evaluated, deferred to a follow-up): each twin's Done handler
- * could, after its Done-intent fence, re-read the tickets the record names
- * (securityReview.amendmentTicketId, briefDisposition.observed[]) and refuse. On Jira
- * that only narrows the window again - the read and the transition are two REST calls,
- * and a reopen in the Jira UI bypasses every fence. On the dynamodb twin it could close
- * it: one TransactWriteItems with a ConditionCheck on the amendment/gate rows' status
- * beside the build ticket's status Update, atomic against any reopen through the table.
+ * TEAM-6143: provider-side fencing. Each caller passes the tickets its final confirm read
+ * Done (the amendment, the settled gates) to transitionToDone as `require_done`, and the
+ * twin refuses the Done with `Done precondition failed:` when one is not Done at the
+ * commit. On the dynamodb twin that CLOSES the window: one TransactWriteItems with a
+ * ConditionCheck on each required row's status beside the build ticket's status Update,
+ * atomic against any reopen through the table. On Jira it only NARROWS it: the twin
+ * re-reads the required tickets after its Done-intent fence, but that read and the
+ * transition are two REST calls, and a reopen in the Jira UI bypasses every fence. A
+ * refusal is answered like a lost final confirm: the report path takes the admission back
+ * (or re-holds the brief), the drain retries and the next tick re-confirms.
  */
 async function confirmDoneAtCommit({ ticketIds, earlier = null }) {
   const open = [];
@@ -4319,10 +4380,18 @@ async function reholdBriefOffGate({ reportKey, record, etag, s3Key, reason, targ
   return putRecordIfUnchanged(reportKey, reheld, etag);
 }
 
-async function transitionToDone(ticketId) {
-  const r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "done" });
+async function transitionToDone(ticketId, { requireDone = [] } = {}) {
+  // TEAM-6143: `require_done` - the tickets this Done was admitted on (a design amendment,
+  // settled Merge Approval gates). Sent only when there are any, so every other Done is
+  // byte-identical to before. The dynamodb twin checks them in the same transaction as
+  // the status write; the jira twin re-reads them right before its POST.
+  const ids = [...new Set(requireDone.map(asText).filter(Boolean))];
+  const r = await ticketTool("Tickets___transition_ticket", { ticket_id: ticketId, transition_id: "done", ...(ids.length > 0 ? { require_done: ids } : {}) });
   if (r.ok) return { ok: true, error: null, alreadyDone: false };
   if (isAlreadyDoneRefusal(r.error)) return { ok: true, error: null, alreadyDone: true };
+  // A required ticket was reopened after the caller's final confirm: no Done, and nothing
+  // to re-read - the refusal is definite. The caller handles it as a lost confirm.
+  if (isDonePreconditionRefusal(r.error)) return { ok: false, error: r.error, alreadyDone: false, preconditionFailed: true };
   // The fallback for an AMBIGUOUS refusal. The jira twin answers `No transition to
   // "Done" found. Available: ...` both for a ticket that is already closed and for one
   // that is genuinely stuck, so there is nothing to match on — stop reading prose and

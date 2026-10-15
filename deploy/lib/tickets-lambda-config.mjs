@@ -117,6 +117,9 @@ export function buildTicketsPolicyStatements({
         "dynamodb:UpdateItem",
         "dynamodb:Query",
         "dynamodb:Scan",
+        // TEAM-6143: a Done carrying require_done is one TransactWriteItems whose
+        // ConditionCheck on each required ticket row needs this action.
+        "dynamodb:ConditionCheckItem",
       ],
       Resource: [
         `arn:aws:dynamodb:${region}:${accountId}:table/${tableName}`,

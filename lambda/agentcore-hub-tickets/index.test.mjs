@@ -86,6 +86,12 @@ const h = vi.hoisted(() => ({
     onStatusWrite: /** @type {null | ((input: any) => void | Promise<void>)} */ (null),
     /** TEAM-5926: every add_comment write (list_append on `comments`). */
     commentUpdates: /** @type {any[]} */ ([]),
+    /** TEAM-6143: every TransactWriteCommand input (a Done carrying require_done). */
+    transacts: /** @type {any[]} */ ([]),
+    /** TEAM-6143: awaited inside the transaction before its conditions are evaluated (a concurrent reopen). */
+    onTransact: /** @type {null | ((input: any) => void | Promise<void>)} */ (null),
+    /** TEAM-6143: a non-condition cancellation (e.g. "TransactionConflict") for the next transaction, once. */
+    transactCancelOnce: /** @type {string | null} */ (null),
   },
 }));
 
@@ -169,12 +175,47 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
   class UpdateCommand { constructor(input) { this.input = input; } }
   class QueryCommand { constructor(input) { this.input = input; } }
   class ScanCommand { constructor(input) { this.input = input; } }
+  class TransactWriteCommand { constructor(input) { this.input = input; } }
   return {
-    PutCommand, GetCommand, UpdateCommand, QueryCommand, ScanCommand,
+    PutCommand, GetCommand, UpdateCommand, QueryCommand, ScanCommand, TransactWriteCommand,
     DynamoDBDocumentClient: {
       from: () => ({
         send: async (cmd) => {
           const name = cmd.constructor.name;
+          if (name === "TransactWriteCommand") {
+            // TEAM-6143: the status Update (index 0) plus a `#s = :done` ConditionCheck per
+            // required ticket, evaluated all-or-nothing against `items` like DynamoDB does.
+            h.state.transacts.push(cmd.input);
+            await h.state.onTransact?.(cmd.input);
+            const items = cmd.input.TransactItems;
+            const cancel = (reasons) => {
+              const err = new Error(`Transaction cancelled, please refer cancellation reasons for specific reasons [${reasons.map((r) => r.Code).join(", ")}]`);
+              err.name = "TransactionCanceledException";
+              err.CancellationReasons = reasons;
+              throw err;
+            };
+            if (h.state.transactCancelOnce) {
+              const code = h.state.transactCancelOnce;
+              h.state.transactCancelOnce = null;
+              cancel(items.map((_, i) => ({ Code: i === 0 ? code : "None" })));
+            }
+            const reasons = items.map((it) => {
+              if (it.ConditionCheck) {
+                const row = h.state.items[it.ConditionCheck.Key.ticketId];
+                return { Code: row && row.status === it.ConditionCheck.ExpressionAttributeValues[":done"] ? "None" : "ConditionalCheckFailed" };
+              }
+              if (h.state.statusRaceOnce && it.Update.ConditionExpression) {
+                h.state.statusRaceOnce = false;
+                h.state.onStatusRace?.(it.Update);
+                return { Code: "ConditionalCheckFailed" };
+              }
+              return { Code: "None" };
+            });
+            if (reasons.some((r) => r.Code !== "None")) cancel(reasons);
+            await h.state.onStatusWrite?.(items[0].Update);
+            h.state.statusUpdates.push(items[0].Update);
+            return {};
+          }
           if (name === "UpdateCommand") {
             const label = cmd.input.ExpressionAttributeValues?.[":label"];
             if (label !== undefined) {
@@ -289,6 +330,9 @@ beforeEach(async () => {
   h.state.workflows = {};
   h.state.onStatusWrite = null;
   h.state.commentUpdates.length = 0;
+  h.state.transacts.length = 0;
+  h.state.onTransact = null;
+  h.state.transactCancelOnce = null;
   delete process.env.ARTIFACT_BUCKET;
   // TEAM-5716: read at module load; unset ⇒ the claim fence is inert.
   delete process.env.WORKFLOWS_TABLE;
@@ -3526,5 +3570,119 @@ describe("transition_ticket — park fenced on the claim generation (TEAM-5716)"
 
     expect(claimReads()).toEqual([]);
     expect(h.state.statusUpdates).toEqual([]);
+  });
+});
+
+// ─── TEAM-6143: the Done's require_done precondition ─────────────────────────
+// workflow-output's final confirm reads the design amendment / Merge Approval gates Done,
+// then calls the Done with them as require_done. The twin makes the status write ONE
+// TransactWriteItems with a `#s = :done` ConditionCheck per required ticket, so a reopen
+// after the confirm cancels the Done atomically instead of letting it through.
+describe("transition_ticket — require_done makes the Done conditional (TEAM-6143)", () => {
+  const transition = (args) => handler({ name: "Tickets___transition_ticket", arguments: args });
+  const ID = "TEAM-4067";
+  const KEY = `completions/${ID}.json`;
+  const AMEND = "TEAM-4070";
+  const GATE = "TEAM-4071";
+  const CLEAN = { ticketId: ID, status: "complete", followUpsPending: false };
+  const devTicket = () => ({ ticketId: ID, status: "in_progress", assignee: "agentcore_hub_backend_dev", phase: "development" });
+  const text = (res) => res.content?.[0]?.text || "";
+  const stored = (key) => { const v = h.state.s3Objects[key]; return typeof v === "string" ? JSON.parse(v) : v; };
+
+  beforeEach(async () => {
+    process.env.ARTIFACT_BUCKET = "test-bucket";
+    h.state.s3 = { "config/agents.json": { agents: [{ agentId: "agentcore_hub_backend_dev", phase: "development" }] } };
+    vi.resetModules();
+    ({ handler } = await import("./index.mjs"));
+    h.state.items[ID] = devTicket();
+    h.state.items[AMEND] = { ticketId: AMEND, status: "done" };
+    h.state.items[GATE] = { ticketId: GATE, status: "done" };
+    h.state.s3Objects[KEY] = CLEAN;
+  });
+  afterEach(() => { delete process.env.ARTIFACT_BUCKET; });
+
+  it("(D1) all required tickets Done ⇒ ONE TransactWriteItems: the status Update + a ConditionCheck per ticket (deduped, self excluded); the Done commits", async () => {
+    const res = await transition({ ticket_id: ID, to_status: "done", require_done: [AMEND, ` ${GATE.toLowerCase()} `, AMEND, ID] });
+
+    expect(res).toMatchObject({ key: ID, status: "transitioned", to: "done" });
+    expect(h.state.transacts).toHaveLength(1);
+    const [update, ...checks] = h.state.transacts[0].TransactItems;
+    expect(update.Update).toMatchObject({ Key: { ticketId: ID } });
+    expect(update.Update.ExpressionAttributeValues[":s"]).toBe("done");
+    expect(checks).toEqual([AMEND, GATE].map((id) => ({
+      ConditionCheck: {
+        TableName: update.Update.TableName,
+        Key: { ticketId: id },
+        ConditionExpression: "#s = :done",
+        ExpressionAttributeNames: { "#s": "status" },
+        ExpressionAttributeValues: { ":done": "done" },
+      },
+    })));
+    expect(h.state.statusUpdates).toEqual([update.Update]);
+    expect(stored(KEY).doneIntent).toBeTruthy(); // a committed Done keeps its intent
+  });
+
+  it("(D2) the amendment is reopened after the fence, before the commit ⇒ the transaction is cancelled: typed done_precondition_failed, no status write, the intent cleared", async () => {
+    h.state.onTransact = () => { h.state.items[AMEND].status = "in_progress"; };
+
+    const res = await transition({ ticket_id: ID, to_status: "done", require_done: [AMEND, GATE] });
+
+    expect(res).toMatchObject({ ok: false, reason: gateContract.DONE_PRECONDITION_FAILED, open: [AMEND] });
+    expect(text(res)).toBe(gateContract.donePreconditionRefusal(ID, [AMEND]));
+    expect(text(res)).toMatch(/^Done precondition failed:/);
+    expect(h.state.transacts).toHaveLength(1);
+    expect(h.state.statusUpdates).toHaveLength(0);
+    expect(h.state.items[ID].status).toBe("in_progress");
+    expect(h.state.s3RecordPuts).toHaveLength(2); // the fence, then its clear
+    expect(stored(KEY).doneIntent).toBeUndefined();
+  });
+
+  it("(D3) the build ticket's own Update loses its expected_status condition ⇒ the existing Status precondition refusal, unchanged", async () => {
+    h.state.statusRaceOnce = true;
+    h.state.onStatusRace = () => { h.state.items[ID].status = "blocked"; };
+
+    const res = await transition({ ticket_id: ID, to_status: "done", expected_status: "in_progress", require_done: [AMEND] });
+
+    expect(text(res)).toMatch(/Status precondition failed/);
+    expect(res.reason).not.toBe(gateContract.DONE_PRECONDITION_FAILED);
+    expect(h.state.statusUpdates).toHaveLength(0);
+    expect(stored(KEY).doneIntent).toBeUndefined();
+  });
+
+  it("(D4) a non-condition cancellation (TransactionConflict) propagates as a provider error; the intent is cleared", async () => {
+    h.state.transactCancelOnce = "TransactionConflict";
+
+    const res = await transition({ ticket_id: ID, to_status: "done", require_done: [AMEND] });
+
+    expect(res.error ?? text(res)).toMatch(/TransactionConflict|Transaction cancelled/);
+    expect(res.reason).not.toBe(gateContract.DONE_PRECONDITION_FAILED);
+    expect(h.state.statusUpdates).toHaveLength(0);
+    expect(stored(KEY).doneIntent).toBeUndefined();
+  });
+
+  it("(D5) no require_done (or only the ticket's own key) ⇒ the single UpdateCommand path, no transaction", async () => {
+    const res = await transition({ ticket_id: ID, to_status: "done", require_done: [ID] });
+
+    expect(res).toMatchObject({ key: ID, status: "transitioned", to: "done" });
+    expect(h.state.transacts).toHaveLength(0);
+    expect(h.state.statusUpdates).toHaveLength(1);
+  });
+
+  it("(D6) a malformed require_done entry is an Error and nothing is written", async () => {
+    const res = await transition({ ticket_id: ID, to_status: "done", require_done: ["not a key"] });
+
+    expect(text(res)).toMatch(/^Error: /);
+    expect(h.state.transacts).toHaveLength(0);
+    expect(h.state.statusUpdates).toHaveLength(0);
+    expect(h.state.s3RecordPuts).toHaveLength(0);
+  });
+
+  it("(D7) require_done on a non-Done transition is ignored", async () => {
+    h.state.items[AMEND].status = "todo";
+
+    const res = await transition({ ticket_id: ID, to_status: "blocked", blocked_by: [AMEND], require_done: [AMEND] });
+
+    expect(res).toMatchObject({ key: ID, status: "transitioned", to: "blocked" });
+    expect(h.state.transacts).toHaveLength(0);
   });
 });

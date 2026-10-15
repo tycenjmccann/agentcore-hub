@@ -31,6 +31,7 @@ import {
   UpdateCommand,
   QueryCommand,
   ScanCommand,
+  TransactWriteCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { randomUUID } from "node:crypto"; // TEAM-5941: the Done-intent fence nonce
 import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
@@ -93,6 +94,9 @@ import {
   terminalMoveRefusal,
   deriveCreateDedupeToken,
   isSettledGateStatus,
+  DONE_PRECONDITION_FAILED,
+  normalizeRequireDone,
+  donePreconditionRefusal,
 } from "./gate-contract.mjs";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -2239,6 +2243,13 @@ async function transitionIssue(args) {
   // `#s = :expected`, so a move between this read and that write is a refusal too.
   const expectedStatus = String(args.expected_status || "").trim().toLowerCase() || null;
 
+  // TEAM-6143: optional, internal (workflow-output only) — tickets that must read done
+  // at the commit of a Done. Enforced only when the resolved target is done, in the
+  // same transaction as the status write (sendTransition). Absent/empty ⇒ the
+  // single-UpdateCommand path below, unchanged.
+  const requireDoneArg = normalizeRequireDone(args.require_done, issueKey);
+  if (requireDoneArg.error) return textResult(`Error: ${requireDoneArg.error}`);
+
   // Get current ticket to determine valid transitions. TEAM-5711: strongly
   // consistent when a precondition was asked for — a stale replica could refuse
   // against a status the ticket has already left. Without one, the read is the
@@ -2305,6 +2316,7 @@ async function transitionIssue(args) {
   // for the brief hold (TEAM-5805; TEAM-5832 made that every ticket, not the operator's).
   let gateVerification = null;
   const admitted = {};
+  const requireDone = transition.to === "done" ? requireDoneArg.ids : [];
   if (transition.to === "done") {
     const gate = await gateConditionCleared(issueKey, current.Item, admitted);
     if (gate.refusal) return gate.refusal;
@@ -2455,16 +2467,62 @@ async function transitionIssue(args) {
       values[":expected"] = expectedStatus;
       condition = condition ? `(${condition}) AND #s = :expected` : "#s = :expected";
     }
-    await ddb.send(
-      new UpdateCommand({
-        TableName: TABLE_NAME,
-        Key: { ticketId: issueKey },
-        UpdateExpression: expr + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
-        ExpressionAttributeNames: names,
-        ExpressionAttributeValues: values,
-        ...(condition ? { ConditionExpression: condition } : {}),
-      })
-    );
+    const update = {
+      TableName: TABLE_NAME,
+      Key: { ticketId: issueKey },
+      UpdateExpression: expr + (removes.length ? ` REMOVE ${removes.join(", ")}` : ""),
+      ExpressionAttributeNames: names,
+      ExpressionAttributeValues: values,
+      ...(condition ? { ConditionExpression: condition } : {}),
+    };
+    if (requireDone.length === 0) {
+      await ddb.send(new UpdateCommand(update));
+      return;
+    }
+    // TEAM-6143: the Done and its preconditions in ONE TransactWriteItems — the status
+    // Update exactly as above, plus a ConditionCheck per required ticket. Atomic against
+    // any reopen through the table (a missing row fails its check too). This closes the
+    // window TEAM-6142 left between workflow-output's final confirm and the Done.
+    try {
+      await ddb.send(
+        new TransactWriteCommand({
+          TransactItems: [
+            { Update: update },
+            ...requireDone.map((id) => ({
+              ConditionCheck: {
+                TableName: TABLE_NAME,
+                Key: { ticketId: id },
+                ConditionExpression: "#s = :done",
+                ExpressionAttributeNames: { "#s": "status" },
+                ExpressionAttributeValues: { ":done": "done" },
+              },
+            })),
+          ],
+        })
+      );
+    } catch (err) {
+      if (err?.name !== "TransactionCanceledException") throw err;
+      const reasons = Array.isArray(err.CancellationReasons) ? err.CancellationReasons : [];
+      const open = requireDone.filter((_, i) => reasons[i + 1]?.Code === "ConditionalCheckFailed");
+      if (open.length > 0) {
+        const refusal = new Error(`done precondition failed for ${issueKey}`);
+        refusal.doneRefusal = {
+          ok: false,
+          reason: DONE_PRECONDITION_FAILED,
+          open,
+          ...textResult(donePreconditionRefusal(issueKey, open)),
+        };
+        throw refusal;
+      }
+      // The build ticket's own condition failed: the same error the single Update
+      // throws, so the fence / blocker / label handling below is unchanged.
+      if (reasons[0]?.Code === "ConditionalCheckFailed") {
+        const condFail = new Error("The conditional request failed");
+        condFail.name = "ConditionalCheckFailedException";
+        throw condFail;
+      }
+      throw err; // TransactionConflict and the like: a provider error, the caller retries
+    }
   };
 
   // TEAM-5707: a failed condition with expected_status set may be the status
@@ -2491,7 +2549,8 @@ async function transitionIssue(args) {
   const isCondFail = (err) => err?.name === "ConditionalCheckFailedException";
 
   // TEAM-5941: the Done-intent fence — the LAST awaited step before the status write
-  // (sendTransition awaits nothing before its UpdateCommand on a done; checkClaim only
+  // (sendTransition awaits nothing before its UpdateCommand — or, with require_done, its
+  // TransactWriteCommand — on a done; checkClaim only
   // runs for a park). A refusal here has written nothing to the table. The label-race
   // retry below is after the fence and needs no second one: the intent is on the record.
   if (transition.to === "done") {
@@ -2513,6 +2572,7 @@ async function transitionIssue(args) {
         break;
       } catch (err) {
         if (err?.claimRefusal) return err.claimRefusal;
+        if (err?.doneRefusal) return err.doneRefusal; // TEAM-6143; the finally clears the intent
         if (!isCondFail(err)) throw err;
         // The reread decides which clause failed: a moved status is the fence; a blocker
         // that landed meanwhile is the guard; neither (with a label clause) is the race.

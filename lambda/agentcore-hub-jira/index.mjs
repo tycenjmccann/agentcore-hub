@@ -92,6 +92,9 @@ import {
   judgeCreateClaim,
   CREATE_CLAIM_WAIT_MS,
   CREATE_CLAIM_POLL_MS,
+  DONE_PRECONDITION_FAILED,
+  normalizeRequireDone,
+  donePreconditionRefusal,
 } from "./gate-contract.mjs";
 
 // ─── Jira Config ─────────────────────────────────────────────────────────────
@@ -2366,7 +2369,7 @@ async function reconcileBlockersAndStatus(ticketId, blockers, assignee) {
 }
 
 async function transitionTicket(params) {
-  const { ticket_id, transition_id, reason, blocked_by, expected_status, claim_started_at, workflow_id } = params;
+  const { ticket_id, transition_id, reason, blocked_by, expected_status, claim_started_at, workflow_id, require_done } = params;
   // TEAM-5707: optional source-status precondition (the harness park sends
   // in_progress). Jira has no conditional transition, so this is best-effort: checked
   // on the first read (before any comment or link), re-read right before the POST,
@@ -2405,6 +2408,14 @@ async function transitionTicket(params) {
   if (badBlocker) {
     throw new Error(`Invalid blocked_by entry ${JSON.stringify(badBlocker)} — expected an issue key like ${PROJECT_KEY}-123`);
   }
+
+  // TEAM-6143: optional, internal (workflow-output only) — tickets that must read Done
+  // when a Done commits. Jira has no conditional transition, so this is a re-read right
+  // before the POST (checkRequireDone): it NARROWS the window between workflow-output's
+  // final confirm and the Done, it cannot close it (a reopen in the Jira UI after the
+  // re-read still lands). The dynamodb twin closes it with a transaction.
+  const requireDoneArg = normalizeRequireDone(require_done, ticket_id);
+  if (requireDoneArg.error) throw new Error(requireDoneArg.error);
 
   const targetStatus = transition_id;
   const jiraStatusName = INTERNAL_TO_JIRA[targetStatus] || targetStatus;
@@ -2588,8 +2599,9 @@ async function transitionTicket(params) {
     }
   }
   await recheckPrecondition();
-  // TEAM-5941: the Done-intent fence — the LAST awaited step before the transition POST
-  // (everything between here and the POST is synchronous). The labels-screen fallback
+  // TEAM-5941: the Done-intent fence — the last awaited step before the transition POST
+  // but one: TEAM-6143's require_done re-read (checkRequireDone, below) follows it, so the
+  // reopen check is as late as Jira allows. The labels-screen fallback
   // below runs after it and needs no second fence: the intent is already on the record.
   if (effectiveStatus.toLowerCase() === "done") await fenceDoneIntent(ticket_id, admitted);
 
@@ -2605,8 +2617,29 @@ async function transitionTicket(params) {
     ...(fenceNonce ? { historyMetadata: fenceHistoryMetadata(fenceNonce, expectedStatus) } : {}),
   });
   const finalStatus = isSkip ? "done" : mapStatusToInternal(match.to.name);
+  // TEAM-6143: the require_done re-read, after the fence and inside the try below so a
+  // refusal clears the intent. A ticket not Done ⇒ the shared typed refusal; a read that
+  // fails ⇒ refuse too (could not look is not Done), as a plain retryable error.
+  const requireDone = finalStatus === "done" ? requireDoneArg.ids : [];
+  const checkRequireDone = async () => {
+    const open = [];
+    for (const id of requireDone) {
+      let issue;
+      try {
+        issue = await jiraFetch(`/rest/api/3/issue/${id}?fields=status`);
+      } catch (err) {
+        throw new Error(`Cannot verify the done precondition on ${id} (${err.message}) — ${ticket_id} not transitioned.`);
+      }
+      if (mapStatusToInternal(issue?.fields?.status?.name) !== "done") open.push(id);
+    }
+    if (open.length === 0) return;
+    const err = new Error(donePreconditionRefusal(ticket_id, open));
+    err.toolResult = { ok: false, reason: DONE_PRECONDITION_FAILED, open };
+    throw err;
+  };
   try {
     try {
+      await checkRequireDone();
       await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(true) });
     } catch (err) {
       // TEAM-4908: a team-managed workflow whose transitions have no SCREEN rejects
@@ -2626,6 +2659,7 @@ async function transitionTicket(params) {
       // the gate stamp with no close — the recoverable half, by the TEAM-4908
       // reasoning — and (TEAM-5724) the park-claim label removed again.
       await recheckPrecondition();
+      await checkRequireDone(); // TEAM-6143: the PUT was one more round-trip a reopen can land in
       await jiraFetch(`/rest/api/3/issue/${ticket_id}/transitions`, { method: "POST", body: transitionBody(false) });
     }
     if (expectedStatus) await verifyExpectedSource(ticket_id, expectedStatus, finalStatus, fenceNonce);

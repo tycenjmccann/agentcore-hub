@@ -64,6 +64,10 @@ const h = vi.hoisted(() => ({
   ship: false,
   /** TEAM-5958 F6: a definite refusal every Tickets___create_ticket answers (`{ error }`, the jira idiom). */
   createRefusal: null,
+  /** TEAM-6143: the security review's design amendment row (`{ id, status }`), read by the drain and the twins. */
+  amend: null,
+  /** TEAM-6143: the REAL twin handler the drain's own Done is routed to (null ⇒ the drain may not transition). */
+  drainTwin: null,
 }));
 
 const notFound = (k) => Object.assign(new Error(`NoSuchKey ${k}`), { name: "NoSuchKey", $metadata: { httpStatusCode: 404 } });
@@ -137,12 +141,26 @@ vi.mock("@aws-sdk/lib-dynamodb", () => {
   const named = (n) => ({ [n]: class { constructor(input) { this.input = input; } } })[n];
   return {
     GetCommand: named("GetCommand"), PutCommand: named("PutCommand"), UpdateCommand: named("UpdateCommand"),
-    QueryCommand: named("QueryCommand"), ScanCommand: named("ScanCommand"),
+    QueryCommand: named("QueryCommand"), ScanCommand: named("ScanCommand"), TransactWriteCommand: named("TransactWriteCommand"),
     DynamoDBDocumentClient: {
       from: () => ({
         send: async (c) => {
           const name = c.constructor.name;
           const i = c.input;
+          if (name === "TransactWriteCommand") {
+            // TEAM-6143: the status Update + a ConditionCheck per require_done ticket, atomic:
+            // the conditions are evaluated at the commit, after anything that lands before it.
+            await h.beforeCommit?.();
+            const [{ Update: u }, ...checks] = i.TransactItems;
+            const reasons = [{ Code: "None" }, ...checks.map(({ ConditionCheck: cc }) => ({
+              Code: h.amend && cc.Key.ticketId === h.amend.id && h.amend.status === cc.ExpressionAttributeValues[":done"] ? "None" : "ConditionalCheckFailed",
+            }))];
+            if (reasons.some((r) => r.Code !== "None")) {
+              throw Object.assign(new Error("Transaction cancelled"), { name: "TransactionCanceledException", CancellationReasons: reasons });
+            }
+            h.ticket.status = u.ExpressionAttributeValues[":s"];
+            return {};
+          }
           if (name === "GetCommand" && i.Key?.ticketId === T) {
             return { Item: { ticketId: T, status: h.ticket.status, assignee: h.ship ? "agentcore_hub_release_manager" : "agentcore_hub_operator", phase: h.ship ? "ship" : "verification", parentKey: EPIC, workflowId: "wf_1" } };
           }
@@ -173,7 +191,11 @@ vi.mock("@aws-sdk/client-lambda", () => ({
       const { tool_name: tool, parameters: p = {} } = JSON.parse(Buffer.from(c.input.Payload).toString("utf8"));
       const comments = (id) => h.ticket.drainComments.get(id) || h.ticket.drainComments.set(id, []).get(id);
       let out;
-      if (tool === "Tickets___get_issue") {
+      if (tool === "Tickets___transition_ticket" && h.drainTwin && p.ticket_id === T) {
+        out = await h.drainTwin({ tool_name: tool, parameters: p });
+      } else if (tool === "Tickets___get_issue" && h.amend && p.ticket_id === h.amend.id) {
+        out = { key: p.ticket_id, fields: { summary: "Amend design", status: { name: jiraName(h.amend.status) } }, comments: [] };
+      } else if (tool === "Tickets___get_issue") {
         const fail = p.ticket_id === T ? await h.beforeDrainRead?.(p) : null;
         out = fail ? { error: fail }
           : p.ticket_id === T
@@ -220,6 +242,8 @@ function jiraFetch() {
       return new Response(null, { status: 204 });
     }
     if (u.includes(`/issue/${T}?fields=labels`)) return json({ key: T, fields: { labels: h.ship ? ["agent:agentcore_hub_release_manager", "phase:ship", "wf:wf_1"] : ["agent:agentcore_hub_operator", "phase:verification", "wf:wf_1"], description: null } });
+    // TEAM-6143: the Jira twin's require_done re-read of the design amendment.
+    if (h.amend && u.includes(`/issue/${h.amend.id}?fields=status`)) return json({ key: h.amend.id, fields: { status: { name: jiraName(h.amend.status) } } });
     if (u.includes(`/issue/${T}?fields=status`)) return json({ key: T, fields: { status: { name: jiraName(h.ticket.status) } }, changelog: { histories: [], total: 0 } });
     throw new Error(`unexpected Jira ${m} ${u}`);
   };
@@ -275,6 +299,8 @@ const resetWorld = (status = "in_progress") => {
   h.beforeRecordPut = null;
   h.ship = false;
   h.createRefusal = null;
+  h.amend = null;
+  h.drainTwin = null;
 };
 const TWIN_GATE_CONTRACTS = [() => import("../agentcore-hub-jira/gate-contract.mjs"), () => import("../agentcore-hub-tickets/gate-contract.mjs")];
 
@@ -969,5 +995,73 @@ describe.each(Object.keys(TWINS))("TEAM-5958 F6 e2e — the %s twin's Done-inten
     expect(res.conflict).toBeUndefined(); // no done_over_follow_ups_hold
     expect(h.ticket.twinComments.filter((c) => c.startsWith("Conflict: "))).toHaveLength(0);
     expect(h.ticket.status).toBe("done");
+  });
+});
+
+// ─── TEAM-6143: the drain's own Done, conditional on the design amendment ────
+// A residual-findings message: the record carries a FAIL security review admitted on a done
+// design amendment. The REAL drain re-marks the stamp provisional (step 6), re-confirms the
+// amendment Done and finalizes (step 7), then calls its Done with require_done:[amendment],
+// routed to the REAL twin. A reopen AFTER that final confirm:
+//   a  before the twin's re-read point (at its Done-intent fence) ⇒ both twins refuse;
+//   b  at the provider commit ⇒ the dynamodb twin's TransactWriteItems cancels (closed); the
+//      Jira twin's re-read has already passed, so the Done lands (the documented residual).
+// A refusal is a retry with the stamp PROVISIONAL again; the next tick drops on the reopen.
+describe.each(Object.keys(TWINS))("TEAM-6143 e2e — the drain's Done through the %s twin, conditional on the amendment", (name) => {
+  const twin = TWINS[name];
+  const AMEND = "TEAM-101";
+  const RESIDUAL = { verdict: "FAIL", summary: "Verdict: FAIL\n- F1 (High): rotate the probe role key", artifacts: "", amendmentTicketId: AMEND };
+  const SR_MSG = { ticketId: T, workflowId: "wf_1", reportKey: KEY, epicKey: EPIC, agentId: "agentcore_hub_security_reviewer", residual: RESIDUAL };
+  let drainCompletion;
+
+  beforeEach(async () => {
+    vi.restoreAllMocks();
+    resetWorld();
+    h.amend = { id: AMEND, status: "done" };
+    put(KEY, JSON.stringify({
+      ticketId: T, workflowId: "wf_1", status: "complete", followUpsPending: false, ticketWrites: "queued",
+      summary: RESIDUAL.summary, securityReview: { verdict: "FAIL", amendmentTicketId: AMEND }, residual: RESIDUAL,
+    }));
+    for (const k of ["TICKET_PROVIDER", "JIRA_SITE_URL", "JIRA_EMAIL", "JIRA_API_TOKEN", "JIRA_PROJECT_KEY", "EVENTS_TABLE"]) delete process.env[k];
+    Object.assign(process.env, { ARTIFACT_BUCKET: "bkt", ...twin.env });
+    vi.stubGlobal("fetch", jiraFetch());
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.resetModules();
+    h.drainTwin = await twin.load();
+    ({ drainCompletion } = await import("./index.mjs"));
+  });
+
+  it("(control) the amendment stays Done ⇒ the drain's Done commits through the twin", async () => {
+    expect(await drainCompletion(SR_MSG)).toMatchObject({ outcome: "applied" });
+    expect(h.ticket.status).toBe("done");
+    expect(record().securityReview).toEqual({ verdict: "FAIL", amendmentTicketId: AMEND });
+  });
+
+  it("(a) the amendment is reopened after the drain's final confirm, before the twin's re-read point ⇒ refused; retry; the stamp PROVISIONAL again; the next tick drops", async () => {
+    h.beforeFencePut = async () => { h.amend.status = "in_progress"; };
+    const drained = await drainCompletion(SR_MSG);
+    expect(drained).toMatchObject({ outcome: "retry", reason: expect.stringMatching(/Done precondition failed: TEAM-101 not done/) });
+    expect(h.ticket.status).toBe("in_progress");
+    expect(record().securityReview).toMatchObject({ verdict: "FAIL", amendmentTicketId: AMEND, provisional: true });
+    expect(record().doneIntent).toBeUndefined();
+
+    expect(await drainCompletion(SR_MSG)).toMatchObject({ outcome: "dropped" });
+    expect(h.ticket.status).toBe("in_progress");
+    expect(record().replayDropped).toMatchObject({ step: "amendment" });
+  });
+
+  it(`(b) the amendment is reopened AT the provider commit ⇒ ${name === "tickets" ? "the transaction is cancelled: no Done (closed)" : "the Done lands (Jira only narrows the window)"}`, async () => {
+    h.beforeCommit = async () => { h.amend.status = "in_progress"; };
+    const drained = await drainCompletion(SR_MSG);
+    if (name === "tickets") {
+      expect(drained).toMatchObject({ outcome: "retry", reason: expect.stringMatching(/Done precondition failed: TEAM-101 not done/) });
+      expect(h.ticket.status).toBe("in_progress");
+      expect(record().securityReview).toMatchObject({ provisional: true });
+    } else {
+      expect(drained).toMatchObject({ outcome: "applied" });
+      expect(h.ticket.status).toBe("done");
+    }
   });
 });

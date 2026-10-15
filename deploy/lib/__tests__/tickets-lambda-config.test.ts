@@ -156,7 +156,7 @@ describe("buildTicketsPolicyStatements — the S3 grants (TEAM-5867 P0)", () => 
       },
       {
         Effect: "Allow",
-        Action: ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan"],
+        Action: ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem", "dynamodb:Query", "dynamodb:Scan", "dynamodb:ConditionCheckItem"],
         Resource: [
           `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/agentcore-hub-tickets`,
           `arn:aws:dynamodb:${REGION}:${ACCOUNT}:table/agentcore-hub-tickets/index/*`,
