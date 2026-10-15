@@ -20,6 +20,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/../config.sh"
+# TEAM-6334: the JIRA_WEBHOOK_SECRET charset rule, shared with
+# deploy/apprunner/setup-jira-webhook.sh (resolved from this script's location).
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/../lib/jira-webhook-secret.sh"
 
 SERVICE_NAME="${EXPRESS_SERVICE_NAME:-agentcore-hub}"
 CLUSTER="${EXPRESS_CLUSTER:-default}"
@@ -40,6 +44,14 @@ while [ $# -gt 0 ]; do
       fi
       UNSETS+=("$2"); shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
+    # TEAM-6334: this key is an HMAC key Jira also holds. The "\n"-joined merge
+    # below would silently drop a trailing newline (and an embedded one splits
+    # the value), so the hub would verify with different bytes than Jira signs
+    # with. Same charset rule as setup-jira-webhook.sh; every other key is
+    # unchanged. Rollback (--unset JIRA_WEBHOOK_SECRET) is unaffected.
+    JIRA_WEBHOOK_SECRET=*)
+      require_jira_webhook_secret_format "${1#JIRA_WEBHOOK_SECRET=}" || exit 1
+      SETS+=("$1"); shift ;;
     *=*) SETS+=("$1"); shift ;;
     *) echo "ERROR: expected KEY=VALUE, --unset KEY or --dry-run, got '$1'" >&2; exit 2 ;;
   esac
