@@ -55,8 +55,10 @@ NOT rewritten by the commands below. That is deliberate:
 header (`verifyHubSignature`, `src/lib/auth/hub-signature.ts`) whenever
 `JIRA_WEBHOOK_SECRET` is set. An unset secret is passthrough, not fail-closed
 (unlike `WEBHOOK_SECRET` on `/api/workflow/webhook`) — see TEAM-6324. Enable it
-in this order; a reversed order is safe too, since the hub accepts unsigned
-requests until step (b) lands:
+in this order: **Jira first (a), then the hub (b). Do not reverse it.** If the
+secret lands on the hub first while Jira still sends unsigned deliveries,
+every delivery gets `401` and its status transition is dropped — Jira does
+not redeliver it — until Jira is configured too.
 
 - **(a) Jira side.** Generate a secret (`openssl rand -hex 32`) and set it on
   the webhook: Jira admin → System → WebHooks → `agentcore-hub-workflow` →
@@ -68,7 +70,9 @@ requests until step (b) lands:
   ./deploy/ecs-express/set-env.sh JIRA_WEBHOOK_SECRET=<the same value>
   ```
   (never the raw ECS update API — it replaces the whole container env, which
-  would blank the other live secrets on this service).
+  would blank the other live secrets on this service). The value is used
+  byte-for-byte as the HMAC key (no trimming), so it must be identical on
+  both sides.
 
 Between (a) and (b) the hub still accepts unsigned requests (and logs one
 `console.warn` per instance). Once (b) rolls out, an unsigned or mismatched
