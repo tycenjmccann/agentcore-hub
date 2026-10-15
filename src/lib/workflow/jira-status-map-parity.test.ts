@@ -95,9 +95,9 @@ describe("jira-client.ts mapJiraStatusToInternal × the REAL jira Lambda (TEAM-6
     expect(mapJiraStatusToInternal(name)).toBe(expected);
   });
 
-  it("is null-safe (undefined/null do not throw)", () => {
-    expect(mapJiraStatusToInternal(undefined)).toBe("todo");
-    expect(mapJiraStatusToInternal(null)).toBe("todo");
+  it("is null-safe (undefined/null do not throw, and match the canonical empty-name output)", () => {
+    expect(mapJiraStatusToInternal(undefined)).toBe("");
+    expect(mapJiraStatusToInternal(null)).toBe("");
   });
 });
 
@@ -161,7 +161,7 @@ describe("ticket-provider-jira.ts JiraCloudProvider — status mapping drive-thr
     try {
       const { JiraCloudProvider } = await import("./ticket-provider-jira");
       const jira = new JiraCloudProvider();
-      const ticket = await jira.createTicket({ title: "t", description: "d", type: "task" });
+      const ticket = await jira.createTicket({ parentId: "TEAM-1", title: "t", description: "d", assignee: "" });
       expect(ticket.status).toBe(expected);
     } finally {
       globalThis.fetch = originalFetch;
