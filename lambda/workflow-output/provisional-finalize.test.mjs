@@ -1070,6 +1070,81 @@ describe("TEAM-6164 F1 — the older message in the FIFO group never Dones over 
     expect(record(R_KEY)).toMatchObject({ ticketWrites: "applied", securityReview: { verdict: "FAIL", amendmentTicketId: AMEND } });
     twinsAdmitAdmission(R_KEY);
   });
+
+  // ─── TEAM-6225 (R4-04 on #970): legacyResidualOf trusted `summary` as the latest report ───
+  // A same-session re-submit keeps the FIRST summary and puts later text in `resubmits`, so two FAIL
+  // reports in one session passed the verdict check and the OLDER FAIL's findings were rebuilt and
+  // posted. A re-submitted record's text is not provably the latest report, so it is not rebuilt: an
+  // open ticket is a surfaced drop at step 5, a ticket already Done records the dev lanes undelivered.
+  const SESSION = "sess-r4-04";
+  const NEWER = { summary: `${reviewCompletion.summary}\n- F6 (High): NEW_BLOCKING_FINDING only the second same-session report carries.` };
+  const RESUBMITTED = /^residual_findings: .*carries no residual text for its FAIL admission on TEAM-5399 \(.*re-submitted in its session/;
+  /** PASS queued (no session); then two FAILs in ONE session, findings unposted; `residual` stripped (a pre-field record). */
+  const queueSameSessionFails = async () => {
+    seedReview();
+    fake.failTool = { Tickets___transition_ticket: PROVIDER_503, Tickets___add_comment: (p) => ([DEV1, DEV2].includes(p.ticket_id) ? PROVIDER_503 : null) };
+    expect(await reportReview(PASS)).toMatchObject({ status: "complete", ticketWrites: "queued" });
+    // The rework dispatch mints the session both FAIL reports run in.
+    fake.objects.set(`workflows/${reviewCompletion.workflow_id}/shared/manifest.json`, JSON.stringify({ sessions: { [reviewCompletion.agent_id]: { sessionId: SESSION, ticketId: REVIEW } } }));
+    expect(await reportReview()).toMatchObject({ status: "complete" });
+    expect(await reportReview(NEWER)).toMatchObject({ status: "complete" });
+    expect(residualComments(DEV1)).toHaveLength(0);
+    expect(residualComments(DEV2)).toHaveLength(0);
+    const cur = record(R_KEY);
+    expect(cur).toMatchObject({ sessionId: SESSION, summary: reviewCompletion.summary, securityReview: { verdict: "FAIL", amendmentTicketId: AMEND } });
+    expect(cur.resubmits.at(-1).summary).toBe(NEWER.summary);
+    delete cur.residual;
+    setRecord(R_KEY, cur);
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+  };
+
+  it("TEAM-6225 R4-04 a pre-`residual` record whose FAIL admission was re-submitted in the same session (summary = the FIRST FAIL, resubmits = the newer FAIL) ⇒ the older PASS message is a surfaced drop at residual_findings, never a Done on the older FAIL's text; a report_completion re-run delivers the newer findings and Dones", async () => {
+    await queueSameSessionFails();
+    const from = fake.calls.length;
+    const out = await drainMsg(0);
+    expect(residualComments(DEV1), "no findings rebuilt from text not proven to be the latest report").toHaveLength(0);
+    expect(residualComments(DEV2)).toHaveLength(0);
+    expect(out, out.reason).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(out.reason).toMatch(RESUBMITTED);
+    expect(transitionsOf(REVIEW, from)).toHaveLength(0);
+    expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+    expect(record(R_KEY)).toMatchObject({ ticketWrites: "dropped", replayDropped: { step: "residual_findings" } });
+    expect(fake.tickets.get(REVIEW).comments.some((c) => c.startsWith(`[replay-dropped:${REVIEW}:residual_findings]`)), "the drop is said on the ticket").toBe(true);
+    // The recovery missingText names: the session's re-run writes `residual` from its own text.
+    expect(await reportReview(NEWER)).toMatchObject({ status: "complete" });
+    expect(residualComments(DEV1)[0]).toContain("NEW_BLOCKING_FINDING");
+    expect(residualComments(DEV2)[0]).toContain("NEW_BLOCKING_FINDING");
+    expect(fake.tickets.get(REVIEW).status).toBe("Done");
+    twinsAdmitAdmission(R_KEY);
+  });
+
+  it("TEAM-6225 R4-04b the same re-submitted record on a review already Done ⇒ applied with NO findings posted and both dev lanes recorded undelivered with the re-submitted reason", async () => {
+    await queueSameSessionFails();
+    fake.tickets.get(REVIEW).status = "Done";
+    const from = fake.calls.length;
+    const out = await drainMsg(0);
+    expect(out, out.reason).toMatchObject({ outcome: "applied" });
+    expect(residualComments(DEV1)).toHaveLength(0);
+    expect(residualComments(DEV2)).toHaveLength(0);
+    expect(transitionsOf(REVIEW, from)).toHaveLength(0);
+    const owed = (record(R_KEY).undelivered || []).filter((u) => u.part === "residual_findings");
+    expect(owed.map((u) => u.ticketId).sort()).toEqual([DEV1, DEV2]);
+    for (const u of owed) expect(`residual_findings: ${u.reason}`).toMatch(RESUBMITTED);
+  });
+
+  it("TEAM-6225 R4-04c legacyResidualOf rebuilds a pre-`residual` record with no (or empty) resubmits and refuses one with any; currentResidual says why", () => {
+    const legacy = { securityReview: { verdict: "FAIL", amendmentTicketId: AMEND }, summary: reviewCompletion.summary, artifacts: reviewCompletion.artifacts };
+    expect(output.legacyResidualOf(legacy)).toMatchObject({ verdict: "FAIL", amendmentTicketId: AMEND, summary: expect.stringContaining("F1 (Critical)") });
+    expect(output.legacyResidualOf({ ...legacy, resubmits: [] })).not.toBeNull();
+    const resubmitted = { ...legacy, resubmits: [{ at: "2026-10-15T00:00:00.000Z", ...NEWER, artifacts: reviewCompletion.artifacts }] };
+    expect(output.legacyResidualOf(resubmitted)).toBeNull();
+    expect(output.currentResidual({ ...legacy, resubmits: [] }, {}).residual).not.toBeNull();
+    const missing = output.currentResidual(resubmitted, {}, R_KEY);
+    expect(missing.residual).toBeNull();
+    expect(`residual_findings: ${missing.missingText}`).toMatch(RESUBMITTED);
+    // The verdict-mismatch wording (R3-03b) is unchanged for a record that was never re-submitted.
+    expect(output.currentResidual({ ...legacy, summary: PASS.summary }, {}, R_KEY).missingText).toMatch(/its summary does not state that verdict/);
+  });
 });
 
 // ─── TEAM-6164 F1 sibling: step 6 cleared followUpsPending off the MESSAGE's entries ───

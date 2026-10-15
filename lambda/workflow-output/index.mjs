@@ -994,15 +994,24 @@ export function residualOf(review, summary, artifacts) {
 
 /**
  * TEAM-6217 (R3-03): the residual a record written BEFORE `residual` existed still holds - its
- * non-PASS stamp beside the report's own `summary` and `artifacts` (:1066), the exact inputs
- * residualOf builds the field from. Valid only when the summary's own verdict line is the stamp's
- * verdict (parseReviewVerdict): a same-session resubmit keeps the FIRST summary under a later
- * stamp, so a mismatch is not this admission's text. null ⇒ nothing trustworthy to rebuild.
+ * non-PASS stamp beside the report's own `summary` and `artifacts`, the exact inputs residualOf
+ * builds the field from. Valid only when that summary is provably the report the stamp came from:
+ *   - its own verdict line is the stamp's verdict (parseReviewVerdict), and
+ *   - TEAM-6225 (R4-04): the record carries no `resubmits`. A same-session re-submit keeps the
+ *     FIRST summary under the LATEST call's stamp, so two FAILs in one session pass the verdict
+ *     check with the older FAIL's text. Nor is the last `resubmits[]` entry the latest report: a
+ *     re-submit is pushed only when it differs from the first summary and every earlier entry
+ *     (reportCompletion's same-session merge), so a session reporting A, B, A ends with
+ *     `resubmits: [B]` while A is current. Re-submitted ⇒ ambiguous ⇒ no rebuild.
+ * null ⇒ nothing trustworthy to rebuild (currentResidual answers missingText).
  */
+const isResubmitted = (record) => Array.isArray(record?.resubmits) && record.resubmits.length > 0;
+
 export function legacyResidualOf(record) {
   const sr = record?.securityReview;
   const verdict = String(sr?.verdict || "").toUpperCase();
   if (!verdict || verdict === "PASS" || !asText(record?.summary).trim()) return null;
+  if (isResubmitted(record)) return null;
   if (parseReviewVerdict(record.summary) !== verdict) return null;
   return residualOf({ residual: true, verdict, amendmentTicketId: asText(sr.amendmentTicketId) || null }, record.summary, record.artifacts);
 }
@@ -1022,7 +1031,8 @@ export function legacyResidualOf(record) {
  *                record's trusted PASS admission (TEAM-6158's rule, decided before step 6 and
  *                before any amendment read, not in step 7 after one).
  *   missingText  the record's stamp is the admission but it carries no `residual` (written before
- *                the field existed), its own summary cannot stand in for it (legacyResidualOf), and
+ *                the field existed), its own summary cannot stand in for it (legacyResidualOf: wrong verdict, or
+ *                TEAM-6225 re-submitted in its session), and
  *                the message's findings are another admission: nothing to post. TEAM-6217 (R3-03):
  *                on an open ticket the caller HOLDS the Done (a surfaced drop) - the findings are
  *                owed before the dev lanes are released; on a ticket already Done it records the
@@ -1043,7 +1053,10 @@ export function currentResidual(record, msg, reportKey = "the completion record"
     const legacy = legacyResidualOf(record);
     if (legacy) return { ...none, residual: legacy };
     const theirs = msg?.residual ? ` and the queued ${String(msg.residual.verdict || "").toUpperCase() || "non-PASS"} findings${asText(msg.residual.amendmentTicketId) ? ` on ${asText(msg.residual.amendmentTicketId)}` : ""} are another admission` : "";
-    return { ...none, missingText: `${reportKey} carries no residual text for its ${admission.verdict} admission${admission.amendmentTicketId ? ` on ${admission.amendmentTicketId}` : ""} (a record written before it carried one, and its summary does not state that verdict)${theirs} - no findings from this replay; a WorkflowOutput___report_completion re-run (or that admission's own queued message) delivers them` };
+    const why = isResubmitted(record)
+      ? "a record written before it carried one, re-submitted in its session, so its summary is not provably the latest report"
+      : "a record written before it carried one, and its summary does not state that verdict";
+    return { ...none, missingText: `${reportKey} carries no residual text for its ${admission.verdict} admission${admission.amendmentTicketId ? ` on ${admission.amendmentTicketId}` : ""} (${why})${theirs} - no findings from this replay; a WorkflowOutput___report_completion re-run (or that admission's own queued message) delivers them` };
   }
   const sr = record?.securityReview;
   if (sr && typeof sr === "object" && String(sr.verdict || "").toUpperCase() === "PASS") {
