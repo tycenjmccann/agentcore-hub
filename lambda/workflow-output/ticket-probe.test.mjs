@@ -2610,4 +2610,144 @@ describe("TEAM-5995 — a brief hold with no deliverable gate", () => {
     expect(record().briefDisposition.provisional).toBeUndefined();
     expect(fake.tickets.get(BUILD).status).toBe("In Progress");
   });
+
+  // ─── TEAM-6205 (ship review round 2 on #970) ─────────────────────────────────────────────
+  // R2-02: a stale-gate RETRY must leave the brief obligation ON THE RECORD. drop() (after its
+  // notices, TEAM-6164 F2) and step 5 re-ask the settled gates and returned retry with nothing
+  // written; the record then said ticketWrites:"queued" with no briefPending, and the agent's
+  // report_completion retry (gate handling only on briefPending:true, :1519) Doned the build with
+  // the gate To Do and no brief body on it - only step 4's [brief-resolved] audit. Both sites now
+  // stamp the off-gate hold (briefPending:true, a part:"brief" entry, no release) before the retry,
+  // through the one helper step 6's re-hold already used (reholdBriefOffGate).
+  const briefHeldOffGate = () => {
+    const r = record();
+    expect(r.briefPending, "the record STATES the brief obligation").toBe(true);
+    expect(r.undelivered).toEqual(expect.arrayContaining([expect.objectContaining({ part: "brief", s3Key: fixture.mergeBrief.s3Key })]));
+    expect(r.briefDisposition, "no release persisted on a gate that reads To Do").toBeUndefined();
+    expect(r.ticketWrites).toBe("queued");
+    expect(r.replayDropped).toBeUndefined();
+  };
+  /** The gate reopens during the LAST release audit (the epic's) - after every gate's own audit read, before step 5's re-ask. */
+  const reopenGateOnEpicAudit = () => {
+    let flipped = 0;
+    fake.beforeTool = (tool, p) => {
+      if (tool === "Tickets___add_comment" && p.ticket_id === "TEAM-5600" && String(p.comment).startsWith(`[brief-resolved:${BUILD}]`) && flipped === 0) { flipped = 1; fake.tickets.get(GATE).status = "To Do"; }
+    };
+    return () => flipped;
+  };
+
+  it("TEAM-6205 R2-02a drop(): the gate reopens during the [replay-dropped] notice ⇒ retried AND the off-gate hold is stamped (briefPending:true, part:brief, no release, still queued); twins refuse", async () => {
+    fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    fake.tickets.get(GATE).status = "Done";
+    const flipped = reopenGateOnDropNotice();
+    const t1 = await tick();
+    expect(flipped()).toBe(1);
+    expect(t1.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    briefHeldOffGate();
+    expect(record().followUpsPending).toBe(true);
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    await twinsRefuse();
+  });
+
+  it("TEAM-6205 R2-02b drop(): after the stale-gate retry an IMMEDIATE report_completion retry (no drain tick in between) puts the brief ON the reopened gate, then Dones", async () => {
+    fake.failTool = { Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    fake.tickets.get(GATE).status = "Done";
+    reopenGateOnDropNotice();
+    expect((await tick()).out.drained).toMatchObject({ retried: 1 });
+    expect(fake.tickets.get(GATE).status).toBe("To Do");
+    fake.beforeTool = null;
+    fake.failTool = null;
+    expect((await rerun()).status).toBe("complete");
+    expect(briefComments(GATE), "the brief BODY is on the reopened gate before the Done").toHaveLength(1);
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE], followUpsPending: false });
+    await twinsAdmit();
+  });
+
+  it("TEAM-6205 R2-02c step 5: the gate reopens during the last release audit ⇒ step 5's re-ask retries AND stamps the off-gate hold; the immediate retry puts the brief on the gate, then Dones", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    const flipped = reopenGateOnEpicAudit();
+    const t1 = await tick();
+    expect(flipped()).toBe(1);
+    expect(t1.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    briefHeldOffGate();
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+    await twinsRefuse();
+    fake.beforeTool = null;
+    expect((await rerun()).status).toBe("complete");
+    expect(briefComments(GATE), "the brief BODY is on the reopened gate before the Done").toHaveLength(1);
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    expect(record()).toMatchObject({ briefPending: false, briefDelivered: "gate", briefTargets: [GATE] });
+    await twinsAdmit();
+  });
+
+  it("TEAM-6205 R2-02d step 5: the stale-gate re-hold DEFERS on a fresh Done-intent (the ticket read open) - nothing stamped, retried", async () => {
+    fake.tickets.get(GATE).status = "Done";
+    reopenGateOnEpicAudit();
+    fake.objects.set(KEY, JSON.stringify({ ...record(), doneIntent: { at: new Date().toISOString(), provider: "jira", nonce: "0f8fad5b-d9cb-469f-a165-70867728950e" } }));
+    fake.etags.set(KEY, `"e${++fake.etagSeq}"`);
+    const t1 = await tick();
+    expect(t1.out.drained).toMatchObject({ applied: 0, dropped: 0, retried: 1 });
+    expect(record().briefPending).toBeUndefined();
+    expect(record().doneIntent).toBeTruthy();
+    expect(fake.tickets.get(BUILD).status).not.toBe("Done");
+  });
+
+  // ─── TEAM-6205 A: the two brief siblings of R2-02 ───────────────────────────────────────
+  // A1 (:1519, evidence): an outage retry with NO drain tick in between. The record carries no
+  // hold, so the retry Dones first and the gate is Ready brief-less until the queued message's own
+  // tick puts the brief body on it. The brief is NOT lost (the message is still queued, step 4 runs
+  // on a ticket already Done); the residual ordering gap is recorded in the PR body, not fixed here.
+  it("TEAM-6205 A1 (evidence): an outage retry with no drain tick Dones first; the queued brief lands on the gate (body) on the next tick, after the Done", async () => {
+    expect((await rerun()).status).toBe("complete");
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    expect(briefComments(GATE), "ordering gap: the gate is Ready brief-less until the next tick").toHaveLength(0);
+    expect(fake.queue, "the queued message still carries the brief").toHaveLength(1);
+    expect((await tick()).out.drained).toMatchObject({ applied: 1, dropped: 0 });
+    expect(briefComments(GATE), "the brief BODY reached the gate").toHaveLength(1);
+    expect(fake.tickets.get(GATE).description).toBe(fixture.mergeBrief.body.trim());
+    expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE], ticketWrites: "applied" });
+  });
+
+  // A2 (step 0): a message that ALONE carries the brief, behind a brief-less message that Doned.
+  // Two defects: (a) ticketWritesDedupId ignored the brief, so a re-report that added the merge brief
+  // inside SQS's 5-minute window was collapsed onto the brief-less message and the brief was never
+  // queued at all; (b) step 0 dropped any message as "already applied" once the record said so, so a
+  // brief only the later message carried never reached the gate. The dedup id now carries the brief
+  // key, and step 0 keeps a message whose brief the record does not show delivered or released.
+  it("TEAM-6205 A2a the dedup id carries the brief: a re-report that adds the merge brief inside the dedup window is its own message, and it delivers the brief", async () => {
+    const { ticketWritesDedupId } = output;
+    expect(ticketWritesDedupId({ ticketId: BUILD, entries: [], briefKey: fixture.mergeBrief.s3Key })).not.toBe(ticketWritesDedupId({ ticketId: BUILD, entries: [] }));
+    expect(ticketWritesDedupId({ ticketId: BUILD, entries: [], briefKey: fixture.mergeBrief.s3Key })).toBe(ticketWritesDedupId({ ticketId: BUILD, entries: [], briefKey: fixture.mergeBrief.s3Key }));
+    // The outage again: a brief-less report first, then the same report naming the brief.
+    fake.queue.length = 0; fake.sends.length = 0; fake.dedup.clear();
+    fake.objects.delete(KEY); fake.etags.delete(KEY);
+    fake.down = true;
+    expect((await rerun({ evidence_keys: "workflows/db9sx9/shared/plan.md" })).ticketWrites).toBe("queued");
+    expect((await rerun()).ticketWrites).toBe("queued");
+    expect(fake.queue, "the brief obligation is its own message").toHaveLength(2);
+    expect(JSON.parse(fake.queue[0].Body).brief).toBeNull();
+    expect(JSON.parse(fake.queue[1].Body).brief).toEqual({ s3Key: fixture.mergeBrief.s3Key });
+    fake.down = false;
+    expect((await tick()).out.drained).toMatchObject({ applied: 2, dropped: 0, retried: 0 });
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    expect(briefComments(GATE), "the later message's brief reached the gate").toHaveLength(1);
+    expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE], ticketWrites: "applied" });
+  });
+
+  it("TEAM-6205 A2b step 0: a message that alone carries the brief is NOT dropped as 'already applied' behind a brief-less message that Doned - its brief goes on the gate", async () => {
+    const original = fake.queue[0].Body;
+    const group = fake.queue[0].group;
+    fake.queue[0].Body = JSON.stringify({ ...JSON.parse(original), brief: null });
+    fake.queue.push({ MessageId: "m2-with-brief", Body: original, group, inFlight: null, receives: 0 });
+    const t = await tick();
+    expect(fake.tickets.get(BUILD).status).toBe("Done");
+    expect(t.out.drained).toMatchObject({ applied: 2, dropped: 0 });
+    expect(briefComments(GATE), "the later message's brief reached the gate").toHaveLength(1);
+    expect(record()).toMatchObject({ briefDelivered: "gate", briefTargets: [GATE], ticketWrites: "applied" });
+    // and a redelivery of that message is now a plain "already applied": the record shows the brief on the gate
+    fake.queue.push({ MessageId: "m2-again", Body: original, group, inFlight: null, receives: 0 });
+    expect((await tick()).out.drained).toMatchObject({ applied: 0, dropped: 1 });
+    expect(briefComments(GATE)).toHaveLength(1);
+  });
 });
