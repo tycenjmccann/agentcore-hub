@@ -5311,7 +5311,7 @@ describe("TEAM-6205 R2-05 — unresolvedRecordFollowUps fails closed on a malfor
     expect(unresolvedRecordFollowUps({ ...rec, followUps: undefined }, none, []).length).toBeGreaterThan(0);
   });
 
-  it("R2-01 mergeRecordFollowUps: the record's unresolved rows ride verbatim in the persisted breakdown; sentinels only hold the flag", async () => {
+  it("R2-01 mergeRecordFollowUps: the record's unresolved rows ride verbatim in the persisted breakdown; a shape sentinel rides as a marker", async () => {
     const { mergeRecordFollowUps } = await import("./index.mjs");
     const b = { hash: "b2", reason: "Jira API 429: rate limited", retryable: true, commentedOn: ["TEAM-1"] };
     const m = mergeRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1", reason: "x" }, b] } }, { ...none, created: [{ hash: "a1", ticketId: "TEAM-9" }] }, [{ hash: "a1" }]);
@@ -5322,10 +5322,21 @@ describe("TEAM-6205 R2-05 — unresolvedRecordFollowUps fails closed on a malfor
     const own = { hash: "a1", reason: "Jira API 400: bad", retryable: false, commentedOn: [] };
     const dup = mergeRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [{ hash: "a1", reason: "older" }, b] } }, { ...none, failed: [own] }, [{ hash: "a1" }]);
     expect(dup.breakdown.failed).toEqual([own, b]);
-    // hollow: the flag holds, nothing fabricated into failed[]
+    // TEAM-6223 (R4-03): hollow, missing or null - the shape sentinel is persisted as a durable marker,
+    // so the breakdown a drain writes still holds the obligation on redelivery
+    const marker = (why, raw) => ({ hash: null, unresolved: true, retryable: false, reason: expect.stringMatching(why), raw });
     const hollow = mergeRecordFollowUps({ followUpsPending: true, followUpsMaterialized: { failed: [] } }, none, []);
     expect(hollow.stillUnfiled).toBe(true);
-    expect(hollow.breakdown.failed).toEqual([]);
+    expect(hollow.breakdown.failed).toEqual([marker(/^followUpsPending:true with an empty followUpsMaterialized\.failed - an obligation nobody can name/, "[]")]);
+    for (const rec of [{ followUpsPending: true }, { followUpsPending: true, followUpsMaterialized: { failed: null } }]) {
+      const m = mergeRecordFollowUps(rec, { ...none, failed: [own] }, [{ hash: "a1" }]);
+      expect(m.stillUnfiled).toBe(true);
+      expect(m.breakdown.failed).toEqual([own, marker(/^followUpsPending:true with no followUpsMaterialized breakdown - an obligation nobody can name/, "null")]);
+    }
+    // a marker read back is the sentinel that wrote it, never a second marker: the merge is idempotent
+    const next = mergeRecordFollowUps({ followUpsPending: true, followUpsMaterialized: hollow.breakdown }, none, []);
+    expect(next.breakdown.failed).toEqual(hollow.breakdown.failed);
+    expect(next.unresolved).toEqual([{ hash: null, reason: hollow.breakdown.failed[0].reason }]);
     // no hold on the record: this message's rows alone decide
     expect(mergeRecordFollowUps({ followUpsPending: false }, none, [])).toMatchObject({ unresolved: [], stillUnfiled: false });
     expect(mergeRecordFollowUps(null, { ...none, failed: [own] }, [{ hash: "a1" }])).toMatchObject({ unresolved: [], stillUnfiled: true });

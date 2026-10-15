@@ -1280,4 +1280,78 @@ describe("TEAM-6205 R2-01 / R2-05 — a drain write carries the record's unresol
     expect(record(R_KEY).followUpsMaterialized.failed).toHaveLength(2);
     expect(record(R_KEY).followUpsPending).toBe(true);
   });
+
+  // ─── TEAM-6223 R4-03 (ship review round 4 on #970) - red on 1934bed: a breakdown-SHAPE sentinel was never persisted ───
+  // unresolvedRecordFollowUps raises a sentinel for the breakdown's SHAPE too (no breakdown, failed:null, a hollow
+  // failed:[]), but mergeRecordFollowUps only wrote markers while iterating prior rows, so the shape held the flag for
+  // one write: drop() saved failed=[A] alone, and the redelivery that filed A cleared the hold and Doned (the hollow
+  // shape also lost the record-named B). Now every shape sentinel is persisted as a durable marker - the same lifecycle
+  // as R3-02, one test per row and shape: WRITER (a), READER (b), DELETE (c), ORDERING (d).
+  const NO_BREAKDOWN = "followUpsPending:true with no followUpsMaterialized breakdown - an obligation nobody can name";
+  const HOLLOW = "followUpsPending:true with an empty followUpsMaterialized.failed - an obligation nobody can name";
+  const SHAPES = [
+    { shape: "missing breakdown", reason: NO_BREAKDOWN, raw: "null", patch: () => ({ followUpsMaterialized: undefined }) },
+    { shape: "failed:null", reason: NO_BREAKDOWN, raw: "null", patch: (cur) => ({ followUpsMaterialized: { ...cur.followUpsMaterialized, failed: null } }) },
+    {
+      shape: "hollow failed:[] naming A+B", reason: HOLLOW, raw: "[]",
+      patch: (cur) => ({
+        followUpsMaterialized: { ...cur.followUpsMaterialized, failed: [] },
+        followUps: [FU_A, FU_B].map((e) => ({ hash: hashOf(e), kind: e.kind, title: e.title })),
+      }),
+    },
+  ];
+  /** The record holds `followUpsPending:true` in `shape`; the queued message carries A; A's create is a permanent 400 ⇒ drop(). */
+  const dropWithShape = async (patch) => {
+    await olderQueuedNewerHeld();
+    patchRecord(R_KEY, patch(record(R_KEY)));
+    fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY), Tickets___create_ticket: "Jira API 400: Field 'labels' is invalid" };
+    const dropped = await drainQueued();
+    expect(dropped, dropped.reason).toMatchObject({ outcome: "dropped", permanent: true });
+    expect(record(R_KEY).followUpsPending).toBe(true);
+  };
+
+  for (const { shape, reason, raw, patch } of SHAPES) {
+    it(`TEAM-6223 R4-03a (WRITER) [${shape}] drop() persists the shape sentinel as a durable marker beside A, never failed=[A] alone`, async () => {
+      await dropWithShape(patch);
+      expect(failedHashes()).toContain(hashOf(FU_A));
+      expect(markers()).toEqual([{ hash: null, unresolved: true, retryable: false, reason: expect.any(String), raw }]);
+      expect(markers()[0].reason.startsWith(reason), markers()[0].reason).toBe(true);
+      expect(record(R_KEY).followUpsMaterialized.failed).toHaveLength(2);
+    });
+
+    it(`TEAM-6223 R4-03b (READER) [${shape}] redelivery files A ⇒ superseded on the marker: no Done, followUpsPending:true, twins refuse`, async () => {
+      await dropWithShape(patch);
+      fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+      const out = await drainQueued();
+      expect(out, out.reason).toMatchObject({ outcome: "dropped", superseded: true });
+      expect(out.reason).toContain(reason);
+      expect(followUpTickets(), "A was filed, B was not").toHaveLength(1);
+      expect(record(R_KEY).followUpsPending, "the unnamed obligation still holds the ticket").toBe(true);
+      expect(fake.tickets.get(REVIEW).status).toBe("In Progress");
+      expect(markers(), "the marker rides through the redelivery").toHaveLength(1);
+      twinsRefuseRecord(R_KEY);
+    });
+
+    it(`TEAM-6223 R4-03c (DELETE) [${shape}] only a report_completion re-run with the full follow_ups list clears the marker, files A and B, and Dones`, async () => {
+      await dropWithShape(patch);
+      fake.failTool = { Tickets___transition_ticket: realDoneGuard(R_KEY) };
+      expect(await reportReview({ ...PASS, follow_ups: JSON.stringify([FU_A, FU_B]) })).toMatchObject({ status: "complete" });
+      expect(followUpTickets()).toHaveLength(2);
+      expect(markers(), "the re-run's own materialization replaced the breakdown").toEqual([]);
+      expect(record(R_KEY)).toMatchObject({ followUpsPending: false, status: "complete" });
+      expect(fake.tickets.get(REVIEW).status).toBe("Done");
+      for (const twin of TWIN_GUARDS) expect(twin.judgeCompletionRecord(R_KEY, fake.objects.get(R_KEY), { securityReview: true })).toMatchObject({ proven: true });
+    });
+
+    it(`TEAM-6223 R4-03d (ORDERING) [${shape}] a second drop over the same record leaves exactly one marker`, async () => {
+      await dropWithShape(patch);
+      const before = markers();
+      expect(before).toHaveLength(1);
+      const again = await drainQueued();
+      expect(again, again.reason).toMatchObject({ outcome: "dropped", permanent: true });
+      expect(markers(), "no growth, no re-wrapping").toEqual(before);
+      expect(record(R_KEY).followUpsMaterialized.failed).toHaveLength(2);
+      expect(record(R_KEY).followUpsPending).toBe(true);
+    });
+  }
 });

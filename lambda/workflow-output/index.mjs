@@ -939,7 +939,10 @@ export function unresolvedRecordFollowUps(record, materialized, entries = []) {
  * an existing marker rides verbatim, so there is no growth); hash-less rows in the other buckets
  * ride verbatim (they claim a filed ticket, not an unfiled one). Only a report_completion re-run,
  * which rewrites the breakdown from its own materialization, clears a marker - a drain cannot name
- * the row. ONE helper for every drain write (drop(), step 6).
+ * the row. TEAM-6223 (R4-03): a sentinel for the breakdown's SHAPE (no breakdown, `failed` null or
+ * hollow) is persisted as a marker the same way - it named no row, so it used to hold the flag for
+ * one write and vanish behind the first row this message stamped. ONE helper for every drain write
+ * (drop(), step 6).
  *
  *   { unresolved, breakdown, stillUnfiled }
  */
@@ -957,16 +960,26 @@ export function mergeRecordFollowUps(record, materialized, entries = []) {
       breakdown.failed.push(row && typeof row === "object" && row.unresolved === true ? row : unresolvedFollowUpMarker(row, i));
     });
   }
+  // TEAM-6223 (R4-03): a sentinel for the breakdown's SHAPE (no breakdown, failed not an array,
+  // a hollow failed:[]) has no row to ride on, so it is persisted as a marker of its own; with
+  // no prior failed rows, every hash:null sentinel is one (row sentinels need a row).
+  const priorFailed = prior?.failed;
+  if (!Array.isArray(priorFailed) || priorFailed.length === 0) {
+    for (const s of unresolved) if (s.hash === null) breakdown.failed.push(unresolvedFollowUpMarker(priorFailed ?? null, null, s.reason));
+  }
   return { unresolved, breakdown, stillUnfiled: breakdown.failed.length > 0 || unresolved.length > 0 };
 }
 
-/** TEAM-6217 (R3-02): the durable marker a hash-less `followUpsMaterialized.failed[i]` row is persisted as. */
-export function unresolvedFollowUpMarker(row, i) {
+/**
+ * TEAM-6217 (R3-02): the durable marker a hash-less `followUpsMaterialized.failed[i]` row is persisted as.
+ * TEAM-6223 (R4-03): and a breakdown-shape sentinel (`why` is its reason, `row` the prior `failed`).
+ */
+export function unresolvedFollowUpMarker(row, i, why = `followUpsMaterialized.failed[${i}] has no hash`) {
   let raw;
   try { raw = JSON.stringify(row); } catch { raw = undefined; }
   return {
     hash: null, unresolved: true, retryable: false,
-    reason: `followUpsMaterialized.failed[${i}] has no hash - an obligation nobody can name; a WorkflowOutput___report_completion re-run with the full follow_ups list restates it`,
+    reason: `${why} - an obligation nobody can name; a WorkflowOutput___report_completion re-run with the full follow_ups list restates it`,
     raw: clampLine(raw ?? String(row), 500),
   };
 }
