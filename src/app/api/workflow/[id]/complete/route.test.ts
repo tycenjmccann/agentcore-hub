@@ -827,3 +827,147 @@ describe("POST complete — completions-record fallback (TEAM-3976)", () => {
     expect(h.state.updates.length).toBe(1); // only the green completion write
   });
 });
+
+/**
+ * TEAM-6136 — the TEAM-6032 (DL-038) follow-up PR gate on this route. The
+ * orchestrator's completeWorkflow refused a run whose Done fixer recorded a
+ * follow-up PR still open into main after the unified merge; this route did not,
+ * so the Workflow Manager's `complete` closed it green. Same gate (the
+ * orchestrator's followUpPrGate), same exclusions, same fail-open.
+ */
+describe("POST complete — open follow-up PR gate (TEAM-6136)", () => {
+  const PR = "https://github.com/o/r/pull/77";
+  const ENV = ["GITHUB_PAT", "SHIP_MERGE_VERIFY"] as const;
+  const savedEnv: Partial<Record<(typeof ENV)[number], string | undefined>> = {};
+  const tickets = [
+    { ticketId: "T-4", type: "task", status: "done", phase: "ship", assignee: "agentcore_hub_release_manager" },
+    { ticketId: "T-9", type: "task", status: "done", phase: "development", assignee: "agentcore_hub_bug_fixer" },
+  ];
+  const workflow = (ship: Record<string, unknown> = { mergeCommit: "9f1c2ab" }) => ({
+    workflowId: "wf_1",
+    phase: "ship",
+    workflowDefId: "software-delivery",
+    featureBranch: "feature/x",
+    repoConfig: { repos: [{ url: "https://github.com/o/r", defaultBranch: "main" }] },
+    agentTasks: {
+      "T-4": { ticketId: "T-4", agentId: "agentcore_hub_release_manager", output: "merged the release PR", ...ship },
+      "T-9": { ticketId: "T-9", agentId: "agentcore_hub_bug_fixer", output: "fixed on main" },
+    },
+  });
+  const phaseOfUpdate = (u: Record<string, unknown>) => {
+    const v = u.ExpressionAttributeValues as Record<string, unknown>;
+    return v?.[":outcome"] ?? v?.[":complete"];
+  };
+  let fetchMock: ReturnType<typeof vi.fn>;
+  const githubReturns = (status: number, pr: Record<string, unknown> | null) => {
+    fetchMock = vi.fn(async () => new Response(JSON.stringify(pr), { status }));
+    vi.stubGlobal("fetch", fetchMock);
+  };
+  const openPr = { state: "open", base: { ref: "main" }, head: { ref: "fix/y" } };
+
+  beforeEach(() => {
+    for (const k of ENV) savedEnv[k] = process.env[k];
+    process.env.GITHUB_PAT = "ghp_test";
+    delete process.env.SHIP_MERGE_VERIFY;
+    h.state.tickets = tickets;
+    h.state.workflow = workflow();
+    h.state.s3Objects = { "completions/T-9.json": JSON.stringify({ ticket_id: "T-9", pr_url: PR }) };
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    for (const k of ENV) {
+      if (savedEnv[k] === undefined) delete process.env[k];
+      else process.env[k] = savedEnv[k];
+    }
+  });
+
+  it("(a) unified PR merged + Done fixer's follow-up PR open into main → 409, no terminal write", async () => {
+    githubReturns(200, openPr);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    const body = await res.json();
+    expect(body.error).toBe("open_follow_up_pr");
+    expect(body.prs).toEqual([PR]);
+    expect(h.state.updates).toEqual([]); // neither the :complete write nor closeBlocked
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0][0])).toBe("https://api.github.com/repos/o/r/pulls/77");
+  });
+
+  it("(a′) a deploy-blocked ship verdict over a merged unified PR is refused too — closeBlocked is gated", async () => {
+    h.state.workflow = workflow({ mergeCommit: "9f1c2ab", outcome: "deploy-blocked", blockReason: "deploy gate" });
+    githubReturns(200, openPr);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe("open_follow_up_pr");
+    expect(h.state.updates).toEqual([]);
+  });
+
+  it("(b) the same PR merged / closed → 200 complete", async () => {
+    githubReturns(200, { ...openPr, state: "closed", merged: true });
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+    expect(h.state.updates.length).toBe(1);
+    expect(phaseOfUpdate(h.state.updates[0])).toBe("complete");
+  });
+
+  it("(c) GitHub 500 → fail-open, 200 complete", async () => {
+    githubReturns(500, { message: "boom" });
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("(d) no GITHUB_PAT → 200 complete and GitHub is never called", async () => {
+    delete process.env.GITHUB_PAT;
+    githubReturns(200, openPr);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("(d′) SHIP_MERGE_VERIFY=off → 200 complete and GitHub is never called", async () => {
+    process.env.SHIP_MERGE_VERIFY = "OFF";
+    githubReturns(200, openPr);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("(e) the unified PR itself (head = featureBranch) is skipped → 200 complete", async () => {
+    githubReturns(200, { ...openPr, head: { ref: "feature/x" } });
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+  });
+
+  it("a pure handoff ship verdict is exempt (orchestrator's !verdict.handoff) → 200, GitHub never called", async () => {
+    h.state.workflow = workflow({ mergeCommit: "9f1c2ab", outcome: "handoff" });
+    githubReturns(200, openPr);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe("complete");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("an intent-only reservation record is no record → falls back to the cached prUrl", async () => {
+    h.state.s3Objects = { "completions/T-9.json": JSON.stringify({ reservation: "done-intent", ticketId: "T-9" }) };
+    const wf = workflow();
+    (wf.agentTasks["T-9"] as Record<string, unknown>).prUrl = "https://github.com/o/r/pull/78";
+    h.state.workflow = wf;
+    githubReturns(200, openPr);
+    await load();
+    const res = await post();
+    expect(res.status).toBe(409);
+    expect((await res.json()).prs).toEqual(["https://github.com/o/r/pull/78"]);
+  });
+});

@@ -13,6 +13,9 @@
  *      an unconditional bypass would let a mistaken diagnosis (or prompt
  *      injection) mark unfinished work complete. Genuinely-finished-but-
  *      unrecorded work is resolved by closing the child ticket, not bypassing.
+ *   2b. Refuses (409 open_follow_up_pr) once the unified PR merged while a
+ *      follow-up PR this run opened into the default branch is still open — the
+ *      orchestrator's own followUpPrGate (TEAM-6032 DL-038, TEAM-6136).
  *   3. Transitions the epic ticket to Done (Jira) so the board rolls up.
  *   4. Conditional write: phase → "complete", completedAt, managerWatch=false,
  *      and compacts runaway escalation noise in the same write.
@@ -38,6 +41,7 @@ import { JiraClient } from "@/lib/workflow/jira-client";
 import { resolveWorkflowDef } from "@/lib/workflow/defs-loader";
 import { SHIP_BLOCKED_OUTCOMES } from "@/lib/workflow/types";
 import { resolveMissingEvidenceFromRecords } from "@/lib/workflow/completion-evidence";
+import { followUpPrGateConfigured, openFollowUpPrsAtCompletion } from "@/lib/workflow/follow-up-pr-gate";
 import agentsConfig from "@/config/agents.json";
 
 const REGION = process.env.AWS_REGION || "us-east-1";
@@ -111,6 +115,23 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: REGION }), 
 });
 const eventBridge = new EventBridgeClient({ region: REGION });
 const s3 = new S3Client({ region: REGION });
+
+/**
+ * TEAM-3976 — completions/{ticketId}.json, or null when absent (404 / NoSuchKey).
+ * Any other failure throws; each caller decides what that means (the evidence
+ * resolver keeps the offender, the follow-up PR gate falls back to prUrl).
+ * TEAM-6136: hoisted out of step 2b so the follow-up PR gate reads the same way.
+ */
+async function readCompletionRecordFromS3(ticketId: string): Promise<Record<string, unknown> | null> {
+  const obj = await s3.send(new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: `completions/${ticketId}.json` }));
+  const body = await obj.Body?.transformToString();
+  return body ? (JSON.parse(body) as Record<string, unknown>) : null;
+}
+
+function isMissingObject(err: unknown): boolean {
+  const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
+  return e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404;
+}
 
 export const dynamic = "force-dynamic";
 
@@ -241,6 +262,8 @@ interface ShipTaskLike extends AgentTaskLike {
 interface ShipVerdict {
   required: boolean;
   shipped: boolean;
+  /** TEAM-4768 pure handoff — read ONLY by the follow-up PR gate's guard (TEAM-6136). */
+  handoff: boolean;
   outcome: string | null;
   blockReason: string | null;
   offenders: Array<{ ticketId: string; phase: string; verdict: string }>;
@@ -287,16 +310,17 @@ const SHIP_SATISFIED_VERDICTS: readonly string[] = ["shipped", "handoff"];
  * the orchestrator twin — "cannot prove a phantom with nothing to inspect → stay
  * green"; human review-gate tickets owe no verdict; "deploy-blocked" outranks
  * "static-ci-only". Runs with no ship phase return required=false (untouched).
- * Keep this in agreement with completion.mjs. TEAM-4768's `handoff` key is the one
- * deliberate omission: it exists only to exempt a pure-handoff run from the
- * orchestrator's GitHub merge-verify probe, and this route has no such probe.
+ * Keep this in agreement with completion.mjs. TEAM-6136: TEAM-4768's `handoff`
+ * key (every inspected ship ticket handed off) is now carried too — it exempts a
+ * pure-handoff run from the follow-up PR gate, exactly as the orchestrator's
+ * `!verdict?.handoff`, and nothing else in this route reads it.
  */
 function evaluateShipVerdict(
   tickets: Ticket[],
   agentTasks: Record<string, ShipTaskLike>,
   requiredPhases: string[]
 ): ShipVerdict {
-  const inert: ShipVerdict = { required: false, shipped: true, outcome: null, blockReason: null, offenders: [] };
+  const inert: ShipVerdict = { required: false, shipped: true, handoff: false, outcome: null, blockReason: null, offenders: [] };
   const shipPhases = requiredPhases.filter((p) => SHIP_PHASES.has(p));
   if (!shipPhases.length) return inert;
   const phases = new Set(shipPhases);
@@ -323,13 +347,17 @@ function evaluateShipVerdict(
   if (shipTickets.length === 0) return { ...inert, required: true };
   let blocked: string | null = null;
   let blockReason: string | null = null;
+  let handoffs = 0;
   const offenders: ShipVerdict["offenders"] = [];
   for (const t of shipTickets) {
     const ticketId = String(t.ticketId || "");
     const entry = tasks[ticketId] || byTicketId.get(ticketId);
     const verdict = shipVerdictOf(entry);
     // TEAM-4763 P1-A: "handoff" satisfies the gate alongside "shipped".
-    if (verdict && SHIP_SATISFIED_VERDICTS.includes(verdict)) continue;
+    if (verdict && SHIP_SATISFIED_VERDICTS.includes(verdict)) {
+      if (verdict === "handoff") handoffs++;
+      continue;
+    }
     offenders.push({ ticketId, phase: phaseOfTicket(t) as string, verdict: verdict || "none" });
     if (verdict === "deploy-blocked") {
       blocked = "deploy-blocked";
@@ -338,8 +366,10 @@ function evaluateShipVerdict(
       blocked = "static-ci-only";
     }
   }
-  if (offenders.length === 0) return { required: true, shipped: true, outcome: null, blockReason: null, offenders: [] };
-  return { required: true, shipped: false, outcome: blocked || "static-ci-only", blockReason, offenders };
+  if (offenders.length === 0) {
+    return { required: true, shipped: true, handoff: handoffs === shipTickets.length, outcome: null, blockReason: null, offenders: [] };
+  }
+  return { required: true, shipped: false, handoff: false, outcome: blocked || "static-ci-only", blockReason, offenders };
 }
 
 /**
@@ -580,16 +610,9 @@ export async function POST(
         missing = await resolveMissingEvidenceFromRecords(missing, agentTasks, {
           readCompletionRecord: async (ticketId) => {
             try {
-              const obj = await s3.send(
-                new GetObjectCommand({ Bucket: ARTIFACT_BUCKET, Key: `completions/${ticketId}.json` })
-              );
-              const body = await obj.Body?.transformToString();
-              return body ? (JSON.parse(body) as Record<string, unknown>) : null;
+              return await readCompletionRecordFromS3(ticketId);
             } catch (err) {
-              const e = err as { name?: string; $metadata?: { httpStatusCode?: number } };
-              if (e?.name === "NoSuchKey" || e?.name === "NotFound" || e?.$metadata?.httpStatusCode === 404) {
-                return null;
-              }
+              if (isMissingObject(err)) return null;
               throw err; // logged by the resolver; offender stays
             }
           },
@@ -689,6 +712,42 @@ export async function POST(
         (workflow.agentTasks as Record<string, ShipTaskLike>) || {},
         requiredPhases
       );
+      // 2c-0. TEAM-6136 — the TEAM-6032 (DL-038) follow-up PR gate, BEFORE the
+      //       blocked close so both terminal writes are gated (the orchestrator's
+      //       order). Same function as the orchestrator, same guard: no
+      //       SHIP_MERGE_VERIFY opt-out, a ship phase, featureBranch, repoConfig,
+      //       GITHUB_PAT, not a pure handoff. Fail-open: never throws.
+      if (
+        followUpPrGateConfigured(workflow, requiredPhases.some((p: string) => SHIP_PHASES.has(p))) &&
+        !verdict.handoff
+      ) {
+        const prs = await openFollowUpPrsAtCompletion({
+          workflow,
+          tickets,
+          readCompletionRecord: async (ticketId) => {
+            if (!ARTIFACT_BUCKET) return null;
+            try {
+              return await readCompletionRecordFromS3(ticketId);
+            } catch (err) {
+              if (isMissingObject(err)) return null;
+              throw err; // the gate falls back to the cached prUrl
+            }
+          },
+          getAgentPhase: (agentId) => AGENT_PHASE_BY_ID[agentId],
+          token: process.env.GITHUB_PAT,
+        });
+        if (prs.length > 0) {
+          console.error(`[complete] CompletionRejectedOpenFollowUpPr ${workflowId}: ${prs.join(", ")} still open`);
+          return NextResponse.json(
+            {
+              error: "open_follow_up_pr",
+              prs,
+              hint: "Merge or close these follow-up PRs first — completion has no bypass.",
+            },
+            { status: 409 }
+          );
+        }
+      }
       if (verdict.required && !verdict.shipped) {
         const offenders = verdict.offenders.map((o) => `${o.ticketId}@${o.phase}:${o.verdict}`).join(", ");
         if (COMPLETION_EVIDENCE_REQUIRED) {
