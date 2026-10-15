@@ -20,12 +20,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-if [[ -f .env.local ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env.local
-  set +a
-fi
+# Shared loader (TEAM-6202) so a .env.local line referencing an unset
+# variable doesn't abort this set -euo pipefail script with "unbound
+# variable" (same fix as TEAM-6200 F4, generalized).
+# shellcheck disable=SC1091
+source "$REPO_ROOT/deploy/lib/load-env-local.sh"
+load_env_local .env.local
 
 : "${JIRA_SITE_URL:?JIRA_SITE_URL must be set}"
 : "${JIRA_EMAIL:?JIRA_EMAIL must be set}"

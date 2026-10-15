@@ -20,13 +20,13 @@ cd "$REPO_ROOT"
 export AWS_PROFILE AWS_REGION
 
 # Source .env.local so verify can read values persisted by run-module.sh
-# (e.g., BUILDER_AGENT_ID written after a successful builder deploy).
-if [[ -f .env.local ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source .env.local
-  set +a
-fi
+# (e.g., BUILDER_AGENT_ID written after a successful builder deploy). Shared
+# loader (TEAM-6202) so a .env.local line referencing an unset variable
+# doesn't abort this set -euo pipefail script with "unbound variable" (same
+# fix as TEAM-6200 F4, generalized).
+# shellcheck disable=SC1091
+source "$REPO_ROOT/deploy/lib/load-env-local.sh"
+load_env_local .env.local
 
 fail() { echo "✗ $MODULE verification failed: $1" >&2; exit 1; }
 pass() { echo "✓ $MODULE verified: $1"; }

@@ -38,12 +38,12 @@ set -euo pipefail
 
 SCRIPT_DIR_BOOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT_BOOT="$(cd "${SCRIPT_DIR_BOOT}/../.." && pwd)"
-if [[ -f "${REPO_ROOT_BOOT}/.env.local" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "${REPO_ROOT_BOOT}/.env.local"
-  set +a
-fi
+# Shared loader (TEAM-6202) so a .env.local line referencing an unset
+# variable doesn't abort this set -euo pipefail script with "unbound
+# variable" (same fix as TEAM-6200 F4, generalized).
+# shellcheck disable=SC1091
+source "${REPO_ROOT_BOOT}/deploy/lib/load-env-local.sh"
+load_env_local "${REPO_ROOT_BOOT}/.env.local"
 
 REGION="${AWS_REGION:-us-east-1}"
 

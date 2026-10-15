@@ -11,12 +11,9 @@ set -e
 # so every deploy script that sources config.sh gets the same env + account
 # guard. Never commit .env.local — it holds account-specific values.
 _CONFIG_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
-if [ -f "$_CONFIG_DIR/.env.local" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  . "$_CONFIG_DIR/.env.local"
-  set +a
-fi
+# shellcheck disable=SC1091
+. "$_CONFIG_DIR/deploy/lib/load-env-local.sh"
+load_env_local "$_CONFIG_DIR/.env.local"
 
 # AWS account (derived from current credentials)
 export AWS_REGION="${AWS_REGION:-us-east-1}"
