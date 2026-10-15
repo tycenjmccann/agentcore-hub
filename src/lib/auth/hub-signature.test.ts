@@ -72,4 +72,19 @@ describe("verifyHubSignature", () => {
   it("tolerates surrounding whitespace in the header", () => {
     expect(verifyHubSignature(PAYLOAD, `  ${VALID_HEADER}  `, SECRET)).toBe(true);
   });
+
+  // TEAM-6344: the body may now be the raw bytes a caller read off the
+  // request (Buffer/Uint8Array), not a decoded string.
+  it("accepts the Atlassian known-answer vector as a Buffer", () => {
+    expect(verifyHubSignature(Buffer.from(PAYLOAD, "utf8"), VALID_HEADER, SECRET)).toBe(true);
+  });
+
+  it("accepts the Atlassian known-answer vector as a Uint8Array", () => {
+    expect(verifyHubSignature(new Uint8Array(Buffer.from(PAYLOAD, "utf8")), VALID_HEADER, SECRET)).toBe(true);
+  });
+
+  it("rejects a BOM-prefixed byte body signed only over the un-prefixed payload", () => {
+    const withBom = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(PAYLOAD, "utf8")]);
+    expect(verifyHubSignature(withBom, VALID_HEADER, SECRET)).toBe(false);
+  });
 });
