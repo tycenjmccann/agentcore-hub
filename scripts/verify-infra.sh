@@ -127,8 +127,8 @@ check_schema() {
   PASS=$((PASS + 1))
 }
 
-# Shared fetch + IAM-glob matcher behind role_policy_grants and
-# role_policy_grants_prefix below. Reads EVERY inline policy (list-role-policies
+# Shared fetch + IAM-glob matcher behind role_policy_grants,
+# role_policy_grants_prefix, role_policy_grants_under and role_policy_list_covers below. Reads EVERY inline policy (list-role-policies
 # + get-role-policy) AND every attached managed policy (list-attached-role-
 # policies + get-policy for DefaultVersionId + get-policy-version) for <role>,
 # so a grant hiding in a managed policy is seen too — not just the inline set.
@@ -139,7 +139,7 @@ check_schema() {
 # Condition, a NotAction/NotResource Deny failing closed (TEAM-5933, the same rule as
 # policyDenies / policyMayDenyUnder in deploy/lib/twin-preflight.mjs). In
 # mode=any/covers an Allow carrying ANY Condition does not count either (TEAM-5883): the
-# checks below ask for an UNCONDITIONED grant, and a conditioned one is exactly
+# checks that use them ask for an UNCONDITIONED grant, and a conditioned one is exactly
 # the hand-narrowed policy they exist to catch. Any
 # failed IAM read fails the WHOLE check closed (does not silently judge a partial
 # document set). Reads IAM documents only — no secret, env var value or approval
@@ -147,15 +147,21 @@ check_schema() {
 #
 # mode=any:    exits 0 iff some Allow statement grants <action> on <target-arn>.
 # mode=prefix: exits 0 iff some Allow statement grants it ONLY under
-#              Condition.StringLike."s3:prefix" == [<prefix>] exactly, in the
-#              SAME statement, and no Allow statement grants it unconditioned or
-#              differently-scoped (an unconditioned grant must fail this mode).
+#              Condition.StringLike."s3:prefix" == exactly the space-separated
+#              <prefix> set (order-insensitive; TEAM-5881), in the SAME statement,
+#              and no Allow statement grants it unconditioned or differently-scoped
+#              (an unconditioned grant must fail this mode).
 # mode=covers: <target-arn> is a literal ARN PREFIX; exits 0 iff some unconditioned
 #              Allow grants <action> with a Resource matching EVERY key under it
 #              (TEAM-5924: a literal prefix of it followed only by `*`), so a grant
 #              on one probe key or a narrower glob (completions/twin-*) does not count.
+# mode=listcovers: <prefix> is a literal KEY prefix (e.g. completions/); exits 0 iff
+#              some Allow grants <action> on <target-arn> either unconditioned, or
+#              under a Condition that is exactly StringLike."s3:prefix" with an entry
+#              matching EVERY key under <prefix> (TEAM-5881). Any other operator or
+#              condition key does not count.
 #
-# Usage: role_policy_match <any|prefix|covers> <role> <action> <target-arn> [<prefix>]
+# Usage: role_policy_match <any|prefix|covers|listcovers> <role> <action> <target-arn> [<prefix>]
 role_policy_match() {
   local mode=$1
   local role=$2
@@ -247,19 +253,24 @@ while True:
         elif not any(glob_re(r).fullmatch(target) for r in resources):
             continue
         cond = st.get("Condition") or {}
+        only_prefix = set(cond) == {"StringLike"} and set(cond["StringLike"]) == {"s3:prefix"}
         if mode in ("any", "covers"):
-            # TEAM-5883: a conditioned Allow is not the grant the caller asks about
-            # (e.g. ListBucket under s3:prefix never binds to the implicit list check
-            # behind GetObject, so S3 still answers 403 for a missing key).
+            # TEAM-5883: a conditioned Allow is not the grant the caller asks about.
             if not cond:
                 granted = True
             continue
-        if set(cond) == {"StringLike"} and set(cond["StringLike"]) == {"s3:prefix"} \
-                and lst(cond["StringLike"]["s3:prefix"]) == [prefix]:
+        if mode == "listcovers":
+            # TEAM-5881: S3 evaluates the implicit ListBucket behind a GetObject /
+            # HeadObject of a missing key with s3:prefix = that key, so a prefix
+            # covering the namespace is as good as no condition for a 404.
+            if not cond or (only_prefix and any(covers_prefix(p, prefix) for p in lst(cond["StringLike"]["s3:prefix"]))):
+                granted = True
+            continue
+        if only_prefix and sorted(lst(cond["StringLike"]["s3:prefix"])) == sorted(prefix.split()):
             scoped = True
         else:
             unscoped = True
-sys.exit(0 if not denied and (granted if mode in ("any", "covers") else (scoped and not unscoped)) else 1)
+sys.exit(0 if not denied and (granted if mode in ("any", "covers", "listcovers") else (scoped and not unscoped)) else 1)
 '
 }
 
@@ -274,14 +285,15 @@ role_policy_grants() {
 
 # role_policy_grants plus the statement's s3:prefix condition (TEAM-5600). Passes
 # only when some statement grants <action> on <target-arn> under
-# Condition.StringLike."s3:prefix" == [<prefix>] exactly, AND no statement grants
+# Condition.StringLike."s3:prefix" == exactly the <prefixes> set (space-separated,
+# TEAM-5881), AND no statement grants
 # it on that target without that condition: an unconditioned ListBucket on the
 # bucket (inline OR via a managed policy, and however the Action/Resource are
 # spelled — including a wildcard) would let the role enumerate every approval
 # record, so it must fail this check rather than satisfy it. See
 # role_policy_match above.
 #
-# Usage: role_policy_grants_prefix <role> <action> <target-arn> <prefix>
+# Usage: role_policy_grants_prefix <role> <action> <target-arn> '<prefix> [<prefix>...]'
 role_policy_grants_prefix() {
   role_policy_match prefix "$@"
 }
@@ -295,6 +307,18 @@ role_policy_grants_prefix() {
 # Usage: role_policy_grants_under <role> <action> <arn-prefix>
 role_policy_grants_under() {
   role_policy_match covers "$@"
+}
+
+# Assert s3:ListBucket on <bucket-arn> covers every key under <key-prefix>, so S3
+# answers a GetObject/HeadObject of a MISSING key there with 404, not 403
+# (TEAM-5867, TEAM-5881). Passes on an unconditioned grant, or on one scoped only
+# by StringLike s3:prefix with an entry covering <key-prefix>: the implicit list
+# check carries s3:prefix = the requested key (live proof CodeBuild
+# agentcore-hub-runtime-image-deploy:3c398e4f). See role_policy_match above.
+#
+# Usage: role_policy_list_covers <role> <bucket-arn> <key-prefix>
+role_policy_list_covers() {
+  role_policy_match listcovers "$1" s3:ListBucket "$2" "$3"
 }
 
 # Assert that IAM's own evaluator ALLOWS <action> on <resource> for a role. This
@@ -377,14 +401,15 @@ check "Lambda: $TICKET_TOOLS_LAMBDA" \
 # the answer is 403, and since TEAM-5832 both ticket twins' Done guard admits a
 # recordless ticket (a human gate, Merge Approval) ONLY on 404 and refuses on
 # anything else — so a role with the read but not the list can never close a human
-# gate. The grant is deliberately UNCONDITIONED (a s3:prefix condition cannot bind
-# to GetObject's implicit list check), unlike the pipeline-tools role's below, and
-# the matcher refuses a conditioned one (TEAM-5883).
+# gate. TEAM-5881: the grant is scoped by s3:prefix to completions/* and config/*; a
+# prefix-scoped ListBucket DOES bind to GetObject's implicit list check (s3:prefix =
+# the requested key; live proof CodeBuild agentcore-hub-runtime-image-deploy:3c398e4f),
+# so the check accepts it, or a still-unconditioned grant on a role not yet re-set-up.
 if [ -n "$ARTIFACT_BUCKET" ]; then
   check "IAM: $TICKETS_ROLE grants s3:GetObject covering completions/*" \
     "role_policy_grants_under $TICKETS_ROLE s3:GetObject arn:aws:s3:::$ARTIFACT_BUCKET/completions/"
   check "IAM: $TICKETS_ROLE grants s3:ListBucket on $ARTIFACT_BUCKET (a missing completions/* record must read as 404, not 403 - TEAM-5867)" \
-    "role_policy_grants $TICKETS_ROLE s3:ListBucket arn:aws:s3:::$ARTIFACT_BUCKET"
+    "role_policy_list_covers $TICKETS_ROLE arn:aws:s3:::$ARTIFACT_BUCKET completions/"
   # TEAM-5941: the Done-intent fence - a conditional PutObject of the record right before
   # the provider commit. A denied write REFUSES the Done (fail closed), so a role without
   # this grant refuses every Done on a ticket that has a completion record.
@@ -419,9 +444,11 @@ if aws lambda get-function-configuration --function-name "$PIPELINE_TOOLS_FUNCTI
     # and every clean deploy reports preapproval reason "rejection_unverified".
     # The grant must also be prefix-scoped: an unconditioned ListBucket fails here
     # (TEAM-5821: including one granted by a wildcard Action/Resource, or by an
-    # attached managed policy).
-    check "IAM: $PIPELINE_TOOLS_ROLE grants s3:ListBucket on $ARTIFACT_BUCKET only under s3:prefix ship-approvals/*.rejected.json" \
-      "role_policy_grants_prefix $PIPELINE_TOOLS_ROLE s3:ListBucket arn:aws:s3:::$ARTIFACT_BUCKET 'pipeline-artifacts/ship-approvals/*.rejected.json'"
+    # attached managed policy). TEAM-5881: the same statement also lists
+    # pipeline-artifacts/handoff/*, so get_state's read of a missing handoff marker
+    # is a NoSuchKey, not a 403 warn; the check wants exactly those two prefixes.
+    check "IAM: $PIPELINE_TOOLS_ROLE grants s3:ListBucket on $ARTIFACT_BUCKET only under s3:prefix ship-approvals/*.rejected.json + handoff/*" \
+      "role_policy_grants_prefix $PIPELINE_TOOLS_ROLE s3:ListBucket arn:aws:s3:::$ARTIFACT_BUCKET 'pipeline-artifacts/ship-approvals/*.rejected.json pipeline-artifacts/handoff/*'"
   else
     echo "  - IAM: ship-approval record write (ARTIFACT_BUCKET not set, skipped)"
   fi

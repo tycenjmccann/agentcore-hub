@@ -122,14 +122,14 @@ describe("parsePlanTwins", () => {
 describe("policyGrants / policyDenies", () => {
   it("sees the grant tickets-lambda-config.mjs writes, for both providers", () => {
     for (const p of ["jira", "dynamodb"] as const) {
-      expect(policyGrants(docs(policyFor(p)), "s3:ListBucket", BUCKET_ARN)).toBe(true);
+      expect(twinPreflight.policyGrantsListUnder(docs(policyFor(p)), BUCKET_ARN, "completions/")).toBe(true);
       expect(policyGrants(docs(policyFor(p)), "s3:GetObject", `${BUCKET_ARN}/completions/x.json`)).toBe(true);
     }
   });
   it("does not count a grant without ArtifactBucketList", () => {
-    expect(policyGrants(docs(withoutList(policyFor("jira"))), "s3:ListBucket", BUCKET_ARN)).toBe(false);
+    expect(twinPreflight.policyGrantsListUnder(docs(withoutList(policyFor("jira"))), BUCKET_ARN, "completions/")).toBe(false);
   });
-  it("does not count a conditioned Allow (TEAM-5883: s3:prefix never binds to GetObject's implicit list)", () => {
+  it("policyGrants still refuses a conditioned Allow (generic rule, unchanged)", () => {
     const doc = { Statement: [{ Effect: "Allow", Action: "s3:ListBucket", Resource: BUCKET_ARN, Condition: { StringLike: { "s3:prefix": ["completions/*"] } } }] };
     expect(policyGrants(docs(doc), "s3:ListBucket", BUCKET_ARN)).toBe(false);
   });
@@ -150,6 +150,45 @@ describe("policyGrants / policyDenies", () => {
   });
 });
 
+// ── TEAM-5881: a ListBucket scoped by s3:prefix covers the implicit list check ─────
+// S3 evaluates the implicit ListBucket behind a GetObject/HeadObject of a missing key
+// with s3:prefix = that key, so a prefix-scoped grant covering completions/* turns the
+// twins' missing record into 404 exactly as an unconditioned one does. Live proof:
+// CodeBuild agentcore-hub-runtime-image-deploy:3c398e4f logged a definite not-found under
+// a role whose only hub-bucket ListBucket is the prefix-scoped ListShipApprovalPrefix.
+describe("TEAM-5881: policyGrantsListUnder", () => {
+  const list = (Condition?: Record<string, unknown>) => ({
+    Statement: [{ Effect: "Allow", Action: "s3:ListBucket", Resource: BUCKET_ARN, ...(Condition ? { Condition } : {}) }],
+  });
+  const grantsList = (doc: unknown) => twinPreflight.policyGrantsListUnder(docs(doc), BUCKET_ARN, "completions/");
+  it("counts an unconditioned grant, and an empty Condition", () => {
+    expect(grantsList(list())).toBe(true);
+    expect(grantsList(list({}))).toBe(true);
+  });
+  it.each([
+    ["completions/*", ["completions/*"]],
+    ["completions/* + config/*", ["completions/*", "config/*"]],
+    ["a single string", "completions/*"],
+  ])("counts a StringLike s3:prefix grant covering %s", (_label, prefixes) => {
+    expect(grantsList(list({ StringLike: { "s3:prefix": prefixes } }))).toBe(true);
+  });
+  it.each([
+    ["an unrelated prefix (workflows/*)", { StringLike: { "s3:prefix": ["workflows/*"] } }],
+    ["a narrower glob (completions/TEAM-*)", { StringLike: { "s3:prefix": ["completions/TEAM-*"] } }],
+    ["an extra s3:delimiter key", { StringLike: { "s3:prefix": ["completions/*"], "s3:delimiter": ["/"] } }],
+    ["StringEquals instead of StringLike", { StringEquals: { "s3:prefix": ["completions/*"] } }],
+    ["a second operator beside it", { StringLike: { "s3:prefix": ["completions/*"] }, Bool: { "aws:SecureTransport": "true" } }],
+    ["a non-S3 condition key", { StringEquals: { "aws:SourceVpce": "vpce-0123" } }],
+  ])("does not count %s", (_label, Condition) => {
+    expect(grantsList(list(Condition))).toBe(false);
+  });
+  it("NotAction / NotResource / object-ARN grants never count", () => {
+    expect(grantsList({ Statement: [{ Effect: "Allow", NotAction: "iam:*", Resource: "*" }] })).toBe(false);
+    expect(grantsList({ Statement: [{ Effect: "Allow", Action: "s3:ListBucket", NotResource: "arn:aws:s3:::other" }] })).toBe(false);
+    expect(grantsList({ Statement: [{ Effect: "Allow", Action: "s3:ListBucket", Resource: `${BUCKET_ARN}/*`, Condition: { StringLike: { "s3:prefix": ["completions/*"] } } }] })).toBe(false);
+  });
+});
+
 // ── the pure decision ───────────────────────────────────────────────────────────
 describe("decideTwin", () => {
   const good = {
@@ -161,6 +200,27 @@ describe("decideTwin", () => {
   };
   it("grant present → proceed", () => {
     expect(decideTwin(good).action).toBe("proceed");
+  });
+  // TEAM-5881: the scoped ArtifactBucketList setup-tickets-lambda.mjs now writes, spelled
+  // out here so this case does not depend on the builder under test.
+  const scopedList = (prefixes: string[]) => ({
+    ...policyFor("jira"),
+    Statement: policyFor("jira").Statement.map((s) =>
+      s.Sid === "ArtifactBucketList" ? { Sid: "ArtifactBucketList", Effect: "Allow", Action: ["s3:ListBucket"], Resource: BUCKET_ARN, Condition: { StringLike: { "s3:prefix": prefixes } } } : s
+    ),
+  });
+  it("a ListBucket scoped to completions/* + config/* → proceed (TEAM-5881)", () => {
+    expect(decideTwin({ ...good, policies: { state: "ok", docs: docs(scopedList(["completions/*", "config/*"])) } }).action).toBe("proceed");
+  });
+  it("a ListBucket scoped only to workflows/* → block, naming s3:ListBucket (TEAM-5881)", () => {
+    const v = decideTwin({ ...good, policies: { state: "ok", docs: docs(scopedList(["workflows/*"])) } });
+    expect(v.action).toBe("block");
+    expect(v.reasons.join(" ")).toMatch(/s3:ListBucket/);
+  });
+  it("a scoped ListBucket beside a ListBucket Deny → block (TEAM-5881)", () => {
+    const doc = scopedList(["completions/*"]);
+    doc.Statement = [...doc.Statement, { Effect: "Deny", Action: "s3:ListBucket", Resource: BUCKET_ARN }];
+    expect(decideTwin({ ...good, policies: { state: "ok", docs: docs(doc) } }).action).toBe("block");
   });
   it("missing grant → block, naming setup-tickets-lambda.mjs", () => {
     const v = decideTwin({ ...good, policies: { state: "ok", docs: docs(withoutList(policyFor("jira"))) } });
@@ -379,7 +439,7 @@ describe("inspectTwin", () => {
     const aws = fakeAws({ get: { "agentcore-hub-jira": ok(encoded) } });
     const r = await inspectTwin("agentcore-hub-jira", { run: aws.run, region: REGION });
     expect(r.policies!.state).toBe("ok");
-    expect(policyGrants(r.policies!.docs, "s3:ListBucket", BUCKET_ARN)).toBe(true);
+    expect(twinPreflight.policyGrantsListUnder(r.policies!.docs, BUCKET_ARN, "completions/")).toBe(true);
   });
 });
 
@@ -395,9 +455,14 @@ describe("runPreflight", () => {
     expect(r.out).toMatch(/agentcore-hub-jira/);
     expect(r.out).toMatch(/node deploy\/setup-tickets-lambda\.mjs/);
   });
-  it("conditioned grant → exit 1", async () => {
+  it("completions/*-scoped grant → exit 0 (TEAM-5881)", async () => {
     const doc = policyFor("jira");
     doc.Statement = doc.Statement.map((s) => (s.Sid === "ArtifactBucketList" ? { ...s, Condition: { StringLike: { "s3:prefix": ["completions/*"] } } } : s));
+    expect((await preflight(plan(JIRA_ROW), fakeAws({ get: { "agentcore-hub-jira": ok(doc) } }))).exitCode).toBe(0);
+  });
+  it("grant scoped to an unrelated prefix → exit 1", async () => {
+    const doc = policyFor("jira");
+    doc.Statement = doc.Statement.map((s) => (s.Sid === "ArtifactBucketList" ? { ...s, Condition: { StringLike: { "s3:prefix": ["workflows/*"] } } } : s));
     expect((await preflight(plan(JIRA_ROW), fakeAws({ get: { "agentcore-hub-jira": ok(doc) } }))).exitCode).toBe(1);
   });
   it("AccessDenied on the IAM read → exit 1, pointing at the deploy role", async () => {
