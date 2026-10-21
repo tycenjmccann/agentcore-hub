@@ -40,7 +40,6 @@ const QUALIFIED_PATTERNS = [
   /\bmust be run by\b/gi,
   /(?<!\b(?:no|without|zero|any|not a)\s+)\bmanual steps?\b/gi,
 ];
-export const MANUAL_STEP_PATTERNS = [...INHERENT_PATTERNS, ...QUALIFIED_PATTERNS];
 
 // A clause reporting its step finished, and what turns it back into an
 // admission: a negation ("was NOT completed") or a future/need marker ("will be
