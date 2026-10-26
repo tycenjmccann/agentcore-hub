@@ -16,7 +16,7 @@
  */
 
 /** Repo config carried through to /api/workflow/start (matches WorkflowInput). */
-export interface RoutineRepoConfig {
+interface RoutineRepoConfig {
   layout?: "monorepo" | "multi-repo";
   repos: Array<{ url: string; defaultBranch?: string; platform?: string }>;
 }
@@ -45,7 +45,7 @@ export interface RoutineSchedule {
   timezone?: string;
 }
 
-export interface RoutineLastRun {
+interface RoutineLastRun {
   at: string;
   workflowId?: string;
   status: "started" | "failed";

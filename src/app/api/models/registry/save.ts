@@ -76,7 +76,7 @@ const SEED_ROWS = new Map<string, CatalogRow>(BUNDLED_REGISTRY.catalog.map((r) =
  * lanes the operator cannot edit would 422 a save on a field the UI does not
  * even render.
  */
-export function applySeedOwnedFields(reg: ModelsRegistry): ModelsRegistry {
+function applySeedOwnedFields(reg: ModelsRegistry): ModelsRegistry {
   const next = clone(reg);
   for (const row of next.catalog) {
     delete row.harnessLanes;
@@ -107,7 +107,7 @@ function flatten(reg: ModelsRegistry): Map<string, string> {
 }
 
 /** Field paths that differ between two documents, for the audit line. */
-export function changedFields(live: ModelsRegistry, next: ModelsRegistry): string[] {
+function changedFields(live: ModelsRegistry, next: ModelsRegistry): string[] {
   const a = flatten(live);
   const b = flatten(next);
   const changed: string[] = [];
@@ -122,7 +122,7 @@ export function changedFields(live: ModelsRegistry, next: ModelsRegistry): strin
  * rollback exists to undo "the wrong model is live", and a prev document written
  * for a relabelled catalog row would make the one-step history useless.
  */
-export function routingChanged(changed: readonly string[]): boolean {
+function routingChanged(changed: readonly string[]): boolean {
   return changed.some((f) => f.startsWith("defaults.") || f.startsWith("tiers.") || f.startsWith("agents."));
 }
 

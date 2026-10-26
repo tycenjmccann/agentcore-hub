@@ -84,15 +84,15 @@ export interface SkippedPrRef {
   mergeable: boolean | null;
 }
 
-export type SweepSkipReason = "open_sweep_pr" | "unchanged_main";
+type SweepSkipReason = "open_sweep_pr" | "unchanged_main";
 
-export interface SweepPreflightSkip {
+interface SweepPreflightSkip {
   decision: "skip";
   reason: SweepSkipReason;
   prs: SkippedPrRef[];
 }
 
-export interface SweepPreflightProceed {
+interface SweepPreflightProceed {
   decision: "proceed";
   /** Paths/symbols an open PR already deletes — do NOT re-report these. */
   alreadyRemoved: string[];

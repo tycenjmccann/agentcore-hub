@@ -20,7 +20,7 @@ async function s3() {
   return new S3Client({ region: REGION });
 }
 
-export async function readRegistry(): Promise<ConnectorRegistry> {
+async function readRegistry(): Promise<ConnectorRegistry> {
   if (!ARTIFACT_BUCKET) return { connectors: [] };
   const { GetObjectCommand } = await import("@aws-sdk/client-s3");
   try {

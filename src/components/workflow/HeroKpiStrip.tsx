@@ -117,7 +117,7 @@ function plural(n: number, word: string): string {
  * Every rendering decision for the three tiles, in one pure function so the
  * state table is readable end to end (and unit-testable without a DOM).
  */
-export function deriveTiles(state: CardState, card: RunCard | null): TileModel[] {
+function deriveTiles(state: CardState, card: RunCard | null): TileModel[] {
   // 1-3: nothing to show — loading, never computed, or the read failed.
   if (state !== "ready" || !card) {
     const skeleton = state === "loading";

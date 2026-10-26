@@ -11,7 +11,7 @@
 import type { IdentityResolver } from "./identity";
 import { cloudflareAccessResolver } from "./adapters/cloudflare-access";
 
-export function authMode(): string {
+function authMode(): string {
   return process.env.AUTH_MODE || "none";
 }
 

@@ -59,7 +59,7 @@ export interface DailyBucket {
  * request's prompt crosses the threshold. Projected per model from the registry
  * catalog by `pricingProjection` (src/lib/models-registry.ts).
  */
-export interface LongContextRates {
+interface LongContextRates {
   thresholdInputTokens: number;
   input: number;
   output: number;
@@ -83,7 +83,7 @@ export interface Pricing {
   cacheWriteMultiplier?: Record<string, number | string>;
 }
 
-export interface ModelWindowUsage {
+interface ModelWindowUsage {
   model: string;
   input: number;
   output: number;
@@ -114,9 +114,9 @@ export interface AgentWindowSummary {
   unpricedModels: string[];
 }
 
-export const DEFAULT_WINDOW_DAYS = 7;
+const DEFAULT_WINDOW_DAYS = 7;
 export const MODEL_ATTR_PREFIX = "m|";
-export const EVALUATOR_ATTR_PREFIX = "e|";
+const EVALUATOR_ATTR_PREFIX = "e|";
 
 const MODEL_FIELDS = new Set<keyof DailyModelUsage>(["input", "output", "cacheRead", "cacheWrite", "cacheWrite1h", "costUsd", "calls"]);
 

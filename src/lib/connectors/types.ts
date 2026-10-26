@@ -30,7 +30,7 @@ export type ConnectorKind =
    *  runtime role's IAM identity is the credential. */
   | "gateway";
 
-export type ConnectorStatus = "active" | "needs_credentials";
+type ConnectorStatus = "active" | "needs_credentials";
 
 export interface Connector {
   id: string;
