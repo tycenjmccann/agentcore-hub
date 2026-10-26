@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { WorkflowEvent, WorkflowState } from "@/lib/workflow/types";
 
-export type StreamStatus = "connecting" | "live" | "reconnecting" | "idle";
+type StreamStatus = "connecting" | "live" | "reconnecting" | "idle";
 
 export interface UseWorkflowStreamOptions {
   workflowId: string;

@@ -23,7 +23,7 @@ export type ModelProvider = "bedrock" | "openai";
  * Base interface for all model options.
  * Contains common fields for UI display and model identification.
  */
-export interface ModelOptionBase {
+interface ModelOptionBase {
   /** Unique identifier for UI selection (e.g., "claude-sonnet-45") */
   id: string;
   /** Human-readable display name (e.g., "Claude Sonnet 4.5 (Recommended)") */
@@ -41,7 +41,7 @@ export interface ModelOptionBase {
 /**
  * Bedrock-specific model option (Claude models via AWS Bedrock).
  */
-export interface BedrockModelOption extends ModelOptionBase {
+interface BedrockModelOption extends ModelOptionBase {
   provider: "bedrock";
 }
 
@@ -49,7 +49,7 @@ export interface BedrockModelOption extends ModelOptionBase {
  * OpenAI-specific model option.
  * Note: apiKeyArn is set server-side from environment variables.
  */
-export interface OpenAIModelOption extends ModelOptionBase {
+interface OpenAIModelOption extends ModelOptionBase {
   provider: "openai";
 }
 

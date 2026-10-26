@@ -6,7 +6,7 @@ import type { CloudCodeCli } from "@/lib/cloud-code/types";
 //   Codex   → OpenAI monochrome; on a dark theme that reads as near-white/neutral
 //   Kiro    → AWS Kiro purple (#8B5CF6)
 // Marks below are the official Simple Icons (MIT) brand paths, fill=currentColor.
-export const CLI_BRAND: Record<
+const CLI_BRAND: Record<
   CloudCodeCli,
   { label: string; chip: string; dot: string }
 > = {

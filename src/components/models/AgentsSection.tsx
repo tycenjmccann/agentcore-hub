@@ -22,7 +22,7 @@ import { DEPLOYABLES, GROUP_ORDER, groupFor } from "./types";
 /** Which registry field a row falls back to when it has no override. */
 const INHERIT_PATH = "defaults.persona";
 
-export function groupSlug(group: string): string {
+function groupSlug(group: string): string {
   return group.toLowerCase().replace(/[^a-z0-9]+/g, "-");
 }
 

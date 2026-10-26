@@ -6,7 +6,7 @@
 import type { EvalWindow } from "./types";
 
 export const EVAL_WINDOWS: EvalWindow[] = ["7", "30", "90", "all"];
-export const DEFAULT_EVAL_WINDOW: EvalWindow = "7";
+const DEFAULT_EVAL_WINDOW: EvalWindow = "7";
 
 /** Anything unrecognised (or absent) falls back to the default window. */
 export function parseWindow(raw: string | null | undefined): EvalWindow {

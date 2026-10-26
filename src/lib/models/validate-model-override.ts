@@ -36,10 +36,10 @@ import { resolveModel } from "@/lib/models-registry";
  * structural subset of that module's `ModelOverride`, so the route assigns it
  * back into the body without a cast.
  */
-export type NormalizedOverride = string | { bedrockModelConfig: { modelId: string } };
+type NormalizedOverride = string | { bedrockModelConfig: { modelId: string } };
 
 /** Reason codes, most specific first — the 400 body quotes one verbatim. */
-export type OverrideRejection =
+type OverrideRejection =
   | "unsupported_shape"
   | "unknown_model"
   | "not_in_catalog"

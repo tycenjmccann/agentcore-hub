@@ -22,7 +22,7 @@
 
 /** Mirrors IntakeSourceSchema's `type` enum in mcp/hub/src/workflow/schemas.ts.
  *  Kept an enum, not a free string, so the two front doors agree. */
-export const INTAKE_SOURCE_TYPES = ["url", "upload", "s3"] as const;
+const INTAKE_SOURCE_TYPES = ["url", "upload", "s3"] as const;
 
 /**
  * Ceiling on how many sources one submission may carry (TEAM-4091 F3).

@@ -14,7 +14,7 @@
 const REGION = process.env.AWS_REGION || "us-east-1";
 
 /** Secrets Manager id for a connector's credential bundle. */
-export function secretIdFor(connectorId: string): string {
+function secretIdFor(connectorId: string): string {
   return `connectors/${connectorId}`;
 }
 

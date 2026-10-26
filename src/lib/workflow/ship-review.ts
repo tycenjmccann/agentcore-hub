@@ -15,7 +15,7 @@
 // ./workflow-defs.ts. Callers pass the resolved value in via `opts`; this
 // module only does the arithmetic, it never decides policy.
 
-export interface ShipFindingLike {
+interface ShipFindingLike {
   // The ledger-authoring prose only instructs setting `regressionOf` on
   // regression findings — ordinary findings omit the key entirely, they
   // don't carry `regressionOf: null`. Treat both as "not a regression."

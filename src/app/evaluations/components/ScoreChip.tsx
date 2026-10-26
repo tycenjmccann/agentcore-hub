@@ -12,7 +12,7 @@ export function scoreColor(score: number): string {
   return "#ef4444";
 }
 
-export function scoreBg(score: number): string {
+function scoreBg(score: number): string {
   if (score >= 0.9) return "rgba(34,197,94,0.12)";
   if (score >= 0.75) return "rgba(245,158,11,0.12)";
   return "rgba(239,68,68,0.12)";

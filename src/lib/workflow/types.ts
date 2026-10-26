@@ -103,7 +103,7 @@ export interface JiraTicket {
  * for unit|live) and no warnings. Shape mirrors validateFixContract's return in
  * lambda/orchestrator/fix-contract.mjs.
  */
-export interface FixContract {
+interface FixContract {
   version: number;
   invariant?: string;
   evidenceSource?: "static" | "unit" | "live";
@@ -224,12 +224,12 @@ export interface AgentTask {
   error?: string;
 }
 
-export interface StoredEvent {
+interface StoredEvent {
   timestamp: string;
   event: WorkflowEvent;
 }
 
-export type WorkflowType = "feature" | "bug";
+type WorkflowType = "feature" | "bug";
 
 export interface WorkflowState {
   id: string;                    // workflow run ID
@@ -312,7 +312,7 @@ export interface RepoConfig {
   repos: RepoTarget[];
 }
 
-export interface RepoTarget {
+interface RepoTarget {
   url: string;                   // git remote URL
   defaultBranch: string;         // "main"
   pathPrefix?: string;           // for monorepo: "ios/", "backend/", etc.
@@ -321,9 +321,9 @@ export interface RepoTarget {
 
 // ─── Agent-to-Agent Messages ─────────────────────────────────────────────────
 
-export type MessageType = "question" | "answer" | "notification";
+type MessageType = "question" | "answer" | "notification";
 
-export interface AgentMessage {
+interface AgentMessage {
   id: string;
   from: string;                  // agent ID
   to: string;                    // agent ID
@@ -335,7 +335,7 @@ export interface AgentMessage {
 
 // ─── Intake ──────────────────────────────────────────────────────────────────
 
-export type IntakeSourceType = "url" | "upload" | "s3";
+type IntakeSourceType = "url" | "upload" | "s3";
 
 /**
  * Submit-time reachability check on one intake source (TEAM-4054). OUTPUT-ONLY:
@@ -462,7 +462,7 @@ export interface WorkflowInput {
   };
 }
 
-export interface PortedSession {
+interface PortedSession {
   /** Cloud Code session id (cc-…) the personas resume via resume_session. */
   sessionId: string;
   /** The CLI conversation id inside the transcript (claude --resume <id>). */
@@ -477,7 +477,7 @@ export interface PortedSession {
 
 // ─── Human Notifications ─────────────────────────────────────────────────────
 
-export type NotificationType =
+type NotificationType =
   | "phase_complete"
   | "blocker"
   | "review_needed"
@@ -486,7 +486,7 @@ export type NotificationType =
 
 /** Curated link in a review package — artifactKey opens the hub's artifact
  *  viewer (/workflow?id=X&artifact=<key>), url is external (PR, preview). */
-export interface ReviewPackageLink {
+interface ReviewPackageLink {
   label: string;
   url?: string;
   artifactKey?: string;

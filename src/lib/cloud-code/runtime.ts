@@ -52,7 +52,7 @@ export function codingRuntimeConfigured(): boolean {
  * runtime's storage, not the new one's. Rows without one predate the field and
  * belong to the app's configured runtime.
  */
-export function resolveRuntimeArn(sessionRuntimeArn?: string): string {
+function resolveRuntimeArn(sessionRuntimeArn?: string): string {
   const arn = sessionRuntimeArn || CODING_RUNTIME_ARN;
   if (!arn) throw new Error("CODING_AGENT_RUNTIME_ARN is not set");
   return arn;

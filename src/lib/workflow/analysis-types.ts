@@ -10,23 +10,23 @@
 
 import type { ShipBlockedOutcome } from "./types";
 
-export type AnalysisTrigger = "auto" | "manual" | "watch";
+type AnalysisTrigger = "auto" | "manual" | "watch";
 // TEAM-3747 D2 — additively includes the lifecycle-integrity terminal outcomes
 // ("deploy-blocked" | "static-ci-only") so a blocked run is analyzed HONESTLY
 // rather than recorded as "complete". Legacy analyses (only complete/cancelled/
 // error) are unaffected. Parity: save_analysis.py RUN_OUTCOMES + WorkflowPhase.
 export type RunOutcome = "complete" | "cancelled" | "error" | ShipBlockedOutcome;
-export type FindingKind = "bottleneck" | "failure" | "success" | "risk";
-export type FindingSeverity = "critical" | "high" | "medium" | "low";
-export type RecommendationPriority = "P0" | "P1" | "P2";
-export type RecommendationType =
+type FindingKind = "bottleneck" | "failure" | "success" | "risk";
+type FindingSeverity = "critical" | "high" | "medium" | "low";
+type RecommendationPriority = "P0" | "P1" | "P2";
+type RecommendationType =
   | "workflow-def"
   | "prompt"
   | "gate-config"
   | "process"
   | "tooling";
 
-export interface PhaseMetric {
+interface PhaseMetric {
   phase: string;
   enteredAt: string | null;
   exitedAt: string | null;
@@ -34,7 +34,7 @@ export interface PhaseMetric {
   taskCount: number;
 }
 
-export interface AgentTaskMetric {
+interface AgentTaskMetric {
   ticketId: string;
   agentId: string;
   phase: string | null;
@@ -72,7 +72,7 @@ export interface HumanReviewMetric {
  * `new` (a defect nobody had filed for), `resurfacing` (same place/invariant as
  * an earlier fix — an earlier fix did not hold), `fix-induced` (a previous fix
  * broke it), `environmental` (red build / stale branch, nobody's disagreement). */
-export interface FixTicketEntry {
+interface FixTicketEntry {
   ticketId: string;
   kind: string;
   originTicketId: string | null;
@@ -89,14 +89,14 @@ export interface FixTicketEntry {
   reverify?: boolean;
 }
 
-export interface ChangeRequestCycle {
+interface ChangeRequestCycle {
   gateTicketId: string;
   rejectedAt: string | null;
   reopenedTickets: string[];
   reworkDurationMs: number | null;
 }
 
-export interface ManagerIntervention {
+interface ManagerIntervention {
   action: string;
   ticketId?: string | null;
   at: string;
@@ -152,7 +152,7 @@ export interface WorkflowMetrics {
   };
 }
 
-export interface AnalysisScores {
+interface AnalysisScores {
   overall: number;
   planning: number;
   execution: number;
@@ -187,7 +187,7 @@ export interface AnalysisRecommendation {
   patternKey?: string | null;
 }
 
-export interface AnalysisTrend {
+interface AnalysisTrend {
   priorRunsCompared: number;
   deltas: {
     totalDurationMs: number | null;
