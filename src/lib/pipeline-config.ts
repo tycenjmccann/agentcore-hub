@@ -80,7 +80,7 @@ function categorize(toolName: string): { icon: string; cardLabel: string; hidden
 }
 
 // Build the map from all tools declared across agents in agents.json
-export const TOOL_ICON_MAP: Record<string, { icon: string; label: string }> = Object.fromEntries(
+const TOOL_ICON_MAP: Record<string, { icon: string; label: string }> = Object.fromEntries(
   [...new Set(agentsConfig.agents.flatMap((a) => a.tools))].map((tool) => {
     const cat = categorize(tool);
     return [tool, { icon: cat.icon, label: cat.cardLabel }];
@@ -90,23 +90,23 @@ export const TOOL_ICON_MAP: Record<string, { icon: string; label: string }> = Ob
 // ─── Phase Display Order ────────────────────────────────────────────────────
 // Defines the left-to-right ordering of phases in the visualization.
 
-export type PipelinePhaseId = "intake" | "requirements" | "design" | "development" | "qa";
+type PipelinePhaseId = "intake" | "requirements" | "design" | "development" | "qa";
 
 // ─── Phase Display Metadata ─────────────────────────────────────────────────
 // Per-phase UI metadata: how to render each phase visually.
 // Agent lists are NOT here — they are derived from agents.json.
 
-export interface PipelineIdentityItem {
+interface PipelineIdentityItem {
   icon: string;
   label: string;
 }
 
-export interface PipelineConfigItem {
+interface PipelineConfigItem {
   key: string;
   val: string;
 }
 
-export interface PipelineDisplayItem {
+interface PipelineDisplayItem {
   icon?: string;
   dot?: "skill" | "ext";
   label: string;
@@ -123,7 +123,7 @@ interface PhaseDisplayMeta {
   outputs: PipelineDisplayItem[];
 }
 
-export const PHASE_DISPLAY_META: Record<PipelinePhaseId, PhaseDisplayMeta> = {
+const PHASE_DISPLAY_META: Record<PipelinePhaseId, PhaseDisplayMeta> = {
   intake: {
     name: "Intake",
     type: "app",
@@ -241,7 +241,7 @@ export const PHASE_DISPLAY_META: Record<PipelinePhaseId, PhaseDisplayMeta> = {
 
 // ─── Agent Config Interface ─────────────────────────────────────────────────
 
-export interface PipelineAgentConfig {
+interface PipelineAgentConfig {
   /** Agent ID — must match agents.json agentId and WorkflowState.agentTasks keys */
   agentId: string;
   /** Display name shown in pipeline */

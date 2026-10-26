@@ -52,7 +52,7 @@ export interface FlowNode {
   y: number;
 }
 
-export interface FlowEdge {
+interface FlowEdge {
   from: string;
   to: string;
   path: string;
@@ -62,7 +62,7 @@ export interface FlowEdge {
   resolved: boolean;
 }
 
-export interface FlowCaption { phase: string; x: number; width: number }
+interface FlowCaption { phase: string; x: number; width: number }
 
 export interface FlowLayout {
   nodes: FlowNode[];
@@ -87,7 +87,7 @@ export const FLOW_METRICS = {
 } as const;
 
 /** Canonical order for the phases the roster + defs use; unknown phases append in first-seen order. */
-export const KNOWN_PHASE_ORDER = [
+const KNOWN_PHASE_ORDER = [
   "intake", "requirements", "design", "development", "review", "ci", "verification", "ship", "cd",
 ];
 
@@ -125,7 +125,7 @@ export function kindOf(t: FlowTicket): FlowKind | null {
 }
 
 /** The ticket that filed a rework ticket, when the record says so. */
-export function filerOf(t: FlowTicket): string | null {
+function filerOf(t: FlowTicket): string | null {
   const sb = t.spawnedBy;
   if (!sb) return null;
   for (const key of ORIGIN_KEYS) {

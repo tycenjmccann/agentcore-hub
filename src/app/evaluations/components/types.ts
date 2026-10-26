@@ -18,7 +18,7 @@ export interface ScorecardEntry {
   passing: number;
 }
 
-export interface ModelCost {
+interface ModelCost {
   model: string;
   input: number;
   output: number;
@@ -91,7 +91,7 @@ export type EvaluatorSeries = Record<string, { day: string; avg: number; count: 
 
 // ─── GET /api/evaluations/results ────────────────────────────────────────────
 
-export interface SessionScore {
+interface SessionScore {
   score?: number | null;
   scoreLabel?: string | null;
   status?: string | null;
@@ -113,7 +113,7 @@ export interface ResultsResponse {
 
 // ─── GET /api/evaluations/sessions/<id> ──────────────────────────────────────
 
-export interface SessionResult {
+interface SessionResult {
   evaluator: string;
   score?: number | null;
   scoreLabel?: string | null;

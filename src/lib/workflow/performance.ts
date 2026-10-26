@@ -63,7 +63,7 @@ export interface CardSummary {
   costMissing?: boolean;
 }
 
-export interface InfraSnapshot {
+interface InfraSnapshot {
   updatedAt: string | null;
   region?: string;
   windowDays?: number;
@@ -183,7 +183,7 @@ export function getPath(obj: unknown, path: string): number | null {
 
 // ─── Fleet view ───────────────────────────────────────────────────────────────
 
-export interface KpiStat { n: number; median: number; mean: number; p75: number; max: number; total: number }
+interface KpiStat { n: number; median: number; mean: number; p75: number; max: number; total: number }
 
 export interface FleetKpi extends KpiDef {
   current: KpiStat | null;
@@ -196,7 +196,7 @@ export interface FleetKpi extends KpiDef {
   series: { t: string; v: number; workflowId: string }[];
 }
 
-export interface AgentAgg {
+interface AgentAgg {
   agentId: string;
   usd: number;
   workMs: number;
@@ -412,9 +412,9 @@ export function formatKpi(unit: KpiUnit, v: number | null | undefined, compact =
 // recomputing a card twice yields the same bytes.
 
 export type KpiComponentKind = "ratio" | "rate" | "count" | "sum" | "excess" | "verdict";
-export type KpiConfidence = "full" | "partial" | "insufficient";
+type KpiConfidence = "full" | "partial" | "insufficient";
 
-export interface KpiGradeDef { grade: string; min: number }
+interface KpiGradeDef { grade: string; min: number }
 
 /**
  * One weighted line of the rubric. Which optional fields matter depends on
@@ -453,7 +453,7 @@ export const KPI_CONFIG = kpiConfig as KpiConfig;
 /** Card schema this build reads/writes. Bumped with any card shape change. */
 export const CURRENT_REPORT_VERSION = 11; // 11: kpiVersion 3 (TEAM-5428) — cancelled/stopped capped at 40 and banded against each other, completions require a completion record (tasksClosedWithoutWork / tasksRecordUnreadable), only WM actions count as interventions, run.outcome "stopped", card.delivery facts (deployed true/false/null + shipRecordsUnreadable); 10: claude_code cache read/write tokens counted, cards no longer show cacheRead=0 (TEAM-5159) — nothing the KPI scorer reads; 9: tokens.total / cache hit rates use uncached input (TEAM-5158) — nothing the KPI scorer reads; 8: codex/kiro usage read from every coding runtime + per-session coding gaps (dataQuality.costPartial) — nothing the KPI scorer reads; 7: registry-driven pricing (openai.gpt-5.5 + long-context rates, cost.unpricedModels) — nothing the KPI scorer reads; 6: kpiVersion 2 (re-invocation classes, dead sessions as errors, WM intervention detail)
 
-export interface KpiComponent {
+interface KpiComponent {
   key: string;
   label: string;
   weight: number;

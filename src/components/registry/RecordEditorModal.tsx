@@ -67,7 +67,7 @@ function extractSkillDef(detail: RegistryRecordDetail): string {
 }
 
 /** Create-mode seed values for the editor (see `prefill` prop). */
-export interface RecordEditorPrefill {
+interface RecordEditorPrefill {
   name?: string;
   description?: string;
   descriptorType?: DescriptorType;

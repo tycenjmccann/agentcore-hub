@@ -44,7 +44,7 @@ export interface ConfigScope {
   userId: string;
 }
 
-export const DEFAULT_SCOPE: ConfigScope = {
+const DEFAULT_SCOPE: ConfigScope = {
   tenantId: DEFAULT_TENANT_ID,
   userId: DEFAULT_USER_ID,
 };
