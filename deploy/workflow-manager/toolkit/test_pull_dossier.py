@@ -7,10 +7,12 @@ counters and a text tail and then thrown away, so a doubled chunk means a double
 count and a tail that reads "hello hello world world" forever after. The dossier
 is the record; this has to be right at collection time.
 
-boto3 (and boto3.dynamodb.conditions) are stubbed in sys.modules BEFORE importing
-pull_dossier — it imports boto3 and reads ARTIFACT_BUCKET at module load, and the
-CI toolkit job installs no boto3 — and dynamodb.Table is replaced with a fake
-that replays canned pages. No production code is modified, no AWS call is made.
+boto3 (and boto3.dynamodb.conditions) are stubbed in sys.modules for the IMPORT
+only — pull_dossier imports boto3 and reads ARTIFACT_BUCKET at module load, and
+the CI toolkit job installs no boto3 — scoped with mock.patch.dict so the stub
+doesn't leak into later-collected test modules in the same pytest session, and
+dynamodb.Table is replaced with a fake that replays canned pages. No production
+code is modified, no AWS call is made.
 
 Run: python3 -m unittest deploy/workflow-manager/toolkit/test_pull_dossier.py
      pytest -q deploy/workflow-manager/toolkit/test_pull_dossier.py
@@ -25,12 +27,16 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-sys.modules["boto3"] = mock.MagicMock()
-sys.modules["boto3.dynamodb"] = mock.MagicMock()
-sys.modules["boto3.dynamodb.conditions"] = mock.MagicMock()
 os.environ.setdefault("ARTIFACT_BUCKET", "test-bucket")
 
-import pull_dossier  # noqa: E402
+# Scoped to the import only: an unscoped sys.modules[...] = MagicMock() would
+# leak into whatever imports boto3 next in the same pytest session.
+with mock.patch.dict(sys.modules, {
+    "boto3": mock.MagicMock(),
+    "boto3.dynamodb": mock.MagicMock(),
+    "boto3.dynamodb.conditions": mock.MagicMock(),
+}):
+    import pull_dossier  # noqa: E402
 
 
 class FakeTable:

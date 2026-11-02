@@ -73,6 +73,8 @@ def test_public_network_mode_passes_through_untouched():
 # was READY. _smoke is what turns "accepted" into "verified", and its failure is
 # what fires the buildspec's rollback trap.
 import io
+import types
+
 import pytest
 
 
@@ -98,7 +100,12 @@ class _FakeDataPlane:
 
 
 def _patch(monkeypatch, client):
-    monkeypatch.setattr(uri.boto3, "client", lambda *a, **k: client)
+    # Patch uri's own `boto3` attribute, not `.client` on whatever boto3 resolved
+    # to at collection time — a leaked sys.modules["boto3"] stub elsewhere in the
+    # battery can be a MagicMock, and pytest's monkeypatch.setattr/undo only
+    # restores values found in the target's own __dict__, which a MagicMock's
+    # auto-created attributes are not.
+    monkeypatch.setattr(uri, "boto3", types.SimpleNamespace(client=lambda *a, **k: client))
     monkeypatch.setattr(uri.time, "sleep", lambda _s: None)
 
 
