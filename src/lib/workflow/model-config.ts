@@ -15,7 +15,7 @@ import type { ModelOverride } from "./types";
  * - openai: OpenAI API (GPT models)
  * - gemini: Google Gemini (future support)
  */
-export type ModelProvider = "bedrock" | "openai";
+type ModelProvider = "bedrock" | "openai";
 
 // ─── Model Option Types ──────────────────────────────────────────────────────
 

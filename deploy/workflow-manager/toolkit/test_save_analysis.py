@@ -10,10 +10,11 @@ reads back the runOutcome written to the analyses table — the actual mapping
 (`phase if phase in RUN_OUTCOMES else "complete"`), not the constant in
 isolation.
 
-boto3 is stubbed in sys.modules BEFORE importing save_analysis (it imports boto3
-at module load, and the CI toolkit job installs no boto3), and ARTIFACT_BUCKET is
-set before import (read at module load). No production code is modified and no
-AWS call is made.
+boto3 is stubbed in sys.modules for the IMPORT only (save_analysis imports boto3
+at module load, and the CI toolkit job installs no boto3), scoped with
+mock.patch.dict so the stub doesn't leak into later-collected test modules in
+the same pytest session, and ARTIFACT_BUCKET is set before import (read at
+module load). No production code is modified and no AWS call is made.
 
 Run: python3 -m unittest deploy/workflow-manager/toolkit/test_save_analysis.py
      pytest -q deploy/workflow-manager/toolkit/test_save_analysis.py
@@ -33,11 +34,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 # save_analysis imports boto3 at module load and reads ARTIFACT_BUCKET from the
 # environment at import time — satisfy both before importing so the test needs
-# neither the boto3 wheel nor any AWS credentials/network.
-sys.modules["boto3"] = mock.MagicMock()
+# neither the boto3 wheel nor any AWS credentials/network. Scoped to the import
+# only: an unscoped sys.modules["boto3"] = MagicMock() would leak into whatever
+# imports boto3 next in the same pytest session.
 os.environ.setdefault("ARTIFACT_BUCKET", "test-bucket")
 
-import save_analysis  # noqa: E402
+with mock.patch.dict(sys.modules, {"boto3": mock.MagicMock()}):
+    import save_analysis  # noqa: E402
 
 
 def _valid_analysis():

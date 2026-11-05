@@ -13,9 +13,11 @@ event lands under.
 The network/AWS seams are mocked at the module boundary: `intervene.api_post`
 (the only HTTP write) records (path, body) and `intervene.publish_intervention`
 (the only events-table write) records (workflowId, action, extra). boto3 is
-stubbed in sys.modules BEFORE import (intervene builds a dynamodb resource at
-module load and the CI toolkit job installs no boto3); WORKFLOW_API_URL is set
-before import for good measure though api_post is fully mocked.
+stubbed in sys.modules for the IMPORT only (intervene builds a dynamodb
+resource at module load and the CI toolkit job installs no boto3), scoped with
+mock.patch.dict so the stub doesn't leak into later-collected test modules in
+the same pytest session; WORKFLOW_API_URL is set before import for good
+measure though api_post is fully mocked.
 
 TEAM-4283 adds a third seam for mark-done's completion-record verification:
 `intervene.fetch_completion_record` (the only S3 read) plus
@@ -38,12 +40,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 # intervene imports boto3 and builds a dynamodb resource at module load, and
 # reads env at import time — satisfy both before importing so the test needs
-# neither the boto3 wheel nor any AWS credentials/network.
-sys.modules["boto3"] = mock.MagicMock()
+# neither the boto3 wheel nor any AWS credentials/network. Scoped to the import
+# only: an unscoped sys.modules["boto3"] = MagicMock() would leak into whatever
+# imports boto3 next in the same pytest session.
 os.environ.setdefault("WORKFLOW_API_URL", "http://test.local")
 os.environ.setdefault("EVENTS_TABLE", "test-events")
 
-import intervene  # noqa: E402
+with mock.patch.dict(sys.modules, {"boto3": mock.MagicMock()}):
+    import intervene  # noqa: E402
 
 
 class Recorder:
