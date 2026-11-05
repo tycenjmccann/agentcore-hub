@@ -20,8 +20,11 @@ opentelemetry-sdk>=1.29.0
 # exercised without it. Constructing the exporter opens no connection — nothing
 # is ever flushed, since that test emits no spans.
 opentelemetry-exporter-otlp-proto-http>=1.29.0
-pytest>=8.0.0
-pytest-asyncio>=0.23.0
+# Capped at the minor CI is green on: pytest 9.2.0, a MINOR release, changed
+# monkeypatch teardown and turned the battery red at unchanged main (TEAM-6460).
+# Bump deliberately, only after the battery is green on the new version (TEAM-6465).
+pytest>=8.0.0,<9.3
+pytest-asyncio>=0.23.0,<1.5
 # image_reader guard tests build real PNGs and re-open the tiles it emits.
 pillow>=11.2.1
 # deploy/coding-agent-runtime/test_setup_failure_response.py exec's the coding
